@@ -61,6 +61,20 @@ export class WorkspaceClient {
   async updateDocument(projectId: string, documentId: string, expectedVersion: number, content?: unknown, kind?: string): Promise<ProjectDocument> { const payload: Record<string, unknown> = { expected_version: expectedVersion }; if (content !== undefined) payload.content = content; if (kind !== undefined) payload.kind = kind; return this.json<ProjectDocument>((await this.request("PATCH", `/v1/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(documentId)}`, new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json" })).body) }
   async listProjects(cursor?: string, limit = 50): Promise<{ items: Project[]; next_cursor: string | null }> { return this.json((await this.request("GET", `/v1/projects?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).body) }
   async createTimeline(projectId: string, timelineId: string, idempotencyKey: string): Promise<Record<string, unknown>> { return this.json((await this.request("POST", `/v1/projects/${encodeURIComponent(projectId)}/timelines`, new TextEncoder().encode(JSON.stringify({ timeline_id: timelineId })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200, 201])).body) }
+  async createTimelineDocument(projectId: string, timelineId: string, config: Record<string, unknown>, registry: Record<string, unknown>, slug: string, name: string, idempotencyKey: string): Promise<Record<string, unknown>> {
+    const timeline = await this.createTimeline(projectId, timelineId, idempotencyKey);
+    const document = await this.createDocument(projectId, `timeline:${timelineId}`, "timeline.composition", { slug, name, config, registry });
+    return { ...timeline, slug, name, config_version: document.version, config, registry };
+  }
+  async updateTimelineDocument(projectId: string, timelineId: string, expectedVersion: number, config: Record<string, unknown>, registry: Record<string, unknown>, slug?: string, name?: string): Promise<Record<string, unknown>> {
+    const current = await this.getDocument(projectId, `timeline:${timelineId}`);
+    const content: Record<string, unknown> = { ...(current.content as Record<string, unknown>), config, registry };
+    if (slug !== undefined) content.slug = slug;
+    if (name !== undefined) content.name = name;
+    const document = await this.updateDocument(projectId, `timeline:${timelineId}`, expectedVersion, content);
+    const timeline = await this.getTimeline(timelineId);
+    return { ...timeline, slug: content.slug ?? timelineId, name: content.name ?? timelineId, config_version: document.version, config, registry };
+  }
   async listTimelines(projectId: string, cursor?: string, limit = 50): Promise<{ items: Record<string, unknown>[]; next_cursor: string | null }> { return this.json((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/timelines?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).body) }
   async getTimeline(timelineId: string): Promise<Record<string, unknown>> { return this.json((await this.request("GET", `/v1/timelines/${encodeURIComponent(timelineId)}`)).body) }
   async listTimelineHistory(timelineId: string, cursor?: string, limit = 50): Promise<{ items: Record<string, unknown>[]; next_cursor: string | null }> { return this.json((await this.request("GET", `/v1/timelines/${encodeURIComponent(timelineId)}/history?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).body) }

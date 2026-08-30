@@ -383,6 +383,56 @@ class WorkspaceClient:
     def create_timeline(self, project_id: str, timeline_id: str, *, idempotency_key: str) -> Mapping[str, Any]:
         return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/timelines", body=json.dumps({"timeline_id": timeline_id}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
 
+    def create_timeline_document(
+        self,
+        project_id: str,
+        timeline_id: str,
+        *,
+        config: Mapping[str, Any],
+        registry: Mapping[str, Any],
+        slug: str,
+        name: str,
+        idempotency_key: str,
+    ) -> Mapping[str, Any]:
+        """Create a timeline and persist its product document atomically enough for clients.
+
+        The neutral runtime stores timeline identity/state and arbitrary product
+        composition separately. This helper composes those existing primitives
+        without importing an Astrid-specific schema into the runtime.
+        """
+        timeline = self.create_timeline(project_id, timeline_id, idempotency_key=idempotency_key)
+        document = self.create_document(
+            project_id,
+            f"timeline:{timeline_id}",
+            "timeline.composition",
+            {"slug": slug, "name": name, "config": dict(config), "registry": dict(registry)},
+        )
+        result = dict(timeline)
+        result.update({"slug": slug, "name": name, "config_version": document.version, "config": dict(config), "registry": dict(registry)})
+        return result
+
+    def update_timeline_document(
+        self,
+        project_id: str,
+        timeline_id: str,
+        *,
+        expected_version: int,
+        config: Mapping[str, Any],
+        registry: Mapping[str, Any],
+        slug: str | None = None,
+        name: str | None = None,
+    ) -> Mapping[str, Any]:
+        current = self.get_document(project_id, f"timeline:{timeline_id}")
+        content = dict(current.content) if isinstance(current.content, Mapping) else {}
+        content.update({"config": dict(config), "registry": dict(registry)})
+        if slug is not None: content["slug"] = slug
+        if name is not None: content["name"] = name
+        document = self.update_document(project_id, f"timeline:{timeline_id}", expected_version=expected_version, content=content)
+        timeline = self.get_timeline(timeline_id)
+        result = dict(timeline)
+        result.update({"slug": content.get("slug", timeline_id), "name": content.get("name", timeline_id), "config_version": document.version, "config": dict(config), "registry": dict(registry)})
+        return result
+
     def list_timelines(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines" + query)[2])
