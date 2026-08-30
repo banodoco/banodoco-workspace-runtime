@@ -123,7 +123,10 @@ class Migrator:
             foreign_keys = [dict(row) for row in conn.execute("PRAGMA foreign_key_check")]
             tables = _table_names(conn)
             counts = {table: conn.execute(f' SELECT count(*) FROM "{table}"').fetchone()[0] for table in tables}
+            column_map = {table: {row[1] for row in conn.execute(f'pragma table_info("{table}")')} for table in tables}
             migrations = _rows(conn, "schema_migrations")
+            media_rows = _rows(conn, "media")
+            location_rows = _rows(conn, "media_locations")
         finally:
             conn.close()
         if integrity != "ok" or foreign_keys:
@@ -132,6 +135,44 @@ class Migrator:
         for path in sorted(self.config.source_root.rglob("*")):
             if path.is_file() and not path.is_symlink():
                 files[str(path.relative_to(self.config.source_root))] = {"size": path.stat().st_size, "sha256": _sha256_file(path)}
+        media_dispositions = []
+        estimated_cas_bytes = 0
+        for media in media_rows:
+            estimated_cas_bytes += int(media.get("byte_size") or 0)
+            locs = [x for x in location_rows if str(x.get("media_id")) == str(media.get("id"))]
+            disposition = []
+            for location in locs:
+                realm = str(location.get("realm") or "").lower()
+                locator = str(location.get("locator") or "")
+                if realm in {"remote", "http", "https"}:
+                    disposition.append({"realm": realm, "disposition": "blocked_remote"})
+                    continue
+                path = Path(locator).expanduser()
+                if not path.is_absolute():
+                    path = self.config.source_root / path
+                try:
+                    path.resolve().relative_to(self.config.source_root)
+                    inside = True
+                except ValueError:
+                    inside = False
+                disposition.append({"realm": realm, "disposition": "readable_local" if path.is_file() and inside else "missing_or_outside_source", "relative_locator": str(path.resolve().relative_to(self.config.source_root)) if inside else "<outside-source>"})
+            media_dispositions.append({"media_id": media.get("id"), "content_hash": media.get("content_hash"), "byte_size": media.get("byte_size"), "locations": disposition})
+        known_columns = {"projects": {"id", "slug", "name", "settings_json", "event_head_seq", "created_at", "updated_at"}, "timelines": {"id", "project_id", "event_stream_id", "name", "document_json", "asset_registry_json", "created_at", "updated_at", "project_data_json"}, "shots": {"id", "project_id", "name", "sort_key", "metadata_json", "created_at", "updated_at"}, "project_references": {"id", "project_id", "kind", "name", "description", "metadata_json", "created_at", "updated_at", "archived_at"}, "media": {"id", "project_id", "media_kind", "mime_type", "byte_size", "content_hash", "metadata_json", "created_at"}, "media_locations": {"id", "media_id", "realm", "locator", "verified_at", "created_at"}, "media_references": {"id", "reference_id", "media_id", "role", "context_task_id", "ordinal", "is_primary", "metadata_json", "created_at"}, "media_relations": {"from_media_id", "to_media_id", "kind", "ordinal", "metadata_json", "created_at"}, "reference_links": {"from_reference_id", "to_reference_id", "kind", "metadata_json", "created_at"}, "generation_variants": {"id", "generation_id", "media_id", "variant_type", "name", "params_json", "is_primary", "starred", "viewed_at", "created_at"}, "generations": {"id", "project_id", "task_id", "type", "name", "based_on_generation_id", "parent_generation_id", "child_order", "params_json", "starred", "deleted_at", "created_at", "updated_at"}, "runs": {"id", "project_id", "event_stream_id", "kind", "status", "title", "input_json", "result_json", "started_at", "finished_at"}, "tasks": {"id", "project_id", "event_stream_id", "run_id", "run_ordinal", "capability", "spec_json", "spec_hash", "input_manifest_json", "status", "priority", "available_at", "max_attempts", "winning_attempt_id", "cancel_request_id", "cancel_requested_at", "created_at", "updated_at", "finished_at"}, "events": {"event_id", "project_id", "project_seq", "stream_id", "seq", "subject_type", "subject_id", "changes_json", "kind", "schema_version", "idempotency_key", "txn_id", "actor_kind", "payload_json", "created_at"}, "event_streams": {"id", "project_id", "stream_type", "aggregate_id", "head_seq", "created_at"}, "schema_migrations": {"pack", "version", "name", "checksum", "applied_at"}, "shot_items": {"id", "shot_id", "media_id", "sort_key", "source_frame", "metadata_json", "created_at"}, "task_dependencies": {"task_id", "depends_on_task_id", "kind", "ordinal"}, "task_outputs": {"task_id", "ordinal", "role", "media_id", "is_primary", "params_json", "created_at"}, "execution_attempts": {"id", "task_id", "attempt_no", "executor_id", "status", "status_version", "lease_id", "lease_expires_at", "heartbeat_counter", "last_heartbeat_at", "progress_json", "error_json", "created_at", "updated_at", "finished_at"}, "command_receipts": {"project_id", "idempotency_key", "request_hash", "command_kind", "txn_id", "primary_stream_id", "resulting_stream_seq", "first_project_seq", "last_project_seq", "event_ids_json", "result_json", "created_at"}, "evidence_items": {"id", "run_id", "task_id", "kind", "summary", "data_json", "media_id", "created_at"}, "runaway_transitions": {"id", "project_id", "run_id", "task_id", "ordinal", "start_ms", "duration_ms", "prompt", "metadata_json", "created_at"}}
+        supported_tables = {"projects", "timelines", "shots", "project_references", "media", "media_locations", "generations"}
+        metadata_only_tables = {"schema_migrations"}
+        unmapped = {}
+        unsupported = {}
+        for table in tables:
+            columns = column_map[table]
+            if table in known_columns:
+                extra = sorted(columns - known_columns[table])
+                if extra:
+                    unmapped[table] = extra
+            else:
+                unmapped[table] = sorted(columns)
+            if table not in supported_tables and table not in metadata_only_tables and counts.get(table, 0):
+                unsupported[table] = {"rows": counts[table], "columns": sorted(columns)}
+        free_bytes = shutil.disk_usage(self.config.destination_root.parent if self.config.destination_root.parent.exists() else self.config.source_root).free
         self._report["inventory"] = {
             "source_root": str(self.config.source_root),
             "database": str(self.database),
@@ -142,6 +183,12 @@ class Migrator:
             "row_counts": counts,
             "files": files,
             "integrity": {"quick_check": integrity, "foreign_key_errors": foreign_keys},
+            "media_locator_dispositions": media_dispositions,
+            "estimated_cas_bytes": estimated_cas_bytes,
+            "destination_free_bytes": free_bytes,
+            "unmapped_fields": unmapped,
+            "unsupported_nonempty_tables": unsupported,
+            "blockers": [],
         }
         return self._report["inventory"]
 
@@ -179,7 +226,16 @@ class Migrator:
             digest = str(row.get("content_hash") or "")
             if digest and len(digest.removeprefix("sha256:")) != 64:
                 raise MigrationError(f"media {row.get('id')} has an invalid content hash")
-        self._report["validation"] = {"ok": True, "foreign_keys": "ok", "invariants": ["unique project IDs/slugs", "project-owned timelines/shots/references", "media-location foreign keys", "content hash shape"]}
+        blockers = []
+        inventory = self._report.get("inventory", {})
+        for table, detail in inventory.get("unsupported_nonempty_tables", {}).items():
+            blockers.append({"kind": "unmapped_table", "table": table, "rows": detail.get("rows"), "reason": "no neutral client operation in this slice"})
+        for media in inventory.get("media_locator_dispositions", []):
+            for location in media.get("locations", []):
+                if location.get("disposition") != "readable_local":
+                    blockers.append({"kind": "media_locator", "media_id": media.get("media_id"), "disposition": location.get("disposition")})
+        inventory["blockers"] = blockers
+        self._report["validation"] = {"ok": not blockers, "foreign_keys": "ok", "invariants": ["unique project IDs/slugs", "project-owned timelines/shots/references", "media-location foreign keys", "content hash shape"], "blockers": blockers}
 
     def _invoke(self, name: str, *args, **kwargs):
         if self.client is None or not hasattr(self.client, name):
@@ -233,6 +289,8 @@ class Migrator:
             self._report["mapping"] = self._mapping_preview(data)
             self._report["reconciliation"] = self._reconcile(data, preview=True)
             return self._report
+        if self._report.get("validation", {}).get("blockers"):
+            raise MigrationError("migration has unresolved source facts; resolve blockers before archive/import/activation")
         archive = self._archive(inventory)
         self._import(data)
         reconciliation = self._reconcile(data, preview=False)
@@ -316,7 +374,8 @@ class Migrator:
         expected = self._mapping_preview(data)
         actual = {"projects": len(self._project_ids), "timelines": len(self._timeline_ids), "media": len(self._media_ids), "references": len(self._reference_ids)} if not preview else {}
         unresolved = self._report.get("unresolved", [])
-        return {"ok": not unresolved, "expected": expected, "mapped": actual, "unresolved": unresolved, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok"}
+        blockers = list(self._report.get("inventory", {}).get("blockers", [])) + unresolved
+        return {"ok": not blockers, "expected": expected, "mapped": actual, "unresolved": unresolved, "blockers": blockers, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok"}
 
     def _activation(self, archive: Path, reconciliation: Mapping[str, Any]) -> Path:
         self.config.destination_root.mkdir(parents=True, exist_ok=True)
