@@ -586,22 +586,33 @@ class RealmStore:
             raise ValidationError("worker_id and positive max_concurrency are required")
         if readiness not in {"ready", "not_ready"}:
             raise ValidationError("readiness must be ready or not_ready")
-        capability_values = list(capabilities or [])
-        capability_ids = []
-        for value in capability_values:
-            if isinstance(value, str):
-                capability_ids.append(value)
-            elif isinstance(value, dict) and (value.get("capability_id") or value.get("id")):
-                capability_ids.append(value.get("capability_id") or value.get("id"))
-                if value.get("definition_digest"):
-                    self.register_capability(value.get("capability_id") or value.get("id"), value["definition_digest"], required_resource_keys=value.get("required_resource_keys"), status=value.get("status", "ready"), unavailable_reason=value.get("unavailable_reason"), estimated_scratch_bytes=value.get("estimated_scratch_bytes", 0), estimated_output_bytes=value.get("estimated_output_bytes", 0))
-            else:
-                raise ValidationError("capabilities must contain ids or capability descriptors")
-        keys = list(dict.fromkeys(resource_keys or []))
-        if any(not isinstance(key, str) or not key for key in keys):
-            raise ValidationError("resource keys must be non-empty strings")
         with self._mutex:
+            # Epoch fencing is deliberately the first operation under the
+            # owner lock.  In particular, do not inspect/register capability
+            # descriptors before rejecting a stale or omitted epoch: a stale
+            # worker must have zero capability and worker side effects.
             epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
+            capability_values = list(capabilities or [])
+            capability_ids = []
+            descriptors = []
+            for value in capability_values:
+                if isinstance(value, str):
+                    capability_ids.append(value)
+                elif isinstance(value, dict) and (value.get("capability_id") or value.get("id")):
+                    capability_id = value.get("capability_id") or value.get("id")
+                    capability_ids.append(capability_id)
+                    if value.get("definition_digest"):
+                        descriptors.append((capability_id, value))
+                else:
+                    raise ValidationError("capabilities must contain ids or capability descriptors")
+            keys = list(dict.fromkeys(resource_keys or []))
+            if any(not isinstance(key, str) or not key for key in keys):
+                raise ValidationError("resource keys must be non-empty strings")
+            # All input validation follows the epoch check, and descriptor
+            # registration only happens after the complete request shape is
+            # known to be valid.
+            for capability_id, value in descriptors:
+                self.register_capability(capability_id, value["definition_digest"], required_resource_keys=value.get("required_resource_keys"), status=value.get("status", "ready"), unavailable_reason=value.get("unavailable_reason"), estimated_scratch_bytes=value.get("estimated_scratch_bytes", 0), estimated_output_bytes=value.get("estimated_output_bytes", 0))
             timestamp = now()
             self.conn.execute("INSERT INTO workers(id, capabilities_json, max_concurrency, resource_keys_json, created_at, last_seen_at, readiness, readiness_reason, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, last_seen_at=excluded.last_seen_at, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, runtime_epoch=excluded.runtime_epoch", (worker_id, canonical_json(capability_ids), max_concurrency, canonical_json(keys), timestamp, timestamp, readiness, None if readiness == "ready" else (readiness_reason or "worker_not_ready"), epoch))
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()

@@ -745,7 +745,7 @@ class RuntimeService:
             raise ConflictError("recovery checkpoint identity is inconsistent")
         return row
 
-    def _reboot_authorized(self, body, attempt_id, expected_nonce=None):
+    def _reboot_authorized(self, body, attempt_id, expected_nonce=None, *, allow_consumed=False):
         """Validate durable, attempt-bound recovery authorization.
 
         A nonce supplied by a caller is not sufficient by itself.  It must be
@@ -758,7 +758,7 @@ class RuntimeService:
         supplied = body.get("nonce")
         if not nonce:
             raise ValidationError("prepare_reboot is required before recovery")
-        if attempt["recovery_nonce_used"]:
+        if attempt["recovery_nonce_used"] and not allow_consumed:
             raise ConflictError("recovery authorization has already been consumed")
         if attempt["recovery_nonce_expires_at"] and attempt["recovery_nonce_expires_at"] <= now():
             raise ValidationError("recovery authorization has expired")
@@ -842,27 +842,40 @@ class RuntimeService:
 
     def request_reboot(self, body):
         """Execute only an allowlisted reboot command after durable checkpointing."""
-        row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
-        self._reboot_authorized(body, row["attempt_id"], row["nonce"])
-        command = str(body.get("command") or "reboot")
-        if command not in self.reboot_allowlist:
-            raise ValidationError("reboot command is not allowlisted", details={"command": command, "allowlist": sorted(self.reboot_allowlist)})
-        if int(row["runtime_epoch"]) != self.store._current_runtime_epoch():
-            raise LeaseError("reboot checkpoint belongs to a stale runtime epoch")
-        checkpoint_bytes = Path(row["checkpoint_path"]).read_bytes()
-        if sha256_bytes(checkpoint_bytes) != row["checkpoint_digest"]:
-            raise ConflictError("recovery checkpoint digest mismatch")
-        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
-        if row["state"] in {"executed", "resumed"} and row["recovery_receipt_json"]:
-            return json.loads(row["recovery_receipt_json"])
-        if row["state"] != "durable":
-            raise ConflictError("reboot has already been requested", details={"state": row["state"]})
-        if self.reboot_executor is None:
-            raise ConflictError("reboot executor is unavailable; tests must inject a safe executor")
-        timestamp = now()
-        with self.store._transaction():
-            self.store.conn.execute("UPDATE recovery_checkpoints SET state='reboot_requested', updated_at=? WHERE id=? AND state='durable'", (timestamp, row["id"]))
-        executor = self.reboot_executor
+        # Claim and consume the one-shot authorization in the same SQLite
+        # transaction as the durable-state transition.  The executor is
+        # intentionally called after commit (it may block or terminate the
+        # process), but no competing request can pass the claim meanwhile.
+        with self.store._mutex:
+            row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
+            if row["state"] in {"executed", "resumed"} and row["recovery_receipt_json"]:
+                # A completed request is safely replayable, but still require
+                # the exact original nonce and authorization.
+                self._reboot_authorized(body, row["attempt_id"], row["nonce"], allow_consumed=True)
+                return json.loads(row["recovery_receipt_json"])
+            self._reboot_authorized(body, row["attempt_id"], row["nonce"])
+            command = str(body.get("command") or "reboot")
+            if command not in self.reboot_allowlist:
+                raise ValidationError("reboot command is not allowlisted", details={"command": command, "allowlist": sorted(self.reboot_allowlist)})
+            if int(row["runtime_epoch"]) != self.store._current_runtime_epoch():
+                raise LeaseError("reboot checkpoint belongs to a stale runtime epoch")
+            checkpoint_bytes = Path(row["checkpoint_path"]).read_bytes()
+            if sha256_bytes(checkpoint_bytes) != row["checkpoint_digest"]:
+                raise ConflictError("recovery checkpoint digest mismatch")
+            checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
+            if row["state"] != "durable":
+                raise ConflictError("reboot has already been requested", details={"state": row["state"]})
+            if self.reboot_executor is None:
+                raise ConflictError("reboot executor is unavailable; tests must inject a safe executor")
+            timestamp = now()
+            with self.store._transaction():
+                consumed = self.store.conn.execute("UPDATE attempts SET recovery_nonce_used=1 WHERE id=? AND recovery_nonce_used=0", (row["attempt_id"],))
+                if consumed.rowcount != 1:
+                    raise ConflictError("recovery authorization has already been consumed")
+                claimed = self.store.conn.execute("UPDATE recovery_checkpoints SET state='reboot_requested', updated_at=? WHERE id=? AND state='durable'", (timestamp, row["id"]))
+                if claimed.rowcount != 1:
+                    raise ConflictError("reboot has already been requested", details={"state": row["state"]})
+            executor = self.reboot_executor
         try:
             parameters = __import__("inspect").signature(executor).parameters
             if any(p.kind == p.VAR_KEYWORD for p in parameters.values()) or {"command", "checkpoint"}.issubset(parameters):
@@ -872,8 +885,9 @@ class RuntimeService:
         except (TypeError, ValueError):
             outcome = executor(command, checkpoint)
         receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": row["attempt_id"], "task_id": row["task_id"], "runtime_epoch": self.store._current_runtime_epoch(), "command": command, "status": "executed", "executor_result": outcome}
-        with self.store._transaction():
-            self.store.conn.execute("UPDATE recovery_checkpoints SET state='executed', recovery_receipt_json=?, updated_at=? WHERE id=?", (canonical_json(receipt), now(), row["id"]))
+        with self.store._mutex:
+            with self.store._transaction():
+                self.store.conn.execute("UPDATE recovery_checkpoints SET state='executed', recovery_receipt_json=?, updated_at=? WHERE id=? AND state='reboot_requested'", (canonical_json(receipt), now(), row["id"]))
         return receipt
 
     def resume_attempt(self, body):

@@ -620,7 +620,7 @@ class WorkspaceClient:
     def checkpoint_attempt(self, attempt_id: str, *, lease_id: str, fence: int, nonce: str, authorization: str, state: Mapping[str, Any] | None = None, runtime_epoch: int | None = None) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "nonce": nonce, "authorization": authorization, "state": dict(state or {})}
         if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
-        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/checkpoint", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/checkpoint", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, expected=(200, 201))[2])
 
     def request_reboot(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int, command: str = "reboot") -> Mapping[str, Any]:
         payload = {"checkpoint_id": checkpoint_id, "nonce": nonce, "authorization": authorization, "runtime_epoch": runtime_epoch, "command": command}

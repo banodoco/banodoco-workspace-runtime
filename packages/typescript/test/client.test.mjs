@@ -56,3 +56,21 @@ test("generated TypeScript client registers capabilities and fences failure", as
   assert.equal(capability.capability_id, "render.new");
   assert.equal(failed.state, "failed");
 });
+
+test("generated TypeScript recovery routes preserve path identity and 201 checkpoint responses", async () => {
+  const calls = [];
+  const transport = async (method, path, headers, body) => {
+    calls.push({ method, path, body: JSON.parse(new TextDecoder().decode(body)) });
+    if (path.endsWith("/prepare-reboot")) return { status: 200, headers: {}, body: json({ attempt_id: "a/1", nonce: "n" }) };
+    if (path.endsWith("/checkpoint")) return { status: 201, headers: {}, body: json({ checkpoint_id: "c", attempt_id: "a/1" }) };
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const client = new WorkspaceClient("http://runtime", "token", transport);
+  const prepared = await client.prepareReboot("a/1", "lease", 3, 7);
+  const checkpoint = await client.checkpointAttempt("a/1", "lease", 3, "n", "n", { step: 2 }, 7);
+  assert.equal(prepared.attempt_id, "a/1");
+  assert.equal(checkpoint.checkpoint_id, "c");
+  assert.equal(calls[0].path, "/v1/attempts/a%2F1/prepare-reboot");
+  assert.equal(calls[0].body.attempt_id, undefined);
+  assert.equal(calls[1].path, "/v1/attempts/a%2F1/checkpoint");
+});

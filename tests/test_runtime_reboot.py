@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
+from banodoco_workspace_client import WorkspaceClient
 
 
 def _digest(name: str) -> str:
@@ -116,6 +119,82 @@ def test_checkpoint_reboot_resume_is_nonce_bound_and_test_injected(tmp_path):
     assert receipt["type"] == "runtime.recovery.receipt"
     assert invoked == [("reboot", {"step": 1})]
     first.close()
+
+
+def test_reboot_request_claim_is_atomic_under_forced_race(tmp_path):
+    root = tmp_path / "realm"
+    started = threading.Event()
+    release = threading.Event()
+    invoked = []
+
+    def blocking_executor(command, checkpoint):
+        invoked.append((command, checkpoint))
+        started.set()
+        assert release.wait(5)
+        return {"test_injected": True}
+
+    service = RuntimeService(root, reboot_executor=blocking_executor)
+    service.register_worker({"worker_id": "worker", "capabilities": ["render.basic"]})
+    service.create_task({"capability_id": "render.basic", "spec": {}, "idempotency_key": "race"})
+    attempt = service.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"]})
+    nonce = service.prepare_reboot({"attempt_id": attempt["attempt_id"], "lease_id": attempt["lease_id"], "fence": attempt["fence"]})["nonce"]
+    checkpoint = service.checkpoint_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "nonce": nonce, "authorization": nonce, "state": {"step": 1}})
+    body = {"checkpoint_id": checkpoint["checkpoint_id"], "nonce": nonce, "authorization": nonce}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(service.request_reboot, body)
+        assert started.wait(5)
+        second = pool.submit(service.request_reboot, body)
+        with pytest.raises(ConflictError, match="consumed|already been requested"):
+            second.result(timeout=5)
+        release.set()
+        receipt = first.result(timeout=5)
+    assert receipt["status"] == "executed"
+    assert invoked == [("reboot", {"step": 1})]
+    # After completion, replay with the exact authorization is deterministic
+    # and does not call the executor a second time.
+    assert service.request_reboot(body) == receipt
+    assert len(invoked) == 1
+    service.close()
+
+
+def test_generated_python_prepare_reboot_binds_path_attempt_id_on_live_daemon(tmp_path):
+    invoked = []
+    daemon = __import__("runtime_protocol.daemon", fromlist=["RuntimeDaemon"]).RuntimeDaemon(
+        tmp_path / "realm", reboot_executor=lambda command, checkpoint: invoked.append((command, checkpoint)) or {"ok": True}
+    ).start()
+    try:
+        owner = WorkspaceClient(daemon.endpoint, daemon.token)
+        task = owner.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="generated-reboot")
+        owner.register_executor({"executor_id": "generated-worker", "max_concurrency": 1, "resource_keys": [], "capabilities": [{"capability_id": "render.basic", "definition_digest": _digest("render.basic"), "status": "ready", "required_resource_keys": [], "estimated_scratch_bytes": 0, "estimated_output_bytes": 1}], "protocol": "workspace.v1"}, idempotency_key="generated-worker")
+        worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
+        epoch = worker.health().runtime_epoch
+        attempt = worker.claim_task(executor_id="generated-worker", capability_ids=["render.basic"], idempotency_key="generated-claim", runtime_epoch=epoch)
+        prepared = worker.prepare_reboot(attempt["attempt_id"], lease_id=attempt["lease_id"], fence=attempt["fence"], runtime_epoch=epoch)
+        assert prepared["attempt_id"] == attempt["attempt_id"]
+        checkpoint = worker.checkpoint_attempt(attempt["attempt_id"], lease_id=attempt["lease_id"], fence=attempt["fence"], nonce=prepared["nonce"], authorization=prepared["nonce"], state={"step": 2}, runtime_epoch=epoch)
+        receipt = worker.request_reboot(checkpoint_id=checkpoint["checkpoint_id"], nonce=prepared["nonce"], authorization=prepared["nonce"], runtime_epoch=epoch)
+        assert receipt["status"] == "executed" and invoked == [("reboot", {"step": 2})]
+        assert task.task_id == attempt["task_id"]
+    finally:
+        daemon.stop()
+
+
+def test_stale_or_omitted_worker_epoch_has_no_descriptor_side_effects(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    service.register_worker({"worker_id": "worker", "capabilities": ["render.basic"]})
+    before_capabilities = service.store.conn.execute("SELECT COUNT(*) FROM capabilities").fetchone()[0]
+    before_workers = service.store.conn.execute("SELECT COUNT(*) FROM workers").fetchone()[0]
+    old_epoch = service.store._current_runtime_epoch()
+    service.store.conn.execute("UPDATE runtime_lifecycle SET runtime_epoch=runtime_epoch+1 WHERE id=1")
+    descriptor = {"capability_id": "render.stale", "definition_digest": _digest("render.stale"), "required_resource_keys": []}
+    with pytest.raises(LeaseError):
+        service.register_worker({"worker_id": "worker", "capabilities": [descriptor], "runtime_epoch": old_epoch})
+    with pytest.raises(LeaseError):
+        service.register_worker({"worker_id": "worker", "capabilities": [descriptor]})
+    assert service.store.conn.execute("SELECT COUNT(*) FROM capabilities").fetchone()[0] == before_capabilities
+    assert service.store.conn.execute("SELECT COUNT(*) FROM workers").fetchone()[0] == before_workers
+    assert service.store.conn.execute("SELECT 1 FROM capabilities WHERE id='render.stale'").fetchone() is None
+    service.close()
 
 
 def test_recovery_authorization_is_durable_one_shot_and_forgery_resistant(tmp_path):

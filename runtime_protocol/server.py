@@ -284,7 +284,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
             self._identity("worker:execute")
             action = path[3]
-            if action == "prepare-reboot": return self._send(200, self.runtime.prepare_reboot(self._body()))
+            if action == "prepare-reboot":
+                body = self._body()
+                # The canonical attempt identity is the path parameter.  The
+                # generated clients intentionally do not duplicate it in the
+                # JSON body, so bind it at the HTTP boundary before invoking
+                # the service.
+                body["attempt_id"] = path[2]
+                return self._send(200, self.runtime.prepare_reboot(body))
             if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body()))
             if action == "settle": return self._send(200, self.runtime.settle_attempt(path[2], self._body()))
             if action == "heartbeat": return self._send(200, self.runtime.heartbeat_attempt(path[2], self._body()))
