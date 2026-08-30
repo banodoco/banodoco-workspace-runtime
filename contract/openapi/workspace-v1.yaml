@@ -1,0 +1,392 @@
+openapi: 3.1.0
+info:
+  title: Banodoco Workspace Runtime
+  version: 1.0.0
+  description: Product-neutral local workspace protocol.
+  x-protocol-id: workspace.v1
+servers:
+  - url: http://127.0.0.1
+security:
+  - bearerAuth: []
+paths:
+  /v1/health:
+    get:
+      operationId: health
+      security: []
+      responses:
+        '200': { description: Healthy, content: { application/json: { schema: { $ref: './schemas/health.json' } } } }
+  /v1/handshake:
+    post:
+      operationId: handshake
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: './schemas/handshake.json' } } }
+      responses:
+        '200': { description: Scoped session, content: { application/json: { schema: { $ref: '#/components/schemas/HandshakeResponse' } } } }
+  /v1/realm:
+    get:
+      operationId: getRealm
+      responses:
+        '200': { description: Current scoped realm, content: { application/json: { schema: { $ref: './schemas/realm.json' } } } }
+  /v1/projects:
+    get:
+      operationId: listProjects
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses:
+        '200': { description: Projects, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectPage' } } } }
+    post:
+      operationId: createProject
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateProject' } } }
+      responses:
+        '201': { description: Created, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/projects/{project_id}:
+    get:
+      operationId: getProject
+      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      responses:
+        '200': { description: Project, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
+  /v1/projects/{project_id}/documents:
+    get:
+      operationId: listDocuments
+      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      responses: { '200': { description: Project documents, content: { application/json: { schema: { $ref: '#/components/schemas/DocumentPage' } } } } }
+    post:
+      operationId: createDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateDocument' } } } }
+      responses: { '201': { description: Versioned document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } } }
+  /v1/projects/{project_id}/documents/{document_id}:
+    get:
+      operationId: getDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/DocumentId' } ]
+      responses: { '200': { description: Versioned document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } } }
+    patch:
+      operationId: updateDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/DocumentId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateDocument' } } } }
+      responses: { '200': { description: Updated document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timelines:
+    post:
+      operationId: createTimeline
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateTimeline' } } } }
+      responses: { '201': { description: Timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } } }
+    get:
+      operationId: listTimelines
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Timelines, content: { application/json: { schema: { $ref: '#/components/schemas/TimelinePage' } } } } }
+  /v1/timelines/{timeline_id}:
+    get:
+      operationId: getTimeline
+      parameters: [ { $ref: '#/components/parameters/TimelineId' } ]
+      responses: { '200': { description: Timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } } }
+    patch:
+      operationId: updateTimeline
+      parameters: [ { $ref: '#/components/parameters/TimelineId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateTimeline' } } } }
+      responses: { '200': { description: Updated timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/shots:
+    post:
+      operationId: createShot
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }
+      responses: { '201': { description: Shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } } }
+  /v1/shots/{shot_id}:
+    get:
+      operationId: getShot
+      parameters: [ { $ref: '#/components/parameters/ShotId' } ]
+      responses: { '200': { description: Shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } } }
+  /v1/timelines/{timeline_id}/references:
+    post:
+      operationId: createReference
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } }
+      responses: { '201': { description: Reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } } }
+  /v1/references/{reference_id}:
+    get:
+      operationId: getReference
+      parameters: [ { $ref: '#/components/parameters/ReferenceId' } ]
+      responses: { '200': { description: Reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } } }
+  /v1/objects:
+    post:
+      operationId: ingestObject
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '201': { description: Managed object, content: { application/json: { schema: { $ref: './schemas/managed-object.json' } } } }
+  /v1/objects/{object_id}:
+    get:
+      operationId: getObject
+      parameters: [ { $ref: '#/components/parameters/ObjectId' }, { $ref: '#/components/parameters/Range' } ]
+      responses:
+        '200': { description: Full bytes, headers: { ETag: { $ref: '#/components/headers/ETag' }, Accept-Ranges: { $ref: '#/components/headers/AcceptRanges' } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '206': { description: Byte range, headers: { Content-Range: { $ref: '#/components/headers/ContentRange' }, ETag: { $ref: '#/components/headers/ETag' } }, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+        '416': { $ref: '#/components/responses/RangeNotSatisfiable' }
+    head:
+      operationId: headObject
+      parameters: [ { $ref: '#/components/parameters/ObjectId' }, { $ref: '#/components/parameters/Range' } ]
+      responses:
+        '200': { description: Metadata, headers: { ETag: { $ref: '#/components/headers/ETag' }, ContentLength: { $ref: '#/components/headers/ContentLength' }, AcceptRanges: { $ref: '#/components/headers/AcceptRanges' } } }
+        '206': { description: Range metadata, headers: { ContentRange: { $ref: '#/components/headers/ContentRange' }, ETag: { $ref: '#/components/headers/ETag' } } }
+  /v1/tasks:
+    post:
+      operationId: admitTask
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdmitTask' } } } }
+      responses: { '201': { description: Admitted task, content: { application/json: { schema: { $ref: './schemas/task.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/claim:
+    post:
+      operationId: claimTask
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimTask' } } } }
+      responses: { '200': { description: Fenced attempt, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/AttemptFence' } } } }, '204': { description: No task available } }
+  /v1/tasks/{task_id}:
+    get:
+      operationId: getTask
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses: { '200': { description: Task, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+  /v1/tasks/{task_id}/cancel:
+    post:
+      operationId: cancelTask
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Cancellation requested, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+  /v1/tasks/{task_id}/retry:
+    post:
+      operationId: retryTask
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Retry requested, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+  /v1/runs/{run_id}:
+    get:
+      operationId: getRun
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses: { '200': { description: Run, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+  /v1/runs/{run_id}/events:
+    get:
+      operationId: listRunEvents
+      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      responses: { '200': { description: Ordered run events, content: { application/json: { schema: { $ref: '#/components/schemas/EventPage' } } } } }
+  /v1/events:
+    get:
+      operationId: listEvents
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: aggregate_id, in: query, required: false, schema: { type: string } } ]
+      responses: { '200': { description: Events, content: { application/json: { schema: { $ref: '#/components/schemas/EventPage' } } } } }
+  /v1/executors:
+    post:
+      operationId: registerExecutor
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }
+      responses: { '201': { description: Registered executor, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } } }
+  /v1/capabilities:
+    get:
+      operationId: listCapabilities
+      responses: { '200': { description: Capabilities, content: { application/json: { schema: { $ref: '#/components/schemas/CapabilityPage' } } } } }
+    post:
+      operationId: registerCapability
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Capability' } } } }
+      responses: { '201': { description: Registered capability, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Capability' } } } } }
+  /v1/projects/{project_id}/generations:
+    get:
+      operationId: listGenerations
+      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      responses: { '200': { description: Project generations, content: { application/json: { schema: { $ref: '#/components/schemas/GenerationPage' } } } } }
+    post:
+      operationId: createGeneration
+      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateGeneration' } } } }
+      responses: { '201': { description: Generation, content: { application/json: { schema: { $ref: './schemas/generation.json' } } } } }
+  /v1/generations/{generation_id}:
+    get:
+      operationId: getGeneration
+      parameters: [ { $ref: '#/components/parameters/GenerationId' } ]
+      responses: { '200': { description: Generation, content: { application/json: { schema: { $ref: './schemas/generation.json' } } } } }
+  /v1/generations/{generation_id}/variants:
+    get:
+      operationId: listVariants
+      parameters: [ { $ref: '#/components/parameters/GenerationId' } ]
+      responses: { '200': { description: Generation variants, content: { application/json: { schema: { $ref: '#/components/schemas/VariantPage' } } } } }
+    post:
+      operationId: createVariant
+      parameters: [ { $ref: '#/components/parameters/GenerationId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateVariant' } } } }
+      responses: { '201': { description: Generation variant, content: { application/json: { schema: { $ref: '#/components/schemas/Variant' } } } } }
+  /v1/attempts/{attempt_id}/settle:
+    post:
+      operationId: settleAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Settlement' } } } }
+      responses: { '200': { description: Settled, content: { application/json: { schema: { $ref: './schemas/task.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/fail:
+    post:
+      operationId: failAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AttemptFailure' } } } }
+      responses: { '200': { description: Failed, content: { application/json: { schema: { $ref: './schemas/task.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/heartbeat:
+    post:
+      operationId: heartbeatAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Heartbeat' } } } }
+      responses: { '200': { description: Lease renewed, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/AttemptFence' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: workspace-scoped-token }
+  parameters:
+    Cursor: { name: cursor, in: query, required: false, schema: { type: string, minLength: 1 } }
+    Limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' } }
+    ProjectId: { name: project_id, in: path, required: true, schema: { type: string } }
+    ObjectId: { name: object_id, in: path, required: true, schema: { type: string } }
+    TaskId: { name: task_id, in: path, required: true, schema: { type: string } }
+    RunId: { name: run_id, in: path, required: true, schema: { type: string } }
+    AttemptId: { name: attempt_id, in: path, required: true, schema: { type: string } }
+    TimelineId: { name: timeline_id, in: path, required: true, schema: { type: string } }
+    ShotId: { name: shot_id, in: path, required: true, schema: { type: string } }
+    ReferenceId: { name: reference_id, in: path, required: true, schema: { type: string } }
+    DocumentId: { name: document_id, in: path, required: true, schema: { type: string } }
+    GenerationId: { name: generation_id, in: path, required: true, schema: { type: string } }
+    Range: { name: Range, in: header, required: false, schema: { type: string, pattern: '^bytes=[0-9]+-[0-9]*$' } }
+  headers:
+    ETag: { description: Strong digest validator, schema: { type: string, pattern: '^"sha256:[0-9a-f]{64}"$' } }
+    AcceptRanges: { description: Supported range unit, schema: { type: string, const: bytes } }
+    ContentRange: { description: Inclusive byte range, schema: { type: string, pattern: '^bytes [0-9]+-[0-9]+/[0-9]+$' } }
+    ContentLength: { description: Number of response bytes, schema: { type: integer, minimum: 0 } }
+  schemas:
+    HandshakeResponse:
+      type: object
+      additionalProperties: false
+      required: [protocol, schema_digest, session_id, actor_id, realm_id, scopes]
+      properties:
+        protocol: { type: string, const: workspace.v1 }
+        schema_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        session_id: { type: string }
+        actor_id: { type: string }
+        realm_id: { type: string }
+        scopes: { type: array, items: { type: string }, uniqueItems: true }
+    CreateProject:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties: { name: { type: string, minLength: 1, maxLength: 512 } }
+    ProjectPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: './schemas/project.json' } }
+        next_cursor: { type: [string, 'null'] }
+    ExpectedVersion:
+      type: object
+      additionalProperties: false
+      properties: { expected_version: { type: integer, minimum: 1 } }
+    AdmitTask:
+      type: object
+      additionalProperties: false
+      required: [capability_id, capability_digest, input_object_ids]
+      properties:
+        capability_id: { type: string, minLength: 1 }
+        capability_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        schema_version: { type: string, minLength: 1 }
+        input_object_ids: { type: array, items: { type: string }, uniqueItems: true }
+        settlement_effect: { type: object, additionalProperties: true }
+    EventPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/event.json' } }, next_cursor: { type: [string, 'null'] } }
+    CapabilityPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties: { items: { type: array, items: { $ref: './schemas/worker.json#/definitions/Capability' } } }
+    CreateTimeline:
+      type: object
+      additionalProperties: false
+      required: [timeline_id]
+      properties: { timeline_id: { type: string, minLength: 1 } }
+    TimelinePage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/timeline.json' } }, next_cursor: { type: [string, 'null'] } }
+    DocumentPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/document.json' } }, next_cursor: { type: [string, 'null'] } }
+    CreateDocument:
+      type: object
+      required: [document_id, kind, content]
+      properties: { document_id: { type: string }, kind: { type: string }, content: {} }
+    UpdateDocument:
+      type: object
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, kind: { type: string }, content: {} }
+    UpdateTimeline:
+      type: object
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, shots: { type: array, items: { $ref: '#/components/schemas/Shot' } }, references: { type: array, items: { $ref: '#/components/schemas/Reference' } } }
+    GenerationPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/generation.json' } }, next_cursor: { type: [string, 'null'] } }
+    CreateGeneration:
+      type: object
+      required: [generation_id]
+      properties: { generation_id: { type: string }, source_task_id: { type: [string, 'null'] }, type: { type: string }, status: { type: string }, metadata: { type: object } }
+    Variant:
+      type: object
+      required: [variant_id, generation_id, variant_type, metadata, created_at]
+      properties: { variant_id: { type: string }, generation_id: { type: string }, object_id: { type: [string, 'null'] }, variant_type: { type: string }, metadata: { type: object }, created_at: { type: string } }
+    VariantPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/Variant' } }, next_cursor: { type: [string, 'null'] } }
+    CreateVariant:
+      type: object
+      required: [variant_id]
+      properties: { variant_id: { type: string }, object_id: { type: string }, variant_type: { type: string }, metadata: { type: object } }
+    AttemptFailure:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence, error]
+      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, error: {} }
+    Shot:
+      type: object
+      additionalProperties: false
+      required: [shot_id, start_ms, duration_ms]
+      properties:
+        shot_id: { type: string, minLength: 1 }
+        start_ms: { type: integer, minimum: 0 }
+        duration_ms: { type: integer, minimum: 1 }
+        reference_ids: { type: array, items: { type: string }, uniqueItems: true }
+    Reference:
+      type: object
+      additionalProperties: false
+      required: [reference_id, object_id]
+      properties: { reference_id: { type: string, minLength: 1 }, object_id: { type: string, minLength: 1 }, role: { type: string } }
+    ClaimTask:
+      type: object
+      additionalProperties: false
+      required: [executor_id, capability_ids]
+      properties: { executor_id: { type: string, minLength: 1 }, capability_ids: { type: array, items: { type: string }, uniqueItems: true } }
+    Heartbeat:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence]
+      properties: { lease_id: { type: string, minLength: 1 }, fence: { type: integer, minimum: 1 } }
+  responses:
+    Conflict:
+      description: Conflict or idempotency mismatch
+      content: { application/json: { schema: { $ref: './schemas/common.json#/$defs/Error' } } }
+    RangeNotSatisfiable:
+      description: Invalid byte range
+      content: { application/json: { schema: { $ref: './schemas/common.json#/$defs/Error' } } }

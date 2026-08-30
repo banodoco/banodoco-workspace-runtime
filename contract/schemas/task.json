@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/task.json",
+  "title": "Task and run state",
+  "type": "object", "additionalProperties": false,
+  "required": ["task_id", "run_id", "state", "version", "capability_id", "capability_digest", "idempotency_key", "created_at", "updated_at"],
+  "properties": {
+    "task_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },
+    "run_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },
+    "state": { "type": "string", "enum": ["queued", "ready", "running", "succeeded", "failed", "cancel_requested", "cancelled", "retrying"] },
+    "version": { "type": "integer", "minimum": 1 },
+    "capability_id": { "type": "string", "minLength": 1 },
+    "capability_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "protocol": { "type": "string", "const": "workspace.v1" },
+    "schema_version": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "attempt_id": { "type": ["string", "null"] },
+    "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+  }
+}

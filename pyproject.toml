@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "banodoco-workspace-runtime"
+version = "0.1.0"
+description = "Independent neutral local workspace runtime and bootstrap"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+banodoco-runtime = "runtime_protocol.cli:main"
+banodoco-local = "banodoco_local.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.setuptools.packages.find]
+include = ["runtime_protocol*", "banodoco_local*"]

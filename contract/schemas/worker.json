@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/worker.json",
+  "title": "Executor registration and fenced settlement",
+  "type": "object", "additionalProperties": false,
+  "definitions": {
+    "Capability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["capability_id", "definition_digest", "status", "required_resource_keys", "estimated_scratch_bytes", "estimated_output_bytes"],
+      "properties": {
+        "capability_id": { "type": "string", "minLength": 1 },
+        "definition_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "status": { "type": "string", "enum": ["ready", "unavailable", "unsupported", "retired"] },
+        "unavailable_reason": { "type": ["string", "null"] },
+        "required_resource_keys": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "estimated_scratch_bytes": { "type": "integer", "minimum": 0 },
+        "estimated_output_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Executor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["executor_id", "max_concurrency", "resource_keys", "capabilities", "protocol"],
+      "properties": {
+        "executor_id": { "type": "string", "minLength": 1 },
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "resource_keys": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "capabilities": { "type": "array", "items": { "$ref": "#/definitions/Capability" } },
+        "protocol": { "type": "string", "const": "workspace.v1" }
+      }
+    },
+    "AttemptFence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attempt_id", "task_id", "lease_id", "fence", "lease_expires_at"],
+      "properties": {
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "fence": { "type": "integer", "minimum": 1 },
+        "lease_expires_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "Settlement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["attempt_id", "lease_id", "fence", "outputs", "effect"],
+      "properties": {
+        "attempt_id": { "type": "string", "minLength": 1 },
+        "lease_id": { "type": "string", "minLength": 1 },
+        "fence": { "type": "integer", "minimum": 1 },
+        "outputs": { "type": "array", "items": { "$ref": "#/definitions/Output" } },
+        "effect": { "anyOf": [{ "$ref": "#/definitions/Effect" }, { "type": "null" }] }
+      }
+    },
+    "Output": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "kind", "digest", "media_type", "size"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "enum": ["object", "document", "value"] },
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "media_type": { "type": "string", "minLength": 1 },
+        "size": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Effect": {
+      "type": "object", "additionalProperties": false,
+      "required": ["effect_type", "target_id", "expected_version", "payload"],
+      "properties": {
+        "effect_type": { "type": "string", "enum": ["set_document", "append_relation", "publish_generation"] },
+        "target_id": { "type": "string", "minLength": 1 },
+        "expected_version": { "type": "integer", "minimum": 1 },
+        "payload": { "type": "object", "additionalProperties": true }
+      }
+    }
+  }
+}
