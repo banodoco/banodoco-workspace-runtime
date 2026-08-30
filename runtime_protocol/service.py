@@ -4,7 +4,7 @@ from .cas import ContentAddressedStore
 from .backup import create_backup, restore_backup, structured_export
 from .store import RealmStore
 from .util import atomic_json_write
-from .util import canonical_json, new_id, now, sha256_bytes
+from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 import hashlib
 import json
 import sqlite3
@@ -575,7 +575,7 @@ class RuntimeService:
     def _task_resource(self, value):
         task, run = value["task"], value["run"]
         spec = task.get("spec", {})
-        resource = {"task_id": task["id"], "run_id": run["id"], "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id"), "runtime_epoch": task.get("runtime_epoch")}
+        resource = {"task_id": task["id"], "run_id": run["id"], "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id"), "runtime_epoch": int(task.get("runtime_epoch") or self.store._current_runtime_epoch())}
         if task.get("waiting_reason"):
             resource["waiting_reason"] = task["waiting_reason"]
         if task.get("lease_fence"):
@@ -593,7 +593,7 @@ class RuntimeService:
         return self.store.settle_task(task_id, body.get("lease_token", ""), body.get("result", {}), effect=body.get("effect"), output_objects=body.get("output_objects"), fence=body.get("fence"))
 
     def heartbeat(self, task_id, body):
-        self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="worker", identity_id=body.get("worker_id"))
+        self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="worker", identity_id=body.get("worker_id"), required=True)
         return self.store.heartbeat_task(task_id, body.get("lease_token", ""), fence=body.get("fence"), lease_seconds=body.get("lease_seconds", 30))
 
     def cancel(self, task_id):
@@ -658,13 +658,13 @@ class RuntimeService:
         return {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
 
     def claim_next(self, body):
+        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"), required=True)
         caps = set(body.get("capability_ids", []))
         rows = self.store.conn.execute("SELECT id, capability FROM tasks WHERE status='queued' ORDER BY created_at").fetchall()
         row = next((x for x in rows if not caps or x["capability"] in caps), None)
         if row is None:
             return None
         attempt_id, lease_id = new_id(), new_id()
-        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"))
         value = self.store.claim_task(row["id"], body["executor_id"], lease_id, runtime_epoch=epoch)
         if value["task"]["status"] != "running":
             return {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
@@ -683,11 +683,7 @@ class RuntimeService:
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             current_epoch = self.store._current_runtime_epoch()
-            supplied_epoch = body.get("runtime_epoch")
-            if supplied_epoch is not None and int(supplied_epoch) != current_epoch:
-                raise LeaseError("attempt belongs to a stale runtime epoch", details={"expected": current_epoch, "actual": supplied_epoch})
-            if not row or row["settled"] or int(row["runtime_epoch"]) != current_epoch or row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
-                raise LeaseError("attempt lease is stale or already settled")
+            self._validate_attempt_lease(row, body, current_epoch)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
             if not task or (task["runtime_epoch"] is not None and int(task["runtime_epoch"]) != current_epoch):
                 raise LeaseError("attempt belongs to a stale runtime epoch")
@@ -766,6 +762,30 @@ class RuntimeService:
             raise ValidationError("recovery nonce authorization is required")
         return nonce
 
+    def _validate_attempt_lease(self, row, body, current, *, require_epoch=True, allow_expired=False):
+        """Validate the complete attempt fence before a mutating side effect."""
+        if require_epoch:
+            self.store._validate_runtime_epoch(
+                body.get("runtime_epoch"),
+                identity="executor",
+                identity_id=row["executor_id"] if row else None,
+                required=True,
+            )
+        if not row or row["settled"] or int(row["runtime_epoch"]) != current:
+            raise LeaseError("attempt lease is stale or already settled")
+        try:
+            supplied_fence = int(body.get("fence", 0))
+        except (TypeError, ValueError) as exc:
+            raise LeaseError("attempt fence is invalid") from exc
+        if row["lease_id"] != body.get("lease_id") or int(row["fence"]) != supplied_fence:
+            raise LeaseError("attempt lease is stale or already settled")
+        if not allow_expired and row["lease_expires_at"]:
+            try:
+                if datetime.fromisoformat(row["lease_expires_at"]) <= datetime.now(timezone.utc):
+                    raise LeaseError("attempt lease has expired")
+            except ValueError as exc:
+                raise LeaseError("attempt lease deadline is invalid") from exc
+
     def prepare_reboot(self, body=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
         body = body or {}
@@ -774,10 +794,7 @@ class RuntimeService:
         if not row or row["settled"]:
             raise LeaseError("attempt lease is stale or already settled")
         current = self.store._current_runtime_epoch()
-        if int(row["runtime_epoch"]) != current:
-            raise LeaseError("attempt belongs to a stale runtime epoch")
-        if row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
-            raise LeaseError("attempt lease is stale or already settled")
+        self._validate_attempt_lease(row, body, current)
         with self.store._mutex:
             with self.store._transaction():
                 current_row = self.store.conn.execute("SELECT recovery_nonce, recovery_nonce_expires_at, recovery_nonce_used FROM attempts WHERE id=?", (attempt_id,)).fetchone()
@@ -796,18 +813,13 @@ class RuntimeService:
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             current = self.store._current_runtime_epoch()
-            if not row or row["settled"] or int(row["runtime_epoch"]) != current:
-                raise LeaseError("attempt lease is stale or already settled")
-            if row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
-                raise LeaseError("attempt lease is stale or already settled")
-            if body.get("runtime_epoch") is not None and int(body["runtime_epoch"]) != current:
-                raise LeaseError("attempt belongs to a stale runtime epoch")
+            self._validate_attempt_lease(row, body, current)
             nonce = self._reboot_authorized(body, attempt_id)
             payload = body.get("checkpoint", body.get("state", {}))
             if not isinstance(payload, (dict, list)):
                 raise ValidationError("checkpoint must be an object or array")
-            canonical = canonical_json(payload).encode("utf-8")
-            if len(canonical) > CHECKPOINT_MAX_BYTES:
+            durable_bytes = durable_json_bytes(payload)
+            if len(durable_bytes) > CHECKPOINT_MAX_BYTES:
                 raise ValidationError("recovery checkpoint exceeds 1 MiB bound")
             # A repeated request with the same durable authorization and bytes
             # is idempotent.  A different payload is a conflict, never a new
@@ -822,6 +834,8 @@ class RuntimeService:
             path = self.store.root / "checkpoints" / f"{checkpoint_id}.json"
             atomic_json_write(path, payload)
             durable_bytes = path.read_bytes()
+            if durable_bytes != durable_json_bytes(payload):
+                raise ConflictError("checkpoint serializer changed while writing")
             digest = sha256_bytes(durable_bytes)
             # atomic_json_write fsyncs the file; fsync the containing directory
             # as well so the rename survives a sudden power loss.
@@ -847,6 +861,7 @@ class RuntimeService:
         # intentionally called after commit (it may block or terminate the
         # process), but no competing request can pass the claim meanwhile.
         with self.store._mutex:
+            current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
             if row["state"] in {"executed", "resumed"} and row["recovery_receipt_json"]:
                 # A completed request is safely replayable, but still require
@@ -859,6 +874,8 @@ class RuntimeService:
                 raise ValidationError("reboot command is not allowlisted", details={"command": command, "allowlist": sorted(self.reboot_allowlist)})
             if int(row["runtime_epoch"]) != self.store._current_runtime_epoch():
                 raise LeaseError("reboot checkpoint belongs to a stale runtime epoch")
+            attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (row["attempt_id"],)).fetchone()
+            self._validate_attempt_lease(attempt, {**body, "lease_id": row["lease_id"], "fence": row["fence"]}, current)
             checkpoint_bytes = Path(row["checkpoint_path"]).read_bytes()
             if sha256_bytes(checkpoint_bytes) != row["checkpoint_digest"]:
                 raise ConflictError("recovery checkpoint digest mismatch")
@@ -875,15 +892,31 @@ class RuntimeService:
                 claimed = self.store.conn.execute("UPDATE recovery_checkpoints SET state='reboot_requested', updated_at=? WHERE id=? AND state='durable'", (timestamp, row["id"]))
                 if claimed.rowcount != 1:
                     raise ConflictError("reboot has already been requested", details={"state": row["state"]})
-            executor = self.reboot_executor
+        executor = self.reboot_executor
+        import inspect
         try:
-            parameters = __import__("inspect").signature(executor).parameters
-            if any(p.kind == p.VAR_KEYWORD for p in parameters.values()) or {"command", "checkpoint"}.issubset(parameters):
-                outcome = executor(command=command, checkpoint=checkpoint)
-            else:
-                outcome = executor(command, checkpoint)
+            signature = inspect.signature(executor)
         except (TypeError, ValueError):
-            outcome = executor(command, checkpoint)
+            # Some extension/callable objects do not expose a signature.  A
+            # single positional invocation is the only safe fallback; never
+            # retry after a TypeError raised by the executor itself.
+            call = lambda: executor(command, checkpoint)
+        else:
+            try:
+                signature.bind(command=command, checkpoint=checkpoint)
+            except TypeError:
+                signature.bind(command, checkpoint)
+                call = lambda: executor(command, checkpoint)
+            else:
+                call = lambda: executor(command=command, checkpoint=checkpoint)
+        try:
+            outcome = call()
+        except Exception as exc:
+            failure = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": row["attempt_id"], "task_id": row["task_id"], "runtime_epoch": current, "command": command, "status": "failed", "error": {"type": type(exc).__name__, "message": str(exc)}}
+            with self.store._mutex:
+                with self.store._transaction():
+                    self.store.conn.execute("UPDATE recovery_checkpoints SET state='executor_failed', recovery_receipt_json=?, updated_at=? WHERE id=? AND state='reboot_requested'", (canonical_json(failure), now(), row["id"]))
+            raise
         receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": row["attempt_id"], "task_id": row["task_id"], "runtime_epoch": self.store._current_runtime_epoch(), "command": command, "status": "executed", "executor_result": outcome}
         with self.store._mutex:
             with self.store._transaction():
@@ -892,8 +925,12 @@ class RuntimeService:
 
     def resume_attempt(self, body):
         with self.store._mutex:
+            current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
-            self._reboot_authorized(body, row["attempt_id"], row["nonce"])
+            # request_reboot consumes the one-shot authorization.  The exact
+            # consumed token remains the authorization for this checkpoint's
+            # one successful resume; it is not a newly reusable nonce.
+            self._reboot_authorized(body, row["attempt_id"], row["nonce"], allow_consumed=True)
             if row["state"] == "resumed" and row["recovery_receipt_json"]:
                 receipt = json.loads(row["recovery_receipt_json"])
                 attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (receipt["attempt_id"],)).fetchone()
@@ -905,9 +942,6 @@ class RuntimeService:
             if sha256_bytes(checkpoint_bytes) != row["checkpoint_digest"]:
                 raise ConflictError("recovery checkpoint digest mismatch")
             checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
-            current = self.store._current_runtime_epoch()
-            if body.get("runtime_epoch") is None or int(body["runtime_epoch"]) != current:
-                raise LeaseError("current runtime epoch is required for recovery resume")
             # Claim this exact task.  Never use claim_next here: a mismatch
             # must not consume an unrelated queued task.
             lease_id = new_id()
@@ -929,8 +963,8 @@ class RuntimeService:
 
     def heartbeat_attempt(self, attempt_id, body):
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
-        if not row or row["settled"] or int(row["runtime_epoch"]) != self.store._current_runtime_epoch() or (body.get("runtime_epoch") is not None and int(body["runtime_epoch"]) != self.store._current_runtime_epoch()) or row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
-            raise LeaseError("attempt lease is stale or already settled")
+        current = self.store._current_runtime_epoch()
+        self._validate_attempt_lease(row, body, current)
         value = self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30))
         expires = value["task"].get("lease_expires_at")
         self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
@@ -938,8 +972,8 @@ class RuntimeService:
 
     def fail_attempt(self, attempt_id, body):
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
-        if not row or row["settled"] or int(row["runtime_epoch"]) != self.store._current_runtime_epoch() or (body.get("runtime_epoch") is not None and int(body["runtime_epoch"]) != self.store._current_runtime_epoch()) or row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
-            raise LeaseError("attempt lease is stale or already settled")
+        current = self.store._current_runtime_epoch()
+        self._validate_attempt_lease(row, body, current)
         failure = body.get("error") or body.get("reason") or {"code": "executor_failed"}
         value = self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"])
         self.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (attempt_id,))

@@ -539,8 +539,8 @@ components:
     AttemptFailure:
       type: object
       additionalProperties: false
-      required: [lease_id, fence, error]
-      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, error: {} }
+      required: [lease_id, fence, runtime_epoch, error]
+      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 }, error: {} }
     Shot:
       type: object
       additionalProperties: false
@@ -592,17 +592,17 @@ components:
     ClaimTask:
       type: object
       additionalProperties: false
-      required: [executor_id, capability_ids]
+      required: [executor_id, capability_ids, runtime_epoch]
       properties: { executor_id: { type: string, minLength: 1 }, capability_ids: { type: array, items: { type: string }, uniqueItems: true }, runtime_epoch: { type: integer, minimum: 1 } }
     Heartbeat:
       type: object
       additionalProperties: false
-      required: [lease_id, fence]
+      required: [lease_id, fence, runtime_epoch]
       properties: { lease_id: { type: string, minLength: 1 }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 } }
     RecoveryPrepare:
       type: object
       additionalProperties: false
-      required: [lease_id, fence]
+      required: [lease_id, fence, runtime_epoch]
       properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 } }
     RecoveryAuthorization:
       type: object
@@ -611,7 +611,7 @@ components:
     RecoveryCheckpoint:
       type: object
       additionalProperties: false
-      required: [lease_id, fence, nonce, authorization]
+      required: [lease_id, fence, nonce, authorization, runtime_epoch]
       properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, nonce: { type: string }, authorization: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, checkpoint: { type: object }, state: { type: object } }
     RecoveryCheckpointReceipt:
       type: object

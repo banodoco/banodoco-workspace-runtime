@@ -30,22 +30,24 @@
     },
     "AttemptFence": {
       "type": "object", "additionalProperties": false,
-      "required": ["attempt_id", "task_id", "lease_id", "fence", "lease_expires_at"],
+      "required": ["attempt_id", "task_id", "lease_id", "fence", "lease_expires_at", "runtime_epoch"],
       "properties": {
         "attempt_id": { "type": "string", "minLength": 1 },
         "task_id": { "type": "string", "minLength": 1 },
         "lease_id": { "type": "string", "minLength": 1 },
         "fence": { "type": "integer", "minimum": 1 },
-        "lease_expires_at": { "type": "string", "format": "date-time" }
+        "lease_expires_at": { "type": "string", "format": "date-time" },
+        "runtime_epoch": { "type": "integer", "minimum": 1 }
       }
     },
     "Settlement": {
       "type": "object", "additionalProperties": false,
-      "required": ["attempt_id", "lease_id", "fence", "outputs", "effect"],
+      "required": ["attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect"],
       "properties": {
         "attempt_id": { "type": "string", "minLength": 1 },
         "lease_id": { "type": "string", "minLength": 1 },
         "fence": { "type": "integer", "minimum": 1 },
+        "runtime_epoch": { "type": "integer", "minimum": 1 },
         "outputs": { "type": "array", "items": { "$ref": "#/definitions/Output" } },
         "effect": { "anyOf": [{ "$ref": "#/definitions/Effect" }, { "type": "null" }] }
       }

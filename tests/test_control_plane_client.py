@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from banodoco_workspace_client import WorkspaceClient
 
 
-TASK = {"task_id": "t", "run_id": "r", "state": "queued", "version": 1, "capability_id": "render.basic", "capability_digest": "sha256:" + "b" * 64, "idempotency_key": "i", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z", "attempt_id": None}
+TASK = {"task_id": "t", "run_id": "r", "state": "queued", "version": 1, "capability_id": "render.basic", "capability_digest": "sha256:" + "b" * 64, "idempotency_key": "i", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z", "attempt_id": None, "runtime_epoch": 1}
 
 
 def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None:
@@ -59,5 +59,5 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
     capability = client.register_capability("render.new", "sha256:" + "c" * 64, idempotency_key="cap-1")
     assert capability.capability_id == "render.new"
     assert client.settle_attempt("a", {"attempt_id": "a", "lease_id": "l", "fence": 4, "outputs": [], "effect": None}, idempotency_key="settle-1").state == "succeeded"
-    assert client.fail_attempt("a", lease_id="l", fence=4, error={"code": "worker_error"}, idempotency_key="fail-1").state == "failed"
+    assert client.fail_attempt("a", lease_id="l", fence=4, error={"code": "worker_error"}, runtime_epoch=1, idempotency_key="fail-1").state == "failed"
     assert any(call[2].get("Idempotency-Key") == "task-1" for call in calls)

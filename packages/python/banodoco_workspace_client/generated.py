@@ -203,12 +203,103 @@ class Task:
     idempotency_key: str
     created_at: str
     updated_at: str
+    runtime_epoch: int
     attempt_id: str | None = None
     result: Mapping[str, Any] | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Task":
-        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], attempt_id=value.get("attempt_id"), result=value.get("result"))
+        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], attempt_id=value.get("attempt_id"), runtime_epoch=int(value["runtime_epoch"]), result=value.get("result"))
+
+
+@dataclass(frozen=True)
+class AttemptFence:
+    attempt_id: str
+    task_id: str
+    lease_id: str
+    fence: int
+    lease_expires_at: str
+    runtime_epoch: int
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "AttemptFence":
+        return cls(attempt_id=value["attempt_id"], task_id=value["task_id"], lease_id=value["lease_id"], fence=int(value["fence"]), lease_expires_at=value["lease_expires_at"], runtime_epoch=int(value["runtime_epoch"]))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class RecoveryAuthorization:
+    attempt_id: str
+    task_id: str
+    executor_id: str
+    runtime_epoch: int
+    nonce: str
+    expires_in_seconds: int
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "RecoveryAuthorization":
+        return cls(attempt_id=value["attempt_id"], task_id=value["task_id"], executor_id=value["executor_id"], runtime_epoch=int(value["runtime_epoch"]), nonce=value["nonce"], expires_in_seconds=int(value["expires_in_seconds"]))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class RecoveryCheckpointReceipt:
+    checkpoint_id: str
+    attempt_id: str
+    task_id: str
+    runtime_epoch: int
+    nonce: str
+    digest: str
+    size: int
+    state: str
+    path: str | None = None
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "RecoveryCheckpointReceipt":
+        return cls(checkpoint_id=value["checkpoint_id"], attempt_id=value["attempt_id"], task_id=value["task_id"], runtime_epoch=int(value["runtime_epoch"]), nonce=value["nonce"], digest=value["digest"], size=int(value["size"]), state=value["state"], path=value.get("path"))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class RecoveryReceipt:
+    type: str
+    checkpoint_id: str
+    attempt_id: str
+    task_id: str
+    runtime_epoch: int
+    command: str
+    status: str
+    version: int | None = None
+    checkpoint_digest: str | None = None
+    executor_result: Any = None
+    checkpoint: Any = None
+    error: Mapping[str, Any] | None = None
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "RecoveryReceipt":
+        return cls(type=value["type"], checkpoint_id=value["checkpoint_id"], attempt_id=value["attempt_id"], task_id=value["task_id"], runtime_epoch=int(value["runtime_epoch"]), command=value["command"], status=value["status"], version=int(value["version"]) if value.get("version") is not None else None, checkpoint_digest=value.get("checkpoint_digest"), executor_result=value.get("executor_result"), checkpoint=value.get("checkpoint"), error=value.get("error"))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class RecoveryResumeReceipt:
+    receipt: RecoveryReceipt
+    attempt: AttemptFence
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "RecoveryResumeReceipt":
+        return cls(receipt=RecoveryReceipt.from_json(value["receipt"]), attempt=AttemptFence.from_json(value["attempt"]))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
 
 
 @dataclass(frozen=True)
@@ -600,35 +691,31 @@ class WorkspaceClient:
 
     list_tasks = list_project_tasks
 
-    def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int | None = None) -> Mapping[str, Any] | None:
-        payload: dict[str, Any] = {"executor_id": executor_id, "capability_ids": capability_ids}
-        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
+    def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int) -> AttemptFence | None:
+        payload: dict[str, Any] = {"executor_id": executor_id, "capability_ids": capability_ids, "runtime_epoch": runtime_epoch}
         status, _, body = self._request("POST", "/v1/tasks/claim", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 204))
-        return None if status == 204 else self._json(body)
+        return None if status == 204 else AttemptFence.from_json(self._json(body))
 
-    def heartbeat_attempt(self, attempt_id: str, *, lease_id: str, fence: int, idempotency_key: str, runtime_epoch: int | None = None) -> Mapping[str, Any]:
-        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence}
-        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
+    def heartbeat_attempt(self, attempt_id: str, *, lease_id: str, fence: int, idempotency_key: str, runtime_epoch: int) -> AttemptFence:
+        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch}
         _, _, body = self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/heartbeat", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
-        return self._json(body)
+        return AttemptFence.from_json(self._json(body))
 
-    def prepare_reboot(self, attempt_id: str, *, lease_id: str, fence: int, runtime_epoch: int | None = None) -> Mapping[str, Any]:
-        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence}
-        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
-        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/prepare-reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+    def prepare_reboot(self, attempt_id: str, *, lease_id: str, fence: int, runtime_epoch: int) -> RecoveryAuthorization:
+        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch}
+        return RecoveryAuthorization.from_json(self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/prepare-reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
 
-    def checkpoint_attempt(self, attempt_id: str, *, lease_id: str, fence: int, nonce: str, authorization: str, state: Mapping[str, Any] | None = None, runtime_epoch: int | None = None) -> Mapping[str, Any]:
-        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "nonce": nonce, "authorization": authorization, "state": dict(state or {})}
-        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
-        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/checkpoint", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, expected=(200, 201))[2])
+    def checkpoint_attempt(self, attempt_id: str, *, lease_id: str, fence: int, nonce: str, authorization: str, state: Mapping[str, Any] | None = None, runtime_epoch: int) -> RecoveryCheckpointReceipt:
+        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "nonce": nonce, "authorization": authorization, "state": dict(state or {}), "runtime_epoch": runtime_epoch}
+        return RecoveryCheckpointReceipt.from_json(self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/checkpoint", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, expected=(200, 201))[2]))
 
-    def request_reboot(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int, command: str = "reboot") -> Mapping[str, Any]:
+    def request_reboot(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int, command: str = "reboot") -> RecoveryReceipt:
         payload = {"checkpoint_id": checkpoint_id, "nonce": nonce, "authorization": authorization, "runtime_epoch": runtime_epoch, "command": command}
-        return self._json(self._request("POST", "/v1/recovery/reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+        return RecoveryReceipt.from_json(self._json(self._request("POST", "/v1/recovery/reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
 
-    def resume_attempt(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int) -> Mapping[str, Any]:
+    def resume_attempt(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int) -> RecoveryResumeReceipt:
         payload = {"checkpoint_id": checkpoint_id, "nonce": nonce, "authorization": authorization, "runtime_epoch": runtime_epoch}
-        return self._json(self._request("POST", "/v1/recovery/resume", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+        return RecoveryResumeReceipt.from_json(self._json(self._request("POST", "/v1/recovery/resume", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
 
     def cancel_task(self, task_id: str, *, idempotency_key: str, expected_version: int | None = None) -> Task:
         return self._task_transition("cancel", task_id, idempotency_key=idempotency_key, expected_version=expected_version)
@@ -705,8 +792,8 @@ class WorkspaceClient:
         _, _, body = self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/settle", body=json.dumps(dict(settlement), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return Task.from_json(self._json(body))
 
-    def fail_attempt(self, attempt_id: str, *, lease_id: str, fence: int, error: Any, idempotency_key: str) -> Task:
-        payload = {"lease_id": lease_id, "fence": fence, "error": error}
+    def fail_attempt(self, attempt_id: str, *, lease_id: str, fence: int, error: Any, runtime_epoch: int, idempotency_key: str) -> Task:
+        payload = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch, "error": error}
         _, _, body = self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/fail", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return Task.from_json(self._json(body))
 

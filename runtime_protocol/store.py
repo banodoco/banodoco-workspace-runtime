@@ -452,8 +452,10 @@ class RealmStore:
         row = self.conn.execute("SELECT runtime_epoch FROM runtime_lifecycle WHERE id=1").fetchone()
         return int(row[0]) if row else 1
 
-    def _validate_runtime_epoch(self, supplied, *, identity, identity_id=None):
+    def _validate_runtime_epoch(self, supplied, *, identity, identity_id=None, required=False):
         current = self._current_runtime_epoch()
+        if required and supplied is None:
+            raise LeaseError(f"{identity} runtime epoch is required", details={"expected": current})
         # Bootstrap callers may omit the epoch when establishing a brand-new
         # identity.  An identity which survived a reboot is different: an
         # omitted epoch is ambiguous and is rejected rather than allowing a
@@ -483,7 +485,7 @@ class RealmStore:
         if not isinstance(ready, bool):
             raise ValidationError("ready must be a boolean")
         with self._mutex:
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id, required=True)
             if not self.conn.execute("SELECT 1 FROM workers WHERE id=?", (worker_id,)).fetchone():
                 raise NotFoundError("worker not found")
             self.conn.execute("UPDATE workers SET readiness=?, readiness_reason=?, last_seen_at=?, runtime_epoch=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "worker_not_ready"), now(), epoch, worker_id))
@@ -494,7 +496,7 @@ class RealmStore:
         if not worker_id:
             raise ValidationError("worker_id is required")
         with self._mutex:
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id, required=True)
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
             if not row:
                 raise NotFoundError("worker not found")
@@ -530,7 +532,7 @@ class RealmStore:
         with self._mutex:
             if not worker_id or not lease_token:
                 raise ValidationError("worker_id and lease_token are required")
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id, required=True)
             with self._transaction():
                 self._reap_expired_leases()
                 task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()

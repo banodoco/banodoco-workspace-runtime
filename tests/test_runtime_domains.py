@@ -56,9 +56,10 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         client.register_executor({"executor_id": "domain-executor", "max_concurrency": 1, "resource_keys": [], "capabilities": [{"capability_id": "render.basic", "definition_digest": _digest("render.basic"), "status": "ready", "required_resource_keys": [], "estimated_scratch_bytes": 0, "estimated_output_bytes": 1}], "protocol": "workspace.v1"}, idempotency_key="domain-executor")
         worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
         failed_task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="failed-domain-task")
-        attempt = worker.claim_task(executor_id="domain-executor", capability_ids=["render.basic"], idempotency_key="failed-domain-claim")
+        epoch = worker.health().runtime_epoch
+        attempt = worker.claim_task(executor_id="domain-executor", capability_ids=["render.basic"], idempotency_key="failed-domain-claim", runtime_epoch=epoch)
         assert attempt is not None
-        failed = worker.fail_attempt(attempt["attempt_id"], lease_id=attempt["lease_id"], fence=attempt["fence"], error={"code": "worker_error"}, idempotency_key="failed-domain-settle")
+        failed = worker.fail_attempt(attempt["attempt_id"], lease_id=attempt["lease_id"], fence=attempt["fence"], error={"code": "worker_error"}, runtime_epoch=epoch, idempotency_key="failed-domain-settle")
         assert failed.task_id == failed_task.task_id and failed.state == "failed"
         assert client.list_run_events(failed_task.run_id)[-1].event_type == "task.failed"
     finally:

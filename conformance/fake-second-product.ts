@@ -61,17 +61,17 @@ export async function runSecondProduct(client: WorkspaceClient): Promise<Record<
   if (run.id !== task.run_id || observed.task_id !== task.task_id || events.items.length < 1 || events.items.some((event, index) => index > 0 && event.sequence < events.items[index - 1].sequence)) throw new Error("task run event observation failed");
   steps.push("task-run-events");
 
-  const attempt = await client.claimTask(executor.executor_id, [capability.capability_id], "second-product-claim-1");
+  const attempt = await client.claimTask(executor.executor_id, [capability.capability_id], "second-product-claim-1", health.runtime_epoch);
   if (!attempt || typeof attempt.attempt_id !== "string") throw new Error("executor claim failed");
-  const heartbeat = await client.heartbeatAttempt(attempt.attempt_id, String(attempt.lease_id), Number(attempt.fence), "second-product-heartbeat-1");
+  const heartbeat = await client.heartbeatAttempt(attempt.attempt_id, String(attempt.lease_id), Number(attempt.fence), "second-product-heartbeat-1", health.runtime_epoch);
   if (heartbeat.fence !== attempt.fence) throw new Error("attempt heartbeat fence failed");
   const output = await client.ingestObject(text.encode("neutral render output"), "application/octet-stream", "second-product-output-1", "render.bin");
-  const settled = await client.settleAttempt(attempt.attempt_id, { attempt_id: attempt.attempt_id, lease_id: attempt.lease_id, fence: attempt.fence, outputs: [{ digest: output.digest, media_type: output.media_type, name: output.filename }] }, "second-product-settle-1");
+  const settled = await client.settleAttempt(attempt.attempt_id, { attempt_id: attempt.attempt_id, lease_id: attempt.lease_id, fence: attempt.fence, runtime_epoch: health.runtime_epoch, outputs: [{ digest: output.digest, media_type: output.media_type, name: output.filename }] }, "second-product-settle-1");
   if (settled.state !== "succeeded") throw new Error("fenced settlement failed");
   const settledOutput = await client.getObject(output.object_id);
   if (bytes(settledOutput.data) !== "neutral render output") throw new Error("settled output was not readable from CAS");
   let duplicateRejected = false;
-  try { await client.settleAttempt(attempt.attempt_id, { attempt_id: attempt.attempt_id, lease_id: attempt.lease_id, fence: attempt.fence, outputs: [] }, "second-product-settle-duplicate"); } catch { duplicateRejected = true; }
+  try { await client.settleAttempt(attempt.attempt_id, { attempt_id: attempt.attempt_id, lease_id: attempt.lease_id, fence: attempt.fence, runtime_epoch: health.runtime_epoch, outputs: [] }, "second-product-settle-duplicate"); } catch { duplicateRejected = true; }
   if (!duplicateRejected) throw new Error("duplicate settlement was accepted");
   steps.push("claim-heartbeat-fenced-settlement-cas-output");
   return { product: "neutral-gallery", realm_id: session.realm_id, project_id: project.project_id, object_id: object.object_id, task_id: task.task_id, steps };
