@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
-from banodoco_workspace_client import ApiError, WorkspaceClient
+from banodoco_workspace_client import ApiError, ClaimWaiting, WorkspaceClient
 
 
 def test_generated_client_smoke_and_scoped_handshake() -> None:
@@ -72,6 +72,29 @@ def test_api_error_preserves_conflict_and_version_details() -> None:
         assert exc.status == 409 and exc.code == "version_conflict" and exc.details["actual"] == 3
     else:
         raise AssertionError("expected ApiError")
+
+
+def test_claim_capability_unavailable_is_typed_waiting_result() -> None:
+    digest = "sha256:" + "a" * 64
+    task = {
+        "task_id": "task-1", "run_id": "run-1", "state": "queued", "version": 1,
+        "capability_id": "render.gpu", "capability_digest": digest,
+        "idempotency_key": "admit-1", "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z", "runtime_epoch": 1,
+        "waiting_reason": "capability_unavailable",
+    }
+
+    def transport(method, path, headers, body):
+        assert method == "POST" and path == "/v1/tasks/claim"
+        return 200, {}, json.dumps({"task": task, "waiting_reason": "capability_unavailable"}).encode()
+
+    result = WorkspaceClient("http://runtime", transport=transport).claim_task(
+        executor_id="worker-1", capability_ids=["render.gpu"],
+        idempotency_key="claim-1", runtime_epoch=1,
+    )
+    assert isinstance(result, ClaimWaiting)
+    assert result.waiting_reason == "capability_unavailable"
+    assert result.task.task_id == "task-1"
 
 
 def test_generator_is_reproducible() -> None:

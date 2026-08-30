@@ -62,7 +62,7 @@ export async function runSecondProduct(client: WorkspaceClient): Promise<Record<
   steps.push("task-run-events");
 
   const attempt = await client.claimTask(executor.executor_id, [capability.capability_id], "second-product-claim-1", health.runtime_epoch);
-  if (!attempt || typeof attempt.attempt_id !== "string") throw new Error("executor claim failed");
+  if (!attempt || "waiting_reason" in attempt || typeof attempt.attempt_id !== "string") throw new Error("executor claim failed");
   const heartbeat = await client.heartbeatAttempt(attempt.attempt_id, String(attempt.lease_id), Number(attempt.fence), "second-product-heartbeat-1", health.runtime_epoch);
   if (heartbeat.fence !== attempt.fence) throw new Error("attempt heartbeat fence failed");
   const output = await client.ingestObject(text.encode("neutral render output"), "application/octet-stream", "second-product-output-1", "render.bin");

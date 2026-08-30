@@ -275,7 +275,7 @@ paths:
       operationId: claimTask
       parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimTask' } } } }
-      responses: { '200': { description: Fenced attempt, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/AttemptFence' } } } }, '204': { description: No task available } }
+      responses: { '200': { description: Fenced attempt or a typed waiting result, content: { application/json: { schema: { oneOf: [ { $ref: './schemas/worker.json#/definitions/AttemptFence' }, { $ref: './schemas/worker.json#/definitions/ClaimWaiting' } ] } } } }, '204': { description: No task available } }
   /v1/tasks/{task_id}:
     get:
       operationId: getTask

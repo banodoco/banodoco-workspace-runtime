@@ -40,6 +40,14 @@
         "runtime_epoch": { "type": "integer", "minimum": 1 }
       }
     },
+    "ClaimWaiting": {
+      "type": "object", "additionalProperties": false,
+      "required": ["task", "waiting_reason"],
+      "properties": {
+        "task": { "$ref": "./task.json" },
+        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network"] }
+      }
+    },
     "Settlement": {
       "type": "object", "additionalProperties": false,
       "required": ["attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect"],

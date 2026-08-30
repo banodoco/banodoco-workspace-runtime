@@ -230,6 +230,19 @@ class AttemptFence:
 
 
 @dataclass(frozen=True)
+class ClaimWaiting:
+    task: Task
+    waiting_reason: str
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "ClaimWaiting":
+        return cls(task=Task.from_json(value["task"]), waiting_reason=str(value["waiting_reason"]))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
 class RecoveryAuthorization:
     attempt_id: str
     task_id: str
@@ -691,10 +704,13 @@ class WorkspaceClient:
 
     list_tasks = list_project_tasks
 
-    def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int) -> AttemptFence | None:
+    def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int) -> AttemptFence | ClaimWaiting | None:
         payload: dict[str, Any] = {"executor_id": executor_id, "capability_ids": capability_ids, "runtime_epoch": runtime_epoch}
         status, _, body = self._request("POST", "/v1/tasks/claim", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 204))
-        return None if status == 204 else AttemptFence.from_json(self._json(body))
+        if status == 204:
+            return None
+        value = self._json(body)
+        return ClaimWaiting.from_json(value) if isinstance(value, Mapping) and "waiting_reason" in value else AttemptFence.from_json(value)
 
     def heartbeat_attempt(self, attempt_id: str, *, lease_id: str, fence: int, idempotency_key: str, runtime_epoch: int) -> AttemptFence:
         payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch}

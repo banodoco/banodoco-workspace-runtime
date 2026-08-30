@@ -19,5 +19,9 @@
     "attempt_id": { "type": ["string", "null"] },
     "runtime_epoch": { "type": "integer", "minimum": 1 },
     "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+    ,"waiting_reason": { "type": "string" }
+    ,"lease_fence": { "type": "integer", "minimum": 1 }
+    ,"lease_expires_at": { "type": "string", "format": "date-time" }
+    ,"result": { "type": "object", "additionalProperties": true }
   }
 }
