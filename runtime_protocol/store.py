@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import sqlite3
+import shutil
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -299,6 +300,8 @@ class RealmStore:
                     waiting_reason = "capability_unavailable" if registered["status"] != "ready" else None
                 else:
                     waiting_reason = None
+                if waiting_reason is None and not self.storage_preflight(capability)["ok"]:
+                    waiting_reason = "insufficient_storage"
                 timestamp, run_id, task_id = now(), new_id(), new_id()
                 self.conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)", (run_id, project_id, capability, canonical_json(spec), idempotency_key, timestamp, timestamp))
                 self.conn.execute("INSERT INTO tasks(id, run_id, capability, spec_json, status, capability_digest, waiting_reason, expected_effect_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)", (task_id, run_id, capability, canonical_json(spec), capability_digest, waiting_reason, canonical_json(expected_effect) if expected_effect else None, timestamp, timestamp))
@@ -442,6 +445,12 @@ class RealmStore:
         row = self.conn.execute("SELECT required_resource_keys_json FROM capabilities WHERE id=?", (capability,)).fetchone()
         return json.loads(row[0]) if row else []
 
+    def storage_preflight(self, capability):
+        row = self.conn.execute("SELECT estimated_scratch_bytes, estimated_output_bytes FROM capabilities WHERE id=?", (capability,)).fetchone()
+        required = int(row[0]) + int(row[1]) if row else 0
+        available = int(shutil.disk_usage(self.root).free)
+        return {"ok": available >= required, "required_bytes": required, "available_bytes": available, "reason": None if available >= required else "insufficient_storage"}
+
     def claim_task(self, task_id, worker_id, lease_token):
         with self._mutex:
             if not worker_id or not lease_token:
@@ -462,6 +471,8 @@ class RealmStore:
                     waiting_reason = "waiting_for_worker"
                 elif capability and capability["status"] != "ready":
                     waiting_reason = "capability_unavailable"
+                elif not self.storage_preflight(task["capability"])["ok"]:
+                    waiting_reason = "insufficient_storage"
                 elif task["capability"] not in self._worker_capability_ids(worker):
                     waiting_reason = "waiting_for_worker"
                 else:
@@ -516,6 +527,28 @@ class RealmStore:
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
             return self._worker_result(row)
 
+    def _validate_settlement_effect(self, effect):
+        if not isinstance(effect, dict):
+            raise ValidationError("settlement effect must be an object")
+        kind = effect.get("effect_type") or effect.get("kind")
+        target = effect.get("target_id") or effect.get("target")
+        expected = effect.get("expected_version")
+        try:
+            expected_version = int(expected)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("settlement effect expected_version must be a positive integer") from exc
+        if not kind or not target or expected is None or expected_version < 1:
+            raise ValidationError("settlement effect requires kind, target, and positive expected_version")
+        # Effects targeting a known project are optimistic-concurrency checked.
+        # Unknown legacy targets remain accepted for compatibility with the
+        # result-only kernel; they cannot accidentally mutate anything here.
+        try:
+            current = self._project(str(target))
+        except NotFoundError:
+            current = None
+        if current is not None and int(current["version"]) != expected_version:
+            raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
+
     def settle_task(self, task_id, lease_token, result, *, effect=None, output_objects=None, fence=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -536,6 +569,8 @@ class RealmStore:
                 raise ValidationError("settlement effect was not predeclared", details={"declared": declared})
             if declared is not None and effect is None:
                 raise ValidationError("declared settlement effect is required")
+            if effect is not None:
+                self._validate_settlement_effect(effect)
             with self._transaction():
                 timestamp = now()
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))

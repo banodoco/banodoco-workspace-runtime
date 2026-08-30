@@ -85,6 +85,21 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "realm"] and method == "GET":
             self._identity("projects:read")
             return self._send(200, self.runtime.realm_resource())
+        if path == ["v1", "export"] and method == "GET":
+            self._identity("admin")
+            return self._send(200, self.runtime.export_structured())
+        if path == ["v1", "backup"] and method == "POST":
+            self._identity("admin")
+            body = self._body()
+            if not body.get("destination"):
+                raise ProtocolError("destination is required")
+            return self._send(201, self.runtime.backup(body["destination"]))
+        if path == ["v1", "restore"] and method == "POST":
+            self._identity("admin")
+            body = self._body()
+            if not body.get("backup") or not body.get("destination"):
+                raise ProtocolError("backup and destination are required")
+            return self._send(201, self.runtime.restore(body["backup"], body["destination"]))
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timelines":
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "POST": return self._send(201, self.runtime.create_timeline(path[2], self._body()))

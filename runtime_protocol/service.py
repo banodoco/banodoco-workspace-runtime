@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from .cas import ContentAddressedStore
+from .backup import create_backup, restore_backup, structured_export
 from .store import RealmStore
+from .util import atomic_json_write
 from .util import canonical_json, new_id, now
 import hashlib
 import json
+from pathlib import Path
 from .errors import ConflictError, NotFoundError, ValidationError, LeaseError
 
 
@@ -51,6 +54,18 @@ class RuntimeService:
 
     def close(self):
         self.store.close()
+
+    def backup(self, destination):
+        return create_backup(self.store, destination)
+
+    def restore(self, backup_dir, destination):
+        return restore_backup(backup_dir, destination)
+
+    def export_structured(self, destination=None):
+        value = structured_export(self.store)
+        if destination is not None:
+            atomic_json_write(Path(destination).expanduser().resolve(), value)
+        return value
 
     def health(self):
         return {"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:92a7ec05df9ee82945142e7f294b82236f9bb69e3e3f612adc04b67665b43bf5", "runtime_epoch": 1}
@@ -184,15 +199,22 @@ class RuntimeService:
         return self._task_resource(self.store.cancel_task(task_id))
 
     def retry_task(self, task_id, body=None):
-        current = self.store.get_task(task_id)
-        expected = (body or {}).get("expected_version")
-        version = int(current["task"].get("attempt", 0)) + 1
-        if expected is not None and int(expected) != version:
-            raise ConflictError("stale task version", details={"expected": expected, "actual": version})
-        self.store._release_reservations(task_id, current["task"].get("lease_token"))
-        self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, worker_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
-        self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (now(), current["run"]["id"]))
-        return self._task_resource(self.store.get_task(task_id))
+        with self.store._mutex:
+            current = self.store.get_task(task_id)
+            status = current["task"]["status"]
+            if status not in {"completed", "cancelled", "failed"}:
+                raise ConflictError("task is not retryable", details={"status": status})
+            expected = (body or {}).get("expected_version")
+            version = int(current["task"].get("attempt", 0)) + 1
+            if expected is not None and int(expected) != version:
+                raise ConflictError("stale task version", details={"expected": expected, "actual": version})
+            with self.store._transaction():
+                timestamp = now()
+                self.store._release_reservations(task_id, current["task"].get("lease_token"))
+                self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, worker_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
+                self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, current["run"]["id"]))
+                self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
+            return self._task_resource(self.store.get_task(task_id))
 
     def events(self, run_id):
         return self.store.list_events(run_id)
