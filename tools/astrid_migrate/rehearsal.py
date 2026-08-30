@@ -387,10 +387,93 @@ class Rehearsal:
         if self.fault_injector is not None:
             self.fault_injector(seam)
 
+    def _resume_from_journal(self, journal: MigrationJournal) -> dict[str, Any]:
+        """Finish a rehearsal from its durable journal, never from ``active``.
+
+        The journal is the recovery cursor.  A process can die after a
+        transition has been persisted but before its caller observes it (or
+        immediately before/after the next transition).  Re-running the whole
+        migration in that situation would write into the rollback authority
+        and could attempt the invalid ``rolled_back -> active`` path.  Only
+        the unfinished suffix is therefore allowed here; all artifact paths
+        come from journal effects, not from a fresh reconstruction.
+        """
+        current = journal._read()
+        state = current["state"]
+        if state == "reactivated":
+            return {
+                "packet": "B10",
+                "journal": current,
+                "idempotent_reactivation": True,
+                "reactivation": None,
+                "reactivation_activation": None,
+            }
+
+        effects = journal.effects()
+        rollback_effect = effects.get("rollback_restore")
+        candidate_effect = effects.get("candidate_backup")
+        reactivation_effect = effects.get("reactivation_restore")
+        if not (rollback_effect and candidate_effect and reactivation_effect):
+            raise MigrationError("migration journal cannot resume: rollback artifacts are not durably recorded")
+        rollback_payload = rollback_effect.get("payload", {})
+        candidate_payload = candidate_effect.get("payload", {})
+        reactivation_payload = reactivation_effect.get("payload", {})
+        rollback_root = Path(str(rollback_payload.get("destination", ""))).expanduser().resolve()
+        candidate_root = Path(str(candidate_payload.get("destination", ""))).expanduser().resolve()
+        reactivation_root = Path(str(reactivation_payload.get("destination", ""))).expanduser().resolve()
+        if not all((rollback_root, candidate_root, reactivation_root)):
+            raise MigrationError("migration journal cannot resume: artifact paths are empty")
+
+        rollback_activation = None
+        if state == "active":
+            # This also covers a crash just before active -> rolled_back.  It
+            # is the only place recovery may enter the rollback state; it
+            # never re-enters active from either terminal-side state.
+            if self.runtime is not None:
+                activate = getattr(self.client, "activate_destination", None)
+                if not callable(activate):
+                    raise MigrationError("migration journal cannot resume without destination activation")
+                rollback_activation = activate(rollback_root, state="rolled_back")
+            journal.transition("rolled_back", backup=effects.get("pre_migration_backup", {}).get("payload"), restore=rollback_payload)
+            current = journal._read()
+            state = current["state"]
+
+        if state != "rolled_back":
+            raise MigrationError(f"migration journal cannot resume from state {state!r}")
+
+        # The restore is idempotent and validates the durable handoff before
+        # any authority swap.  In the before-transition crash case the active
+        # authority may already be the reactivated copy; repeating this
+        # verified copy/swap is still safe and does not touch journal state
+        # until the reactivation transition is persisted.
+        candidate_backup = Path(str(candidate_payload.get("destination", "")))
+        reactivation_result = self._restore_or_reuse(candidate_backup, reactivation_root)
+        activate = getattr(self.client, "activate_destination", None) if self.runtime is not None else None
+        reactivation_activation = None
+        if self.runtime is not None:
+            if not callable(activate):
+                raise MigrationError("migration journal cannot resume without destination activation")
+            reactivation_activation = activate(reactivation_root, state="reactivated")
+        reactivated = journal.transition("reactivated", destination=str(self.config.destination_root), candidate_restore=reactivation_result)
+        return {
+            "packet": "B10",
+            "journal": reactivated,
+            "rollback_activation": rollback_activation,
+            "reactivation": reactivation_result,
+            "reactivation_activation": reactivation_activation,
+            "idempotent_reactivation": MigrationJournal(self.config.destination_root / "migration-journal.json").transition("reactivated", destination=str(self.config.destination_root), candidate_restore=reactivation_result) == reactivated,
+        }
+
     def run(self) -> dict[str, Any]:
         evidence_root = (self.config.evidence_root or self.config.destination_root / "migration-evidence").resolve()
         evidence_root.mkdir(parents=True, exist_ok=True)
         journal = MigrationJournal(self.config.destination_root / "migration-journal.json", fault_injector=self.fault_injector, crash_at=self.crash_at)
+        # Recovery begins by reading the durable cursor.  In particular, do
+        # not replay migration writes once rollback or reactivation has been
+        # persisted; doing so would re-enter the wrong authority and lose the
+        # exact crash seam that the rehearsal is meant to prove.
+        if journal._read()["state"] in {"active", "rolled_back", "reactivated"}:
+            return self._resume_from_journal(journal)
         baseline = None
         if self.runtime is not None:
             reader = getattr(self.client, "destination_snapshot", None)

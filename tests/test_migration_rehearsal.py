@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from runtime_protocol.service import RuntimeService
-from tools.astrid_migrate import MigrationConfig, RuntimeServiceAdapter, build_synthetic_fixture, run_rehearsal
+from tools.astrid_migrate import MigrationConfig, MigrationError, RuntimeServiceAdapter, build_synthetic_fixture, run_rehearsal
 
 
 def test_b10_rehearsal_preserves_evidence_and_reactivates_idempotently(tmp_path):
@@ -51,3 +53,51 @@ def test_b10_journal_rejects_skipping_rollback(tmp_path):
         assert "active -> reactivated" in str(exc)
     else:
         raise AssertionError("journal allowed reactivation without rollback")
+
+
+@pytest.mark.parametrize(
+    "seam",
+    (
+        "after_active_to_rolled_back",
+        "before_rolled_back_to_reactivated",
+        "after_rolled_back_to_reactivated",
+    ),
+)
+def test_b10_restart_resumes_from_durable_journal_at_transition_seams(tmp_path, seam):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    runtime_root = tmp_path / "destination"
+    archive_root = tmp_path / "source-archive"
+    rollback_root = tmp_path / "rollback"
+    evidence_root = tmp_path / "evidence"
+
+    runtime = RuntimeService(runtime_root, display_name="B10 disposable")
+    try:
+        with pytest.raises(MigrationError, match=f"injected rehearsal crash at {seam}"):
+            run_rehearsal(
+                MigrationConfig(source, archive_root, runtime_root, evidence_root=evidence_root, capacity_margin_bytes=0),
+                RuntimeServiceAdapter(runtime),
+                runtime=runtime,
+                rollback_root=rollback_root,
+                crash_at=seam,
+            )
+    finally:
+        runtime.close()
+
+    # A restart opens the configured destination path, which is the authority
+    # that the activation handoff selected.  Resume must consume the journal
+    # suffix and must not replay migration or attempt rolled_back -> active.
+    runtime = RuntimeService(runtime_root, display_name="B10 disposable")
+    try:
+        resumed = run_rehearsal(
+            MigrationConfig(source, archive_root, runtime_root, evidence_root=evidence_root, capacity_margin_bytes=0),
+            RuntimeServiceAdapter(runtime),
+            runtime=runtime,
+            rollback_root=rollback_root,
+        )
+        assert resumed["journal"]["state"] == "reactivated"
+        assert resumed["idempotent_reactivation"] is True
+        transitions = [(entry["from"], entry["to"]) for entry in resumed["journal"]["entries"]]
+        assert transitions == [("prepared", "active"), ("active", "rolled_back"), ("rolled_back", "reactivated")]
+    finally:
+        runtime.close()

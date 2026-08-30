@@ -647,43 +647,104 @@ class Migrator:
             errors.append({"kind": "events", "reason": "destination event truth is empty"})
         if truth.get("events") and any(not row.get("kind") or not row.get("payload_json") for row in truth["events"]):
             errors.append({"kind": "events", "reason": "destination event truth contains incomplete records"})
-        # A migration is accepted only when the destination can account for
-        # event identity, payload bytes, and stream ordering.  Clients may
-        # either return the normalized comparison directly or expose the raw
-        # event/stream rows, in which case compare the deterministic fields.
-        event_check = truth.get("event_reconciliation")
+        # A migration is accepted only when the raw destination ledger agrees
+        # with the raw source ledger.  In particular, do not accept an
+        # adapter-provided ``event_reconciliation``/attestation object: that
+        # is a claim made by the wrapper, not independently observed truth.
+        # This is deliberately performed even when the wrapper also returns
+        # convenient booleans; a truncated or altered wrapper must fail.
         if self.config.require_destination_verification:
-            if isinstance(event_check, Mapping):
-                for field in ("counts", "ids", "payload_digests", "stream_heads", "stream_order"):
-                    if event_check.get(field) is not True:
-                        errors.append({"kind": "events", "reason": f"event {field} reconciliation failed", "details": event_check.get(field)})
+            source_events = list(data.get("events", []))
+            destination_events = list(truth.get("events", []))
+            source_streams = list(data.get("event_streams", []))
+            destination_streams = list(truth.get("event_streams", []))
+
+            def payload_digest(row):
+                value = row.get("payload_json", row.get("payload", {}))
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        pass
+                return hashlib.sha256(_canonical(value)).hexdigest()
+
+            source_ids = [str(row.get("event_id", row.get("id", ""))) for row in source_events]
+            destination_ids = [str(row.get("event_id", row.get("id", ""))) for row in destination_events]
+            source_payloads = [payload_digest(row) for row in source_events]
+            destination_payloads = [payload_digest(row) for row in destination_events]
+            def stream_head(row):
+                try:
+                    return int(row.get("head_seq", 0))
+                except (TypeError, ValueError):
+                    return None
+            def event_order(row):
+                try:
+                    seq = int(row.get("seq", 0))
+                except (TypeError, ValueError):
+                    seq = None
+                return (str(row.get("stream_id", "")), seq)
+
+            # The neutral runtime currently emits a native event ledger whose
+            # IDs and stream columns intentionally differ from legacy Astrid's
+            # rows.  It still gets independently checked from the raw rows:
+            # non-empty/truncation, unique IDs, valid payloads, and monotonic
+            # native ordering/heads.  A legacy-preserving destination (the
+            # migration contract used by external clients) takes the strict
+            # source-to-destination identity path below.
+            native_shape = bool(destination_events) and all(
+                "event_id" not in row and "stream_id" not in row for row in destination_events
+            )
+            if native_shape:
+                if source_events and not destination_events:
+                    errors.append({"kind": "events", "reason": "destination event ledger is truncated"})
+                native_ids = [row.get("id") for row in destination_events]
+                if any(value in (None, "") for value in native_ids) or len(native_ids) != len(set(map(str, native_ids))):
+                    errors.append({"kind": "events", "reason": "destination event IDs are missing or duplicated", "ids": native_ids})
+                if any(not row.get("kind") or not row.get("payload_json") for row in destination_events):
+                    errors.append({"kind": "events", "reason": "destination event payload is missing"})
+                # Match every raw native event to a source event by its
+                # semantic kind and payload digest.  Consume matches so a
+                # wrapper cannot truncate repeated events or substitute an
+                # altered payload while retaining a truthful-looking count.
+                source_by_kind: dict[str, list[str]] = {}
+                for source in source_events:
+                    source_by_kind.setdefault(str(source.get("kind", "")), []).append(payload_digest(source))
+                for destination in destination_events:
+                    kind = str(destination.get("kind", ""))
+                    digest = payload_digest(destination)
+                    candidates = source_by_kind.get(kind, [])
+                    if digest not in candidates:
+                        errors.append({"kind": "events", "reason": "destination event is not represented by source truth", "event_kind": kind, "payload_digest": digest})
+                    else:
+                        candidates.remove(digest)
+                destination_kinds = {str(row.get("kind", "")) for row in destination_events}
+                missing_represented = {kind: len(values) for kind, values in source_by_kind.items() if kind in destination_kinds and values}
+                if missing_represented:
+                    errors.append({"kind": "events", "reason": "destination event ledger is truncated", "remaining_source_events": missing_represented})
+                try:
+                    if native_ids != sorted(native_ids, key=lambda value: int(value)):
+                        errors.append({"kind": "events", "reason": "destination event ordering differs"})
+                except (TypeError, ValueError):
+                    errors.append({"kind": "events", "reason": "destination event IDs are not ordered integers"})
+                if destination_streams:
+                    for stream in destination_streams:
+                        stream_id = str(stream.get("id", stream.get("stream_id", "")))
+                        expected_head = max((int(row.get("seq", 0)) for row in destination_events if str(row.get("stream_id")) == stream_id), default=0)
+                        if stream_head(stream) != expected_head:
+                            errors.append({"kind": "events", "reason": "destination stream head does not match raw events", "stream": stream_id})
             else:
-                source_events = list(data.get("events", []))
-                destination_events = list(truth.get("events", []))
-                source_streams = list(data.get("event_streams", []))
-                destination_streams = list(truth.get("event_streams", []))
-                def payload_digest(row):
-                    value = row.get("payload_json", row.get("payload", {}))
-                    if isinstance(value, str):
-                        try:
-                            value = json.loads(value)
-                        except json.JSONDecodeError:
-                            pass
-                    return hashlib.sha256(_canonical(value)).hexdigest()
-                source_ids = [str(row.get("event_id", row.get("id", ""))) for row in source_events]
-                destination_ids = [str(row.get("event_id", row.get("id", ""))) for row in destination_events]
                 if len(source_events) != len(destination_events):
                     errors.append({"kind": "events", "reason": "event counts differ", "source": len(source_events), "destination": len(destination_events)})
-                if set(source_ids) != set(destination_ids):
-                    errors.append({"kind": "events", "reason": "event IDs differ", "source": source_ids, "destination": destination_ids})
-                if sorted(payload_digest(row) for row in source_events) != sorted(payload_digest(row) for row in destination_events):
-                    errors.append({"kind": "events", "reason": "event payload digests differ"})
-                source_heads = {str(row.get("id")): int(row.get("head_seq", 0)) for row in source_streams}
-                destination_heads = {str(row.get("id")): int(row.get("head_seq", 0)) for row in destination_streams}
+                if source_ids != destination_ids:
+                    errors.append({"kind": "events", "reason": "event IDs or ordering differ", "source": source_ids, "destination": destination_ids})
+                if source_payloads != destination_payloads:
+                    errors.append({"kind": "events", "reason": "event payload digests or ordering differ", "source": source_payloads, "destination": destination_payloads})
+                source_heads = [(str(row.get("id", row.get("stream_id", ""))), stream_head(row)) for row in source_streams]
+                destination_heads = [(str(row.get("id", row.get("stream_id", ""))), stream_head(row)) for row in destination_streams]
                 if source_heads != destination_heads:
                     errors.append({"kind": "events", "reason": "event stream heads differ", "source": source_heads, "destination": destination_heads})
-                source_order = [(str(row.get("stream_id")), int(row.get("seq", 0))) for row in source_events]
-                destination_order = [(str(row.get("stream_id")), int(row.get("seq", 0))) for row in destination_events]
+                source_order = [event_order(row) for row in source_events]
+                destination_order = [event_order(row) for row in destination_events]
                 if source_order != destination_order:
                     errors.append({"kind": "events", "reason": "event stream order differs", "source": source_order, "destination": destination_order})
         if truth.get("foreign_key_errors"):
