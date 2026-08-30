@@ -21,6 +21,8 @@ class RuntimeService:
         self.store = RealmStore(root)
         self.cas = ContentAddressedStore(self.store.cas_root)
         self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
+        self.runtime_session_id = new_id()
+        self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
         self.support_root = Path(support_root).expanduser().resolve() if support_root else None
         self._ensure_default_capability()
 
@@ -62,7 +64,13 @@ class RuntimeService:
         raise ConflictError("whole-realm purge is offline-only; stop the runtime and use the purge command", details={"next_action": "banodoco-runtime purge --root <realm> --confirm 'PURGE <realm_id>'"})
 
     def health(self):
-        return {"status": "ok", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": 1}
+        return {"status": "ok", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
+
+    def runtime_lifecycle(self):
+        """Return current boot/session and recovery facts for diagnostics."""
+        value = dict(self._runtime_state)
+        value["runtime_session_id"] = self.runtime_session_id
+        return value
 
     def realm_resource(self):
         row = self.store.realm

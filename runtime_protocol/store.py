@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 LEASE_SECONDS = 30
 
 
@@ -125,6 +125,58 @@ class RealmStore:
             version = 5
         if version < 6:
             self._run_migration(6)
+            version = 6
+        if version < 7:
+            self._run_migration(7)
+
+    def begin_runtime_session(self, boot_id):
+        """Open a durable boot session and recover work owned by old boots.
+
+        The monotonically increasing epoch lives in SQLite and is advanced
+        atomically with recovery of every running task. Recovery returns
+        interrupted tasks to the durable queue with their original task/run
+        ids; old lease tokens and fences cannot settle after this commits.
+        """
+        if not boot_id:
+            raise ValidationError("boot_id is required")
+        with self._mutex:
+            with self._transaction():
+                row = self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone()
+                previous_epoch = int(row["runtime_epoch"]) if row else 0
+                previous_boot = row["boot_id"] if row else None
+                epoch = previous_epoch + 1
+                started_at = now()
+                self.conn.execute(
+                    "INSERT INTO runtime_lifecycle(id, runtime_epoch, boot_id, previous_boot_id, started_at, recovered_task_count) VALUES (1, ?, ?, ?, ?, 0) ON CONFLICT(id) DO UPDATE SET runtime_epoch=excluded.runtime_epoch, boot_id=excluded.boot_id, previous_boot_id=excluded.previous_boot_id, started_at=excluded.started_at, recovered_task_count=0",
+                    (epoch, boot_id, previous_boot, started_at),
+                )
+                interrupted = self.conn.execute(
+                    "SELECT id, run_id, lease_token, lease_fence, attempt FROM tasks WHERE status='running' ORDER BY created_at, id"
+                ).fetchall()
+                for task in interrupted:
+                    self.conn.execute(
+                        "UPDATE tasks SET status='queued', worker_id=NULL, lease_token=NULL, lease_expires_at=NULL, attempt_id=NULL, waiting_reason='runtime_recovery', updated_at=? WHERE id=? AND status='running'",
+                        (started_at, task["id"]),
+                    )
+                    self.conn.execute(
+                        "UPDATE runs SET status='queued', updated_at=? WHERE id=? AND status='running'",
+                        (started_at, task["run_id"]),
+                    )
+                    self._release_reservations(task["id"], task["lease_token"])
+                    self._append_event(
+                        task["run_id"], task["id"], "task.runtime_recovered",
+                        {"previous_runtime_epoch": previous_epoch or None, "runtime_epoch": epoch, "previous_boot_id": previous_boot, "boot_id": boot_id, "stale_fence": int(task["lease_fence"] or 0), "attempt": int(task["attempt"] or 0), "recovery": "requeued"},
+                    )
+                self.conn.execute("UPDATE runtime_lifecycle SET recovered_task_count=? WHERE id=1", (len(interrupted),))
+            value = dict(self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone())
+            value["recovered_task_count"] = int(value["recovered_task_count"])
+            value["runtime_epoch"] = int(value["runtime_epoch"])
+            return value
+
+    def runtime_lifecycle(self):
+        with self._mutex:
+            row = self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone()
+            return dict(row) if row else None
 
     def _run_migration(self, version):
         migration = (Path(__file__).parent / "migrations" / f"{version:03d}_*.sql")
@@ -665,6 +717,7 @@ class RealmStore:
             "project_documents", "generations", "generation_variants", "timelines",
             "timeline_shots", "timeline_references", "timeline_revisions",
             "timeline_shot_state", "timeline_reference_state", "media_relations",
+            "runtime_lifecycle",
             "realm_lifecycle",
         }
         actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
