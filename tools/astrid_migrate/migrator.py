@@ -29,6 +29,10 @@ class MigrationConfig:
     freeze_probe: Callable[[], bool] | None = None
     evidence_root: Path | None = None
     capacity_margin_bytes: int | None = None
+    # B10 rehearsals must prove writes against the destination authority.  The
+    # ordinary offline migrator keeps the older response-only fixture mode for
+    # callers that do not have a read API.
+    require_destination_verification: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
@@ -437,7 +441,18 @@ class Migrator:
 
     def _archive(self, inventory: Mapping[str, Any]) -> Path:
         if self.config.archive_root.exists():
-            raise MigrationError(f"archive destination already exists: {self.config.archive_root}")
+            manifest_path = self.config.archive_root / "manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                archived = _file_map(self.config.archive_root / "source")
+            except (OSError, json.JSONDecodeError, MigrationError):
+                archived = None
+                manifest = {}
+            if archived == inventory.get("files") and manifest.get("source_manifest_sha256") == inventory.get("source_manifest_sha256") and manifest.get("files_sha256") == _files_digest(archived or {}):
+                self._report["archive_reused"] = True
+                self._report["archive_peak_bytes"] = _tree_size(self.config.archive_root)
+                return self.config.archive_root
+            raise MigrationError(f"archive destination already exists and does not match the frozen source: {self.config.archive_root}")
         try:
             self.config.archive_root.relative_to(self.config.source_root)
         except ValueError:
@@ -556,14 +571,24 @@ class Migrator:
                 self._run_ids[str(row.get("run_id") or run_id)] = run_id
 
     def _destination_reconciliation(self, data: Mapping[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
-        reader = getattr(self.client, "destination_snapshot", None)
+        reader = getattr(self.client, "destination_verification", None)
         if not callable(reader):
+            reader = getattr(self.client, "destination_snapshot", None)
+        if not callable(reader):
+            if self.config.require_destination_verification:
+                return {"ok": False, "errors": [{"kind": "destination_verification", "reason": "client must expose destination_verification() or destination_snapshot()"}]}
             return None
         try:
             truth = reader()
         except Exception as exc:
             return {"ok": False, "errors": [{"kind": "destination_read", "reason": str(exc)}]}
         errors = []
+        if not isinstance(truth, Mapping):
+            return {"ok": False, "errors": [{"kind": "destination_verification", "reason": "destination snapshot must be a mapping"}]}
+        required_sections = ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "event_streams", "media_locations", "foreign_key_errors")
+        missing_sections = [section for section in required_sections if section not in truth]
+        if self.config.require_destination_verification and missing_sections:
+            errors.append({"kind": "destination_verification", "reason": "snapshot is not a complete authority snapshot", "missing": missing_sections})
         projects = truth.get("projects", [])
         by_slug = {str(row.get("slug")): row for row in projects}
         for source in data.get("projects", []):
@@ -582,12 +607,23 @@ class Migrator:
             if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("timeline_references", [])):
                 errors.append({"kind": "reference", "id": source.get("id"), "reason": "missing from destination truth"})
         actual_media = {str(row.get("digest") or row.get("content_hash")) .removeprefix("sha256:") for row in truth.get("objects", [])}
+        cas_objects = {str(row.get("digest")) .removeprefix("sha256:"): row for row in truth.get("cas_objects", []) if isinstance(row, Mapping)}
         for source in data.get("media", []):
             digest = str(source.get("content_hash") or "").removeprefix("sha256:")
             if digest and digest not in actual_media:
                 errors.append({"kind": "media", "id": source.get("id"), "reason": "content digest missing from destination truth", "digest": digest})
             elif digest and not any(str(row.get("digest")) .removeprefix("sha256:") == digest and str(row.get("realm")) == "cas" for row in truth.get("media_locations", [])):
                 errors.append({"kind": "media_location", "id": source.get("id"), "reason": "CAS location missing from destination truth", "digest": digest})
+            if self.config.require_destination_verification:
+                cas = cas_objects.get(digest)
+                try:
+                    cas_size = int(cas.get("size", -1)) if cas else -1
+                except (TypeError, ValueError):
+                    cas_size = -1
+                locator = Path(str(cas.get("locator", ""))).expanduser() if cas else None
+                bytes_verified = bool(locator and locator.is_file() and locator.stat().st_size == cas_size and _sha256_file(locator) == digest)
+                if not cas or str(cas.get("sha256", "")).removeprefix("sha256:") != digest or cas_size != int(source.get("byte_size") or -1) or not bytes_verified:
+                    errors.append({"kind": "cas_bytes", "id": source.get("id"), "reason": "destination CAS bytes were not verified by content hash", "digest": digest})
         for source in data.get("timelines", []):
             document = _json(source.get("document_json"), None)
             if document is None:
@@ -606,6 +642,45 @@ class Migrator:
             errors.append({"kind": "events", "reason": "destination event truth is empty"})
         if truth.get("events") and any(not row.get("kind") or not row.get("payload_json") for row in truth["events"]):
             errors.append({"kind": "events", "reason": "destination event truth contains incomplete records"})
+        # A migration is accepted only when the destination can account for
+        # event identity, payload bytes, and stream ordering.  Clients may
+        # either return the normalized comparison directly or expose the raw
+        # event/stream rows, in which case compare the deterministic fields.
+        event_check = truth.get("event_reconciliation")
+        if self.config.require_destination_verification:
+            if isinstance(event_check, Mapping):
+                for field in ("counts", "ids", "payload_digests", "stream_heads", "stream_order"):
+                    if event_check.get(field) is not True:
+                        errors.append({"kind": "events", "reason": f"event {field} reconciliation failed", "details": event_check.get(field)})
+            else:
+                source_events = list(data.get("events", []))
+                destination_events = list(truth.get("events", []))
+                source_streams = list(data.get("event_streams", []))
+                destination_streams = list(truth.get("event_streams", []))
+                def payload_digest(row):
+                    value = row.get("payload_json", row.get("payload", {}))
+                    if isinstance(value, str):
+                        try:
+                            value = json.loads(value)
+                        except json.JSONDecodeError:
+                            pass
+                    return hashlib.sha256(_canonical(value)).hexdigest()
+                source_ids = [str(row.get("event_id", row.get("id", ""))) for row in source_events]
+                destination_ids = [str(row.get("event_id", row.get("id", ""))) for row in destination_events]
+                if len(source_events) != len(destination_events):
+                    errors.append({"kind": "events", "reason": "event counts differ", "source": len(source_events), "destination": len(destination_events)})
+                if set(source_ids) != set(destination_ids):
+                    errors.append({"kind": "events", "reason": "event IDs differ", "source": source_ids, "destination": destination_ids})
+                if sorted(payload_digest(row) for row in source_events) != sorted(payload_digest(row) for row in destination_events):
+                    errors.append({"kind": "events", "reason": "event payload digests differ"})
+                source_heads = {str(row.get("id")): int(row.get("head_seq", 0)) for row in source_streams}
+                destination_heads = {str(row.get("id")): int(row.get("head_seq", 0)) for row in destination_streams}
+                if source_heads != destination_heads:
+                    errors.append({"kind": "events", "reason": "event stream heads differ", "source": source_heads, "destination": destination_heads})
+                source_order = [(str(row.get("stream_id")), int(row.get("seq", 0))) for row in source_events]
+                destination_order = [(str(row.get("stream_id")), int(row.get("seq", 0))) for row in destination_events]
+                if source_order != destination_order:
+                    errors.append({"kind": "events", "reason": "event stream order differs", "source": source_order, "destination": destination_order})
         if truth.get("foreign_key_errors"):
             errors.append({"kind": "foreign_keys", "reason": "destination foreign-key check failed", "details": truth["foreign_key_errors"]})
         return {"ok": not errors, "errors": errors, "counts": {key: len(value) for key, value in truth.items() if isinstance(value, list)}, "truth": truth}
