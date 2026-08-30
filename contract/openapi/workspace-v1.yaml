@@ -28,6 +28,40 @@ paths:
       operationId: getRealm
       responses:
         '200': { description: Current scoped realm, content: { application/json: { schema: { $ref: './schemas/realm.json' } } } }
+  /v1/doctor:
+    get:
+      operationId: doctor
+      responses:
+        '200': { description: Read-only integrity and support-state report, content: { application/json: { schema: { $ref: './schemas/doctor.json' } } } }
+  /v1/backup:
+    post:
+      operationId: createBackup
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateBackup' } } } }
+      responses: { '201': { description: Verified online backup, content: { application/json: { schema: { $ref: './schemas/backup.json' } } } } }
+  /v1/restore:
+    post:
+      operationId: restoreBackup
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RestoreBackup' } } } }
+      responses: { '201': { description: Prepared inactive restored realm, content: { application/json: { schema: { $ref: './schemas/backup.json' } } } } }
+  /v1/export:
+    get:
+      operationId: exportRealm
+      responses: { '200': { description: Structured realm export, content: { application/json: { schema: { $ref: './schemas/export.json' } } } } }
+  /v1/realm/tombstone:
+    post:
+      operationId: tombstoneRealm
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/LifecycleRequest' } } } }
+      responses: { '200': { description: Logical realm removal, content: { application/json: { schema: { $ref: './schemas/realm-lifecycle.json' } } } } }
+  /v1/realm/recover:
+    post:
+      operationId: recoverRealm
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/LifecycleRequest' } } } }
+      responses: { '200': { description: Recovered realm tombstone, content: { application/json: { schema: { $ref: './schemas/realm-lifecycle.json' } } } } }
+  /v1/realm/purge:
+    post:
+      operationId: purgeRealm
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PurgeRealm' } } } }
+      responses: { '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects:
     get:
       operationId: listProjects
@@ -543,6 +577,25 @@ components:
       additionalProperties: false
       required: [lease_id, fence]
       properties: { lease_id: { type: string, minLength: 1 }, fence: { type: integer, minimum: 1 } }
+    CreateBackup:
+      type: object
+      additionalProperties: false
+      required: [destination]
+      properties: { destination: { type: string, minLength: 1 } }
+    RestoreBackup:
+      type: object
+      additionalProperties: false
+      required: [backup, destination]
+      properties: { backup: { type: string, minLength: 1 }, destination: { type: string, minLength: 1 } }
+    LifecycleRequest:
+      type: object
+      additionalProperties: false
+      properties: { reason: { type: string }, expected_version: { type: integer, minimum: 1 } }
+    PurgeRealm:
+      type: object
+      additionalProperties: false
+      required: [confirmation]
+      properties: { confirmation: { type: string, minLength: 1 } }
   responses:
     Conflict:
       description: Conflict or idempotency mismatch

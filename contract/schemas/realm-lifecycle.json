@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "title": "RealmLifecycle", "type": "object", "additionalProperties": false,
+  "required": ["realm_id", "state", "version"],
+  "properties": {"realm_id": {"type": "string"}, "state": {"enum": ["active", "tombstoned"]}, "tombstoned_at": {"type": ["string", "null"]}, "reason": {"type": ["string", "null"]}, "version": {"type": "integer", "minimum": 1}}
+}

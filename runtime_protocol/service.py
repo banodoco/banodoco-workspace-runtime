@@ -17,10 +17,11 @@ from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None):
         self.store = RealmStore(root)
         self.cas = ContentAddressedStore(self.store.cas_root)
         self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
+        self.support_root = Path(support_root).expanduser().resolve() if support_root else None
         self._ensure_default_capability()
 
     def close(self):
@@ -38,12 +39,35 @@ class RuntimeService:
             atomic_json_write(Path(destination).expanduser().resolve(), value)
         return value
 
+    def doctor(self):
+        return self.store.doctor(catalog_path=(self.support_root / "catalog.json") if self.support_root else None)
+
+    def tombstone(self, body=None):
+        body = body or {}
+        return self.store.tombstone_realm(reason=body.get("reason"), expected_version=body.get("expected_version"))
+
+    def recover_realm(self, body=None):
+        body = body or {}
+        return self.store.restore_tombstone(expected_version=body.get("expected_version"))
+
+    def purge(self, body=None):
+        """Return the explicit offline purge boundary; never purge online."""
+        body = body or {}
+        confirmation = body.get("confirmation")
+        required = f"PURGE {self.realm['id']}"
+        if confirmation != required:
+            raise ValidationError(f"whole-realm purge requires confirmation exactly {required!r}")
+        if self.store.realm_lifecycle()["state"] != "tombstoned":
+            raise ConflictError("whole-realm purge requires a tombstoned realm")
+        raise ConflictError("whole-realm purge is offline-only; stop the runtime and use the purge command", details={"next_action": "banodoco-runtime purge --root <realm> --confirm 'PURGE <realm_id>'"})
+
     def health(self):
         return {"status": "ok", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": 1}
 
     def realm_resource(self):
         row = self.store.realm
-        return {"realm_id": row["id"], "display_name": row["display_name"], "version": 1, "created_at": row["created_at"]}
+        lifecycle = self.store.realm_lifecycle()
+        return {"realm_id": row["id"], "display_name": row["display_name"], "version": 1, "created_at": row["created_at"], "state": lifecycle["state"], "tombstoned_at": lifecycle["tombstoned_at"], "lifecycle_version": lifecycle["version"]}
 
     def handshake(self, body):
         requested = list(body.get("requested_scopes") or [])

@@ -26,6 +26,50 @@ class Health:
         return getattr(self, key)
 
 
+@dataclass(frozen=True)
+class IntegrityCheck:
+    ok: bool
+    values: Mapping[str, Any]
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "IntegrityCheck":
+        return cls(ok=bool(value.get("ok", False)), values=dict(value))
+
+    def __getitem__(self, key: str) -> Any:
+        return self.values[key]
+
+
+@dataclass(frozen=True)
+class IntegrityReport:
+    state: str
+    ok: bool
+    schema_version: int
+    recovery_action: str
+    checks: Mapping[str, IntegrityCheck]
+    issues: tuple[str, ...] = ()
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "IntegrityReport":
+        checks = {str(key): IntegrityCheck.from_json(item) for key, item in value.get("checks", {}).items() if isinstance(item, Mapping)}
+        return cls(state=str(value.get("state", "unhealthy")), ok=bool(value.get("ok", False)), schema_version=int(value.get("schema_version", 0)), recovery_action=str(value.get("recovery_action", "")), checks=checks, issues=tuple(value.get("issues", [])))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class RealmLifecycle:
+    realm_id: str
+    state: str
+    version: int
+    tombstoned_at: str | None = None
+    reason: str | None = None
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "RealmLifecycle":
+        return cls(realm_id=str(value["realm_id"]), state=str(value["state"]), version=int(value["version"]), tombstoned_at=value.get("tombstoned_at"), reason=value.get("reason"))
+
+
 class ApiError(RuntimeError):
     def __init__(self, status: int, code: str, message: str, request_id: str = "", details: Mapping[str, Any] | None = None):
         super().__init__(f"{code}: {message}")
@@ -271,6 +315,34 @@ class WorkspaceClient:
 
     def get_realm(self) -> Realm:
         return Realm.from_json(self._json(self._request("GET", "/v1/realm")[2]))
+
+    def doctor(self) -> IntegrityReport:
+        return IntegrityReport.from_json(self._json(self._request("GET", "/v1/doctor")[2]))
+
+    def create_backup(self, destination: str) -> Mapping[str, Any]:
+        payload = {"destination": destination}
+        return self._json(self._request("POST", "/v1/backup", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, expected=(200, 201))[2])
+
+    def restore_backup(self, backup: str, destination: str) -> Mapping[str, Any]:
+        payload = {"backup": backup, "destination": destination}
+        return self._json(self._request("POST", "/v1/restore", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, expected=(200, 201))[2])
+
+    def export_realm(self) -> Mapping[str, Any]:
+        return self._json(self._request("GET", "/v1/export")[2])
+
+    def tombstone_realm(self, *, reason: str | None = None, expected_version: int | None = None) -> RealmLifecycle:
+        payload: dict[str, Any] = {}
+        if reason is not None: payload["reason"] = reason
+        if expected_version is not None: payload["expected_version"] = expected_version
+        return RealmLifecycle.from_json(self._json(self._request("POST", "/v1/realm/tombstone", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
+
+    def recover_realm(self, *, expected_version: int | None = None) -> RealmLifecycle:
+        payload = {} if expected_version is None else {"expected_version": expected_version}
+        return RealmLifecycle.from_json(self._json(self._request("POST", "/v1/realm/recover", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
+
+    def purge_realm(self, confirmation: str) -> Mapping[str, Any]:
+        payload = {"confirmation": confirmation}
+        return self._json(self._request("POST", "/v1/realm/purge", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
 
     def create_project(self, name: str, *, idempotency_key: str, slug: str | None = None, metadata: Mapping[str, Any] | None = None) -> Project:
         payload: dict[str, Any] = {"name": name}

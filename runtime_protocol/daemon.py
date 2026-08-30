@@ -44,7 +44,7 @@ class RuntimeDaemon:
     def start(self):
         if self.httpd:
             return self
-        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id)
+        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root)
         self.token, self.credential_path = self.credentials.provision("owner", ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"])
         self.worker_token, _ = self.credentials.provision("fake-worker", ["handshake", "worker:execute", "tasks:read"])
         if self.bootstrap_token_file and self.bootstrap_token_file.exists():

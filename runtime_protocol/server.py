@@ -90,6 +90,18 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "realm"] and method == "GET":
             self._identity("projects:read")
             return self._send(200, self.runtime.realm_resource())
+        if path == ["v1", "doctor"] and method == "GET":
+            self._identity("admin")
+            return self._send(200, self.runtime.doctor())
+        if path == ["v1", "realm", "tombstone"] and method == "POST":
+            self._identity("admin")
+            return self._send(200, self.runtime.tombstone(self._body()))
+        if path == ["v1", "realm", "recover"] and method == "POST":
+            self._identity("admin")
+            return self._send(200, self.runtime.recover_realm(self._body()))
+        if path == ["v1", "realm", "purge"] and method == "POST":
+            self._identity("admin")
+            return self._send(200, self.runtime.purge(self._body()))
         if path == ["v1", "export"] and method == "GET":
             self._identity("admin")
             return self._send(200, self.runtime.export_structured())

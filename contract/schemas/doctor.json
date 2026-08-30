@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IntegrityReport", "type": "object", "additionalProperties": false,
+  "required": ["state", "ok", "schema_version", "recovery_action", "checks"],
+  "properties": {
+    "state": {"enum": ["ready", "unhealthy"]}, "ok": {"type": "boolean"},
+    "schema_version": {"type": "integer", "minimum": 1}, "issues": {"type": "array", "items": {"type": "string"}},
+    "recovery_action": {"type": "string", "minLength": 1}, "next_action": {"type": "string", "minLength": 1},
+    "checks": {"type": "object", "required": ["sqlite_integrity", "foreign_keys", "schema", "reachable_cas", "catalog", "activation"], "additionalProperties": true,
+      "properties": {
+        "sqlite_integrity": {"$ref": "#/$defs/check"}, "foreign_keys": {"$ref": "#/$defs/check"},
+        "schema": {"$ref": "#/$defs/check"}, "reachable_cas": {"$ref": "#/$defs/check"},
+        "catalog": {"$ref": "#/$defs/check"}, "activation": {"$ref": "#/$defs/check"}
+      }}
+  },
+  "$defs": {"check": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}, "additionalProperties": true}}
+}

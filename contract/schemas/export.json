@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "title": "StructuredExport", "type": "object", "additionalProperties": true,
+  "required": ["format_version", "exported_at", "realm", "projects", "objects"],
+  "properties": {"format_version": {"type": "integer"}, "exported_at": {"type": "string"}, "realm": {"type": "object"}, "projects": {"type": "array"}, "objects": {"type": "array"}}
+}

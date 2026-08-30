@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import shutil
 import time
 from pathlib import Path
 
@@ -27,6 +28,7 @@ def _parser():
     doctor = sub.add_parser("doctor", help="read-only runtime health check")
     doctor.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--support-root")
     backup = sub.add_parser("backup", help="create a verified self-contained realm backup")
     backup.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     backup.add_argument("--destination", required=True)
@@ -37,6 +39,9 @@ def _parser():
     export.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     export.add_argument("--destination")
     export.add_argument("--json", action="store_true")
+    purge = sub.add_parser("purge", help="irreversibly remove a tombstoned realm (offline only)")
+    purge.add_argument("--root", required=True)
+    purge.add_argument("--confirm", required=True)
     return parser
 
 
@@ -49,7 +54,7 @@ def main(argv=None):
         else:
             try:
                 store = RealmStore(root, acquire_owner=False)
-                result = store.doctor()
+                result = store.doctor(catalog_path=(Path(args.support_root) / "catalog.json") if args.support_root else None)
                 store.close()
             except Exception as exc:
                 result = {"state": "unhealthy", "ok": False, "error": str(exc)}
@@ -77,6 +82,20 @@ def main(argv=None):
             from .util import atomic_json_write
             atomic_json_write(Path(args.destination).expanduser().resolve(), value)
         print(json.dumps(value, sort_keys=True))
+        return 0
+    if args.command == "purge":
+        root = Path(args.root).expanduser().resolve()
+        store = RealmStore(root, acquire_owner=False)
+        try:
+            realm_id = store.realm["id"]
+            if args.confirm != f"PURGE {realm_id}":
+                raise SystemExit(f"confirmation must be exactly: PURGE {realm_id}")
+            if store.realm_lifecycle()["state"] != "tombstoned":
+                raise SystemExit("realm must be tombstoned before purge")
+        finally:
+            store.close()
+        shutil.rmtree(root)
+        print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     daemon = RuntimeDaemon(args.root, support_root=args.support_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file).start()
     print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path)}, sort_keys=True), flush=True)

@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 LEASE_SECONDS = 30
 
 
@@ -122,6 +122,9 @@ class RealmStore:
             version = 4
         if version < 5:
             self._run_migration(5)
+            version = 5
+        if version < 6:
+            self._run_migration(6)
 
     def _run_migration(self, version):
         migration = (Path(__file__).parent / "migrations" / f"{version:03d}_*.sql")
@@ -160,7 +163,31 @@ class RealmStore:
                 return row
             rid, timestamp = realm_id or new_id(), now()
             self.conn.execute("INSERT INTO realm VALUES (?, ?, ?, ?)", (rid, display_name, timestamp, timestamp))
+            self.conn.execute("INSERT OR IGNORE INTO realm_lifecycle(realm_id, state, version) VALUES (?, 'active', 1)", (rid,))
             return dict(self.conn.execute("SELECT * FROM realm WHERE id=?", (rid,)).fetchone())
+
+    def realm_lifecycle(self):
+        row = self.conn.execute("SELECT * FROM realm_lifecycle WHERE realm_id=?", (self.realm["id"],)).fetchone()
+        return dict(row) if row else {"realm_id": self.realm["id"], "state": "active", "tombstoned_at": None, "reason": None, "version": 1}
+
+    def tombstone_realm(self, *, reason=None, expected_version=None):
+        with self._mutex:
+            lifecycle = self.realm_lifecycle()
+            if expected_version is not None and int(expected_version) != int(lifecycle["version"]):
+                raise ConflictError("realm lifecycle version conflict", details={"expected": expected_version, "actual": lifecycle["version"]})
+            if lifecycle["state"] == "tombstoned":
+                return lifecycle
+            timestamp = now()
+            self.conn.execute("UPDATE realm_lifecycle SET state='tombstoned', tombstoned_at=?, reason=?, version=version+1 WHERE realm_id=?", (timestamp, reason, self.realm["id"]))
+            return self.realm_lifecycle()
+
+    def restore_tombstone(self, *, expected_version=None):
+        with self._mutex:
+            lifecycle = self.realm_lifecycle()
+            if expected_version is not None and int(expected_version) != int(lifecycle["version"]):
+                raise ConflictError("realm lifecycle version conflict", details={"expected": expected_version, "actual": lifecycle["version"]})
+            self.conn.execute("UPDATE realm_lifecycle SET state='active', tombstoned_at=NULL, reason=NULL, version=version+1 WHERE realm_id=?", (self.realm["id"],))
+            return self.realm_lifecycle()
 
     def _project(self, selector: str):
         row = self.conn.execute("SELECT * FROM projects WHERE id=? OR slug=?", (selector, selector)).fetchone()
@@ -612,11 +639,50 @@ class RealmStore:
                 self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
                 return self.get_task(task_id)
 
-    def doctor(self):
-        quick = self.conn.execute("PRAGMA quick_check").fetchone()[0]
-        fk = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+    def doctor(self, *, catalog_path=None):
+        """Return a read-only, actionable integrity report.
+
+        ``catalog_path`` is optional because the store is also useful outside
+        the daemon (for example during an offline backup check).  When it is
+        supplied, support-state checks are included alongside the authoritative
+        SQLite/CAS checks.
+        """
+        return self.integrity_report(catalog_path=catalog_path)
+
+    def integrity_report(self, *, catalog_path=None):
+        try:
+            quick = self.conn.execute("PRAGMA quick_check").fetchone()[0]
+        except sqlite3.DatabaseError as exc:
+            quick = f"error: {exc}"
+        try:
+            fk_rows = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+        except sqlite3.DatabaseError as exc:
+            fk_rows = [("error", str(exc))]
+        fk = [tuple(row) for row in fk_rows]
+        expected_tables = {
+            "realm", "projects", "objects", "project_objects", "runs", "tasks",
+            "events", "workers", "reservations", "capabilities", "schema_migrations",
+            "project_documents", "generations", "generation_variants", "timelines",
+            "timeline_shots", "timeline_references", "timeline_revisions",
+            "timeline_shot_state", "timeline_reference_state", "media_relations",
+            "realm_lifecycle",
+        }
+        actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        missing_tables = sorted(expected_tables - actual_tables)
+        schema_row = self.conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()
+        actual_schema = int(schema_row[0] or 0)
+        schema_ok = actual_schema == SCHEMA_VERSION and not missing_tables
         objects = self.conn.execute("SELECT digest FROM objects").fetchall()
-        missing = [row[0] for row in objects if not (self.cas_root / row[0][:2] / row[0][2:]).is_file()]
+        reachable = {str(row[0]) for row in objects}
+        missing = [digest for digest in sorted(reachable) if not (self.cas_root / digest[:2] / digest[2:]).is_file()]
+        orphaned = []
+        if self.cas_root.exists():
+            for path in self.cas_root.glob("*/*"):
+                if path.is_file():
+                    digest = path.parent.name + path.name
+                    if digest not in reachable:
+                        orphaned.append(digest)
+        cas_ok = not missing
         event_errors = []
         for run in self.conn.execute("SELECT id FROM runs"):
             previous = ""
@@ -627,5 +693,80 @@ class RealmStore:
                 if expected != event["event_hash"]:
                     event_errors.append({"run_id": run[0], "event_id": event["id"], "reason": "hash_mismatch"})
                 previous = event["event_hash"]
-        healthy = quick == "ok" and not fk and not missing and not event_errors
-        return {"state": "ready" if healthy else "unhealthy", "ok": healthy, "schema_version": SCHEMA_VERSION, "checks": {"sqlite_quick_check": quick, "foreign_keys": not bool(fk), "cas_missing": missing, "event_chain_errors": event_errors}}
+        sqlite_ok = quick == "ok"
+        catalog_check = {"status": "not_configured", "ok": True, "issues": []}
+        activation_check = {"status": "not_configured", "ok": True, "issues": []}
+        if catalog_path is not None:
+            catalog_check = self._catalog_check(Path(catalog_path))
+            activation_check = self._activation_check(catalog_check)
+        healthy = sqlite_ok and not fk and schema_ok and cas_ok and not event_errors and catalog_check["ok"] and activation_check["ok"]
+        issues = []
+        if not sqlite_ok: issues.append("sqlite_integrity")
+        if fk: issues.append("foreign_keys")
+        if not schema_ok: issues.append("schema")
+        if missing: issues.append("reachable_cas")
+        if event_errors: issues.append("event_chain")
+        issues.extend(catalog_check.get("issues", [])); issues.extend(activation_check.get("issues", []))
+        recovery = "No recovery action required." if healthy else "Restore the realm from a verified backup, then re-run doctor."
+        if (catalog_check["ok"] is False or activation_check["ok"] is False) and sqlite_ok and not fk and schema_ok and cas_ok:
+            recovery = "Repair the catalog and activation manifest, then restart the runtime."
+        return {
+            "state": "ready" if healthy else "unhealthy", "ok": healthy,
+            "schema_version": SCHEMA_VERSION, "issues": issues,
+            "recovery_action": recovery, "next_action": recovery,
+            "checks": {
+                "sqlite_integrity": {"ok": sqlite_ok, "result": quick},
+                "sqlite": {"ok": sqlite_ok, "result": quick},
+                "sqlite_quick_check": quick,
+                "foreign_keys": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
+                "foreign_key": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
+                "schema": {"ok": schema_ok, "expected_version": SCHEMA_VERSION, "actual_version": actual_schema, "missing_tables": missing_tables},
+                "reachable_cas": {"ok": cas_ok, "missing": missing, "orphaned": sorted(orphaned)},
+                "cas_missing": missing,
+                "event_chain": {"ok": not bool(event_errors), "errors": event_errors},
+                "event_chain_errors": event_errors,
+                "catalog": catalog_check,
+                "activation": activation_check,
+                "catalog_activation": {"ok": catalog_check["ok"] and activation_check["ok"], "catalog": catalog_check, "activation": activation_check},
+            },
+        }
+
+    def _catalog_check(self, path):
+        try:
+            value = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"status": "invalid", "ok": False, "issues": ["catalog_missing" if isinstance(exc, FileNotFoundError) else "catalog_invalid"], "path": str(path)}
+        realm = self.realm
+        selected = value.get("selected_realm_id")
+        registered = [row for row in value.get("realms", []) if row.get("realm_id") == (realm or {}).get("id")]
+        issues = []
+        if selected != (realm or {}).get("id"): issues.append("catalog_selection")
+        if not registered: issues.append("catalog_realm_missing")
+        return {"status": "ready" if not issues else "invalid", "ok": not issues, "issues": issues, "path": str(path), "selected_realm_id": selected}
+
+    def _activation_check(self, catalog_check):
+        if catalog_check.get("status") == "not_configured":
+            return catalog_check.copy()
+        if not catalog_check.get("ok"):
+            return {"status": "blocked", "ok": False, "issues": ["activation_catalog_unavailable"]}
+        try:
+            catalog = json.loads(Path(catalog_check["path"]).read_text(encoding="utf-8"))
+            row = next(item for item in catalog.get("realms", []) if item.get("realm_id") == self.realm["id"])
+            # A bare RuntimeDaemon may be launched without the optional
+            # banodoco-local activation layer.  In that mode catalog
+            # registration is still authoritative, but activation is not
+            # configured and therefore cannot be called broken.
+            if not row.get("activation_manifest"):
+                return {"status": "not_configured", "ok": True, "issues": []}
+            activation_path = Path(str(row.get("activation_manifest", "")))
+            if not activation_path.is_file():
+                raise FileNotFoundError
+            activation = json.loads(activation_path.read_text(encoding="utf-8"))
+            issues = []
+            if activation.get("realm_id") != self.realm["id"]: issues.append("activation_realm_mismatch")
+            if Path(str(activation.get("destination_realm_root", ""))).resolve() != self.root.resolve(): issues.append("activation_root_mismatch")
+            expected_digest = row.get("activation_digest")
+            if expected_digest and hashlib.sha256(activation_path.read_bytes()).hexdigest() != expected_digest: issues.append("activation_digest_mismatch")
+            return {"status": "ready" if not issues else "invalid", "ok": not issues, "issues": issues, "path": str(activation_path)}
+        except (OSError, StopIteration, json.JSONDecodeError):
+            return {"status": "invalid", "ok": False, "issues": ["activation_missing"]}
