@@ -87,8 +87,35 @@ def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path
         recovered = client.recover_timeline("timeline", expected_version=archived["version"], version=saved["version"], idempotency_key="recover")
         assert archived["archived"] is True and recovered["archived"] is False and recovered["shots"] == saved["shots"]
 
+        shot = client.create_shot("timeline", {"shot_id": "shot-mounted", "start_ms": 0, "duration_ms": 100, "reference_ids": []}, idempotency_key="shot")
+        reference = client.create_reference("timeline", {"reference_id": "reference-mounted", "object_id": object_row.object_id, "role": "source"}, idempotency_key="reference")
+        shots, _ = client.list_project_shots(project.project_id)
+        references, _ = client.list_project_references(project.project_id)
+        assert any(item["shot_id"] == shot["shot_id"] for item in shots) and any(item["reference_id"] == reference["reference_id"] for item in references)
+        shot = client.update_shot("shot-mounted", expected_version=1, duration_ms=200)
+        reference = client.update_reference("reference-mounted", expected_version=1, role="hero")
+        shot = client.archive_shot("shot-mounted", expected_version=shot["version"], idempotency_key="archive-shot")
+        reference = client.archive_reference("reference-mounted", expected_version=reference["version"], idempotency_key="archive-reference")
+        assert shot["archived"] is True and reference["archived"] is True
+        assert all(item["shot_id"] != "shot-mounted" for item in client.list_project_shots(project.project_id)[0])
+        assert any(item["shot_id"] == "shot-mounted" and item["archived"] is True for item in client.list_project_shots(project.project_id, include_archived=True)[0])
+        shot = client.recover_shot("shot-mounted", expected_version=shot["version"], idempotency_key="recover-shot")
+        reference = client.recover_reference("reference-mounted", expected_version=reference["version"], idempotency_key="recover-reference")
+        assert shot["archived"] is False and reference["archived"] is False
+
+        second_object = client.ingest_project_object(project.project_id, b"second-managed", media_type="application/octet-stream", idempotency_key="media-2")
+        relation = client.create_media_relation(project.project_id, object_row.object_id, second_object.object_id, "derived_from", idempotency_key="relation")
+        relations, _ = client.list_media_relations(project.project_id)
+        assert relation["kind"] == "derived_from" and relations[0]["to_object_id"] == second_object.object_id
+
         generation = client.create_generation(project.project_id, "generation")
         client.create_variant(generation.generation_id, "variant")
         assert client.get_variant("variant").generation_id == generation.generation_id
+
+        client.register_capability("render.basic", _digest("render.basic"), idempotency_key="listed-capability")
+        task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="listed-task", project_id=project.project_id, spec={"prompt": "listed"})
+        tasks, _ = client.list_project_tasks(project.project_id)
+        runs, _ = client.list_project_runs(project.project_id)
+        assert [item.task_id for item in tasks] == [task.task_id] and runs[0]["id"] == task.run_id
     finally:
         daemon.stop()

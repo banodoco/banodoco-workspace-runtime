@@ -348,11 +348,46 @@ class WorkspaceClient:
     def get_shot(self, shot_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/shots/{_path_part(shot_id)}")[2])
 
+    def list_project_shots(self, project_id: str, *, cursor: str | None = None, limit: int = 50, include_archived: bool = False) -> tuple[list[Mapping[str, Any]], str | None]:
+        query = f"?limit={int(limit)}&include_archived={'true' if include_archived else 'false'}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/shots" + query)[2])
+        return list(value.get("items", [])), value.get("next_cursor")
+
+    def update_shot(self, shot_id: str, *, expected_version: int, start_ms: int | None = None, duration_ms: int | None = None, reference_ids: list[str] | None = None) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"expected_version": expected_version}
+        if start_ms is not None: payload["start_ms"] = start_ms
+        if duration_ms is not None: payload["duration_ms"] = duration_ms
+        if reference_ids is not None: payload["reference_ids"] = reference_ids
+        return self._json(self._request("PATCH", f"/v1/shots/{_path_part(shot_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
+    def archive_shot(self, shot_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/shots/{_path_part(shot_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def recover_shot(self, shot_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/shots/{_path_part(shot_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
     def create_reference(self, timeline_id: str, reference: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
         return self._json(self._request("POST", f"/v1/timelines/{_path_part(timeline_id)}/references", body=json.dumps(dict(reference), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
 
     def get_reference(self, reference_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/references/{_path_part(reference_id)}")[2])
+
+    def list_project_references(self, project_id: str, *, cursor: str | None = None, limit: int = 50, include_archived: bool = False) -> tuple[list[Mapping[str, Any]], str | None]:
+        query = f"?limit={int(limit)}&include_archived={'true' if include_archived else 'false'}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/references" + query)[2])
+        return list(value.get("items", [])), value.get("next_cursor")
+
+    def update_reference(self, reference_id: str, *, expected_version: int, object_id: str | None = None, role: str | None = None) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"expected_version": expected_version}
+        if object_id is not None: payload["object_id"] = object_id
+        if role is not None: payload["role"] = role
+        return self._json(self._request("PATCH", f"/v1/references/{_path_part(reference_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
+    def archive_reference(self, reference_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/references/{_path_part(reference_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def recover_reference(self, reference_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/references/{_path_part(reference_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def list_projects(self, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Project], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
@@ -381,6 +416,16 @@ class WorkspaceClient:
     list_objects = list_project_objects
     list_project_media = list_project_objects
     list_media = list_project_objects
+
+    def create_media_relation(self, project_id: str, from_object_id: str, to_object_id: str, kind: str, *, metadata: Mapping[str, Any] | None = None, idempotency_key: str) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"from_object_id": from_object_id, "to_object_id": to_object_id, "kind": kind}
+        if metadata is not None: payload["metadata"] = metadata
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/media-relations", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
+
+    def list_media_relations(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/media-relations" + query)[2])
+        return list(value.get("items", [])), value.get("next_cursor")
 
     def get_object(self, object_id: str, *, byte_range: tuple[int, int | None] | None = None) -> ByteResponse:
         headers: dict[str, str] = {}
@@ -413,6 +458,13 @@ class WorkspaceClient:
         _, _, body = self._request("GET", f"/v1/tasks/{_path_part(task_id)}")
         return Task.from_json(self._json(body))
 
+    def list_project_tasks(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/tasks" + query)[2])
+        return [Task.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+
+    list_tasks = list_project_tasks
+
     def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str) -> Mapping[str, Any] | None:
         status, _, body = self._request("POST", "/v1/tasks/claim", body=json.dumps({"executor_id": executor_id, "capability_ids": capability_ids}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 204))
         return None if status == 204 else self._json(body)
@@ -435,6 +487,13 @@ class WorkspaceClient:
     def get_run(self, run_id: str) -> Mapping[str, Any]:
         _, _, body = self._request("GET", f"/v1/runs/{_path_part(run_id)}")
         return self._json(body)
+
+    def list_project_runs(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/runs" + query)[2])
+        return list(value.get("items", [])), value.get("next_cursor")
+
+    list_runs = list_project_runs
 
     def list_events(self, *, cursor: str | None = None, limit: int = 50, aggregate_id: str | None = None) -> tuple[list[Event], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "") + (f"&aggregate_id={_path_part(aggregate_id)}" if aggregate_id else "")

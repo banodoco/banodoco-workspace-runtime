@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/media-relation.json",
+  "title": "Project-scoped managed-media relation",
+  "type": "object", "additionalProperties": false,
+  "required": ["project_id", "from_object_id", "to_object_id", "kind", "metadata", "created_at"],
+  "properties": {
+    "project_id": { "type": "string", "minLength": 1 },
+    "from_object_id": { "type": "string", "minLength": 1 },
+    "to_object_id": { "type": "string", "minLength": 1 },
+    "kind": { "type": "string", "enum": ["derived_from", "variant_of", "uses_as_input", "mask_for", "audio_for"] },
+    "metadata": { "type": "object", "additionalProperties": true },
+    "created_at": { "type": "string" }
+  }
+}

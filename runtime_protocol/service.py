@@ -130,12 +130,16 @@ class RuntimeService:
                 refs = [{"reference_id": value["id"], "object_id": value["object_id"], **({"role": value["role"]} if value["role"] else {})} for value in refs]
             with self.store._transaction():
                 timestamp = now()
+                self.store.conn.execute("DELETE FROM timeline_shot_state WHERE id IN (SELECT id FROM timeline_shots WHERE timeline_id=?)", (timeline_id,))
+                self.store.conn.execute("DELETE FROM timeline_reference_state WHERE id IN (SELECT id FROM timeline_references WHERE timeline_id=?)", (timeline_id,))
                 self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
                 self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
                 for shot in shots:
                     self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
+                    self.store.conn.execute("INSERT INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (shot["shot_id"],))
                 for reference in refs:
                     self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
+                    self.store.conn.execute("INSERT INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (reference["reference_id"],))
                 self.store.conn.execute("UPDATE timelines SET version=?, created_at=created_at WHERE id=?", (expected + 1, timeline_id))
                 resource = self._timeline_resource(timeline_id)
                 self._record_timeline_revision(timeline_id, resource)
@@ -154,6 +158,44 @@ class RuntimeService:
         project = self.store.get_project(project_id)
         rows = self.store.conn.execute("SELECT id FROM timelines WHERE project_id=? ORDER BY created_at", (project["id"],))
         return {"items": [self._timeline_resource(x["id"]) for x in rows], "next_cursor": None}
+
+    def _shot_resource(self, row):
+        state = self.store.conn.execute("SELECT version, archived_at FROM timeline_shot_state WHERE id=?", (row["id"],)).fetchone()
+        timeline = self.store.conn.execute("SELECT project_id FROM timelines WHERE id=?", (row["timeline_id"],)).fetchone()
+        return {"shot_id": row["id"], "timeline_id": row["timeline_id"], "project_id": timeline["project_id"], "start_ms": int(row["start_ms"]), "duration_ms": int(row["duration_ms"]), "reference_ids": json.loads(row["reference_ids_json"]), "version": int(state["version"] if state else 1), "archived": bool(state and state["archived_at"])}
+
+    def _reference_resource(self, row):
+        state = self.store.conn.execute("SELECT version, archived_at FROM timeline_reference_state WHERE id=?", (row["id"],)).fetchone()
+        timeline = self.store.conn.execute("SELECT project_id FROM timelines WHERE id=?", (row["timeline_id"],)).fetchone()
+        return {"reference_id": row["id"], "timeline_id": row["timeline_id"], "project_id": timeline["project_id"], "object_id": row["object_id"], **({"role": row["role"]} if row["role"] else {}), "version": int(state["version"] if state else 1), "archived": bool(state and state["archived_at"])}
+
+    def list_project_tasks(self, project_id, *, limit=50):
+        project = self.store.get_project(project_id)
+        limit = max(1, min(int(limit), 200))
+        rows = self.store.conn.execute("SELECT id FROM tasks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?) ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
+        return {"items": [self._task_resource(self.store.get_task(row["id"])) for row in rows], "next_cursor": None}
+
+    def list_project_runs(self, project_id, *, limit=50):
+        project = self.store.get_project(project_id)
+        limit = max(1, min(int(limit), 200))
+        rows = self.store.conn.execute("SELECT id FROM runs WHERE project_id=? ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
+        return {"items": [self.run(row["id"]) for row in rows], "next_cursor": None}
+
+    def list_project_shots(self, project_id, *, include_archived=False, limit=50):
+        project = self.store.get_project(project_id)
+        limit = max(1, min(int(limit), 200))
+        query = "SELECT s.* FROM timeline_shots s JOIN timelines t ON t.id=s.timeline_id LEFT JOIN timeline_shot_state st ON st.id=s.id WHERE t.project_id=?"
+        if not include_archived: query += " AND st.archived_at IS NULL"
+        rows = self.store.conn.execute(query + " ORDER BY s.id LIMIT ?", (project["id"], limit)).fetchall()
+        return {"items": [self._shot_resource(row) for row in rows], "next_cursor": None}
+
+    def list_project_references(self, project_id, *, include_archived=False, limit=50):
+        project = self.store.get_project(project_id)
+        limit = max(1, min(int(limit), 200))
+        query = "SELECT r.* FROM timeline_references r JOIN timelines t ON t.id=r.timeline_id LEFT JOIN timeline_reference_state st ON st.id=r.id WHERE t.project_id=?"
+        if not include_archived: query += " AND st.archived_at IS NULL"
+        rows = self.store.conn.execute(query + " ORDER BY r.id LIMIT ?", (project["id"], limit)).fetchall()
+        return {"items": [self._reference_resource(row) for row in rows], "next_cursor": None}
 
     def list_timeline_history(self, timeline_id, *, limit=50):
         self._timeline_resource(timeline_id)
@@ -200,12 +242,16 @@ class RuntimeService:
                 raise ConflictError("timeline version conflict", details={"expected": expected, "actual": current["version"]})
             revision = self._timeline_revision(timeline_id, target)
             with self.store._transaction():
+                self.store.conn.execute("DELETE FROM timeline_shot_state WHERE id IN (SELECT id FROM timeline_shots WHERE timeline_id=?)", (timeline_id,))
+                self.store.conn.execute("DELETE FROM timeline_reference_state WHERE id IN (SELECT id FROM timeline_references WHERE timeline_id=?)", (timeline_id,))
                 self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
                 self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
                 for shot in revision["shots"]:
                     self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
+                    self.store.conn.execute("INSERT INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (shot["shot_id"],))
                 for reference in revision["references"]:
                     self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
+                    self.store.conn.execute("INSERT INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (reference["reference_id"],))
                 self.store.conn.execute("UPDATE timelines SET archived_at=NULL, version=? WHERE id=?", (expected + 1, timeline_id))
                 resource = self._timeline_resource(timeline_id)
                 self._record_timeline_revision(timeline_id, resource)
@@ -215,17 +261,19 @@ class RuntimeService:
         if int(body.get("duration_ms", 0)) < 1 or int(body.get("start_ms", 0)) < 0: raise ValidationError("invalid shot timing")
         self._timeline_resource(timeline_id)
         self.store.conn.execute("INSERT OR REPLACE INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (body["shot_id"], timeline_id, int(body["start_ms"]), int(body["duration_ms"]), canonical_json(body.get("reference_ids", []))))
-        return next(x for x in self._timeline_resource(timeline_id)["shots"] if x["shot_id"] == body["shot_id"])
+        self.store.conn.execute("INSERT OR IGNORE INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (body["shot_id"],))
+        return self._shot_resource(self.store.conn.execute("SELECT * FROM timeline_shots WHERE id=?", (body["shot_id"],)).fetchone())
 
     def get_shot(self, shot_id):
         row = self.store.conn.execute("SELECT * FROM timeline_shots WHERE id=?", (shot_id,)).fetchone()
         if not row: raise NotFoundError("shot not found")
-        return {"shot_id": row["id"], "start_ms": row["start_ms"], "duration_ms": row["duration_ms"], "reference_ids": json.loads(row["reference_ids_json"])}
+        return self._shot_resource(row)
 
     def create_reference(self, timeline_id, body):
         self._timeline_resource(timeline_id)
         self.store.conn.execute("INSERT OR REPLACE INTO timeline_references VALUES (?, ?, ?, ?)", (body["reference_id"], timeline_id, body["object_id"], body.get("role")))
-        return {k: v for k, v in body.items() if k in {"reference_id", "object_id", "role"}}
+        self.store.conn.execute("INSERT OR IGNORE INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (body["reference_id"],))
+        return self._reference_resource(self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (body["reference_id"],)).fetchone())
 
     def _document_resource(self, row):
         value = dict(row)
@@ -351,7 +399,52 @@ class RuntimeService:
     def get_reference(self, reference_id):
         row = self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (reference_id,)).fetchone()
         if not row: raise NotFoundError("reference not found")
-        return {"reference_id": row["id"], "object_id": row["object_id"], **({"role": row["role"]} if row["role"] else {})}
+        return self._reference_resource(row)
+
+    def _update_shot_state(self, shot_id, body, *, archived=None):
+        expected = self._expected_version(body)
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM timeline_shots WHERE id=?", (shot_id,)).fetchone()
+            if not row: raise NotFoundError("shot not found")
+            state = self.store.conn.execute("SELECT version, archived_at FROM timeline_shot_state WHERE id=?", (shot_id,)).fetchone()
+            actual = int(state["version"] if state else 1)
+            if expected != actual: raise ConflictError("shot version conflict", details={"expected": expected, "actual": actual})
+            if archived is None:
+                if state and state["archived_at"]: raise ConflictError("archived shot must be recovered before update")
+                start = body.get("start_ms", row["start_ms"]); duration = body.get("duration_ms", row["duration_ms"]); refs = body.get("reference_ids", json.loads(row["reference_ids_json"]))
+                if int(start) < 0 or int(duration) < 1 or not isinstance(refs, list): raise ValidationError("invalid shot timing or reference_ids")
+            else:
+                start, duration, refs = row["start_ms"], row["duration_ms"], json.loads(row["reference_ids_json"])
+            with self.store._transaction():
+                self.store.conn.execute("UPDATE timeline_shots SET start_ms=?, duration_ms=?, reference_ids_json=? WHERE id=?", (int(start), int(duration), canonical_json(refs), shot_id))
+                self.store.conn.execute("INSERT OR REPLACE INTO timeline_shot_state(id, version, archived_at) VALUES (?, ?, ?)", (shot_id, actual + 1, now() if archived is True else None if archived is False else (state["archived_at"] if state else None)))
+            return self.get_shot(shot_id)
+
+    def update_shot(self, shot_id, body): return self._update_shot_state(shot_id, body)
+    def archive_shot(self, shot_id, body): return self._update_shot_state(shot_id, body, archived=True)
+    def recover_shot(self, shot_id, body): return self._update_shot_state(shot_id, body, archived=False)
+
+    def _update_reference_state(self, reference_id, body, *, archived=None):
+        expected = self._expected_version(body)
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (reference_id,)).fetchone()
+            if not row: raise NotFoundError("reference not found")
+            state = self.store.conn.execute("SELECT version, archived_at FROM timeline_reference_state WHERE id=?", (reference_id,)).fetchone()
+            actual = int(state["version"] if state else 1)
+            if expected != actual: raise ConflictError("reference version conflict", details={"expected": expected, "actual": actual})
+            if archived is None:
+                if state and state["archived_at"]: raise ConflictError("archived reference must be recovered before update")
+                object_id = body.get("object_id", row["object_id"]); role = body.get("role", row["role"])
+                if not object_id: raise ValidationError("reference object_id is required")
+            else: object_id, role = row["object_id"], row["role"]
+            with self.store._transaction():
+                self.store.conn.execute("UPDATE timeline_references SET object_id=?, role=? WHERE id=?", (object_id, role, reference_id))
+                self.store.conn.execute("INSERT OR REPLACE INTO timeline_reference_state(id, version, archived_at) VALUES (?, ?, ?)", (reference_id, actual + 1, now() if archived is True else None if archived is False else (state["archived_at"] if state else None)))
+            return self.get_reference(reference_id)
+
+    def update_reference(self, reference_id, body): return self._update_reference_state(reference_id, body)
+    def archive_reference(self, reference_id, body): return self._update_reference_state(reference_id, body, archived=True)
+    def recover_reference(self, reference_id, body): return self._update_reference_state(reference_id, body, archived=False)
 
     def ingest(self, project, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None):
         obj = self.cas.put(data, expected_digest=expected_digest)
@@ -385,6 +478,32 @@ class RuntimeService:
             item["relation"] = row["relation"]
             items.append(item)
         return {"items": items, "next_cursor": None}
+
+    def create_media_relation(self, project, body):
+        project_id = self.store.get_project(project)["id"]
+        allowed = {"derived_from", "variant_of", "uses_as_input", "mask_for", "audio_for"}
+        kind = str(body.get("kind") or "")
+        if kind not in allowed: raise ValidationError("unsupported media relation kind")
+        source = str(body.get("from_object_id") or "").removeprefix("sha256:")
+        target = str(body.get("to_object_id") or "").removeprefix("sha256:")
+        if not source or not target or source == target: raise ValidationError("media relation requires distinct from_object_id and to_object_id")
+        for digest in (source, target):
+            if not self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone(): raise NotFoundError("object not found")
+            if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone(): raise NotFoundError("object is not in project")
+        metadata = body.get("metadata", {})
+        if not isinstance(metadata, dict): raise ValidationError("media relation metadata must be an object")
+        with self.store._mutex:
+            try:
+                self.store.conn.execute("INSERT INTO media_relations VALUES (?, ?, ?, ?, ?, ?)", (project_id, source, target, kind, canonical_json(metadata), now()))
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("media relation already exists") from exc
+        return {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "metadata": metadata, "created_at": self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=?", (project_id, source, target, kind)).fetchone()[0]}
+
+    def list_media_relations(self, project, *, limit=50):
+        project_id = self.store.get_project(project)["id"]
+        limit = max(1, min(int(limit), 200))
+        rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY created_at, from_digest, to_digest, kind LIMIT ?", (project_id, limit)).fetchall()
+        return {"items": [{"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]} for row in rows], "next_cursor": None}
 
     def create_task(self, body):
         capability = body.get("capability_id") or body.get("capability")

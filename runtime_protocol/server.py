@@ -133,8 +133,18 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.recover_timeline(path[2], body))
         if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_shot(path[2]))
+        if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "PATCH":
+            self._identity("projects:write"); return self._send(200, self.runtime.update_shot(path[2], self._body()))
+        if len(path) == 4 and path[:2] == ["v1", "shots"] and path[3] in ("archive", "recover") and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.archive_shot(path[2], self._body()) if path[3] == "archive" else self.runtime.recover_shot(path[2], self._body()))
         if len(path) == 3 and path[:2] == ["v1", "references"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_reference(path[2]))
+        if len(path) == 3 and path[:2] == ["v1", "references"] and method == "PATCH":
+            self._identity("projects:write"); return self._send(200, self.runtime.update_reference(path[2], self._body()))
+        if len(path) == 4 and path[:2] == ["v1", "references"] and path[3] in ("archive", "recover") and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.archive_reference(path[2], self._body()) if path[3] == "archive" else self.runtime.recover_reference(path[2], self._body()))
         if path == ["v1", "projects"]:
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
@@ -179,6 +189,23 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     data = self.rfile.read(length)
                     result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"))
                     return self._send(201, self.runtime._object_resource(result))
+            if len(path) == 4 and path[3] in ("tasks", "runs") and method == "GET":
+                self._identity("tasks:read")
+                query = parse_qs(urlsplit(self.path).query)
+                value = self.runtime.list_project_tasks(selector, limit=query.get("limit", [50])[0]) if path[3] == "tasks" else self.runtime.list_project_runs(selector, limit=query.get("limit", [50])[0])
+                return self._send(200, value)
+            if len(path) == 4 and path[3] in ("shots", "references") and method == "GET":
+                self._identity("projects:read")
+                query = parse_qs(urlsplit(self.path).query)
+                include_archived = query.get("include_archived", ["false"])[0].lower() == "true"
+                value = self.runtime.list_project_shots(selector, include_archived=include_archived, limit=query.get("limit", [50])[0]) if path[3] == "shots" else self.runtime.list_project_references(selector, include_archived=include_archived, limit=query.get("limit", [50])[0])
+                return self._send(200, value)
+            if len(path) == 4 and path[3] == "media-relations":
+                self._identity("objects:read" if method == "GET" else "objects:write")
+                if method == "GET":
+                    query = parse_qs(urlsplit(self.path).query)
+                    return self._send(200, self.runtime.list_media_relations(selector, limit=query.get("limit", [50])[0]))
+                if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body()))
         if path == ["v1", "objects"] and method == "POST":
             self._identity("objects:write")
             length = int(self.headers.get("Content-Length", "0")); data = self.rfile.read(length)
