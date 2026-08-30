@@ -612,6 +612,24 @@ class WorkspaceClient:
         _, _, body = self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/heartbeat", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return self._json(body)
 
+    def prepare_reboot(self, attempt_id: str, *, lease_id: str, fence: int, runtime_epoch: int | None = None) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence}
+        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
+        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/prepare-reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
+    def checkpoint_attempt(self, attempt_id: str, *, lease_id: str, fence: int, nonce: str, authorization: str, state: Mapping[str, Any] | None = None, runtime_epoch: int | None = None) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "nonce": nonce, "authorization": authorization, "state": dict(state or {})}
+        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
+        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/checkpoint", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
+    def request_reboot(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int, command: str = "reboot") -> Mapping[str, Any]:
+        payload = {"checkpoint_id": checkpoint_id, "nonce": nonce, "authorization": authorization, "runtime_epoch": runtime_epoch, "command": command}
+        return self._json(self._request("POST", "/v1/recovery/reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
+    def resume_attempt(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int) -> Mapping[str, Any]:
+        payload = {"checkpoint_id": checkpoint_id, "nonce": nonce, "authorization": authorization, "runtime_epoch": runtime_epoch}
+        return self._json(self._request("POST", "/v1/recovery/resume", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
     def cancel_task(self, task_id: str, *, idempotency_key: str, expected_version: int | None = None) -> Task:
         return self._task_transition("cancel", task_id, idempotency_key=idempotency_key, expected_version=expected_version)
 

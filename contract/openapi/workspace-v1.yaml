@@ -358,6 +358,18 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Settlement' } } } }
       responses: { '200': { description: Settled, content: { application/json: { schema: { $ref: './schemas/task.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/prepare-reboot:
+    post:
+      operationId: prepareReboot
+      parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryPrepare' } } } }
+      responses: { '200': { description: Durable recovery authorization, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryAuthorization' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/checkpoint:
+    post:
+      operationId: checkpointAttempt
+      parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpoint' } } } }
+      responses: { '201': { description: Durable checkpoint, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpointReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/fail:
     post:
       operationId: failAttempt
@@ -370,6 +382,16 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Heartbeat' } } } }
       responses: { '200': { description: Lease renewed, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/AttemptFence' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/recovery/reboot:
+    post:
+      operationId: requestReboot
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryRequest' } } } }
+      responses: { '200': { description: Reboot receipt, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/recovery/resume:
+    post:
+      operationId: resumeAttempt
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryRequest' } } } }
+      responses: { '200': { description: Resume receipt and exact attempt, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryResumeReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
 components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer, bearerFormat: workspace-scoped-token }
@@ -571,12 +593,43 @@ components:
       type: object
       additionalProperties: false
       required: [executor_id, capability_ids]
-      properties: { executor_id: { type: string, minLength: 1 }, capability_ids: { type: array, items: { type: string }, uniqueItems: true } }
+      properties: { executor_id: { type: string, minLength: 1 }, capability_ids: { type: array, items: { type: string }, uniqueItems: true }, runtime_epoch: { type: integer, minimum: 1 } }
     Heartbeat:
       type: object
       additionalProperties: false
       required: [lease_id, fence]
-      properties: { lease_id: { type: string, minLength: 1 }, fence: { type: integer, minimum: 1 } }
+      properties: { lease_id: { type: string, minLength: 1 }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 } }
+    RecoveryPrepare:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence]
+      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, runtime_epoch: { type: integer, minimum: 1 } }
+    RecoveryAuthorization:
+      type: object
+      required: [attempt_id, task_id, executor_id, runtime_epoch, nonce, expires_in_seconds]
+      properties: { attempt_id: { type: string }, task_id: { type: string }, executor_id: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, nonce: { type: string }, expires_in_seconds: { type: integer, minimum: 0 } }
+    RecoveryCheckpoint:
+      type: object
+      additionalProperties: false
+      required: [lease_id, fence, nonce, authorization]
+      properties: { lease_id: { type: string }, fence: { type: integer, minimum: 1 }, nonce: { type: string }, authorization: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, checkpoint: { type: object }, state: { type: object } }
+    RecoveryCheckpointReceipt:
+      type: object
+      required: [checkpoint_id, attempt_id, task_id, runtime_epoch, nonce, digest, size, state]
+      properties: { checkpoint_id: { type: string }, attempt_id: { type: string }, task_id: { type: string }, runtime_epoch: { type: integer }, nonce: { type: string }, digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, size: { type: integer, minimum: 0 }, state: { type: string }, path: { type: string } }
+    RecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [nonce, authorization, runtime_epoch]
+      properties: { checkpoint_id: { type: string }, attempt_id: { type: string }, nonce: { type: string }, authorization: { type: string }, runtime_epoch: { type: integer, minimum: 1 }, command: { type: string } }
+    RecoveryReceipt:
+      type: object
+      required: [type, checkpoint_id, attempt_id, task_id, runtime_epoch, command, status]
+      properties: { type: { type: string }, version: { type: integer }, checkpoint_id: { type: string }, attempt_id: { type: string }, task_id: { type: string }, runtime_epoch: { type: integer }, command: { type: string }, status: { type: string }, checkpoint_digest: { type: string }, executor_result: {} }
+    RecoveryResumeReceipt:
+      type: object
+      required: [receipt, attempt]
+      properties: { receipt: { $ref: '#/components/schemas/RecoveryReceipt' }, attempt: { $ref: './schemas/worker.json#/definitions/AttemptFence' } }
     CreateBackup:
       type: object
       additionalProperties: false

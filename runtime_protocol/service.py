@@ -10,6 +10,7 @@ import json
 import sqlite3
 import base64
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .errors import ConflictError, NotFoundError, ValidationError, LeaseError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
@@ -30,7 +31,10 @@ class RuntimeService:
         self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
         self.support_root = Path(support_root).expanduser().resolve() if support_root else None
         self.reboot_executor = reboot_executor
-        self.reboot_allowlist = frozenset(reboot_allowlist or REBOOT_COMMAND_ALLOWLIST)
+        configured_allowlist = frozenset(reboot_allowlist or REBOOT_COMMAND_ALLOWLIST)
+        if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
+            raise ValidationError("reboot allowlist contains an unsupported command", details={"allowlist": sorted(configured_allowlist), "supported": sorted(REBOOT_COMMAND_ALLOWLIST)})
+        self.reboot_allowlist = configured_allowlist
         self._ensure_default_capability()
 
     def close(self):
@@ -589,7 +593,7 @@ class RuntimeService:
         return self.store.settle_task(task_id, body.get("lease_token", ""), body.get("result", {}), effect=body.get("effect"), output_objects=body.get("output_objects"), fence=body.get("fence"))
 
     def heartbeat(self, task_id, body):
-        self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="worker")
+        self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="worker", identity_id=body.get("worker_id"))
         return self.store.heartbeat_task(task_id, body.get("lease_token", ""), fence=body.get("fence"), lease_seconds=body.get("lease_seconds", 30))
 
     def cancel(self, task_id):
@@ -648,7 +652,7 @@ class RuntimeService:
         if max_concurrency < 1:
             raise ValidationError("max_concurrency must be positive")
         capabilities = body.get("capabilities", [])
-        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor")
+        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"))
         self.store.register_worker(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch)
         self.store.conn.execute("INSERT OR REPLACE INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)", (body["executor_id"], max_concurrency, canonical_json(body.get("resource_keys", [])), canonical_json(capabilities), body.get("protocol", "workspace.v1"), now(), epoch))
         return {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
@@ -660,7 +664,7 @@ class RuntimeService:
         if row is None:
             return None
         attempt_id, lease_id = new_id(), new_id()
-        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor")
+        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"))
         value = self.store.claim_task(row["id"], body["executor_id"], lease_id, runtime_epoch=epoch)
         if value["task"]["status"] != "running":
             return {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
@@ -730,17 +734,37 @@ class RuntimeService:
     def _checkpoint_row(self, checkpoint_id=None, attempt_id=None):
         if checkpoint_id:
             row = self.store.conn.execute("SELECT * FROM recovery_checkpoints WHERE id=?", (checkpoint_id,)).fetchone()
+            if row and attempt_id is not None and row["attempt_id"] != attempt_id:
+                raise LeaseError("checkpoint is bound to a different attempt")
         else:
             row = self.store.conn.execute("SELECT * FROM recovery_checkpoints WHERE attempt_id=? ORDER BY created_at DESC LIMIT 1", (attempt_id,)).fetchone()
         if not row:
             raise NotFoundError("recovery checkpoint not found")
+        attempt = self.store.conn.execute("SELECT task_id, executor_id, lease_id, fence FROM attempts WHERE id=?", (row["attempt_id"],)).fetchone()
+        if not attempt or attempt["task_id"] != row["task_id"] or attempt["executor_id"] != row["executor_id"] or attempt["lease_id"] != row["lease_id"] or int(attempt["fence"]) != int(row["fence"]):
+            raise ConflictError("recovery checkpoint identity is inconsistent")
         return row
 
-    @staticmethod
-    def _reboot_authorized(body, nonce):
+    def _reboot_authorized(self, body, attempt_id, expected_nonce=None):
+        """Validate durable, attempt-bound recovery authorization.
+
+        A nonce supplied by a caller is not sufficient by itself.  It must be
+        the nonce persisted by ``prepare_reboot`` for this exact attempt and
+        must still be within its short validity window.
+        """
+        attempt = self.store.conn.execute("SELECT recovery_nonce, recovery_nonce_expires_at, recovery_nonce_used FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        nonce = attempt["recovery_nonce"] if attempt else None
         authorization = body.get("authorization") or body.get("authorization_nonce")
-        if not nonce or not authorization or str(authorization) != str(nonce):
+        supplied = body.get("nonce")
+        if not nonce:
+            raise ValidationError("prepare_reboot is required before recovery")
+        if attempt["recovery_nonce_used"]:
+            raise ConflictError("recovery authorization has already been consumed")
+        if attempt["recovery_nonce_expires_at"] and attempt["recovery_nonce_expires_at"] <= now():
+            raise ValidationError("recovery authorization has expired")
+        if not supplied or not authorization or str(supplied) != str(nonce) or str(authorization) != str(nonce) or (expected_nonce is not None and str(expected_nonce) != str(nonce)):
             raise ValidationError("recovery nonce authorization is required")
+        return nonce
 
     def prepare_reboot(self, body=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
@@ -754,8 +778,18 @@ class RuntimeService:
             raise LeaseError("attempt belongs to a stale runtime epoch")
         if row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
             raise LeaseError("attempt lease is stale or already settled")
-        nonce = new_id() + new_id()
-        return {"attempt_id": attempt_id, "task_id": row["task_id"], "executor_id": row["executor_id"], "runtime_epoch": current, "nonce": nonce, "expires_in_seconds": 300}
+        with self.store._mutex:
+            with self.store._transaction():
+                current_row = self.store.conn.execute("SELECT recovery_nonce, recovery_nonce_expires_at, recovery_nonce_used FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+                if current_row["recovery_nonce"] and not current_row["recovery_nonce_used"] and (not current_row["recovery_nonce_expires_at"] or current_row["recovery_nonce_expires_at"] > now()):
+                    nonce = current_row["recovery_nonce"]
+                    expires_at = current_row["recovery_nonce_expires_at"]
+                else:
+                    nonce = new_id() + new_id()
+                    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat(timespec="milliseconds")
+                    self.store.conn.execute("UPDATE attempts SET recovery_nonce=?, recovery_nonce_expires_at=?, recovery_nonce_used=0 WHERE id=? AND settled=0", (nonce, expires_at, attempt_id))
+        expires_in = max(0, int((datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)).total_seconds()))
+        return {"attempt_id": attempt_id, "task_id": row["task_id"], "executor_id": row["executor_id"], "runtime_epoch": current, "nonce": nonce, "expires_in_seconds": expires_in}
 
     def checkpoint_attempt(self, attempt_id, body):
         """Persist a bounded, fsync'd R1 checkpoint before a reboot request."""
@@ -768,16 +802,27 @@ class RuntimeService:
                 raise LeaseError("attempt lease is stale or already settled")
             if body.get("runtime_epoch") is not None and int(body["runtime_epoch"]) != current:
                 raise LeaseError("attempt belongs to a stale runtime epoch")
-            nonce = str(body.get("nonce") or "")
-            self._reboot_authorized(body, nonce)
+            nonce = self._reboot_authorized(body, attempt_id)
             payload = body.get("checkpoint", body.get("state", {}))
-            encoded = canonical_json(payload).encode("utf-8")
-            if len(encoded) > CHECKPOINT_MAX_BYTES:
+            if not isinstance(payload, (dict, list)):
+                raise ValidationError("checkpoint must be an object or array")
+            canonical = canonical_json(payload).encode("utf-8")
+            if len(canonical) > CHECKPOINT_MAX_BYTES:
                 raise ValidationError("recovery checkpoint exceeds 1 MiB bound")
+            # A repeated request with the same durable authorization and bytes
+            # is idempotent.  A different payload is a conflict, never a new
+            # checkpoint that could be resumed accidentally.
+            existing = self.store.conn.execute("SELECT * FROM recovery_checkpoints WHERE attempt_id=? AND nonce=? ORDER BY created_at DESC LIMIT 1", (attempt_id, nonce)).fetchone()
+            if existing:
+                existing_bytes = Path(existing["checkpoint_path"]).read_bytes()
+                if sha256_bytes(existing_bytes) != existing["checkpoint_digest"] or json.loads(existing_bytes.decode("utf-8")) != payload:
+                    raise ConflictError("recovery checkpoint authorization already binds different bytes")
+                return {"checkpoint_id": existing["id"], "attempt_id": existing["attempt_id"], "task_id": existing["task_id"], "runtime_epoch": existing["runtime_epoch"], "nonce": nonce, "digest": "sha256:" + existing["checkpoint_digest"], "size": existing["checkpoint_size"], "state": existing["state"], "path": existing["checkpoint_path"]}
             checkpoint_id = new_id()
-            digest = sha256_bytes(encoded)
             path = self.store.root / "checkpoints" / f"{checkpoint_id}.json"
             atomic_json_write(path, payload)
+            durable_bytes = path.read_bytes()
+            digest = sha256_bytes(durable_bytes)
             # atomic_json_write fsyncs the file; fsync the containing directory
             # as well so the rename survives a sudden power loss.
             try:
@@ -790,26 +835,33 @@ class RuntimeService:
                 raise ConflictError("checkpoint directory could not be made durable") from exc
             timestamp = now()
             with self.store._transaction():
-                self.store.conn.execute("INSERT INTO recovery_checkpoints(id, attempt_id, task_id, executor_id, runtime_epoch, lease_id, fence, nonce, checkpoint_path, checkpoint_digest, checkpoint_size, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'durable', ?, ?)", (checkpoint_id, attempt_id, row["task_id"], row["executor_id"], current, row["lease_id"], row["fence"], nonce, str(path), digest, len(encoded), timestamp, timestamp))
-            return {"checkpoint_id": checkpoint_id, "attempt_id": attempt_id, "task_id": row["task_id"], "runtime_epoch": current, "nonce": nonce, "digest": "sha256:" + digest, "size": len(encoded), "state": "durable", "path": str(path)}
+                self.store.conn.execute("INSERT INTO recovery_checkpoints(id, attempt_id, task_id, executor_id, runtime_epoch, lease_id, fence, nonce, checkpoint_path, checkpoint_digest, checkpoint_size, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'durable', ?, ?)", (checkpoint_id, attempt_id, row["task_id"], row["executor_id"], current, row["lease_id"], row["fence"], nonce, str(path), digest, len(durable_bytes), timestamp, timestamp))
+            return {"checkpoint_id": checkpoint_id, "attempt_id": attempt_id, "task_id": row["task_id"], "runtime_epoch": current, "nonce": nonce, "digest": "sha256:" + digest, "size": len(durable_bytes), "state": "durable", "path": str(path)}
 
     create_checkpoint = checkpoint_attempt
 
     def request_reboot(self, body):
         """Execute only an allowlisted reboot command after durable checkpointing."""
         row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
-        self._reboot_authorized(body, row["nonce"])
+        self._reboot_authorized(body, row["attempt_id"], row["nonce"])
         command = str(body.get("command") or "reboot")
         if command not in self.reboot_allowlist:
             raise ValidationError("reboot command is not allowlisted", details={"command": command, "allowlist": sorted(self.reboot_allowlist)})
         if int(row["runtime_epoch"]) != self.store._current_runtime_epoch():
             raise LeaseError("reboot checkpoint belongs to a stale runtime epoch")
-        checkpoint = json.loads(Path(row["checkpoint_path"]).read_text(encoding="utf-8"))
+        checkpoint_bytes = Path(row["checkpoint_path"]).read_bytes()
+        if sha256_bytes(checkpoint_bytes) != row["checkpoint_digest"]:
+            raise ConflictError("recovery checkpoint digest mismatch")
+        checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
+        if row["state"] in {"executed", "resumed"} and row["recovery_receipt_json"]:
+            return json.loads(row["recovery_receipt_json"])
+        if row["state"] != "durable":
+            raise ConflictError("reboot has already been requested", details={"state": row["state"]})
+        if self.reboot_executor is None:
+            raise ConflictError("reboot executor is unavailable; tests must inject a safe executor")
         timestamp = now()
         with self.store._transaction():
             self.store.conn.execute("UPDATE recovery_checkpoints SET state='reboot_requested', updated_at=? WHERE id=? AND state='durable'", (timestamp, row["id"]))
-        if self.reboot_executor is None:
-            raise ConflictError("reboot executor is unavailable; tests must inject a safe executor")
         executor = self.reboot_executor
         try:
             parameters = __import__("inspect").signature(executor).parameters
@@ -825,18 +877,39 @@ class RuntimeService:
         return receipt
 
     def resume_attempt(self, body):
-        row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
-        self._reboot_authorized(body, row["nonce"])
-        if row["state"] not in {"recovered", "reboot_requested", "executed"}:
-            raise ConflictError("checkpoint is not ready for resume", details={"state": row["state"]})
-        checkpoint = json.loads(Path(row["checkpoint_path"]).read_text(encoding="utf-8"))
-        claim = self.claim_next({"executor_id": row["executor_id"], "capability_ids": [], "runtime_epoch": self.store._current_runtime_epoch()})
-        if not claim or claim.get("task_id") != row["task_id"]:
-            raise ConflictError("checkpoint task is not queued for resume")
-        receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": claim["attempt_id"], "task_id": row["task_id"], "runtime_epoch": self.store._current_runtime_epoch(), "command": "resume", "status": "resumed", "checkpoint_digest": "sha256:" + row["checkpoint_digest"], "checkpoint": checkpoint}
-        with self.store._transaction():
-            self.store.conn.execute("UPDATE recovery_checkpoints SET state='resumed', recovery_receipt_json=?, updated_at=? WHERE id=?", (canonical_json(receipt), now(), row["id"]))
-        return {"receipt": receipt, "attempt": claim}
+        with self.store._mutex:
+            row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
+            self._reboot_authorized(body, row["attempt_id"], row["nonce"])
+            if row["state"] == "resumed" and row["recovery_receipt_json"]:
+                receipt = json.loads(row["recovery_receipt_json"])
+                attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (receipt["attempt_id"],)).fetchone()
+                if attempt:
+                    return {"receipt": receipt, "attempt": {"attempt_id": attempt["id"], "task_id": attempt["task_id"], "lease_id": attempt["lease_id"], "fence": attempt["fence"], "lease_expires_at": attempt["lease_expires_at"], "runtime_epoch": attempt["runtime_epoch"]}}
+            if row["state"] not in {"recovered", "reboot_requested", "executed"}:
+                raise ConflictError("checkpoint is not ready for resume", details={"state": row["state"]})
+            checkpoint_bytes = Path(row["checkpoint_path"]).read_bytes()
+            if sha256_bytes(checkpoint_bytes) != row["checkpoint_digest"]:
+                raise ConflictError("recovery checkpoint digest mismatch")
+            checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
+            current = self.store._current_runtime_epoch()
+            if body.get("runtime_epoch") is None or int(body["runtime_epoch"]) != current:
+                raise LeaseError("current runtime epoch is required for recovery resume")
+            # Claim this exact task.  Never use claim_next here: a mismatch
+            # must not consume an unrelated queued task.
+            lease_id = new_id()
+            claim = self.store.claim_task(row["task_id"], row["executor_id"], lease_id, runtime_epoch=current)
+            task = claim["task"]
+            if task.get("status") != "running" or task.get("id") != row["task_id"]:
+                raise ConflictError("checkpoint task is not queued for resume")
+            attempt_id = new_id()
+            with self.store._transaction():
+                self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, row["task_id"], lease_id, task["lease_fence"], row["executor_id"], task["lease_expires_at"], current))
+                self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=? AND status='running'", (attempt_id, row["task_id"]))
+            resumed_attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": resumed_attempt["id"], "task_id": row["task_id"], "runtime_epoch": current, "command": "resume", "status": "resumed", "checkpoint_digest": "sha256:" + row["checkpoint_digest"], "checkpoint": checkpoint}
+            with self.store._transaction():
+                self.store.conn.execute("UPDATE recovery_checkpoints SET state='resumed', recovery_receipt_json=?, updated_at=? WHERE id=? AND state IN ('recovered', 'reboot_requested', 'executed')", (canonical_json(receipt), now(), row["id"]))
+            return {"receipt": receipt, "attempt": {"attempt_id": resumed_attempt["id"], "task_id": row["task_id"], "lease_id": resumed_attempt["lease_id"], "fence": resumed_attempt["fence"], "lease_expires_at": resumed_attempt["lease_expires_at"], "runtime_epoch": current}}
 
     resume = resume_attempt
 

@@ -14,7 +14,7 @@ from .service import RuntimeService
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None):
+    def __init__(self, root, *, support_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None):
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("runtime daemon only binds to loopback")
         self.root = Path(root).expanduser().resolve()
@@ -23,6 +23,11 @@ class RuntimeDaemon:
         self.realm_id = realm_id
         self.owner_lock = Path(owner_lock).expanduser().resolve() if owner_lock else None
         self.bootstrap_token_file = Path(bootstrap_token_file).expanduser().resolve() if bootstrap_token_file else None
+        # Reboot is deliberately disabled unless a host supplies an executor.
+        # The service additionally validates that any configured command is in
+        # its small, explicit allowlist.
+        self.reboot_executor = reboot_executor
+        self.reboot_allowlist = reboot_allowlist
         self.instance_id = uuid.uuid4().hex
         self.service = None
         self.httpd = None
@@ -44,7 +49,7 @@ class RuntimeDaemon:
     def start(self):
         if self.httpd:
             return self
-        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root)
+        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist)
         self.token, self.credential_path = self.credentials.provision("owner", ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"])
         self.worker_token, _ = self.credentials.provision("fake-worker", ["handshake", "worker:execute", "tasks:read"])
         if self.bootstrap_token_file and self.bootstrap_token_file.exists():

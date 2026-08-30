@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 LEASE_SECONDS = 30
 
 
@@ -131,6 +131,9 @@ class RealmStore:
             version = 7
         if version < 8:
             self._run_migration(8)
+            version = 8
+        if version < 9:
+            self._run_migration(9)
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
@@ -449,10 +452,22 @@ class RealmStore:
         row = self.conn.execute("SELECT runtime_epoch FROM runtime_lifecycle WHERE id=1").fetchone()
         return int(row[0]) if row else 1
 
-    def _validate_runtime_epoch(self, supplied, *, identity):
+    def _validate_runtime_epoch(self, supplied, *, identity, identity_id=None):
         current = self._current_runtime_epoch()
-        # Omitted epochs are treated as current for the v1 compatibility
-        # surface.  Once a caller supplies an epoch it is an identity fence.
+        # Bootstrap callers may omit the epoch when establishing a brand-new
+        # identity.  An identity which survived a reboot is different: an
+        # omitted epoch is ambiguous and is rejected rather than allowing a
+        # stale client to mutate the new session.
+        if supplied is None and identity_id:
+            table = "executors" if identity == "executor" else "workers"
+            row = self.conn.execute(f"SELECT runtime_epoch FROM {table} WHERE id=?", (identity_id,)).fetchone()
+            # The legacy worker claim route uses the worker registry directly;
+            # it is still an executor identity for epoch-fencing purposes.
+            if row is None and identity == "executor":
+                row = self.conn.execute("SELECT runtime_epoch FROM workers WHERE id=?", (identity_id,)).fetchone()
+            if row and int(row[0]) != current:
+                raise LeaseError(f"{identity} runtime epoch is required after restart", details={"expected": current})
+        # For a supplied epoch, always apply the identity fence.
         if supplied is not None:
             try:
                 supplied = int(supplied)
@@ -468,7 +483,7 @@ class RealmStore:
         if not isinstance(ready, bool):
             raise ValidationError("ready must be a boolean")
         with self._mutex:
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
             if not self.conn.execute("SELECT 1 FROM workers WHERE id=?", (worker_id,)).fetchone():
                 raise NotFoundError("worker not found")
             self.conn.execute("UPDATE workers SET readiness=?, readiness_reason=?, last_seen_at=?, runtime_epoch=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "worker_not_ready"), now(), epoch, worker_id))
@@ -479,7 +494,7 @@ class RealmStore:
         if not worker_id:
             raise ValidationError("worker_id is required")
         with self._mutex:
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
             if not row:
                 raise NotFoundError("worker not found")
@@ -515,7 +530,7 @@ class RealmStore:
         with self._mutex:
             if not worker_id or not lease_token:
                 raise ValidationError("worker_id and lease_token are required")
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
             with self._transaction():
                 self._reap_expired_leases()
                 task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -586,7 +601,7 @@ class RealmStore:
         if any(not isinstance(key, str) or not key for key in keys):
             raise ValidationError("resource keys must be non-empty strings")
         with self._mutex:
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
             timestamp = now()
             self.conn.execute("INSERT INTO workers(id, capabilities_json, max_concurrency, resource_keys_json, created_at, last_seen_at, readiness, readiness_reason, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, last_seen_at=excluded.last_seen_at, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, runtime_epoch=excluded.runtime_epoch", (worker_id, canonical_json(capability_ids), max_concurrency, canonical_json(keys), timestamp, timestamp, readiness, None if readiness == "ready" else (readiness_reason or "worker_not_ready"), epoch))
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
