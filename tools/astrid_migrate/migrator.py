@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
+from contextlib import contextmanager
 from typing import Any, Callable, Mapping
 
 
@@ -65,7 +66,22 @@ def _canonical(value: Any) -> bytes:
 
 
 def _tree_size(root: Path) -> int:
+    if not root.exists():
+        return 0
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file() and not path.is_symlink())
+
+
+def _file_map(root: Path) -> dict[str, dict[str, Any]]:
+    """Return a content-addressed description of every regular file below root."""
+    return {
+        str(path.relative_to(root)): {"size": path.stat().st_size, "sha256": _sha256_file(path)}
+        for path in sorted(root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _files_digest(files: Mapping[str, Mapping[str, Any]]) -> str:
+    return _sha256_bytes(_canonical([{"path": name, **dict(files[name])} for name in sorted(files)]))
 
 
 def _table_names(conn: sqlite3.Connection) -> list[str]:
@@ -129,6 +145,45 @@ class Migrator:
         self._document_ids: dict[str, Any] = {}
         self._import_counts: dict[str, int] = {}
         self._report: dict[str, Any] = {}
+        self._freeze_handles: list[Any] = []
+
+    @contextmanager
+    def source_freeze(self):
+        """Hold any legacy writer lock for the complete migration critical path.
+
+        Old roots did not all have a lock file, so the lock is supplemented by
+        manifest revalidation at every copy seam.  This keeps the operation
+        fail-closed without creating a new authority or mutating the source.
+        """
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover
+            fcntl = None
+        handles = []
+        if fcntl is not None:
+            lock_paths = [self.database.with_suffix(self.database.suffix + ".lock"), self.database.with_suffix(".lock"), self.config.source_root / ".astrid" / "writer.lock"]
+            for lock_path in lock_paths:
+                if not lock_path.exists():
+                    continue
+                handle = lock_path.open("rb")
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    handle.close()
+                    raise MigrationError("Astrid writer is active; freeze writers before migrating") from exc
+                handles.append((handle, fcntl))
+        self._freeze_handles = handles
+        started = time.time()
+        try:
+            _assert_writer_free(self.config.source_root, self.database, self.config.freeze_probe)
+            yield {"started_at": started, "lock_count": len(handles)}
+        finally:
+            for handle, module in reversed(handles):
+                try:
+                    module.flock(handle.fileno(), module.LOCK_UN)
+                finally:
+                    handle.close()
+            self._freeze_handles = []
 
     def _source_manifest(self, inventory: Mapping[str, Any]) -> dict[str, Any]:
         """Build the immutable, root-complete identity for this source."""
@@ -138,13 +193,16 @@ class Migrator:
             "source_version": self.config.source_version,
             "database_sha256": inventory["database_sha256"],
             "files": inventory["files"],
+            "files_sha256": inventory["files_sha256"],
+            "source_facts_sha256": inventory["source_facts_sha256"],
             "row_counts": inventory["row_counts"],
             "schema_migrations": inventory["schema_migrations"],
         }
         return payload | {"source_manifest_sha256": _sha256_bytes(_canonical(payload))}
 
     def inventory(self) -> dict[str, Any]:
-        _assert_writer_free(self.config.source_root, self.database, self.config.freeze_probe)
+        if not self._freeze_handles:
+            _assert_writer_free(self.config.source_root, self.database, self.config.freeze_probe)
         conn = sqlite3.connect(f"file:{self.database}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
@@ -160,10 +218,17 @@ class Migrator:
             conn.close()
         if integrity != "ok" or foreign_keys:
             raise MigrationError("Astrid source failed SQLite integrity/foreign-key preflight")
-        files = {}
-        for path in sorted(self.config.source_root.rglob("*")):
-            if path.is_file() and not path.is_symlink():
-                files[str(path.relative_to(self.config.source_root))] = {"size": path.stat().st_size, "sha256": _sha256_file(path)}
+        files = _file_map(self.config.source_root)
+        facts_conn = sqlite3.connect(f"file:{self.database}?mode=ro", uri=True)
+        facts_conn.row_factory = sqlite3.Row
+        try:
+            source_facts = {table: _rows(facts_conn, table) for table in _table_names(facts_conn)}
+        finally:
+            facts_conn.close()
+        # Include every table and every row, not only entities currently
+        # imported by the neutral client.  This is the root-complete fact
+        # identity used to detect drift and to reconcile the destination.
+        source_facts_sha256 = _sha256_bytes(_canonical(source_facts))
         media_dispositions = []
         estimated_cas_bytes = 0
         for media in media_rows:
@@ -211,6 +276,8 @@ class Migrator:
             "tables": tables,
             "row_counts": counts,
             "files": files,
+            "files_sha256": _files_digest(files),
+            "source_facts_sha256": source_facts_sha256,
             "integrity": {"quick_check": integrity, "foreign_key_errors": foreign_keys},
             "media_locator_dispositions": media_dispositions,
             "estimated_cas_bytes": estimated_cas_bytes,
@@ -294,11 +361,12 @@ class Migrator:
             nested = value.get("task") or value.get("run") or value.get("project")
             if isinstance(nested, Mapping):
                 return Migrator._result_id(nested, *keys)
+            return None
         for key in keys:
             result = getattr(value, key, None)
             if result is not None:
                 return result
-        return value
+        return value if value is not None else None
 
     def _media_bytes(self, media: Mapping[str, Any], locations: list[Mapping[str, Any]]) -> tuple[bytes, str]:
         candidates = [x for x in locations if str(x.get("media_id")) == str(media.get("id"))]
@@ -325,37 +393,44 @@ class Migrator:
                 return raw, path.name
         raise MigrationError(f"media {media.get('id')} has no local bytes; remote media is not runnable in local-v1")
 
+    def _assert_source_digest(self, expected: str, seam: str) -> None:
+        current = self.inventory()
+        if current["source_manifest_sha256"] != expected:
+            raise MigrationError(f"source changed at {seam}; discard the clone and restart rehearsal")
+
     def migrate(self) -> dict[str, Any]:
-        inventory = self.inventory()
-        frozen_source_digest = inventory["source_manifest_sha256"]
-        # Re-read the complete source identity immediately before any archive
-        # or client write.  A changed clone is rejected rather than producing
-        # an archive whose rows and bytes came from different source epochs.
-        current_inventory = self.inventory()
-        if current_inventory["source_manifest_sha256"] != frozen_source_digest:
-            raise MigrationError("source changed after B10 freeze; discard the clone and restart rehearsal")
-        data = self._load()
-        self.validate(data)
-        if self.config.dry_run:
-            for row in data.get("media", []):
-                self._media_bytes(row, data.get("media_locations", []))
-            self._report["dry_run"] = True
-            self._report["mapping"] = self._mapping_preview(data)
-            self._report["reconciliation"] = self._reconcile(data, preview=True)
+        with self.source_freeze() as freeze_info:
+            self._report["source_freeze"] = freeze_info
+            inventory = self.inventory()
+            frozen_source_digest = inventory["source_manifest_sha256"]
+            # Re-read before and after loading so rows and bytes can never be
+            # combined from two source epochs.
+            self._assert_source_digest(frozen_source_digest, "pre-load")
+            data = self._load()
+            self._assert_source_digest(frozen_source_digest, "post-load")
+            self.validate(data)
+            if self.config.dry_run:
+                for row in data.get("media", []):
+                    self._media_bytes(row, data.get("media_locations", []))
+                self._report["dry_run"] = True
+                self._report["mapping"] = self._mapping_preview(data)
+                self._report["reconciliation"] = self._reconcile(data, preview=True)
+                return self._report
+            if self._report.get("validation", {}).get("blockers"):
+                raise MigrationError("migration has unresolved source facts; resolve blockers before archive/import/activation")
+            archive = self._archive(inventory)
+            self._assert_source_digest(frozen_source_digest, "post-archive")
+            self._import(data)
+            self._assert_source_digest(frozen_source_digest, "post-import")
+            reconciliation = self._reconcile(data, preview=False)
+            self._report["reconciliation"] = reconciliation
+            if not reconciliation["ok"]:
+                raise MigrationError("migration reconciliation failed; source remains untouched; see verified archive rollback")
+            activation = self._activation(archive, reconciliation)
+            self._report["archive"] = str(archive)
+            self._report["activation_manifest"] = str(activation)
+            self._report["rollback"] = str(archive / "ROLLBACK.md")
             return self._report
-        if self._report.get("validation", {}).get("blockers"):
-            raise MigrationError("migration has unresolved source facts; resolve blockers before archive/import/activation")
-        archive = self._archive(inventory)
-        self._import(data)
-        reconciliation = self._reconcile(data, preview=False)
-        self._report["reconciliation"] = reconciliation
-        if not reconciliation["ok"]:
-            raise MigrationError("migration reconciliation failed; source remains untouched; see verified archive rollback")
-        activation = self._activation(archive, reconciliation)
-        self._report["archive"] = str(archive)
-        self._report["activation_manifest"] = str(activation)
-        self._report["rollback"] = str(archive / "ROLLBACK.md")
-        return self._report
 
     def _mapping_preview(self, data):
         return {"projects": len(data.get("projects", [])), "timelines": len(data.get("timelines", [])), "shots": len(data.get("shots", [])), "references": len(data.get("project_references", [])), "generations": len(data.get("generations", [])), "media": len(data.get("media", [])), "runs": len(data.get("runs", [])), "tasks": len(data.get("tasks", []))}
@@ -373,12 +448,19 @@ class Migrator:
         temporary = Path(tempfile.mkdtemp(prefix=f".{self.config.archive_root.name}.", dir=self.config.archive_root.parent))
         try:
             shutil.copytree(self.config.source_root, temporary / "source", symlinks=True)
-            manifest = {"format_version": 2, "source_version": self.config.source_version, "source_root": str(self.config.source_root), "files": inventory["files"], "database_sha256": inventory["database_sha256"], "source_manifest_sha256": inventory["source_manifest_sha256"], "source_manifest": inventory["source_manifest"], "created_at": time.time()}
+            archived_files = _file_map(temporary / "source")
+            self._report["archive_peak_bytes"] = _tree_size(temporary)
+            if archived_files != inventory["files"]:
+                raise MigrationError("source changed while archive was being copied; discard the clone and restart rehearsal")
+            archived_db = temporary / "source" / self.database.relative_to(self.config.source_root)
+            manifest = {"format_version": 2, "source_version": self.config.source_version, "source_root": str(self.config.source_root), "files": archived_files, "files_sha256": _files_digest(archived_files), "database_sha256": _sha256_file(archived_db), "source_manifest_sha256": inventory["source_manifest_sha256"], "source_manifest": inventory["source_manifest"], "archive_source_tree_sha256": _files_digest(archived_files), "created_at": time.time()}
             (temporary / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
             (temporary / "ROLLBACK.md").write_text("# Astrid migration rollback\n\nThe original source is untouched. Stop the runtime, remove the activated realm, restore the verified source archive under `source/`, and rerun the legacy launcher only after review.\n\nArchive manifest: `manifest.json`.\n")
             for path in temporary.rglob("*"):
                 if path.is_file():
                     path.chmod(0o400)
+            if _file_map(temporary / "source") != archived_files or _sha256_file(archived_db) != manifest["database_sha256"]:
+                raise MigrationError("archive bytes failed post-copy verification")
             temporary.rename(self.config.archive_root)
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
@@ -396,14 +478,20 @@ class Migrator:
             except TypeError:
                 value = self._invoke("create_project", name, idempotency_key=f"astrid-migrate-project-{row['id']}")
             self._project_ids[str(row["id"])] = value
+            if self._result_id(value, "project_id", "id") is None:
+                self._report.setdefault("unresolved", []).append({"kind": "project", "id": row.get("id"), "reason": "client returned no durable identity"})
         for row, raw, filename in media_payloads:
             value = self._invoke("ingest_object", raw, media_type=str(row.get("mime_type") or "application/octet-stream"), idempotency_key=f"astrid-migrate-media-{row['id']}", filename=filename)
             self._media_ids[str(row["id"])] = value
+            if self._result_id(value, "object_id", "digest", "id") is None:
+                self._report.setdefault("unresolved", []).append({"kind": "media", "id": row.get("id"), "reason": "client returned no durable identity"})
         for row in data.get("timelines", []):
             project = self._project_ids[str(row["project_id"])]
             project_id = getattr(project, "project_id", project.get("project_id", project.get("id")) if isinstance(project, Mapping) else project)
             value = self._invoke("create_timeline", project_id, str(row["id"]), idempotency_key=f"astrid-migrate-timeline-{row['id']}")
             self._timeline_ids[str(row["id"])] = value
+            if self._result_id(value, "timeline_id", "id") is None:
+                self._report.setdefault("unresolved", []).append({"kind": "timeline", "id": row.get("id"), "reason": "client returned no durable identity"})
             document = _json(row.get("document_json"), None)
             if document is not None and hasattr(self.client, "create_document"):
                 body = {"document_id": f"timeline:{row['id']}", "kind": "timeline", "content": document}
@@ -416,23 +504,35 @@ class Migrator:
             timeline_id = str(_json(row.get("metadata_json"), {}).get("timeline_id") or row.get("timeline_id") or "")
             if not timeline_id:
                 continue
-            self._invoke("create_shot", timeline_id, {"shot_id": str(row["id"]), "start_ms": 0, "duration_ms": 1, "reference_ids": []}, idempotency_key=f"astrid-migrate-shot-{row['id']}")
-            self._import_counts["shots"] = self._import_counts.get("shots", 0) + 1
+            shot = self._invoke("create_shot", timeline_id, {"shot_id": str(row["id"]), "start_ms": 0, "duration_ms": 1, "reference_ids": []}, idempotency_key=f"astrid-migrate-shot-{row['id']}")
+            if self._result_id(shot, "shot_id", "id") is not None:
+                self._import_counts["shots"] = self._import_counts.get("shots", 0) + 1
+            else:
+                self._report.setdefault("unresolved", []).append({"kind": "shot", "id": row.get("id"), "reason": "client returned no durable identity"})
         for row in data.get("project_references", []):
             project_id = str(row["project_id"])
             timeline = next((x for x in data.get("timelines", []) if str(x.get("project_id")) == project_id), None)
             if timeline and hasattr(self.client, "create_reference"):
-                self._invoke("create_reference", str(timeline["id"]), {"reference_id": str(row["id"]), "object_id": "", "role": row.get("kind")}, idempotency_key=f"astrid-migrate-reference-{row['id']}")
-                self._reference_ids[str(row["id"])] = row["id"]
+                reference = self._invoke("create_reference", str(timeline["id"]), {"reference_id": str(row["id"]), "object_id": "", "role": row.get("kind")}, idempotency_key=f"astrid-migrate-reference-{row['id']}")
+                if self._result_id(reference, "reference_id", "id") is not None:
+                    self._reference_ids[str(row["id"])] = self._result_id(reference, "reference_id", "id")
+                else:
+                    self._report.setdefault("unresolved", []).append({"kind": "reference", "id": row.get("id"), "reason": "client returned no durable identity"})
             elif hasattr(self.client, "create_project_reference"):
-                self._invoke("create_project_reference", dict(row), idempotency_key=f"astrid-migrate-reference-{row['id']}")
-                self._reference_ids[str(row["id"])] = row["id"]
+                reference = self._invoke("create_project_reference", dict(row), idempotency_key=f"astrid-migrate-reference-{row['id']}")
+                if self._result_id(reference, "reference_id", "id") is not None:
+                    self._reference_ids[str(row["id"])] = self._result_id(reference, "reference_id", "id")
+                else:
+                    self._report.setdefault("unresolved", []).append({"kind": "reference", "id": row.get("id"), "reason": "client returned no durable identity"})
             else:
                 self._report.setdefault("unresolved", []).append({"kind": "reference", "id": row.get("id"), "reason": "client_missing_reference_operation"})
         for row in data.get("generations", []):
             if hasattr(self.client, "create_generation"):
-                self._invoke("create_generation", dict(row), idempotency_key=f"astrid-migrate-generation-{row['id']}")
-                self._import_counts["generations"] = self._import_counts.get("generations", 0) + 1
+                generation = self._invoke("create_generation", dict(row), idempotency_key=f"astrid-migrate-generation-{row['id']}")
+                if self._result_id(generation, "generation_id", "id") is not None:
+                    self._import_counts["generations"] = self._import_counts.get("generations", 0) + 1
+                else:
+                    self._report.setdefault("unresolved", []).append({"kind": "generation", "id": row.get("id"), "reason": "client returned no durable identity"})
             else:
                 self._report.setdefault("unresolved", []).append({"kind": "generation", "id": row.get("id"), "reason": "client_missing_create_generation"})
         for row in data.get("tasks", []):
@@ -455,22 +555,78 @@ class Migrator:
             if run_id is not None:
                 self._run_ids[str(row.get("run_id") or run_id)] = run_id
 
+    def _destination_reconciliation(self, data: Mapping[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+        reader = getattr(self.client, "destination_snapshot", None)
+        if not callable(reader):
+            return None
+        try:
+            truth = reader()
+        except Exception as exc:
+            return {"ok": False, "errors": [{"kind": "destination_read", "reason": str(exc)}]}
+        errors = []
+        projects = truth.get("projects", [])
+        by_slug = {str(row.get("slug")): row for row in projects}
+        for source in data.get("projects", []):
+            actual = by_slug.get(str(source.get("slug")))
+            if not actual or str(actual.get("name")) != str(source.get("name")):
+                errors.append({"kind": "project", "id": source.get("id"), "reason": "destination truth missing or differs"})
+            elif self._result_id(self._project_ids.get(str(source.get("id"))), "project_id", "id") != actual.get("id"):
+                errors.append({"kind": "project", "id": source.get("id"), "reason": "returned identity differs from destination truth"})
+        for source in data.get("timelines", []):
+            if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("timelines", [])):
+                errors.append({"kind": "timeline", "id": source.get("id"), "reason": "missing from destination truth"})
+        for source in data.get("shots", []):
+            if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("timeline_shots", [])):
+                errors.append({"kind": "shot", "id": source.get("id"), "reason": "missing from destination truth"})
+        for source in data.get("project_references", []):
+            if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("timeline_references", [])):
+                errors.append({"kind": "reference", "id": source.get("id"), "reason": "missing from destination truth"})
+        actual_media = {str(row.get("digest") or row.get("content_hash")) .removeprefix("sha256:") for row in truth.get("objects", [])}
+        for source in data.get("media", []):
+            digest = str(source.get("content_hash") or "").removeprefix("sha256:")
+            if digest and digest not in actual_media:
+                errors.append({"kind": "media", "id": source.get("id"), "reason": "content digest missing from destination truth", "digest": digest})
+            elif digest and not any(str(row.get("digest")) .removeprefix("sha256:") == digest and str(row.get("realm")) == "cas" for row in truth.get("media_locations", [])):
+                errors.append({"kind": "media_location", "id": source.get("id"), "reason": "CAS location missing from destination truth", "digest": digest})
+        for source in data.get("timelines", []):
+            document = _json(source.get("document_json"), None)
+            if document is None:
+                continue
+            expected_id = f"timeline:{source['id']}"
+            actual_document = next((row for row in truth.get("documents", []) if str(row.get("id")) == expected_id), None)
+            if actual_document is None or _json(actual_document.get("content_json"), None) != document:
+                errors.append({"kind": "timeline_document", "id": source.get("id"), "reason": "document content differs from destination truth"})
+        for source in data.get("generations", []):
+            if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("generations", [])):
+                errors.append({"kind": "generation", "id": source.get("id"), "reason": "missing from destination truth"})
+        expected_tasks = len(data.get("tasks", []))
+        if len(truth.get("tasks", [])) < expected_tasks:
+            errors.append({"kind": "tasks", "reason": "destination task truth is incomplete"})
+        if data.get("events") and not truth.get("events"):
+            errors.append({"kind": "events", "reason": "destination event truth is empty"})
+        if truth.get("events") and any(not row.get("kind") or not row.get("payload_json") for row in truth["events"]):
+            errors.append({"kind": "events", "reason": "destination event truth contains incomplete records"})
+        if truth.get("foreign_key_errors"):
+            errors.append({"kind": "foreign_keys", "reason": "destination foreign-key check failed", "details": truth["foreign_key_errors"]})
+        return {"ok": not errors, "errors": errors, "counts": {key: len(value) for key, value in truth.items() if isinstance(value, list)}, "truth": truth}
+
     def _reconcile(self, data, *, preview: bool) -> dict[str, Any]:
         expected = self._mapping_preview(data)
         actual = {"projects": len(self._project_ids), "timelines": len(self._timeline_ids), "shots": self._import_counts.get("shots", 0), "references": len(self._reference_ids), "generations": self._import_counts.get("generations", 0), "media": len(self._media_ids), "runs": len(self._run_ids), "tasks": len(self._task_ids), "documents": len(self._document_ids)} if not preview else {}
         unresolved = self._report.get("unresolved", [])
         blockers = list(self._report.get("inventory", {}).get("blockers", [])) + unresolved
-        source_facts = {
-            "projects": data.get("projects", []),
-            "timelines": data.get("timelines", []),
-            "shots": data.get("shots", []),
-            "project_references": data.get("project_references", []),
-            "media": data.get("media", []),
-            "runs": data.get("runs", []),
-            "tasks": data.get("tasks", []),
-        }
-        source_facts_sha256 = _sha256_bytes(_canonical(source_facts))
-        return {"ok": not blockers, "expected": expected, "mapped": actual, "unresolved": unresolved, "blockers": blockers, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok", "source_facts_sha256": source_facts_sha256, "source_counts": expected, "mapped_counts": actual}
+        source_facts_sha256 = self._report.get("inventory", {}).get("source_facts_sha256") or _sha256_bytes(_canonical({table: data.get(table, []) for table in sorted(data)}))
+        destination = None if preview else self._destination_reconciliation(data)
+        if destination is not None and not destination["ok"]:
+            blockers.extend(destination["errors"])
+        if not preview and destination is None:
+            # A language client without a read surface is supported for the
+            # legacy unit fixtures, but a write response must carry an actual
+            # identity.  A no-op client therefore fails closed.
+            missing = [kind for kind, values in (("project", self._project_ids), ("timeline", self._timeline_ids), ("media", self._media_ids), ("reference", self._reference_ids), ("task", self._task_ids)) if any(value is None for value in values.values())]
+            if missing:
+                blockers.append({"kind": "destination_truth", "reason": "client returned no durable identities", "entities": missing})
+        return {"ok": not blockers, "expected": expected, "mapped": actual, "unresolved": unresolved, "blockers": blockers, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok", "source_facts_sha256": source_facts_sha256, "source_counts": expected, "mapped_counts": actual, "destination_truth": destination}
 
     def _activation(self, archive: Path, reconciliation: Mapping[str, Any]) -> Path:
         self.config.destination_root.mkdir(parents=True, exist_ok=True)
