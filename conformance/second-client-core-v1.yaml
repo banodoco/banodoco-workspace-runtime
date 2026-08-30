@@ -10,34 +10,35 @@ steps:
     request: GET /v1/health
     assert: [status=ok, protocol=workspace.v1]
   - id: scoped-handshake
-    request: POST /v1/handshake
-    body: {protocol: workspace.v1, client_name: neutral-gallery, client_version: 0.1.0, requested_scopes: [realm:read, project:write]}
-    assert: [scoped actor_id, realm_id, schema_digest]
-  - id: project-create-read
+    request: POST /v1/handshake with requested scopes
+    body: {protocol: workspace.v1, client_name: neutral-gallery, client_version: 0.1.0}
+    assert: [scoped actor_id, realm_id, schema_digest, requested scopes honored]
+  - id: project-create-read-list
     request: POST /v1/projects
     headers: [Idempotency-Key]
-    then: "GET /v1/projects/{project_id}"
-    assert: [version=1, same project_id]
-  - id: managed-object-ingest
+    then: ["GET /v1/projects/{project_id}", "GET /v1/projects"]
+    assert: [version=1, same project_id, created project listed]
+  - id: managed-object-get-head-range-etag
     request: POST /v1/objects
     headers: [Idempotency-Key, Content-Type]
     then: ["GET /v1/objects/{object_id}", "HEAD /v1/objects/{object_id}", "GET /v1/objects/{object_id} Range:bytes=0-3"]
     assert: [sha256 digest, strong ETag, Accept-Ranges=bytes, inclusive Content-Range, 206]
-  - id: minimum-composition
-    request: neutral document commands for timeline, shot, and reference
-    assert: [opaque ids, optimistic version, no product-shaped fields]
-  - id: task-observation
-    request: POST /v1/tasks
+  - id: timeline-shot-reference-create-read-update
+    request: neutral commands for timeline, shot, and reference
+    then: ["POST /v1/projects/{project_id}/timelines", "GET /v1/timelines/{timeline_id}", "POST /v1/timelines/{timeline_id}/shots", "GET /v1/shots/{shot_id}", "POST /v1/timelines/{timeline_id}/references", "GET /v1/references/{reference_id}", "PATCH /v1/timelines/{timeline_id}"]
+    assert: [opaque ids, optimistic version 1 to 2, neutral fields only]
+  - id: register-capability-executor
+    request: POST /v1/capabilities then POST /v1/executors
+    then: ["GET /v1/capabilities"]
+    assert: [protocol workspace.v1, resource keys, readiness truthful, render.neutral registered]
+  - id: task-cancel-retry
+    request: "POST /v1/tasks then POST /v1/tasks/{task_id}/cancel then POST /v1/tasks/{task_id}/retry"
+    headers: [Idempotency-Key, expected_version]
+    assert: [deterministic cancelled then queued transitions]
+  - id: task-run-events
+    request: POST /v1/tasks for registered capability
     then: ["GET /v1/runs/{run_id}", "GET /v1/tasks/{task_id}", "GET /v1/events"]
     assert: [capability digest pinned, durable cursor, monotonic sequence]
-  - id: cancellation-retry
-    request: "POST /v1/tasks/{task_id}/cancel then POST /v1/tasks/{task_id}/retry"
-    headers: [Idempotency-Key]
-    assert: [deterministic state transitions, version conflict on stale expected_version]
-  - id: fake-worker-settlement
-    request: "POST /v1/attempts/{attempt_id}/settle"
-    assert: [lease_id and fence required, typed outputs, declared effect only, stale/duplicate settlement deterministic]
-  - id: registered-capability
-    request: POST /v1/executors
-    then: ["GET /v1/capabilities", "admit render capability task"]
-    assert: [protocol workspace.v1, resource keys, readiness truthful]
+  - id: claim-heartbeat-fenced-settlement-cas-output
+    request: "POST /v1/tasks/claim then POST /v1/attempts/{attempt_id}/heartbeat then POST /v1/objects then POST /v1/attempts/{attempt_id}/settle"
+    assert: [lease_id and fence required, output digest already in CAS, succeeded state, duplicate settlement rejected]

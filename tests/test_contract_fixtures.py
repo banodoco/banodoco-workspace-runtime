@@ -41,4 +41,4 @@ def test_python_and_typescript_operation_indexes_are_identical() -> None:
 def test_fake_actor_has_no_product_shaped_symbols() -> None:
     source = (ROOT / "conformance/fake-second-product.ts").read_text()
     assert not re.search(r"\bAstrid\b|\bREIGH\b|\bthread\b|\bpack\b", source, re.I)
-    assert "WorkspaceClient" in source and "render.basic" in source
+    assert "WorkspaceClient" in source and "render.neutral" in source
