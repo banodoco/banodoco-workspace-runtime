@@ -622,7 +622,12 @@ class Migrator:
                     cas_size = -1
                 locator = Path(str(cas.get("locator", ""))).expanduser() if cas else None
                 bytes_verified = bool(locator and locator.is_file() and locator.stat().st_size == cas_size and _sha256_file(locator) == digest)
-                if not cas or str(cas.get("sha256", "")).removeprefix("sha256:") != digest or cas_size != int(source.get("byte_size") or -1) or not bytes_verified:
+                expected_size = source.get("byte_size")
+                try:
+                    expected_size = int(expected_size) if expected_size is not None else -1
+                except (TypeError, ValueError):
+                    expected_size = -1
+                if not cas or str(cas.get("sha256", "")).removeprefix("sha256:") != digest or cas_size != expected_size or not bytes_verified:
                     errors.append({"kind": "cas_bytes", "id": source.get("id"), "reason": "destination CAS bytes were not verified by content hash", "digest": digest})
         for source in data.get("timelines", []):
             document = _json(source.get("document_json"), None)
