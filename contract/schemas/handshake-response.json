@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/handshake-response.json",
+  "title": "Scoped actor handshake response",
+  "type": "object", "additionalProperties": false,
+  "required": ["protocol", "schema_digest", "session_id", "actor_id", "realm_id", "scopes"],
+  "properties": {
+    "protocol": { "type": "string", "const": "workspace.v1" },
+    "schema_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "actor_id": { "type": "string", "minLength": 1 },
+    "realm_id": { "type": "string", "minLength": 1 },
+    "scopes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+  }
+}

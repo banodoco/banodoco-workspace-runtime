@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/common.json",
+  "title": "Workspace protocol common definitions",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "Id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },
+    "Digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "Version": { "type": "integer", "minimum": 1 },
+    "Cursor": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "Timestamp": { "type": "string", "format": "date-time" },
+    "ActorScope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actor_id", "realm_id", "scopes"],
+      "properties": {
+        "actor_id": { "$ref": "#/\u0024defs/Id" },
+        "realm_id": { "$ref": "#/\u0024defs/Id" },
+        "scopes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      }
+    },
+    "Page": {
+      "type": "object", "additionalProperties": false,
+      "required": ["items", "next_cursor"],
+      "properties": {
+        "items": { "type": "array" },
+        "next_cursor": { "anyOf": [{ "$ref": "#/\u0024defs/Cursor" }, { "type": "null" }] }
+      }
+    },
+    "Error": {
+      "type": "object", "additionalProperties": false,
+      "required": ["code", "message", "request_id"],
+      "properties": {
+        "code": { "type": "string", "enum": ["invalid_request", "unauthorized", "forbidden", "not_found", "conflict", "version_conflict", "idempotency_conflict", "unsupported_version", "range_not_satisfiable", "lease_fenced", "invalid_settlement", "not_ready", "internal"] },
+        "message": { "type": "string" },
+        "request_id": { "$ref": "#/\u0024defs/Id" },
+        "details": { "type": "object", "additionalProperties": true }
+      }
+    }
+  }
+}

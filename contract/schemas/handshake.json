@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/handshake.json",
+  "title": "Scoped actor handshake",
+  "type": "object", "additionalProperties": false,
+  "required": ["protocol", "client_name", "client_version", "requested_scopes"],
+  "properties": {
+    "protocol": { "type": "string", "const": "workspace.v1" },
+    "client_name": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{0,63}$" },
+    "client_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "requested_scopes": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+  }
+}

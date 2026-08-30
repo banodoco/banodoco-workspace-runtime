@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/timeline.json",
+  "title": "Minimum product-neutral timeline composition",
+  "type": "object", "additionalProperties": false,
+  "required": ["timeline_id", "project_id", "version", "shots", "references"],
+  "properties": {
+    "timeline_id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "shots": { "type": "array", "items": { "$ref": "#/$defs/Shot" } },
+    "references": { "type": "array", "items": { "$ref": "#/$defs/Reference" } }
+  },
+  "$defs": {
+    "Shot": { "type": "object", "additionalProperties": false, "required": ["shot_id", "start_ms", "duration_ms"], "properties": { "shot_id": { "type": "string" }, "start_ms": { "type": "integer", "minimum": 0 }, "duration_ms": { "type": "integer", "minimum": 1 }, "reference_ids": { "type": "array", "items": { "type": "string" } } } },
+    "Reference": { "type": "object", "additionalProperties": false, "required": ["reference_id", "object_id"], "properties": { "reference_id": { "type": "string" }, "object_id": { "type": "string" }, "role": { "type": "string" } } }
+  }
+}

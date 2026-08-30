@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/event.json",
+  "title": "Durable event",
+  "type": "object", "additionalProperties": false,
+  "required": ["event_id", "sequence", "cursor", "event_type", "aggregate_type", "aggregate_id", "payload", "occurred_at"],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 1 },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "cursor": { "type": "string", "minLength": 1 },
+    "event_type": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+    "aggregate_type": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$" },
+    "aggregate_id": { "type": "string", "minLength": 1 },
+    "payload": { "type": "object", "additionalProperties": true },
+    "occurred_at": { "type": "string", "format": "date-time" }
+  }
+}

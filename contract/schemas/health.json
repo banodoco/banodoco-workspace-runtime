@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/health.json",
+  "title": "Health response",
+  "type": "object", "additionalProperties": false,
+  "required": ["status", "protocol", "schema_digest", "runtime_epoch"],
+  "properties": {
+    "status": { "type": "string", "enum": ["ok", "degraded"] },
+    "protocol": { "type": "string", "const": "workspace.v1" },
+    "schema_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "runtime_epoch": { "type": "integer", "minimum": 1 }
+  }
+}
