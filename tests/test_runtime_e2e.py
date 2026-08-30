@@ -28,16 +28,16 @@ def daemon(tmp_path):
 def test_project_managed_object_and_fake_worker_end_to_end(daemon):
     client = Api(daemon.endpoint, daemon.token)
     health = client.health()
-    assert health["ok"] is True
+    assert health["status"] == "ok"
     handshake = client.handshake()
-    assert handshake["protocol_version"] == "core-v1"
+    assert handshake["actor_id"] == "owner"
     project = client.create_project("demo", "Demo", {"theme": "neutral"}, idempotency_key="project-1")
-    assert project["slug"] == "demo" and project["version"] == 1
+    assert project["name"] == "Demo" and project["version"] == 1
     same = client.create_project("demo", "Demo", {"theme": "neutral"}, idempotency_key="project-1")
-    assert same["id"] == project["id"]
+    assert same["project_id"] == project["project_id"]
     source = b"managed bytes\x00"
     obj = client.ingest("demo", source, media_type="application/octet-stream", original_name="source.bin")
-    digest = hashlib.sha256(source).hexdigest()
+    digest = "sha256:" + hashlib.sha256(source).hexdigest()
     assert obj["digest"] == digest
     received, headers = client.read_object(digest)
     assert received == source
@@ -45,24 +45,23 @@ def test_project_managed_object_and_fake_worker_end_to_end(daemon):
     ranged, range_headers = client.read_object(digest, range_header="bytes=0-6")
     assert ranged == source[:7]
     assert range_headers["Content-Range"] == f"bytes 0-6/{len(source)}"
-    task = client.create_task("testing.echo", {"text": "hello"}, project="demo", idempotency_key="task-1")
-    task_id = task["task"]["id"]
+    task = client.create_task("render.basic", {"text": "hello"}, project="demo", idempotency_key="task-1")
+    task_id = task["task_id"]
     lease = "lease-1"
-    client.register_worker("fake", ["testing.echo"], resource_keys=["cpu"])
+    client.register_worker("fake", ["render.basic"], resource_keys=["cpu"])
     worker = Api(daemon.endpoint, daemon.worker_token)
     claimed = worker.claim(task_id, worker_id="fake", lease_token=lease)
-    assert claimed["task"]["status"] == "running"
+    assert claimed["state"] == "running"
     settled = worker.settle(task_id, lease, {"text": "hello", "digest": digest})
-    assert settled["task"]["status"] == "completed"
-    assert client.task(task_id)["task"]["result_json"] == json.dumps({"digest": digest, "text": "hello"}, sort_keys=True, separators=(",", ":"))
-    events = client.events(task["run"]["id"])
-    assert [event["kind"] for event in events] == ["task.admitted", "task.claimed", "task.completed"]
+    assert settled["state"] == "succeeded"
+    events = client.events(task["run_id"])
+    assert [event["event_type"] for event in events["items"]] == ["task.admitted", "task.claimed", "task.completed"]
 
 
 def test_restart_reconnect_and_catalog_discovery(daemon, tmp_path):
     client = Api(daemon.endpoint, daemon.token)
     project = client.create_project("persist", "Persistent")
-    realm_id = client.health()["realm_id"]
+    realm_id = client.get_project(project["project_id"])["realm_id"]
     discovery = json.loads((tmp_path / "support" / "discovery.json").read_text())
     catalog = json.loads((tmp_path / "support" / "catalog.json").read_text())
     assert discovery["realm_id"] == realm_id
@@ -72,8 +71,8 @@ def test_restart_reconnect_and_catalog_discovery(daemon, tmp_path):
     restarted = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         second = Api(restarted.endpoint, restarted.token)
-        assert second.health()["realm_id"] == realm_id
-        assert second.get_project(project["id"])["name"] == "Persistent"
+        assert second.get_project(project["project_id"])["realm_id"] == realm_id
+        assert second.get_project(project["project_id"])["name"] == "Persistent"
     finally:
         restarted.stop()
 
@@ -128,14 +127,18 @@ def test_non_health_routes_require_scoped_credential(daemon):
 
 def test_stale_lease_and_undeclared_effect_are_rejected(daemon):
     client = Api(daemon.endpoint, daemon.token)
-    task = client.create_task("testing.echo", {}, expected_effect={"kind": "project.update", "target": "p", "expected_version": 1})
-    task_id = task["task"]["id"]
-    client.register_worker("effect-worker", ["testing.echo"])
+    project = client.create_project("effect-target", "Effect Target")
+    effect = {"kind": "project.update", "target": project["project_id"], "expected_version": 1, "payload": {"name": "Settled Effect"}}
+    task = client.create_task("render.basic", {}, project=project["project_id"], expected_effect=effect)
+    task_id = task["task_id"]
+    client.register_worker("effect-worker", ["render.basic"])
     worker = Api(daemon.endpoint, daemon.worker_token)
     worker.claim(task_id, worker_id="effect-worker", lease_token="good")
     with pytest.raises(RuntimeError):
         worker.settle(task_id, "bad", {})
     with pytest.raises(RuntimeError):
         worker.settle(task_id, "good", {}, effect={"kind": "other"})
-    settled = worker.settle(task_id, "good", {}, effect={"kind": "project.update", "target": "p", "expected_version": 1})
-    assert settled["task"]["status"] == "completed"
+    settled = worker.settle(task_id, "good", {}, effect=effect)
+    assert settled["state"] == "succeeded"
+    updated = client.get_project(project["project_id"])
+    assert updated["name"] == "Settled Effect" and updated["version"] == 2

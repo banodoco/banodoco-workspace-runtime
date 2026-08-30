@@ -30,12 +30,20 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
             return 200, {}, json.dumps({"items": [event], "next_cursor": "c1"}).encode()
         if path == "/v1/executors":
             return 201, {}, json.dumps({"executor_id": "x", "max_concurrency": 1, "resource_keys": ["cpu"], "capabilities": [], "protocol": "workspace.v1"}).encode()
+        if path == "/v1/capabilities" and method == "POST":
+            value = json.loads(body)
+            assert value["capability_id"] == "render.new"
+            return 201, {}, json.dumps({"capability_id": "render.new", "definition_digest": value["definition_digest"], "status": "ready", "required_resource_keys": [], "estimated_scratch_bytes": 0, "estimated_output_bytes": 0}).encode()
         if path == "/v1/capabilities":
             return 200, {}, json.dumps({"items": [{"capability_id": "render.basic", "definition_digest": "sha256:" + "b" * 64, "status": "ready", "required_resource_keys": ["cpu"], "estimated_scratch_bytes": 0, "estimated_output_bytes": 1}]}).encode()
         if path.endswith("/settle"):
             value = json.loads(body)
             assert value["lease_id"] == "l" and value["fence"] == 4
             return 200, {}, json.dumps({**TASK, "state": "succeeded", "version": 2}).encode()
+        if path.endswith("/fail"):
+            value = json.loads(body)
+            assert value["lease_id"] == "l" and value["fence"] == 4
+            return 200, {}, json.dumps({**TASK, "state": "failed", "version": 2}).encode()
         raise AssertionError((method, path))
 
     client = WorkspaceClient("http://runtime", transport=transport)
@@ -48,5 +56,8 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
     executor = client.register_executor({"executor_id": "x", "max_concurrency": 1, "resource_keys": ["cpu"], "capabilities": [], "protocol": "workspace.v1"}, idempotency_key="exec-1")
     assert executor.executor_id == "x"
     assert client.list_capabilities()[0].status == "ready"
+    capability = client.register_capability("render.new", "sha256:" + "c" * 64, idempotency_key="cap-1")
+    assert capability.capability_id == "render.new"
     assert client.settle_attempt("a", {"attempt_id": "a", "lease_id": "l", "fence": 4, "outputs": [], "effect": None}, idempotency_key="settle-1").state == "succeeded"
+    assert client.fail_attempt("a", lease_id="l", fence=4, error={"code": "worker_error"}, idempotency_key="fail-1").state == "failed"
     assert any(call[2].get("Idempotency-Key") == "task-1" for call in calls)

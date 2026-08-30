@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import hashlib
+
+import pytest
+
+from banodoco_workspace_client import ApiError, WorkspaceClient
+from runtime_protocol.daemon import RuntimeDaemon
+
+
+def _digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_path):
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        session = client.handshake("domain-client", "0.1.0", ["projects:read", "projects:write"])
+        assert session.actor_id == "owner"
+        projects, cursor = client.list_projects()
+        assert cursor is None and projects == []
+        project = client.create_project("Domain Project", idempotency_key="domain-project")
+
+        document = client.create_document(project.project_id, "doc-1", "notes", {"text": "one"})
+        assert document.version == 1
+        updated = client.update_document(project.project_id, "doc-1", expected_version=1, content={"text": "two"})
+        assert updated.version == 2 and updated.content == {"text": "two"}
+        with pytest.raises(ApiError) as stale_document:
+            client.update_document(project.project_id, "doc-1", expected_version=1, content={"text": "three"})
+        assert stale_document.value.status == 409
+
+        timeline = client.create_timeline(project.project_id, "timeline-1", idempotency_key="timeline-1")
+        assert timeline["version"] == 1
+        saved = client.update_timeline("timeline-1", expected_version=1, shots=[{"shot_id": "shot-1", "start_ms": 0, "duration_ms": 1000, "reference_ids": []}])
+        assert saved["version"] == 2 and saved["shots"][0]["shot_id"] == "shot-1"
+        with pytest.raises(ApiError) as stale_timeline:
+            client.update_timeline("timeline-1", expected_version=1, shots=[])
+        assert stale_timeline.value.status == 409
+
+        object_row = client.ingest_object(b"variant", media_type="application/octet-stream", idempotency_key="variant-object")
+        generation = client.create_generation(project.project_id, "generation-1", metadata={"prompt": "neutral"})
+        assert generation.project_id == project.project_id
+        variant = client.create_variant(generation.generation_id, "variant-1", object_id=object_row.object_id, metadata={"seed": 1})
+        assert variant.object_id == object_row.object_id
+        variants, _ = client.list_variants(generation.generation_id)
+        assert [item.variant_id for item in variants] == ["variant-1"]
+
+        task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="domain-task")
+        run = client.get_run(task.run_id)
+        assert task.task_id in run["task_ids"]
+        events = client.list_run_events(task.run_id)
+        assert events[0].event_type == "task.admitted" and events[0].sequence < events[-1].sequence + 1
+        client.cancel_task(task.task_id, idempotency_key="domain-cancel")
+
+        client.register_executor({"executor_id": "domain-executor", "max_concurrency": 1, "resource_keys": [], "capabilities": [{"capability_id": "render.basic", "definition_digest": _digest("render.basic"), "status": "ready", "required_resource_keys": [], "estimated_scratch_bytes": 0, "estimated_output_bytes": 1}], "protocol": "workspace.v1"}, idempotency_key="domain-executor")
+        worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
+        failed_task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="failed-domain-task")
+        attempt = worker.claim_task(executor_id="domain-executor", capability_ids=["render.basic"], idempotency_key="failed-domain-claim")
+        assert attempt is not None
+        failed = worker.fail_attempt(attempt["attempt_id"], lease_id=attempt["lease_id"], fence=attempt["fence"], error={"code": "worker_error"}, idempotency_key="failed-domain-settle")
+        assert failed.task_id == failed_task.task_id and failed.state == "failed"
+        assert client.list_run_events(failed_task.run_id)[-1].event_type == "task.failed"
+    finally:
+        daemon.stop()

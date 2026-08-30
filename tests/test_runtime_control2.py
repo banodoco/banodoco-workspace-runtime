@@ -119,8 +119,9 @@ def test_http_executor_claim_heartbeat_and_release_surface(tmp_path):
         owner.request("POST", "/v1/capabilities", {"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "required_resource_keys": ["gpu"]})
         owner.request("POST", "/v1/executors", {"executor_id": "executor", "max_concurrency": 1, "resource_keys": ["gpu"], "capabilities": ["render.gpu"], "protocol": "workspace.v1"})
         headers = {"Idempotency-Key": "task-http-1"}
-        first = owner.request("POST", "/v1/tasks", {"capability": "render.gpu", "spec": {"input_object_ids": []}}, headers=headers)
-        second = owner.request("POST", "/v1/tasks", {"capability": "render.gpu", "spec": {"input_object_ids": []}}, headers={**headers, "Idempotency-Key": "task-http-2"})
+        task_body = {"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "input_object_ids": []}
+        first = owner.request("POST", "/v1/tasks", task_body, headers=headers)
+        second = owner.request("POST", "/v1/tasks", task_body, headers={**headers, "Idempotency-Key": "task-http-2"})
         worker = Api(daemon.endpoint, daemon.worker_token)
         first_attempt = worker.request("POST", "/v1/tasks/claim", {"executor_id": "executor", "capability_ids": ["render.gpu"]}, headers={"Idempotency-Key": "claim-http-1"})
         assert first_attempt["fence"] == 1

@@ -47,13 +47,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         for key, value in (headers or {}).items():
             self.send_header(key, str(value))
         if body is None:
-            canonical = "application/json" in self.headers.get("Accept", "")
-            if error is not None and canonical:
-                encoded = json.dumps(error, sort_keys=True).encode()
-            elif canonical:
-                encoded = json.dumps(payload, sort_keys=True).encode()
-            else:
-                encoded = json.dumps({"ok": status < 400, "data": payload if error is None else None, "error": error, "receipt": receipt, "idempotency_key": idempotency_key}, sort_keys=True).encode()
+            encoded = json.dumps(error if error is not None else payload, sort_keys=True).encode()
             self.send_header("Content-Type", "application/json")
         else:
             encoded = body
@@ -71,17 +65,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
-        canonical = "application/json" in self.headers.get("Accept", "")
         if path in (["health"], ["v1", "health"]):
-            if canonical:
-                return self._send(200, self.runtime.health())
-            return self._send(200, {"ok": True, "realm_id": self.runtime.realm["id"], "protocol_version": "core-v1", "schema_version": 1, "doctor": self.runtime.store.doctor()})
+            return self._send(200, self.runtime.health())
         if path == ["v1", "handshake"] and method == "POST":
-            value = self.runtime.handshake(self._body())
+            identity = self._identity("handshake")
+            body = self._body()
+            body["authenticated_actor"] = identity["actor"]
+            value = self.runtime.handshake(body)
             return self._send(200, value)
         if path == ["v1", "handshake"] and method == "GET":
-            self._identity("health")
-            return self._send(200, {"protocol_version": "core-v1", "schema_version": 1, "realm": self.runtime.realm, "actor": self._identity("health")["actor"]})
+            identity = self._identity("handshake")
+            return self._send(200, self.runtime.handshake({"authenticated_actor": identity["actor"], "requested_scopes": []}))
         if path == ["v1", "realm"] and method == "GET":
             self._identity("projects:read")
             return self._send(200, self.runtime.realm_resource())
@@ -102,7 +96,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(201, self.runtime.restore(body["backup"], body["destination"]))
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timelines":
             self._identity("projects:read" if method == "GET" else "projects:write")
-            if method == "POST": return self._send(201, self.runtime.create_timeline(path[2], self._body()))
+            if method == "POST": return self._send(201, self.runtime.create_timeline(path[2], self._body().get("timeline_id", "")))
             if method == "GET": return self._send(200, self.runtime.list_timelines(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("shots", "references") and method == "POST":
             self._identity("projects:write")
@@ -110,6 +104,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(201, self.runtime.create_shot(path[2], body) if path[3] == "shots" else self.runtime.create_reference(path[2], body))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime._timeline_resource(path[2]))
+        if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
+            self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body()))
         if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_shot(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "references"] and method == "GET":
@@ -117,14 +113,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "projects"]:
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
-                if canonical:
-                    return self._send(200, self.runtime.list_projects())
-                return self._send(200, [self.runtime.store.get_project(r["id"]) for r in self.runtime.store.conn.execute("SELECT id FROM projects ORDER BY created_at")])
+                return self._send(200, self.runtime.list_projects())
             if method == "POST":
                 body = self._body()
-                if canonical:
-                    return self._send(201, self.runtime._project_resource(self.runtime.create_project(body, idempotency_key=self.headers.get("Idempotency-Key"))))
-                return self._send(201, self.runtime.store.create_project(body.get("slug", ""), body.get("name", ""), body.get("metadata"), idempotency_key=body.get("idempotency_key")))
+                return self._send(201, self.runtime._project_resource(self.runtime.create_project(body, idempotency_key=self.headers.get("Idempotency-Key"))))
         if path == ["v1", "workers"] and method == "POST":
             self._identity("worker:register")
             return self._send(201, self.runtime.register_worker(self._body()))
@@ -136,12 +128,22 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 3:
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET":
-                    if canonical:
-                        return self._send(200, self.runtime._project_resource(self.runtime.get_project(selector)))
-                    return self._send(200, self.runtime.store.get_project(selector))
+                    return self._send(200, self.runtime._project_resource(self.runtime.get_project(selector)))
                 if method in ("PATCH", "PUT"):
                     value = self.runtime.update_project(selector, self._body())
-                    return self._send(200, self.runtime._project_resource(value) if canonical else value)
+                    return self._send(200, self.runtime._project_resource(value))
+            if len(path) == 4 and path[3] == "documents":
+                self._identity("projects:read" if method == "GET" else "projects:write")
+                if method == "GET": return self._send(200, self.runtime.list_documents(selector))
+                if method == "POST": return self._send(201, self.runtime.create_document(selector, self._body()))
+            if len(path) == 5 and path[3] == "documents" and method in ("GET", "PATCH"):
+                self._identity("projects:read" if method == "GET" else "projects:write")
+                if method == "GET": return self._send(200, self.runtime.get_document(selector, path[4]))
+                return self._send(200, self.runtime.update_document(selector, path[4], self._body()))
+            if len(path) == 4 and path[3] == "generations":
+                self._identity("projects:read" if method == "GET" else "projects:write")
+                if method == "GET": return self._send(200, self.runtime.list_generations(selector))
+                if method == "POST": return self._send(201, self.runtime.create_generation(selector, self._body()))
             if len(path) == 4 and path[3] == "objects":
                 self._identity("objects:read" if method == "GET" else "objects:write")
                 if method == "GET":
@@ -150,7 +152,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     length = int(self.headers.get("Content-Length", "0"))
                     data = self.rfile.read(length)
                     result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"))
-                    return self._send(201, result)
+                    return self._send(201, self.runtime._object_resource(result))
         if path == ["v1", "objects"] and method == "POST":
             self._identity("objects:write")
             length = int(self.headers.get("Content-Length", "0")); data = self.rfile.read(length)
@@ -176,7 +178,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     return self._send(416, {"code": "invalid_range", "message": "invalid byte range"}, headers={"Content-Range": f"bytes */{total}"})
             digest = path[2].removeprefix("sha256:")
-            etag_value = "sha256:" + digest if canonical else digest
+            etag_value = "sha256:" + digest
             headers = {"Content-Type": metadata["media_type"], "ETag": f'"{etag_value}"', "Accept-Ranges": "bytes", "X-Content-Digest": etag_value}
             if status == 206:
                 headers["Content-Range"] = f"bytes {start}-{end}/{total}"
@@ -184,10 +186,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "tasks"] and method == "POST":
             self._identity("tasks:write")
             body = self._body()
-            if canonical:
-                body["idempotency_key"] = self.headers.get("Idempotency-Key") or body.get("idempotency_key")
-                return self._send(201, self.runtime._task_resource(self.runtime.create_task(body)))
-            return self._send(201, self.runtime.store.create_task(body.get("capability", ""), body.get("spec", {}), body.get("project"), body.get("idempotency_key"), body.get("expected_effect")))
+            body["idempotency_key"] = self.headers.get("Idempotency-Key") or body.get("idempotency_key")
+            return self._send(201, self.runtime._task_resource(self.runtime.create_task(body)))
         if path == ["v1", "tasks", "claim"] and method == "POST":
             self._identity("worker:execute")
             result = self.runtime.claim_next(self._body())
@@ -199,36 +199,42 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if method == "GET":
                 self._identity("tasks:read")
                 value = self.runtime.task(task_id)
-                return self._send(200, self.runtime._task_resource(value) if canonical else value)
+                return self._send(200, self.runtime._task_resource(value))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
             self._identity("worker:execute" if action in ("claim", "settle", "heartbeat") else "tasks:write")
             if method == "POST" and action == "claim":
-                return self._send(200, self.runtime.claim(task_id, self._body()))
+                return self._send(200, self.runtime._task_resource(self.runtime.claim(task_id, self._body())))
             if method == "POST" and action == "settle":
-                return self._send(200, self.runtime.settle(task_id, self._body()))
+                return self._send(200, self.runtime._task_resource(self.runtime.settle(task_id, self._body())))
             if method == "POST" and action == "heartbeat":
                 return self._send(200, self.runtime.heartbeat(task_id, self._body()))
             if method == "POST" and action == "cancel":
-                if canonical:
-                    return self._send(200, self.runtime.cancel_task_canonical(task_id, self._body()))
-                return self._send(200, self.runtime.cancel(task_id))
+                return self._send(200, self.runtime.cancel_task_canonical(task_id, self._body()))
             if method == "POST" and action == "retry":
                 return self._send(200, self.runtime.retry_task(task_id, self._body()))
             if method == "GET" and action == "events":
                 task = self.runtime.store.get_task(task_id)
-                return self._send(200, self.runtime.events(task["run"]["id"]))
+                return self._send(200, self.runtime.events_page(task["run"]["id"]))
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
             self._identity("worker:execute")
             action = path[3]
             if action == "settle": return self._send(200, self.runtime.settle_attempt(path[2], self._body()))
             if action == "heartbeat": return self._send(200, self.runtime.heartbeat_attempt(path[2], self._body()))
+            if action == "fail": return self._send(200, self.runtime.fail_attempt(path[2], self._body()))
+        if len(path) == 3 and path[:2] == ["v1", "generations"] and method == "GET":
+            self._identity("projects:read"); return self._send(200, self.runtime.get_generation(path[2]))
+        if len(path) == 4 and path[:2] == ["v1", "generations"] and path[3] == "variants":
+            self._identity("projects:read" if method == "GET" else "projects:write")
+            if method == "GET": return self._send(200, self.runtime.list_variants(path[2]))
+            if method == "POST": return self._send(201, self.runtime.create_variant(path[2], self._body()))
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] == "events" and method == "GET":
             self._identity("tasks:read")
-            return self._send(200, self.runtime.events(path[2]))
+            return self._send(200, self.runtime.events_page(path[2]))
         if path == ["v1", "events"] and method == "GET":
             self._identity("tasks:read")
-            return self._send(200, self.runtime.events_page(parse_qs(urlsplit(self.path).query).get("aggregate_id", [None])[0]))
+            query = parse_qs(urlsplit(self.path).query)
+            return self._send(200, self.runtime.events_page(query.get("aggregate_id", [None])[0], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if path == ["v1", "capabilities"] and method == "GET":
             self._identity("worker:execute")
             return self._send(200, self.runtime.list_capabilities())
@@ -240,7 +246,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(201, self.runtime.register_executor(self._body()))
         if len(path) == 3 and path[:2] == ["v1", "runs"] and method == "GET":
             self._identity("tasks:read")
-            return self._send(200, self.runtime.task(path[2]))
+            return self._send(200, self.runtime.run(path[2]))
         raise NotFoundError("route not found")
 
     def do_GET(self):

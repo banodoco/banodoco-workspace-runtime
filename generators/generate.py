@@ -40,7 +40,8 @@ def render() -> dict[str, str]:
     operations = operation_index()
     py = '"""Generated contract metadata; do not edit by hand."""\n\nPROTOCOL = "workspace.v1"\nSCHEMA_DIGEST = ' + repr(digest) + "\nOPERATIONS = " + repr(tuple(operations)) + "\n"
     ts = '/** Generated contract metadata; do not edit by hand. */\n\nexport const PROTOCOL = "workspace.v1" as const;\nexport const SCHEMA_DIGEST = ' + json.dumps(digest) + ";\nexport const OPERATIONS = " + json.dumps(operations) + " as const;\n"
-    return {"packages/python/banodoco_workspace_client/contract_metadata.py": py, "packages/typescript/src/contract-metadata.ts": ts}
+    runtime = '"""Generated contract metadata; do not edit by hand."""\n\nPROTOCOL = "workspace.v1"\nSCHEMA_DIGEST = ' + repr(digest) + "\nOPERATIONS = " + repr(tuple(operations)) + "\n"
+    return {"packages/python/banodoco_workspace_client/contract_metadata.py": py, "packages/typescript/src/contract-metadata.ts": ts, "runtime_protocol/contract_metadata.py": runtime}
 
 
 def main() -> int:

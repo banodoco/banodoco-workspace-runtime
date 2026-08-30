@@ -42,8 +42,8 @@ class RuntimeDaemon:
         if self.httpd:
             return self
         self.service = RuntimeService(self.root, display_name=self.display_name)
-        self.token, self.credential_path = self.credentials.provision("owner", ["admin", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register"])
-        self.worker_token, _ = self.credentials.provision("fake-worker", ["worker:execute", "tasks:read"])
+        self.token, self.credential_path = self.credentials.provision("owner", ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register"])
+        self.worker_token, _ = self.credentials.provision("fake-worker", ["handshake", "worker:execute", "tasks:read"])
         self.httpd = RuntimeHTTPServer((self.host, self.port), RuntimeHandler)
         self.httpd.runtime = self.service
         self.httpd.credentials = self.credentials

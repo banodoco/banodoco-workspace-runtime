@@ -24,10 +24,7 @@ class Api:
             with urllib.request.urlopen(request, timeout=5) as response:
                 data = response.read()
                 if response.headers.get("Content-Type", "").startswith("application/json"):
-                    envelope = json.loads(data)
-                    if not envelope.get("ok"):
-                        raise RuntimeError(envelope.get("error"))
-                    return envelope.get("data")
+                    return json.loads(data)
                 return data, dict(response.headers)
         except urllib.error.HTTPError as exc:
             try:

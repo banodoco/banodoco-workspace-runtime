@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEASE_SECONDS = 30
 
 
@@ -89,98 +89,41 @@ class RealmStore:
         if version > SCHEMA_VERSION:
             raise ValidationError(f"database schema {version} is newer than runtime {SCHEMA_VERSION}")
         if version < 1:
-            try:
-                self.conn.executescript("""
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS realm (
-                    id TEXT PRIMARY KEY, display_name TEXT NOT NULL,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS projects (
-                    id TEXT PRIMARY KEY, realm_id TEXT NOT NULL REFERENCES realm(id),
-                    slug TEXT NOT NULL, name TEXT NOT NULL, metadata_json TEXT NOT NULL,
-                    version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    idempotency_key TEXT, UNIQUE(realm_id, slug), UNIQUE(realm_id, idempotency_key)
-                );
-                CREATE TABLE IF NOT EXISTS objects (
-                    digest TEXT PRIMARY KEY, size INTEGER NOT NULL, media_type TEXT NOT NULL,
-                    original_name TEXT, created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS project_objects (
-                    project_id TEXT NOT NULL REFERENCES projects(id), digest TEXT NOT NULL REFERENCES objects(digest),
-                    relation TEXT NOT NULL DEFAULT 'managed', created_at TEXT NOT NULL,
-                    PRIMARY KEY(project_id, digest, relation)
-                );
-                CREATE TABLE IF NOT EXISTS runs (
-                    id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), capability TEXT NOT NULL,
-                    spec_json TEXT NOT NULL, status TEXT NOT NULL, idempotency_key TEXT,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(project_id, idempotency_key)
-                );
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), capability TEXT NOT NULL,
-                    spec_json TEXT NOT NULL, status TEXT NOT NULL, lease_token TEXT,
-                    worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0, expected_effect_json TEXT,
-                    result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id),
-                    task_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL,
-                    previous_hash TEXT, event_hash TEXT NOT NULL, created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS workers (
-                    id TEXT PRIMARY KEY, capabilities_json TEXT NOT NULL, max_concurrency INTEGER NOT NULL,
-                    resource_keys_json TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS reservations (
-                    task_id TEXT NOT NULL REFERENCES tasks(id), resource_key TEXT NOT NULL,
-                    lease_token TEXT NOT NULL, created_at TEXT NOT NULL, released_at TEXT,
-                    PRIMARY KEY(task_id, resource_key)
-                );
-                CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
-                CREATE INDEX IF NOT EXISTS idx_projects_realm ON projects(realm_id);
-                INSERT INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'));
-                COMMIT;
-                """)
-            except Exception:
-                self.conn.rollback()
-                raise
+            self._run_migration(1)
+            version = 1
         if version < 2:
-            try:
-                # A short-lived convergence build created ``capabilities``
-                # before this migration with seven columns.  Upgrade that
-                # shape in place so existing realms remain readable.
-                capability_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
-                if capability_columns:
-                    for column in ("created_at", "updated_at"):
-                        if column not in capability_columns:
-                            self.conn.execute(f"ALTER TABLE capabilities ADD COLUMN {column} TEXT")
-                self.conn.executescript("""
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS capabilities (
-                    id TEXT PRIMARY KEY, definition_digest TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'ready', required_resource_keys_json TEXT NOT NULL DEFAULT '[]',
-                    estimated_scratch_bytes INTEGER NOT NULL DEFAULT 0, estimated_output_bytes INTEGER NOT NULL DEFAULT 0,
-                    unavailable_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-                );
-                ALTER TABLE workers ADD COLUMN readiness TEXT NOT NULL DEFAULT 'ready';
-                ALTER TABLE workers ADD COLUMN readiness_reason TEXT;
-                ALTER TABLE tasks ADD COLUMN capability_digest TEXT;
-                ALTER TABLE tasks ADD COLUMN waiting_reason TEXT;
-                ALTER TABLE tasks ADD COLUMN lease_expires_at TEXT;
-                ALTER TABLE tasks ADD COLUMN lease_fence INTEGER NOT NULL DEFAULT 0;
-                ALTER TABLE reservations ADD COLUMN worker_id TEXT;
-                ALTER TABLE reservations ADD COLUMN fence INTEGER NOT NULL DEFAULT 0;
-                ALTER TABLE reservations ADD COLUMN lease_expires_at TEXT;
-                CREATE INDEX IF NOT EXISTS idx_tasks_worker_status ON tasks(worker_id, status);
-                CREATE INDEX IF NOT EXISTS idx_reservations_active ON reservations(worker_id, resource_key, released_at);
-                INSERT INTO schema_migrations(version, applied_at) VALUES (2, datetime('now'));
-                COMMIT;
-                """)
-                timestamp = now()
-                self.conn.execute("UPDATE capabilities SET created_at=COALESCE(created_at, ?), updated_at=COALESCE(updated_at, ?)", (timestamp, timestamp))
-            except Exception:
-                self.conn.rollback()
-                raise
+            # A short-lived convergence build created ``capabilities`` before
+            # this migration with seven columns. Upgrade that shape explicitly
+            # so old realms remain readable; the ALTER is part of migration 2,
+            # never a swallowed startup repair.
+            capability_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
+            if capability_columns:
+                missing = [column for column in ("created_at", "updated_at") if column not in capability_columns]
+                if missing:
+                    statements = ["BEGIN IMMEDIATE"]
+                    statements.extend(f"ALTER TABLE capabilities ADD COLUMN {column} TEXT" for column in missing)
+                    statements.append("COMMIT")
+                    self.conn.executescript(";\n".join(statements) + ";")
+            self._run_migration(2)
+            self.conn.execute("UPDATE capabilities SET created_at=COALESCE(created_at, ?), updated_at=COALESCE(updated_at, ?)", (now(), now()))
+            version = 2
+        if version < 3:
+            task_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(tasks)")}
+            statements = ["BEGIN IMMEDIATE"]
+            if "attempt_id" not in task_columns:
+                statements.append("ALTER TABLE tasks ADD COLUMN attempt_id TEXT")
+            statements.append((Path(__file__).parent / "migrations" / "003_domains.sql").read_text(encoding="utf-8"))
+            statements.append("INSERT INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'))")
+            statements.append("COMMIT")
+            self.conn.executescript(";\n".join(statements) + ";")
+
+    def _run_migration(self, version):
+        migration = (Path(__file__).parent / "migrations" / f"{version:03d}_*.sql")
+        matches = list(migration.parent.glob(migration.name))
+        if len(matches) != 1:
+            raise ValidationError(f"migration {version} is missing or ambiguous")
+        script = matches[0].read_text(encoding="utf-8")
+        self.conn.executescript("BEGIN IMMEDIATE;\n" + script + f"\nINSERT INTO schema_migrations(version, applied_at) VALUES ({version}, datetime('now'));\nCOMMIT;")
 
     def close(self):
         with self._mutex:
@@ -247,7 +190,7 @@ class RealmStore:
             return self._project(selector)
 
     def list_projects(self):
-        return [self._project(row["id"]) for row in self.conn.execute("SELECT id FROM projects ORDER BY created_at")]
+        return {"items": [self._project(row["id"]) for row in self.conn.execute("SELECT id FROM projects ORDER BY created_at")], "next_cursor": None}
 
     def update_project(self, selector: str, *, name=None, metadata=None, expected_version=None):
         with self._mutex:
@@ -299,6 +242,8 @@ class RealmStore:
                     capability_digest = registered_digest
                     waiting_reason = "capability_unavailable" if registered["status"] != "ready" else None
                 else:
+                    if capability_digest is not None:
+                        raise ConflictError("capability is not registered", details={"capability_id": capability})
                     waiting_reason = None
                 if waiting_reason is None and not self.storage_preflight(capability)["ok"]:
                     waiting_reason = "insufficient_storage"
@@ -469,6 +414,8 @@ class RealmStore:
                     waiting_reason = "waiting_for_worker"
                 elif worker["readiness"] != "ready":
                     waiting_reason = "waiting_for_worker"
+                elif not capability and task["capability_digest"] is not None:
+                    raise ConflictError("capability is not registered", details={"capability_id": task["capability"]})
                 elif capability and capability["status"] != "ready":
                     waiting_reason = "capability_unavailable"
                 elif not self.storage_preflight(task["capability"])["ok"]:
@@ -549,6 +496,23 @@ class RealmStore:
         if current is not None and int(current["version"]) != expected_version:
             raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
 
+    def _apply_settlement_effect(self, effect):
+        kind = effect.get("effect_type") or effect.get("kind")
+        if kind != "project.update":
+            return
+        target = effect.get("target_id") or effect.get("target")
+        current = self._project(str(target))
+        payload = effect.get("payload") or {}
+        if not isinstance(payload, dict):
+            raise ValidationError("project.update payload must be an object")
+        name = payload.get("name", current["name"])
+        metadata = payload.get("metadata", current["metadata"])
+        if not name:
+            raise ValidationError("project name is required")
+        changed = self.conn.execute("UPDATE projects SET name=?, metadata_json=?, version=version+1, updated_at=? WHERE id=? AND version=?", (name, canonical_json(metadata), now(), current["id"], int(effect["expected_version"])))
+        if changed.rowcount != 1:
+            raise ConflictError("stale settlement effect target version")
+
     def settle_task(self, task_id, lease_token, result, *, effect=None, output_objects=None, fence=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -573,6 +537,8 @@ class RealmStore:
                 self._validate_settlement_effect(effect)
             with self._transaction():
                 timestamp = now()
+                if effect is not None:
+                    self._apply_settlement_effect(effect)
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self._release_reservations(task_id, lease_token)
@@ -614,6 +580,30 @@ class RealmStore:
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
                 self._append_event(task["run_id"], task_id, "task.cancelled", {})
+                return self.get_task(task_id)
+
+    def fail_task(self, task_id, lease_token, failure, *, fence=None):
+        with self._mutex:
+            task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                raise NotFoundError("task not found")
+            if task["status"] != "running" or task["lease_token"] != lease_token:
+                raise LeaseError("attempt lease is stale or already settled")
+            if fence is not None and int(fence) != int(task["lease_fence"] or 0):
+                raise LeaseError("attempt fence is stale", details={"expected": task["lease_fence"], "actual": fence})
+            if task["lease_expires_at"]:
+                try:
+                    if datetime.fromisoformat(task["lease_expires_at"]) <= datetime.now(timezone.utc):
+                        raise LeaseError("attempt lease has expired")
+                except ValueError as exc:
+                    raise LeaseError("attempt lease deadline is invalid") from exc
+            with self._transaction():
+                timestamp = now()
+                result = {"error": failure}
+                self.conn.execute("UPDATE tasks SET status='failed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
+                self.conn.execute("UPDATE runs SET status='failed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
+                self._release_reservations(task_id, lease_token)
+                self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
                 return self.get_task(task_id)
 
     def doctor(self):

@@ -7,8 +7,11 @@ from .util import atomic_json_write
 from .util import canonical_json, new_id, now
 import hashlib
 import json
+import sqlite3
+import base64
 from pathlib import Path
 from .errors import ConflictError, NotFoundError, ValidationError, LeaseError
+from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 
 
 class RuntimeService:
@@ -18,38 +21,6 @@ class RuntimeService:
         self.store = RealmStore(root)
         self.cas = ContentAddressedStore(self.store.cas_root)
         self.realm = self.store.ensure_realm(display_name)
-        # These small protocol tables are additive to the Stage 1 store schema;
-        # keeping them here lets old realms upgrade without a destructive
-        # migration while making attempts and composition durable.
-        self.store.conn.executescript("""
-        CREATE TABLE IF NOT EXISTS executors (
-          id TEXT PRIMARY KEY, max_concurrency INTEGER NOT NULL,
-          resource_keys_json TEXT NOT NULL, capabilities_json TEXT NOT NULL,
-          protocol TEXT NOT NULL, created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS attempts (
-          id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
-          lease_id TEXT NOT NULL, fence INTEGER NOT NULL, executor_id TEXT NOT NULL,
-          lease_expires_at TEXT NOT NULL, settled INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS timelines (
-          id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
-          version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS timeline_shots (
-          id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL REFERENCES timelines(id),
-          start_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
-          reference_ids_json TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS timeline_references (
-          id TEXT PRIMARY KEY, timeline_id TEXT NOT NULL REFERENCES timelines(id),
-          object_id TEXT NOT NULL, role TEXT
-        );
-        """)
-        try:
-            self.store.conn.execute("ALTER TABLE tasks ADD COLUMN attempt_id TEXT")
-        except Exception:
-            pass
         self._ensure_default_capability()
 
     def close(self):
@@ -68,7 +39,7 @@ class RuntimeService:
         return value
 
     def health(self):
-        return {"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:92a7ec05df9ee82945142e7f294b82236f9bb69e3e3f612adc04b67665b43bf5", "runtime_epoch": 1}
+        return {"status": "ok", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": 1}
 
     def realm_resource(self):
         row = self.store.realm
@@ -76,7 +47,10 @@ class RuntimeService:
 
     def handshake(self, body):
         requested = list(body.get("requested_scopes") or [])
-        return {"protocol": "workspace.v1", "schema_digest": "sha256:92a7ec05df9ee82945142e7f294b82236f9bb69e3e3f612adc04b67665b43bf5", "session_id": new_id(), "actor_id": str(body.get("client_name") or "anonymous"), "realm_id": self.realm["id"], "scopes": requested}
+        actor = body.get("authenticated_actor")
+        if not actor:
+            raise ValidationError("authenticated actor is required")
+        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested}
 
     def create_project(self, body, *, idempotency_key=None):
         name = str(body.get("name") or "")
@@ -88,7 +62,7 @@ class RuntimeService:
         return self.store.get_project(selector)
 
     def list_projects(self):
-        return self.store.list_projects()
+        return {"items": [self._project_resource(value) for value in self.store.list_projects()["items"]], "next_cursor": None}
 
     def update_project(self, selector, body):
         return self.store.update_project(selector, name=body.get("name"), metadata=body.get("metadata"), expected_version=body.get("expected_version"))
@@ -103,7 +77,55 @@ class RuntimeService:
         refs = [dict(x) for x in self.store.conn.execute("SELECT * FROM timeline_references WHERE timeline_id=?", (timeline_id,))]
         return {"timeline_id": row["id"], "project_id": row["project_id"], "version": row["version"], "shots": [{"shot_id": x["id"], "start_ms": x["start_ms"], "duration_ms": x["duration_ms"], "reference_ids": json.loads(x["reference_ids_json"])} for x in shots], "references": [{"reference_id": x["id"], "object_id": x["object_id"], **({"role": x["role"]} if x["role"] else {})} for x in refs]}
 
+    @staticmethod
+    def _expected_version(body):
+        value = (body or {}).get("expected_version")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValidationError("expected_version must be a positive integer")
+        return value
+
+    def update_timeline(self, timeline_id, body):
+        expected = self._expected_version(body)
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
+            if not row:
+                raise NotFoundError("timeline not found")
+            if int(row["version"]) != expected:
+                raise ConflictError("timeline version conflict", details={"expected": expected, "actual": int(row["version"])})
+            shots = body.get("shots")
+            refs = body.get("references")
+            if shots is not None:
+                if not isinstance(shots, list) or len({item.get("shot_id") for item in shots if isinstance(item, dict)}) != len(shots):
+                    raise ValidationError("shots must be a list with unique shot_id values")
+                for shot in shots:
+                    if not isinstance(shot, dict) or not shot.get("shot_id") or int(shot.get("start_ms", -1)) < 0 or int(shot.get("duration_ms", 0)) < 1:
+                        raise ValidationError("invalid shot timing")
+            if refs is not None:
+                if not isinstance(refs, list) or len({item.get("reference_id") for item in refs if isinstance(item, dict)}) != len(refs):
+                    raise ValidationError("references must be a list with unique reference_id values")
+                for reference in refs:
+                    if not isinstance(reference, dict) or not reference.get("reference_id") or not reference.get("object_id"):
+                        raise ValidationError("references require reference_id and object_id")
+            if shots is None:
+                shots = [dict(value) for value in self.store.conn.execute("SELECT * FROM timeline_shots WHERE timeline_id=?", (timeline_id,))]
+                shots = [{"shot_id": value["id"], "start_ms": value["start_ms"], "duration_ms": value["duration_ms"], "reference_ids": json.loads(value["reference_ids_json"])} for value in shots]
+            if refs is None:
+                refs = [dict(value) for value in self.store.conn.execute("SELECT * FROM timeline_references WHERE timeline_id=?", (timeline_id,))]
+                refs = [{"reference_id": value["id"], "object_id": value["object_id"], **({"role": value["role"]} if value["role"] else {})} for value in refs]
+            with self.store._transaction():
+                timestamp = now()
+                self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
+                self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
+                for shot in shots:
+                    self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
+                for reference in refs:
+                    self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
+                self.store.conn.execute("UPDATE timelines SET version=?, created_at=created_at WHERE id=?", (expected + 1, timeline_id))
+            return self._timeline_resource(timeline_id)
+
     def create_timeline(self, project_id, timeline_id):
+        if not timeline_id:
+            raise ValidationError("timeline_id is required")
         project = self.store.get_project(project_id)
         self.store.conn.execute("INSERT OR IGNORE INTO timelines VALUES (?, ?, 1, ?)", (timeline_id, project["id"], now()))
         return self._timeline_resource(timeline_id)
@@ -128,6 +150,121 @@ class RuntimeService:
         self._timeline_resource(timeline_id)
         self.store.conn.execute("INSERT OR REPLACE INTO timeline_references VALUES (?, ?, ?, ?)", (body["reference_id"], timeline_id, body["object_id"], body.get("role")))
         return {k: v for k, v in body.items() if k in {"reference_id", "object_id", "role"}}
+
+    def _document_resource(self, row):
+        value = dict(row)
+        value["document_id"] = value.pop("id")
+        value["content"] = json.loads(value.pop("content_json"))
+        return value
+
+    def create_document(self, project_id, body):
+        project = self.store.get_project(project_id)
+        document_id = str(body.get("document_id") or "")
+        kind = str(body.get("kind") or "")
+        if not document_id or not kind or "content" not in body:
+            raise ValidationError("document_id, kind, and content are required")
+        content = body["content"]
+        with self.store._mutex:
+            existing = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
+            if existing:
+                if existing["kind"] == kind and json.loads(existing["content_json"]) == content:
+                    return self._document_resource(existing)
+                raise ConflictError("document already exists", details={"document_id": document_id})
+            timestamp = now()
+            self.store.conn.execute("INSERT INTO project_documents VALUES (?, ?, ?, ?, 1, ?, ?)", (document_id, project["id"], kind, canonical_json(content), timestamp, timestamp))
+            return self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
+
+    def list_documents(self, project_id):
+        project = self.store.get_project(project_id)
+        return {"items": [self._document_resource(row) for row in self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? ORDER BY created_at, id", (project["id"],))], "next_cursor": None}
+
+    def get_document(self, project_id, document_id):
+        project = self.store.get_project(project_id)
+        row = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
+        if not row:
+            raise NotFoundError("document not found")
+        return self._document_resource(row)
+
+    def update_document(self, project_id, document_id, body):
+        expected = self._expected_version(body)
+        project = self.store.get_project(project_id)
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
+            if not row:
+                raise NotFoundError("document not found")
+            if int(row["version"]) != expected:
+                raise ConflictError("document version conflict", details={"expected": expected, "actual": int(row["version"])})
+            kind = str(body.get("kind", row["kind"]))
+            content = body.get("content", json.loads(row["content_json"]))
+            if not kind:
+                raise ValidationError("document kind is required")
+            timestamp = now()
+            self.store.conn.execute("UPDATE project_documents SET kind=?, content_json=?, version=?, updated_at=? WHERE id=?", (kind, canonical_json(content), expected + 1, timestamp, document_id))
+            return self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
+
+    def _generation_resource(self, row):
+        value = dict(row)
+        value["generation_id"] = value.pop("id")
+        value["metadata"] = json.loads(value.pop("metadata_json"))
+        return value
+
+    def create_generation(self, project_id, body):
+        project = self.store.get_project(project_id)
+        generation_id = str(body.get("generation_id") or "")
+        if not generation_id:
+            raise ValidationError("generation_id is required")
+        metadata = body.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValidationError("generation metadata must be an object")
+        with self.store._mutex:
+            try:
+                self.store.conn.execute("INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)", (generation_id, project["id"], body.get("source_task_id"), body.get("type", "generation"), body.get("status", "created"), canonical_json(metadata), now(), now()))
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("generation already exists", details={"generation_id": generation_id}) from exc
+            return self._generation_resource(self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone())
+
+    def list_generations(self, project_id):
+        project = self.store.get_project(project_id)
+        return {"items": [self._generation_resource(row) for row in self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at, id", (project["id"],))], "next_cursor": None}
+
+    def get_generation(self, generation_id):
+        row = self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone()
+        if not row:
+            raise NotFoundError("generation not found")
+        return self._generation_resource(row)
+
+    def create_variant(self, generation_id, body):
+        self.get_generation(generation_id)
+        variant_id = str(body.get("variant_id") or "")
+        if not variant_id:
+            raise ValidationError("variant_id is required")
+        metadata = body.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValidationError("variant metadata must be an object")
+        object_id = body.get("object_id")
+        if object_id:
+            object_id = str(object_id).removeprefix("sha256:")
+            if not self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (object_id,)).fetchone():
+                raise NotFoundError("object not found")
+        with self.store._mutex:
+            try:
+                self.store.conn.execute("INSERT INTO generation_variants VALUES (?, ?, ?, ?, ?, ?)", (variant_id, generation_id, object_id, body.get("variant_type", "original"), canonical_json(metadata), now()))
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("generation variant already exists", details={"variant_id": variant_id}) from exc
+            return self._variant_resource(self.store.conn.execute("SELECT * FROM generation_variants WHERE id=?", (variant_id,)).fetchone())
+
+    @staticmethod
+    def _variant_resource(row):
+        value = dict(row)
+        value["variant_id"] = value.pop("id")
+        value["metadata"] = json.loads(value.pop("metadata_json"))
+        if value.get("object_id"):
+            value["object_id"] = "sha256:" + value["object_id"]
+        return value
+
+    def list_variants(self, generation_id):
+        self.get_generation(generation_id)
+        return {"items": [self._variant_resource(row) for row in self.store.conn.execute("SELECT * FROM generation_variants WHERE generation_id=? ORDER BY created_at, id", (generation_id,))], "next_cursor": None}
 
     def get_reference(self, reference_id):
         row = self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (reference_id,)).fetchone()
@@ -166,6 +303,15 @@ class RuntimeService:
 
     def task(self, task_id):
         return self.store.get_task(task_id)
+
+    def run(self, run_id):
+        row = self.store.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            raise NotFoundError("run not found")
+        value = dict(row)
+        value["spec"] = json.loads(value.pop("spec_json"))
+        value["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (run_id,))]
+        return value
 
     def _task_resource(self, value):
         task, run = value["task"], value["run"]
@@ -269,10 +415,37 @@ class RuntimeService:
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         if not row or row["settled"] or row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
             raise LeaseError("attempt lease is stale or already settled")
-        result = {"outputs": body.get("outputs", [])}
+        outputs = self._publish_outputs(body.get("outputs", []))
+        result = {"outputs": outputs}
         value = self.store.settle_task(row["task_id"], row["lease_id"], result, effect=body.get("effect"), fence=body.get("fence"))
         self.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (attempt_id,))
         return self._task_resource(value)
+
+    def _publish_outputs(self, outputs):
+        if not isinstance(outputs, list):
+            raise ValidationError("outputs must be a list")
+        published = []
+        for output in outputs:
+            if not isinstance(output, dict) or not output.get("digest"):
+                raise ValidationError("each output requires a digest")
+            digest = str(output["digest"]).removeprefix("sha256:")
+            data_field = output.get("data_base64")
+            if data_field is not None:
+                try:
+                    data = base64.b64decode(data_field, validate=True)
+                except (ValueError, TypeError) as exc:
+                    raise ValidationError("output data_base64 is invalid") from exc
+                stored = self.cas.put(data, expected_digest=digest)
+                size = stored["size"]
+            else:
+                path = self.cas.path_for(digest)
+                if not path.is_file():
+                    raise ConflictError("output must be published to runtime CAS before settlement", details={"digest": output["digest"]})
+                size = path.stat().st_size
+                self.cas.verify(digest)
+            self.store.record_object(digest, size, output.get("media_type", "application/octet-stream"), output.get("name"))
+            published.append({key: value for key, value in output.items() if key != "data_base64"})
+        return published
 
     def heartbeat_attempt(self, attempt_id, body):
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
@@ -283,10 +456,28 @@ class RuntimeService:
         self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
         return {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires}
 
-    def events_page(self, aggregate_id=None):
-        rows = self.store.conn.execute("SELECT * FROM events ORDER BY id").fetchall()
+    def fail_attempt(self, attempt_id, body):
+        row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        if not row or row["settled"] or row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
+            raise LeaseError("attempt lease is stale or already settled")
+        failure = body.get("error") or body.get("reason") or {"code": "executor_failed"}
+        value = self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"])
+        self.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (attempt_id,))
+        return self._task_resource(value)
+
+    def events_page(self, aggregate_id=None, *, cursor=None, limit=50):
+        try:
+            page_size = max(1, min(200, int(limit)))
+            after = int(cursor or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("cursor and limit must be valid integers") from exc
+        rows = self.store.conn.execute("SELECT * FROM events WHERE id>? ORDER BY id", (after,)).fetchall()
         items = []
         for row in rows:
             if aggregate_id and aggregate_id not in (row["task_id"], row["run_id"]): continue
             items.append({"event_id": str(row["id"]), "sequence": int(row["id"]), "cursor": str(row["id"]), "event_type": row["kind"], "aggregate_type": "task" if row["task_id"] else "run", "aggregate_id": row["task_id"] or row["run_id"], "payload": json.loads(row["payload_json"]), "occurred_at": row["created_at"]})
-        return {"items": items, "next_cursor": None}
+        next_cursor = None
+        if len(items) > page_size:
+            items = items[:page_size]
+            next_cursor = items[-1]["cursor"]
+        return {"items": items, "next_cursor": next_cursor}
