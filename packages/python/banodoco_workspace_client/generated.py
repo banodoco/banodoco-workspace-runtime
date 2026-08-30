@@ -204,10 +204,11 @@ class Task:
     created_at: str
     updated_at: str
     attempt_id: str | None = None
+    result: Mapping[str, Any] | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Task":
-        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], attempt_id=value.get("attempt_id"))
+        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], attempt_id=value.get("attempt_id"), result=value.get("result"))
 
 
 @dataclass(frozen=True)
@@ -390,9 +391,9 @@ class WorkspaceClient:
         *,
         config: Mapping[str, Any],
         registry: Mapping[str, Any],
-        slug: str,
-        name: str,
         idempotency_key: str,
+        slug: str | None = None,
+        name: str | None = None,
     ) -> Mapping[str, Any]:
         """Create a timeline and persist its product document atomically enough for clients.
 
@@ -400,13 +401,24 @@ class WorkspaceClient:
         composition separately. This helper composes those existing primitives
         without importing an Astrid-specific schema into the runtime.
         """
+        slug = slug or timeline_id
+        name = name or slug
         timeline = self.create_timeline(project_id, timeline_id, idempotency_key=idempotency_key)
-        document = self.create_document(
-            project_id,
-            f"timeline:{timeline_id}",
-            "timeline.composition",
-            {"slug": slug, "name": name, "config": dict(config), "registry": dict(registry)},
-        )
+        content = {"slug": slug, "name": name, "config": dict(config), "registry": dict(registry)}
+        # A response can be lost after either request. Replaying the
+        # deterministic document write is safe because create_document is
+        # idempotent for the same document id/kind/content. A caller can also
+        # retry the same idempotency key after a persistent transport failure.
+        document = None
+        last_error: Exception | None = None
+        for _ in range(2):
+            try:
+                document = self.create_document(project_id, f"timeline:{timeline_id}", "timeline.composition", content)
+                break
+            except Exception as exc:
+                last_error = exc
+        if document is None:
+            raise RuntimeError("timeline composition document was not persisted; retry the same idempotency key") from last_error
         result = dict(timeline)
         result.update({"slug": slug, "name": name, "config_version": document.version, "config": dict(config), "registry": dict(registry)})
         return result

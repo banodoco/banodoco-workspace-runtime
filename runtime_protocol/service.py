@@ -563,6 +563,8 @@ class RuntimeService:
             resource["lease_fence"] = task["lease_fence"]
         if task.get("lease_expires_at"):
             resource["lease_expires_at"] = task["lease_expires_at"]
+        if task.get("result") is not None:
+            resource["result"] = task["result"]
         return resource
 
     def claim(self, task_id, body):

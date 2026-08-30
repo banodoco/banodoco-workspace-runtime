@@ -65,6 +65,50 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         daemon.stop()
 
 
+def test_timeline_document_retry_repairs_partial_two_request_write(tmp_path, monkeypatch):
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Composition", idempotency_key="composition-project")
+        original = client.create_document
+        calls = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ConnectionError("response lost after composition write")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(client, "create_document", fail_once)
+        result = client.create_timeline_document(
+            project.project_id,
+            "composition",
+            config={"tracks": []},
+            registry={"assets": {}},
+            idempotency_key="composition-timeline",
+            slug=None,
+            name=None,
+        )
+        assert calls == 2
+        assert result["slug"] == "composition" and result["name"] == "composition"
+        assert client.get_timeline("composition")["config"] == {"tracks": []}
+
+        # Replaying after the partial write is idempotent and does not add a
+        # second timeline or composition document.
+        replay = client.create_timeline_document(
+            project.project_id,
+            "composition",
+            config={"tracks": []},
+            registry={"assets": {}},
+            idempotency_key="composition-timeline",
+        )
+        assert replay["config_version"] == result["config_version"]
+        assert len(client.list_timelines(project.project_id)[0]) == 1
+    finally:
+        daemon.stop()
+
+
 def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path):
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:

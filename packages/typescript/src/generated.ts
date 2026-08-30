@@ -16,7 +16,7 @@ export interface ManagedObject { object_id: string; digest: string; media_type: 
 export interface MediaRelation { project_id: string; from_object_id: string; to_object_id: string; kind: "derived_from" | "variant_of" | "uses_as_input" | "mask_for" | "audio_for"; metadata: Record<string, unknown>; created_at: string }
 export interface ByteResponse { data: Uint8Array; status: number; headers: HeadersLike; etag?: string; content_range?: string }
 export type TaskState = "queued" | "ready" | "running" | "succeeded" | "failed" | "cancel_requested" | "cancelled" | "retrying";
-export interface Task { task_id: string; run_id: string; state: TaskState; version: number; capability_id: string; capability_digest: string; idempotency_key: string; created_at: string; updated_at: string; attempt_id?: string | null }
+export interface Task { task_id: string; run_id: string; state: TaskState; version: number; capability_id: string; capability_digest: string; idempotency_key: string; created_at: string; updated_at: string; attempt_id?: string | null; result?: Record<string, unknown> | null }
 export interface Event { event_id: string; sequence: number; cursor: string; event_type: string; aggregate_type: string; aggregate_id: string; payload: Record<string, unknown>; occurred_at: string }
 export type CapabilityStatus = "ready" | "unavailable" | "unsupported" | "retired";
 export interface Capability { capability_id: string; definition_digest: string; status: CapabilityStatus; required_resource_keys: string[]; estimated_scratch_bytes: number; estimated_output_bytes: number; unavailable_reason?: string | null }
@@ -61,9 +61,17 @@ export class WorkspaceClient {
   async updateDocument(projectId: string, documentId: string, expectedVersion: number, content?: unknown, kind?: string): Promise<ProjectDocument> { const payload: Record<string, unknown> = { expected_version: expectedVersion }; if (content !== undefined) payload.content = content; if (kind !== undefined) payload.kind = kind; return this.json<ProjectDocument>((await this.request("PATCH", `/v1/projects/${encodeURIComponent(projectId)}/documents/${encodeURIComponent(documentId)}`, new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json" })).body) }
   async listProjects(cursor?: string, limit = 50): Promise<{ items: Project[]; next_cursor: string | null }> { return this.json((await this.request("GET", `/v1/projects?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).body) }
   async createTimeline(projectId: string, timelineId: string, idempotencyKey: string): Promise<Record<string, unknown>> { return this.json((await this.request("POST", `/v1/projects/${encodeURIComponent(projectId)}/timelines`, new TextEncoder().encode(JSON.stringify({ timeline_id: timelineId })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200, 201])).body) }
-  async createTimelineDocument(projectId: string, timelineId: string, config: Record<string, unknown>, registry: Record<string, unknown>, slug: string, name: string, idempotencyKey: string): Promise<Record<string, unknown>> {
+  async createTimelineDocument(projectId: string, timelineId: string, config: Record<string, unknown>, registry: Record<string, unknown>, idempotencyKey: string, slug?: string | null, name?: string | null): Promise<Record<string, unknown>> {
+    slug ??= timelineId; name ??= slug;
     const timeline = await this.createTimeline(projectId, timelineId, idempotencyKey);
-    const document = await this.createDocument(projectId, `timeline:${timelineId}`, "timeline.composition", { slug, name, config, registry });
+    const content = { slug, name, config, registry };
+    let document: ProjectDocument | undefined;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try { document = await this.createDocument(projectId, `timeline:${timelineId}`, "timeline.composition", content); break; }
+      catch (error) { lastError = error; }
+    }
+    if (!document) throw lastError ?? new Error("timeline composition document was not persisted; retry the same idempotency key");
     return { ...timeline, slug, name, config_version: document.version, config, registry };
   }
   async updateTimelineDocument(projectId: string, timelineId: string, expectedVersion: number, config: Record<string, unknown>, registry: Record<string, unknown>, slug?: string, name?: string): Promise<Record<string, unknown>> {
