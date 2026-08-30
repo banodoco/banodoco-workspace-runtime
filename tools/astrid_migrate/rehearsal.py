@@ -184,6 +184,17 @@ class RuntimeServiceAdapter:
         snapshot["database_sha256"] = _sha256_file(self.service.store.db_path)
         return snapshot
 
+    def destination_raw_ledger(self):
+        """Read the event/stream ledger directly from the runtime authority.
+
+        B10 verification receives a separately obtained ledger so a wrapper
+        around ``destination_verification`` cannot make a truncated or
+        expanded event/stream list look complete.  Keep this method raw and
+        free of the convenience reconciliation claim below.
+        """
+        snapshot = self.destination_snapshot()
+        return {"events": snapshot.get("events", []), "event_streams": snapshot.get("event_streams", [])}
+
     # Explicit alias used by strict B10 clients.  Keeping this as a separate
     # interface makes it impossible for the rehearsal to silently fall back to
     # client-side maps or a fabricated write response.

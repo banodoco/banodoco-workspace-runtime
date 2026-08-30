@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
@@ -684,6 +685,55 @@ class Migrator:
                     seq = None
                 return (str(row.get("stream_id", "")), seq)
 
+            # A destination adapter may expose a convenience verification
+            # snapshot whose rows are transformed, paged, or accidentally
+            # truncated by a wrapper.  If it also exposes an independent raw
+            # ledger reader, reconcile the returned rows against that second
+            # authority read before applying source-to-destination checks.
+            # This is intentionally separate from the old
+            # ``event_reconciliation`` attestation: counts and identity sets
+            # come from raw rows, not booleans asserted by the wrapper.
+            raw_reader = getattr(self.client, "destination_raw_ledger", None)
+            raw_truth = None
+            if callable(raw_reader):
+                try:
+                    raw_truth = raw_reader()
+                except Exception as exc:
+                    errors.append({"kind": "events", "reason": "independent raw destination read failed", "details": str(exc)})
+                if not isinstance(raw_truth, Mapping):
+                    errors.append({"kind": "events", "reason": "independent raw destination ledger must be a mapping"})
+                    raw_truth = None
+
+            if raw_truth is not None:
+                raw_events = list(raw_truth.get("events", []))
+                raw_streams = list(raw_truth.get("event_streams", []))
+                if len(destination_events) != len(raw_events):
+                    errors.append({"kind": "events", "reason": "destination event rows are truncated or expanded", "raw": len(raw_events), "returned": len(destination_events)})
+                raw_event_ids = [str(row.get("event_id", row.get("id", ""))) for row in raw_events]
+                returned_event_ids = [str(row.get("event_id", row.get("id", ""))) for row in destination_events]
+                if Counter(raw_event_ids) != Counter(returned_event_ids):
+                    errors.append({"kind": "events", "reason": "destination event ID set differs from raw ledger", "missing": sorted((Counter(raw_event_ids) - Counter(returned_event_ids)).elements()), "unexpected": sorted((Counter(returned_event_ids) - Counter(raw_event_ids)).elements())})
+                raw_event_kinds = Counter(str(row.get("kind", row.get("event_type", ""))) for row in raw_events)
+                returned_event_kinds = Counter(str(row.get("kind", row.get("event_type", ""))) for row in destination_events)
+                if raw_event_kinds != returned_event_kinds:
+                    errors.append({"kind": "events", "reason": "destination event kind set differs from raw ledger", "missing": sorted((raw_event_kinds - returned_event_kinds).elements()), "unexpected": sorted((returned_event_kinds - raw_event_kinds).elements())})
+                if len(destination_streams) != len(raw_streams):
+                    errors.append({"kind": "events", "reason": "destination event stream rows are truncated or expanded", "raw": len(raw_streams), "returned": len(destination_streams)})
+                raw_stream_ids = [str(row.get("id", row.get("stream_id", ""))) for row in raw_streams]
+                returned_stream_ids = [str(row.get("id", row.get("stream_id", ""))) for row in destination_streams]
+                if Counter(raw_stream_ids) != Counter(returned_stream_ids):
+                    errors.append({"kind": "events", "reason": "destination event stream ID set differs from raw ledger", "missing": sorted((Counter(raw_stream_ids) - Counter(returned_stream_ids)).elements()), "unexpected": sorted((Counter(returned_stream_ids) - Counter(raw_stream_ids)).elements())})
+                def stream_key(row):
+                    return (str(row.get("id", row.get("stream_id", ""))), str(row.get("stream_type", row.get("kind", ""))), str(row.get("aggregate_id", "")), stream_head(row))
+                raw_stream_keys = Counter(stream_key(row) for row in raw_streams)
+                returned_stream_keys = Counter(stream_key(row) for row in destination_streams)
+                if raw_stream_keys != returned_stream_keys:
+                    errors.append({"kind": "events", "reason": "destination event stream set differs from raw ledger", "missing": sorted((raw_stream_keys - returned_stream_keys).elements()), "unexpected": sorted((returned_stream_keys - raw_stream_keys).elements())})
+                raw_event_semantics = Counter((str(row.get("kind", row.get("event_type", ""))), payload_digest(row)) for row in raw_events)
+                returned_event_semantics = Counter((str(row.get("kind", row.get("event_type", ""))), payload_digest(row)) for row in destination_events)
+                if raw_event_semantics != returned_event_semantics:
+                    errors.append({"kind": "events", "reason": "destination event payload set differs from raw ledger", "missing": sorted((raw_event_semantics - returned_event_semantics).elements()), "unexpected": sorted((returned_event_semantics - raw_event_semantics).elements())})
+
             # The neutral runtime currently emits a native event ledger whose
             # IDs and stream columns intentionally differ from legacy Astrid's
             # rows.  It still gets independently checked from the raw rows:
@@ -695,17 +745,11 @@ class Migrator:
                 "event_id" not in row and "stream_id" not in row for row in destination_events
             )
             if native_shape:
-                if source_events and not destination_events:
-                    errors.append({"kind": "events", "reason": "destination event ledger is truncated"})
-                native_ids = [row.get("id") for row in destination_events]
-                if any(value in (None, "") for value in native_ids) or len(native_ids) != len(set(map(str, native_ids))):
-                    errors.append({"kind": "events", "reason": "destination event IDs are missing or duplicated", "ids": native_ids})
-                if any(not row.get("kind") or not row.get("payload_json") for row in destination_events):
-                    errors.append({"kind": "events", "reason": "destination event payload is missing"})
-                # Match every raw native event to a source event by its
-                # semantic kind and payload digest.  Consume matches so a
-                # wrapper cannot truncate repeated events or substitute an
-                # altered payload while retaining a truthful-looking count.
+                # Native runtime IDs are intentionally not the legacy event
+                # IDs.  Source matching below therefore remains semantic,
+                # while the independent raw-ledger comparison above enforces
+                # exact counts and identity/kind/stream sets on the actual
+                # destination authority.
                 source_by_kind: dict[str, list[str]] = {}
                 for source in source_events:
                     source_by_kind.setdefault(str(source.get("kind", "")), []).append(payload_digest(source))
@@ -721,17 +765,29 @@ class Migrator:
                 missing_represented = {kind: len(values) for kind, values in source_by_kind.items() if kind in destination_kinds and values}
                 if missing_represented:
                     errors.append({"kind": "events", "reason": "destination event ledger is truncated", "remaining_source_events": missing_represented})
+                native_ids = [row.get("id") for row in destination_events]
+                if any(value in (None, "") for value in native_ids) or len(native_ids) != len(set(map(str, native_ids))):
+                    errors.append({"kind": "events", "reason": "destination event IDs are missing or duplicated", "ids": native_ids})
+                if any(not row.get("kind") or not row.get("payload_json") for row in destination_events):
+                    errors.append({"kind": "events", "reason": "destination event payload is missing"})
                 try:
                     if native_ids != sorted(native_ids, key=lambda value: int(value)):
                         errors.append({"kind": "events", "reason": "destination event ordering differs"})
                 except (TypeError, ValueError):
                     errors.append({"kind": "events", "reason": "destination event IDs are not ordered integers"})
-                if destination_streams:
-                    for stream in destination_streams:
-                        stream_id = str(stream.get("id", stream.get("stream_id", "")))
-                        expected_head = max((int(row.get("seq", 0)) for row in destination_events if str(row.get("stream_id")) == stream_id), default=0)
-                        if stream_head(stream) != expected_head:
-                            errors.append({"kind": "events", "reason": "destination stream head does not match raw events", "stream": stream_id})
+                # Stream IDs may also be runtime-owned.  Still require the
+                # complete raw stream set and reject an omitted, duplicated,
+                # or unexpected stream.  When native rows expose a stream
+                # reference, verify every reference resolves and every head
+                # is derived from the raw event rows.
+                native_stream_ids = [row.get("id", row.get("stream_id")) for row in destination_streams]
+                if any(value in (None, "") for value in native_stream_ids) or len(native_stream_ids) != len(set(map(str, native_stream_ids))):
+                    errors.append({"kind": "events", "reason": "destination event stream IDs are missing or duplicated", "ids": native_stream_ids})
+                for stream in destination_streams:
+                    stream_id = str(stream.get("id", stream.get("stream_id", "")))
+                    expected_head = max((int(row.get("seq", 0)) for row in destination_events if str(row.get("stream_id")) == stream_id), default=0)
+                    if stream_head(stream) != expected_head:
+                        errors.append({"kind": "events", "reason": "destination stream head does not match raw events", "stream": stream_id})
             else:
                 if len(source_events) != len(destination_events):
                     errors.append({"kind": "events", "reason": "event counts differ", "source": len(source_events), "destination": len(destination_events)})
@@ -739,8 +795,22 @@ class Migrator:
                     errors.append({"kind": "events", "reason": "event IDs or ordering differ", "source": source_ids, "destination": destination_ids})
                 if source_payloads != destination_payloads:
                     errors.append({"kind": "events", "reason": "event payload digests or ordering differ", "source": source_payloads, "destination": destination_payloads})
+                source_kinds = Counter(str(row.get("kind", "")) for row in source_events)
+                destination_kinds = Counter(str(row.get("kind", "")) for row in destination_events)
+                if source_kinds != destination_kinds:
+                    errors.append({"kind": "events", "reason": "event kind set differs", "missing": sorted((source_kinds - destination_kinds).elements()), "unexpected": sorted((destination_kinds - source_kinds).elements())})
                 source_heads = [(str(row.get("id", row.get("stream_id", ""))), stream_head(row)) for row in source_streams]
                 destination_heads = [(str(row.get("id", row.get("stream_id", ""))), stream_head(row)) for row in destination_streams]
+                source_stream_ids = [str(row.get("id", row.get("stream_id", ""))) for row in source_streams]
+                destination_stream_ids = [str(row.get("id", row.get("stream_id", ""))) for row in destination_streams]
+                if len(source_streams) != len(destination_streams):
+                    errors.append({"kind": "events", "reason": "event stream counts differ", "source": len(source_streams), "destination": len(destination_streams)})
+                if Counter(source_stream_ids) != Counter(destination_stream_ids):
+                    errors.append({"kind": "events", "reason": "event stream ID set differs", "missing": sorted((Counter(source_stream_ids) - Counter(destination_stream_ids)).elements()), "unexpected": sorted((Counter(destination_stream_ids) - Counter(source_stream_ids)).elements())})
+                source_stream_kinds = Counter((str(row.get("stream_type", row.get("kind", ""))), str(row.get("aggregate_id", ""))) for row in source_streams)
+                destination_stream_kinds = Counter((str(row.get("stream_type", row.get("kind", ""))), str(row.get("aggregate_id", ""))) for row in destination_streams)
+                if source_stream_kinds != destination_stream_kinds:
+                    errors.append({"kind": "events", "reason": "event stream kind/aggregate set differs", "missing": sorted((source_stream_kinds - destination_stream_kinds).elements()), "unexpected": sorted((destination_stream_kinds - source_stream_kinds).elements())})
                 if source_heads != destination_heads:
                     errors.append({"kind": "events", "reason": "event stream heads differ", "source": source_heads, "destination": destination_heads})
                 source_order = [event_order(row) for row in source_events]
