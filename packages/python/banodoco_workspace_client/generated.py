@@ -11,6 +11,21 @@ from typing import Any, Callable, Mapping
 PROTOCOL = "workspace.v1"
 
 
+@dataclass(frozen=True)
+class Health:
+    status: str
+    protocol: str
+    schema_digest: str
+    runtime_epoch: int
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "Health":
+        return cls(status=value["status"], protocol=value["protocol"], schema_digest=value["schema_digest"], runtime_epoch=int(value.get("runtime_epoch", 0)))
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+
 class ApiError(RuntimeError):
     def __init__(self, status: int, code: str, message: str, request_id: str = "", details: Mapping[str, Any] | None = None):
         super().__init__(f"{code}: {message}")
@@ -44,7 +59,9 @@ class Realm:
 class Project:
     project_id: str
     realm_id: str
+    slug: str
     name: str
+    metadata: Mapping[str, Any]
     version: int
     created_at: str
     updated_at: str
@@ -52,7 +69,7 @@ class Project:
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Project":
-        return cls(project_id=value["project_id"], realm_id=value["realm_id"], name=value["name"], version=int(value["version"]), created_at=value["created_at"], updated_at=value["updated_at"], archived=bool(value.get("archived", False)))
+        return cls(project_id=value["project_id"], realm_id=value["realm_id"], slug=value.get("slug", value["project_id"]), name=value["name"], metadata=value.get("metadata", {}), version=int(value["version"]), created_at=value["created_at"], updated_at=value["updated_at"], archived=bool(value.get("archived", False)))
 
 
 @dataclass(frozen=True)
@@ -109,10 +126,11 @@ class ManagedObject:
     version: int
     created_at: str
     filename: str | None = None
+    relation: str | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "ManagedObject":
-        return cls(object_id=value["object_id"], digest=value["digest"], media_type=value["media_type"], size=int(value["size"]), version=int(value["version"]), created_at=value["created_at"], filename=value.get("filename"))
+        return cls(object_id=value["object_id"], digest=value["digest"], media_type=value["media_type"], size=int(value["size"]), version=int(value["version"]), created_at=value["created_at"], filename=value.get("filename"), relation=value.get("relation"))
 
 
 @dataclass(frozen=True)
@@ -239,9 +257,9 @@ class WorkspaceClient:
             raise ApiError(0, "invalid_response", "expected JSON object")
         return value
 
-    def health(self) -> Mapping[str, Any]:
+    def health(self) -> Health:
         _, _, body = self._request("GET", "/v1/health")
-        return self._json(body)
+        return Health.from_json(self._json(body))
 
     def handshake(self, client_name: str, client_version: str, requested_scopes: list[str]) -> Handshake:
         payload = {"protocol": PROTOCOL, "client_name": client_name, "client_version": client_version, "requested_scopes": requested_scopes}
@@ -254,12 +272,23 @@ class WorkspaceClient:
     def get_realm(self) -> Realm:
         return Realm.from_json(self._json(self._request("GET", "/v1/realm")[2]))
 
-    def create_project(self, name: str, *, idempotency_key: str) -> Project:
-        _, _, body = self._request("POST", "/v1/projects", body=json.dumps({"name": name}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
+    def create_project(self, name: str, *, idempotency_key: str, slug: str | None = None, metadata: Mapping[str, Any] | None = None) -> Project:
+        payload: dict[str, Any] = {"name": name}
+        if slug is not None: payload["slug"] = slug
+        if metadata is not None: payload["metadata"] = metadata
+        _, _, body = self._request("POST", "/v1/projects", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
         return Project.from_json(self._json(body))
 
     def get_project(self, project_id: str) -> Project:
         _, _, body = self._request("GET", f"/v1/projects/{_path_part(project_id)}")
+        return Project.from_json(self._json(body))
+
+    def update_project(self, project_id: str, *, expected_version: int | None = None, name: str | None = None, metadata: Mapping[str, Any] | None = None) -> Project:
+        payload: dict[str, Any] = {}
+        if expected_version is not None: payload["expected_version"] = expected_version
+        if name is not None: payload["name"] = name
+        if metadata is not None: payload["metadata"] = metadata
+        _, _, body = self._request("PATCH", f"/v1/projects/{_path_part(project_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
         return Project.from_json(self._json(body))
 
     def create_document(self, project_id: str, document_id: str, kind: str, content: Any) -> ProjectDocument:
@@ -289,6 +318,23 @@ class WorkspaceClient:
 
     def get_timeline(self, timeline_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/timelines/{_path_part(timeline_id)}")[2])
+
+    def list_timeline_history(self, timeline_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/timelines/{_path_part(timeline_id)}/history" + query)[2])
+        return list(value.get("items", [])), value.get("next_cursor")
+
+    def diff_timeline(self, timeline_id: str, *, from_version: int, to_version: int) -> Mapping[str, Any]:
+        path = f"/v1/timelines/{_path_part(timeline_id)}/diff?from_version={int(from_version)}&to_version={int(to_version)}"
+        return self._json(self._request("GET", path)[2])
+
+    def archive_timeline(self, timeline_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        payload = {"expected_version": expected_version}
+        return self._json(self._request("POST", f"/v1/timelines/{_path_part(timeline_id)}/archive", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def recover_timeline(self, timeline_id: str, *, expected_version: int, version: int, idempotency_key: str) -> Mapping[str, Any]:
+        payload = {"expected_version": expected_version, "version": version}
+        return self._json(self._request("POST", f"/v1/timelines/{_path_part(timeline_id)}/recover", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def update_timeline(self, timeline_id: str, *, expected_version: int, shots: list[Mapping[str, Any]] | None = None, references: list[Mapping[str, Any]] | None = None) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"expected_version": expected_version}
@@ -321,6 +367,21 @@ class WorkspaceClient:
         _, _, body = self._request("POST", "/v1/objects", body=bytes(data), headers=headers, expected=(200, 201))
         return ManagedObject.from_json(self._json(body))
 
+    def ingest_project_object(self, project_id: str, data: bytes, *, media_type: str, idempotency_key: str, filename: str | None = None) -> ManagedObject:
+        headers = {"Content-Type": media_type, "Idempotency-Key": idempotency_key}
+        if filename: headers["X-Original-Name"] = filename
+        _, _, body = self._request("POST", f"/v1/projects/{_path_part(project_id)}/objects", body=bytes(data), headers=headers, expected=(200, 201))
+        return ManagedObject.from_json(self._json(body))
+
+    def list_project_objects(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[ManagedObject], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/objects" + query)[2])
+        return [ManagedObject.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+
+    list_objects = list_project_objects
+    list_project_media = list_project_objects
+    list_media = list_project_objects
+
     def get_object(self, object_id: str, *, byte_range: tuple[int, int | None] | None = None) -> ByteResponse:
         headers: dict[str, str] = {}
         if byte_range:
@@ -339,10 +400,12 @@ class WorkspaceClient:
         status, response_headers, body = self._request("HEAD", f"/v1/objects/{_path_part(object_id)}", headers=headers, expected=(200, 206))
         return ByteResponse(body, status, response_headers)
 
-    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None) -> Task:
+    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None, project_id: str | None = None, spec: Mapping[str, Any] | None = None) -> Task:
         payload: dict[str, Any] = {"capability_id": capability_id, "capability_digest": capability_digest, "schema_version": schema_version, "input_object_ids": input_object_ids}
         if settlement_effect is not None:
             payload["settlement_effect"] = settlement_effect
+        if project_id is not None: payload["project"] = project_id
+        if spec is not None: payload["spec"] = spec
         _, _, body = self._request("POST", "/v1/tasks", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
         return Task.from_json(self._json(body))
 
@@ -399,6 +462,9 @@ class WorkspaceClient:
     def list_variants(self, generation_id: str) -> tuple[list[GenerationVariant], str | None]:
         value = self._json(self._request("GET", f"/v1/generations/{_path_part(generation_id)}/variants")[2])
         return [GenerationVariant.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+
+    def get_variant(self, variant_id: str) -> GenerationVariant:
+        return GenerationVariant.from_json(self._json(self._request("GET", f"/v1/variants/{_path_part(variant_id)}")[2]))
 
     def create_variant(self, generation_id: str, variant_id: str, *, object_id: str | None = None, variant_type: str = "original", metadata: Mapping[str, Any] | None = None) -> GenerationVariant:
         payload: dict[str, Any] = {"variant_id": variant_id, "variant_type": variant_type, "metadata": metadata or {}}

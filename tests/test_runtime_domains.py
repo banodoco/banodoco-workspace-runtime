@@ -63,3 +63,32 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         assert client.list_run_events(failed_task.run_id)[-1].event_type == "task.failed"
     finally:
         daemon.stop()
+
+
+def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path):
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        client.handshake("domain-client", "0.1.0", ["projects:read", "projects:write", "objects:read", "objects:write"])
+        project = client.create_project("Settings", idempotency_key="project", slug="settings", metadata={"theme": "dark"})
+        assert project.slug == "settings" and project.metadata == {"theme": "dark"}
+        object_row = client.ingest_project_object(project.project_id, b"managed", media_type="application/octet-stream", idempotency_key="media", filename="managed.bin")
+        objects, cursor = client.list_project_objects(project.project_id)
+        assert cursor is None and objects[0].object_id == object_row.object_id and objects[0].relation == "managed"
+
+        client.create_document(project.project_id, "settings", "settings", {"theme": "dark"})
+        client.create_document(project.project_id, "review", "review", {"approved": False})
+        timeline = client.create_timeline(project.project_id, "timeline", idempotency_key="timeline")
+        saved = client.update_timeline("timeline", expected_version=1, shots=[{"shot_id": "shot", "start_ms": 0, "duration_ms": 100}])
+        history, _ = client.list_timeline_history("timeline")
+        assert [item["version"] for item in history] == [1, 2]
+        assert client.diff_timeline("timeline", from_version=1, to_version=2)["changes"]["shots"]["added"]
+        archived = client.archive_timeline("timeline", expected_version=saved["version"], idempotency_key="archive")
+        recovered = client.recover_timeline("timeline", expected_version=archived["version"], version=saved["version"], idempotency_key="recover")
+        assert archived["archived"] is True and recovered["archived"] is False and recovered["shots"] == saved["shots"]
+
+        generation = client.create_generation(project.project_id, "generation")
+        client.create_variant(generation.generation_id, "variant")
+        assert client.get_variant("variant").generation_id == generation.generation_id
+    finally:
+        daemon.stop()

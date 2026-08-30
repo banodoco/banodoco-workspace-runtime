@@ -117,6 +117,20 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read"); return self._send(200, self.runtime._timeline_resource(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
             self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body()))
+        if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("history", "diff") and method == "GET":
+            self._identity("projects:read")
+            query = parse_qs(urlsplit(self.path).query)
+            if path[3] == "history":
+                return self._send(200, self.runtime.list_timeline_history(path[2], limit=query.get("limit", [50])[0]))
+            if "from_version" not in query or "to_version" not in query:
+                raise ProtocolError("from_version and to_version are required")
+            return self._send(200, self.runtime.diff_timeline(path[2], query["from_version"][0], query["to_version"][0]))
+        if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("archive", "recover") and method == "POST":
+            self._identity("projects:write")
+            body = self._body()
+            if path[3] == "archive":
+                return self._send(200, self.runtime.archive_timeline(path[2], body))
+            return self._send(200, self.runtime.recover_timeline(path[2], body))
         if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_shot(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "references"] and method == "GET":
@@ -158,7 +172,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 4 and path[3] == "objects":
                 self._identity("objects:read" if method == "GET" else "objects:write")
                 if method == "GET":
-                    return self._send(200, self.runtime.objects(selector))
+                    query = parse_qs(urlsplit(self.path).query)
+                    return self._send(200, self.runtime.list_project_objects(selector, limit=query.get("limit", [50])[0]))
                 if method == "POST":
                     length = int(self.headers.get("Content-Length", "0"))
                     data = self.rfile.read(length)
@@ -239,6 +254,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET": return self._send(200, self.runtime.list_variants(path[2]))
             if method == "POST": return self._send(201, self.runtime.create_variant(path[2], self._body()))
+        if len(path) == 3 and path[:2] == ["v1", "variants"] and method == "GET":
+            self._identity("projects:read"); return self._send(200, self.runtime.get_variant(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] == "events" and method == "GET":
             self._identity("tasks:read")
             return self._send(200, self.runtime.events_page(path[2]))

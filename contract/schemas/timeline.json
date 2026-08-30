@@ -3,11 +3,12 @@
   "$id": "https://banodoco.dev/workspace/v1/schemas/timeline.json",
   "title": "Minimum product-neutral timeline composition",
   "type": "object", "additionalProperties": false,
-  "required": ["timeline_id", "project_id", "version", "shots", "references"],
+  "required": ["timeline_id", "project_id", "version", "shots", "references", "archived"],
   "properties": {
     "timeline_id": { "type": "string", "minLength": 1 },
     "project_id": { "type": "string", "minLength": 1 },
     "version": { "type": "integer", "minimum": 1 },
+    "archived": { "type": "boolean" },
     "shots": { "type": "array", "items": { "$ref": "#/$defs/Shot" } },
     "references": { "type": "array", "items": { "$ref": "#/$defs/Reference" } }
   },

@@ -8,6 +8,7 @@ from .generated import (
     Executor,
     Generation,
     GenerationVariant,
+    Health,
     Handshake,
     ManagedObject,
     Project,
@@ -17,4 +18,4 @@ from .generated import (
     WorkspaceClient,
 )
 
-__all__ = ["ApiError", "ByteResponse", "Capability", "Event", "Executor", "Generation", "GenerationVariant", "Handshake", "ManagedObject", "Project", "ProjectDocument", "Realm", "Task", "WorkspaceClient"]
+__all__ = ["ApiError", "ByteResponse", "Capability", "Event", "Executor", "Generation", "GenerationVariant", "Handshake", "Health", "ManagedObject", "Project", "ProjectDocument", "Realm", "Task", "WorkspaceClient"]

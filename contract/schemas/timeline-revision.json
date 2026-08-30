@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/timeline-revision.json",
+  "title": "Immutable timeline revision",
+  "type": "object", "additionalProperties": false,
+  "required": ["timeline_id", "version", "shots", "references", "created_at"],
+  "properties": {
+    "timeline_id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "shots": { "type": "array", "items": { "$ref": "timeline.json#/$defs/Shot" } },
+    "references": { "type": "array", "items": { "$ref": "timeline.json#/$defs/Reference" } },
+    "created_at": { "type": "string" }
+  }
+}

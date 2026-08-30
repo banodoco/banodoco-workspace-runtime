@@ -69,6 +69,11 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/DocumentId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateDocument' } } } }
       responses: { '200': { description: Updated document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/objects:
+    get:
+      operationId: listProjectObjects
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Project-scoped managed objects, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedObjectPage' } } } } }
   /v1/projects/{project_id}/timelines:
     post:
       operationId: createTimeline
@@ -89,6 +94,31 @@ paths:
       parameters: [ { $ref: '#/components/parameters/TimelineId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateTimeline' } } } }
       responses: { '200': { description: Updated timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/history:
+    get:
+      operationId: listTimelineHistory
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      responses: { '200': { description: Timeline revisions, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineRevisionPage' } } } } }
+  /v1/timelines/{timeline_id}/diff:
+    get:
+      operationId: diffTimeline
+      parameters:
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { name: from_version, in: query, required: true, schema: { type: integer, minimum: 1 } }
+        - { name: to_version, in: query, required: true, schema: { type: integer, minimum: 1 } }
+      responses: { '200': { description: Timeline revision diff, content: { application/json: { schema: { $ref: './schemas/timeline-diff.json' } } } } }
+  /v1/timelines/{timeline_id}/archive:
+    post:
+      operationId: archiveTimeline
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/timelines/{timeline_id}/recover:
+    post:
+      operationId: recoverTimeline
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoverTimeline' } } } }
+      responses: { '200': { description: Recovered timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/timelines/{timeline_id}/shots:
     post:
       operationId: createShot
@@ -219,6 +249,11 @@ paths:
       parameters: [ { $ref: '#/components/parameters/GenerationId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateVariant' } } } }
       responses: { '201': { description: Generation variant, content: { application/json: { schema: { $ref: '#/components/schemas/Variant' } } } } }
+  /v1/variants/{variant_id}:
+    get:
+      operationId: getVariant
+      parameters: [ { name: variant_id, in: path, required: true, schema: { type: string } } ]
+      responses: { '200': { description: Generation variant, content: { application/json: { schema: { $ref: '#/components/schemas/Variant' } } } } }
   /v1/attempts/{attempt_id}/settle:
     post:
       operationId: settleAttempt
@@ -276,7 +311,7 @@ components:
       type: object
       additionalProperties: false
       required: [name]
-      properties: { name: { type: string, minLength: 1, maxLength: 512 } }
+      properties: { name: { type: string, minLength: 1, maxLength: 512 }, slug: { type: string, minLength: 1, maxLength: 128 }, metadata: { type: object, additionalProperties: true } }
     ProjectPage:
       type: object
       additionalProperties: false
@@ -297,6 +332,8 @@ components:
         capability_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
         schema_version: { type: string, minLength: 1 }
         input_object_ids: { type: array, items: { type: string }, uniqueItems: true }
+        project: { type: string }
+        spec: { type: object, additionalProperties: true }
         settlement_effect: { type: object, additionalProperties: true }
     EventPage:
       type: object
@@ -334,6 +371,21 @@ components:
       type: object
       required: [expected_version]
       properties: { expected_version: { type: integer, minimum: 1 }, shots: { type: array, items: { $ref: '#/components/schemas/Shot' } }, references: { type: array, items: { $ref: '#/components/schemas/Reference' } } }
+    ManagedObjectPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/managed-object.json' } }, next_cursor: { type: [string, 'null'] } }
+    TimelineRevisionPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/timeline-revision.json' } }, next_cursor: { type: [string, 'null'] } }
+    RecoverTimeline:
+      type: object
+      additionalProperties: false
+      required: [expected_version, version]
+      properties: { expected_version: { type: integer, minimum: 1 }, version: { type: integer, minimum: 1 } }
     GenerationPage:
       type: object
       required: [items, next_cursor]

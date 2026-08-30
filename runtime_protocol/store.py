@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEASE_SECONDS = 30
 
 
@@ -116,6 +116,9 @@ class RealmStore:
             statements.append("INSERT INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'))")
             statements.append("COMMIT")
             self.conn.executescript(";\n".join(statements) + ";")
+            version = 3
+        if version < 4:
+            self._run_migration(4)
 
     def _run_migration(self, version):
         migration = (Path(__file__).parent / "migrations" / f"{version:03d}_*.sql")

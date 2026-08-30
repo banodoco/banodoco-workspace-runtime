@@ -68,14 +68,30 @@ class RuntimeService:
         return self.store.update_project(selector, name=body.get("name"), metadata=body.get("metadata"), expected_version=body.get("expected_version"))
 
     def _project_resource(self, value):
-        return {"project_id": value["id"], "realm_id": value["realm_id"], "name": value["name"], "version": value["version"], "created_at": value["created_at"], "updated_at": value["updated_at"], "archived": False}
+        return {"project_id": value["id"], "realm_id": value["realm_id"], "slug": value["slug"], "name": value["name"], "metadata": value.get("metadata", {}), "version": value["version"], "created_at": value["created_at"], "updated_at": value["updated_at"], "archived": False}
 
     def _timeline_resource(self, timeline_id):
         row = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
         if not row: raise NotFoundError("timeline not found")
         shots = [dict(x) for x in self.store.conn.execute("SELECT * FROM timeline_shots WHERE timeline_id=?", (timeline_id,))]
         refs = [dict(x) for x in self.store.conn.execute("SELECT * FROM timeline_references WHERE timeline_id=?", (timeline_id,))]
-        return {"timeline_id": row["id"], "project_id": row["project_id"], "version": row["version"], "shots": [{"shot_id": x["id"], "start_ms": x["start_ms"], "duration_ms": x["duration_ms"], "reference_ids": json.loads(x["reference_ids_json"])} for x in shots], "references": [{"reference_id": x["id"], "object_id": x["object_id"], **({"role": x["role"]} if x["role"] else {})} for x in refs]}
+        return {"timeline_id": row["id"], "project_id": row["project_id"], "version": row["version"], "archived": bool(row["archived_at"]), "shots": [{"shot_id": x["id"], "start_ms": x["start_ms"], "duration_ms": x["duration_ms"], "reference_ids": json.loads(x["reference_ids_json"])} for x in shots], "references": [{"reference_id": x["id"], "object_id": x["object_id"], **({"role": x["role"]} if x["role"] else {})} for x in refs]}
+
+    def _record_timeline_revision(self, timeline_id, resource=None):
+        resource = resource or self._timeline_resource(timeline_id)
+        self.store.conn.execute(
+            "INSERT OR IGNORE INTO timeline_revisions(timeline_id, version, shots_json, references_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (timeline_id, resource["version"], canonical_json(resource["shots"]), canonical_json(resource["references"]), now()),
+        )
+
+    def _timeline_revision(self, timeline_id, version):
+        row = self.store.conn.execute("SELECT * FROM timeline_revisions WHERE timeline_id=? AND version=?", (timeline_id, version)).fetchone()
+        if row:
+            return {"timeline_id": timeline_id, "version": int(row["version"]), "shots": json.loads(row["shots_json"]), "references": json.loads(row["references_json"]), "created_at": row["created_at"]}
+        current = self._timeline_resource(timeline_id)
+        if int(current["version"]) == int(version):
+            return {"timeline_id": timeline_id, "version": current["version"], "shots": current["shots"], "references": current["references"], "created_at": now()}
+        raise NotFoundError("timeline revision not found", details={"timeline_id": timeline_id, "version": version})
 
     @staticmethod
     def _expected_version(body):
@@ -121,19 +137,79 @@ class RuntimeService:
                 for reference in refs:
                     self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
                 self.store.conn.execute("UPDATE timelines SET version=?, created_at=created_at WHERE id=?", (expected + 1, timeline_id))
-            return self._timeline_resource(timeline_id)
+                resource = self._timeline_resource(timeline_id)
+                self._record_timeline_revision(timeline_id, resource)
+            return resource
 
     def create_timeline(self, project_id, timeline_id):
         if not timeline_id:
             raise ValidationError("timeline_id is required")
         project = self.store.get_project(project_id)
-        self.store.conn.execute("INSERT OR IGNORE INTO timelines VALUES (?, ?, 1, ?)", (timeline_id, project["id"], now()))
-        return self._timeline_resource(timeline_id)
+        self.store.conn.execute("INSERT OR IGNORE INTO timelines(id, project_id, version, created_at, archived_at) VALUES (?, ?, 1, ?, NULL)", (timeline_id, project["id"], now()))
+        resource = self._timeline_resource(timeline_id)
+        self._record_timeline_revision(timeline_id, resource)
+        return resource
 
     def list_timelines(self, project_id):
         project = self.store.get_project(project_id)
         rows = self.store.conn.execute("SELECT id FROM timelines WHERE project_id=? ORDER BY created_at", (project["id"],))
         return {"items": [self._timeline_resource(x["id"]) for x in rows], "next_cursor": None}
+
+    def list_timeline_history(self, timeline_id, *, limit=50):
+        self._timeline_resource(timeline_id)
+        limit = max(1, min(int(limit), 200))
+        rows = self.store.conn.execute("SELECT * FROM timeline_revisions WHERE timeline_id=? ORDER BY version LIMIT ?", (timeline_id, limit)).fetchall()
+        items = [{"timeline_id": timeline_id, "version": int(row["version"]), "shots": json.loads(row["shots_json"]), "references": json.loads(row["references_json"]), "created_at": row["created_at"]} for row in rows]
+        if not items:
+            current = self._timeline_resource(timeline_id)
+            items = [{"timeline_id": timeline_id, "version": current["version"], "shots": current["shots"], "references": current["references"], "created_at": now()}]
+        return {"items": items, "next_cursor": None}
+
+    @staticmethod
+    def _diff_items(before, after, key):
+        old = {str(item.get(key)): item for item in before}
+        new = {str(item.get(key)): item for item in after}
+        return {"added": [new[item_id] for item_id in sorted(new.keys() - old.keys())], "removed": [old[item_id] for item_id in sorted(old.keys() - new.keys())], "changed": [{"id": item_id, "before": old[item_id], "after": new[item_id]} for item_id in sorted(old.keys() & new.keys()) if old[item_id] != new[item_id]]}
+
+    def diff_timeline(self, timeline_id, from_version, to_version):
+        self._timeline_resource(timeline_id)
+        before = self._timeline_revision(timeline_id, int(from_version))
+        after = self._timeline_revision(timeline_id, int(to_version))
+        return {"timeline_id": timeline_id, "from_version": int(from_version), "to_version": int(to_version), "changes": {"shots": self._diff_items(before["shots"], after["shots"], "shot_id"), "references": self._diff_items(before["references"], after["references"], "reference_id")}}
+
+    def archive_timeline(self, timeline_id, body):
+        expected = self._expected_version(body)
+        with self.store._mutex:
+            current = self._timeline_resource(timeline_id)
+            if current["version"] != expected:
+                raise ConflictError("timeline version conflict", details={"expected": expected, "actual": current["version"]})
+            with self.store._transaction():
+                self.store.conn.execute("UPDATE timelines SET archived_at=?, version=? WHERE id=?", (now(), expected + 1, timeline_id))
+                resource = self._timeline_resource(timeline_id)
+                self._record_timeline_revision(timeline_id, resource)
+            return resource
+
+    def recover_timeline(self, timeline_id, body):
+        expected = self._expected_version(body)
+        target = body.get("version")
+        if isinstance(target, bool) or not isinstance(target, int) or target < 1:
+            raise ValidationError("version must be a positive integer")
+        with self.store._mutex:
+            current = self._timeline_resource(timeline_id)
+            if current["version"] != expected:
+                raise ConflictError("timeline version conflict", details={"expected": expected, "actual": current["version"]})
+            revision = self._timeline_revision(timeline_id, target)
+            with self.store._transaction():
+                self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
+                self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
+                for shot in revision["shots"]:
+                    self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
+                for reference in revision["references"]:
+                    self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
+                self.store.conn.execute("UPDATE timelines SET archived_at=NULL, version=? WHERE id=?", (expected + 1, timeline_id))
+                resource = self._timeline_resource(timeline_id)
+                self._record_timeline_revision(timeline_id, resource)
+            return resource
 
     def create_shot(self, timeline_id, body):
         if int(body.get("duration_ms", 0)) < 1 or int(body.get("start_ms", 0)) < 0: raise ValidationError("invalid shot timing")
@@ -266,6 +342,12 @@ class RuntimeService:
         self.get_generation(generation_id)
         return {"items": [self._variant_resource(row) for row in self.store.conn.execute("SELECT * FROM generation_variants WHERE generation_id=? ORDER BY created_at, id", (generation_id,))], "next_cursor": None}
 
+    def get_variant(self, variant_id):
+        row = self.store.conn.execute("SELECT * FROM generation_variants WHERE id=?", (variant_id,)).fetchone()
+        if not row:
+            raise NotFoundError("generation variant not found")
+        return self._variant_resource(row)
+
     def get_reference(self, reference_id):
         row = self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (reference_id,)).fetchone()
         if not row: raise NotFoundError("reference not found")
@@ -294,6 +376,15 @@ class RuntimeService:
 
     def objects(self, project):
         return self.store.list_project_objects(project)
+
+    def list_project_objects(self, project, *, limit=50):
+        limit = max(1, min(int(limit), 200))
+        items = []
+        for row in self.store.list_project_objects(project)[:limit]:
+            item = self._object_resource(row)
+            item["relation"] = row["relation"]
+            items.append(item)
+        return {"items": items, "next_cursor": None}
 
     def create_task(self, body):
         capability = body.get("capability_id") or body.get("capability")
