@@ -22,7 +22,8 @@ from typing import Any, Mapping
 from .bootstrap import BootstrapError, SourceProfile
 
 
-PROTOCOL_VERSION = "workspace-v1"
+PROTOCOL_VERSION = "workspace.v1"
+WIRE_PROTOCOL = PROTOCOL_VERSION
 SCHEMA_VERSION = "workspace-schema-v1"
 WAIT_SECONDS = 10.0
 
@@ -234,7 +235,7 @@ class LocalRuntimeBoundary:
         try:
             with urllib.request.urlopen(request, timeout=0.5) as response:
                 value = json.loads(response.read().decode("utf-8"))
-            return value.get("status") == "ok" and value.get("protocol") == PROTOCOL_VERSION
+            return value.get("status") == "ok" and value.get("protocol") == WIRE_PROTOCOL
         except (OSError, ValueError, json.JSONDecodeError):
             return False
 

@@ -23,7 +23,7 @@ python3 -m runtime_protocol start --root .runtime
 ```
 
 `start` prints the loopback endpoint and owner credential path, then keeps the
-daemon alive until SIGINT/SIGTERM. The test suite demonstrates the core-v1
+daemon alive until SIGINT/SIGTERM. The test suite demonstrates the workspace.v1
 HTTP boundary, project CRUD, managed object ingest and authenticated byte
 reads (`ETag`/`Range`), deterministic worker claim/settlement, restart
 reconnect, hash verification, path safety, and sole-owner refusal.

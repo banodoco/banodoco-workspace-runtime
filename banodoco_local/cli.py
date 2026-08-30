@@ -48,7 +48,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    paths = RuntimePaths.current_mac()
+    paths = RuntimePaths.current_mac(__import__("os").environ.get("BANODOCO_LOCAL_HOME"))
     if args.command == "doctor":
         result = doctor(paths)
         if args.json:

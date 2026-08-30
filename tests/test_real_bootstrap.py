@@ -25,7 +25,7 @@ def test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client(tmp_
         first = bootstrap(paths, boundary, _config())
         discovery = json.loads(paths.discovery_path.read_text())
         assert first.status == "started"
-        assert discovery["protocol_version"] == "workspace-v1"
+        assert discovery["protocol_version"] == "workspace.v1"
         assert discovery["schema_version"] == "workspace-schema-v1"
         assert discovery["active_realm"] == first.realm_id
         assert discovery["runtime_instance_id"]
@@ -33,7 +33,7 @@ def test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client(tmp_
 
         credential = json.loads((paths.credentials_dir / "astrid.json").read_text())
         client = WorkspaceClient(first.endpoint, credential["token"])
-        assert client.health()["protocol"] == "workspace-v1"
+        assert client.health()["protocol"] == "workspace.v1"
         assert client.get_realm().realm_id == first.realm_id
         project = client.create_project("real-bootstrap", idempotency_key="real-bootstrap-project")
 

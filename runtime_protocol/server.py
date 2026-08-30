@@ -67,6 +67,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         method = self.command
         if path in (["health"], ["v1", "health"]):
             return self._send(200, self.runtime.health())
+        if path == ["v1", "credentials"] and method == "POST":
+            self._identity("credentials:provision")
+            body = self._body()
+            actor = str(body.get("actor_id") or "")
+            token = str(body.get("credential") or "")
+            scope = str(body.get("scope") or "")
+            if not actor or not token or scope != "astrid":
+                raise ProtocolError("actor_id, credential, and astrid scope are required")
+            scopes = ["handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write"]
+            self.server.credentials.provision_static(actor, token, scopes)  # type: ignore[attr-defined]
+            return self._send(201, {"actor_id": actor, "scope": scope})
         if path == ["v1", "handshake"] and method == "POST":
             identity = self._identity("handshake")
             body = self._body()

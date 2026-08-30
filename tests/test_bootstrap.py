@@ -69,7 +69,7 @@ class FakeBoundary:
             "pid": pid,
             "runtime_instance_id": f"instance-{pid}",
             "coordinator_epoch": 1,
-            "protocol_version": "workspace-v1",
+            "protocol_version": "workspace.v1",
             "schema_version": "workspace-schema-v1",
             "capability_digest": "caps-v1",
         }

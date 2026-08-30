@@ -17,10 +17,10 @@ from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace"):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None):
         self.store = RealmStore(root)
         self.cas = ContentAddressedStore(self.store.cas_root)
-        self.realm = self.store.ensure_realm(display_name)
+        self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
         self._ensure_default_capability()
 
     def close(self):

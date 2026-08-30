@@ -22,7 +22,7 @@ from .io import atomic_write_json, owner_only, read_json, remove_file
 from .paths import RuntimePaths
 
 
-PROTOCOL_VERSION = "workspace-v1"
+PROTOCOL_VERSION = "workspace.v1"
 SCHEMA_VERSION = "workspace-schema-v1"
 CATALOG_VERSION = 1
 DISCOVERY_VERSION = 1
