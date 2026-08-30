@@ -376,6 +376,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     if config.profile != "astrid":
         raise BootstrapError("Stage 1 supports only the astrid profile.")
     source = config.resolve_source_profile(paths)
+    configure = getattr(boundary, "configure_source", None)
+    if configure is not None:
+        configure(source)
     collision = _legacy_collision(paths, config.legacy_roots)
     if collision is not None:
         raise LegacyRootCollisionError(LEGACY_NEXT_ACTION.format(legacy_root=collision))

@@ -44,7 +44,9 @@ class LiveDiscovery:
         self.path = Path(path).expanduser().resolve()
 
     def publish(self, **fields):
-        allowed = {"endpoint", "pid", "instance_id", "realm_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file"}
+        # Canonical discovery is shared with banodoco-local. Legacy aliases
+        # remain readable for older neutral clients during this beta.
+        allowed = {"version", "endpoint", "pid", "runtime_instance_id", "active_realm", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "instance_id", "realm_id"}
         atomic_json_write(self.path, {k: fields[k] for k in allowed if k in fields})
 
     def clear(self, instance_id: str | None = None):

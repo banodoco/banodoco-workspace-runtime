@@ -19,6 +19,7 @@ from .bootstrap import (
     doctor,
 )
 from .paths import RuntimePaths
+from .runtime_boundary import LocalRuntimeBoundary
 
 __all__ = [
     "BootstrapConfig",
@@ -29,6 +30,7 @@ __all__ = [
     "LegacyRootCollisionError",
     "RuntimeBoundary",
     "RuntimePaths",
+    "LocalRuntimeBoundary",
     "SourceProfile",
     "UnsupportedRealmError",
     "bootstrap",

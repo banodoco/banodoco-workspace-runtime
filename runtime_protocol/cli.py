@@ -21,6 +21,9 @@ def _parser():
     start.add_argument("--host", default="127.0.0.1")
     start.add_argument("--port", type=int, default=0)
     start.add_argument("--display-name", default="Workspace")
+    start.add_argument("--realm-id")
+    start.add_argument("--owner-lock")
+    start.add_argument("--bootstrap-token-file")
     doctor = sub.add_parser("doctor", help="read-only runtime health check")
     doctor.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     doctor.add_argument("--json", action="store_true")
@@ -75,7 +78,7 @@ def main(argv=None):
             atomic_json_write(Path(args.destination).expanduser().resolve(), value)
         print(json.dumps(value, sort_keys=True))
         return 0
-    daemon = RuntimeDaemon(args.root, support_root=args.support_root, display_name=args.display_name, host=args.host, port=args.port).start()
+    daemon = RuntimeDaemon(args.root, support_root=args.support_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file).start()
     print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path)}, sort_keys=True), flush=True)
     stop = False
     def handle(*_):

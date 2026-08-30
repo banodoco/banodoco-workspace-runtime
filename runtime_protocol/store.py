@@ -147,12 +147,12 @@ class RealmStore:
         row = self.conn.execute("SELECT * FROM realm LIMIT 1").fetchone()
         return dict(row) if row else None
 
-    def ensure_realm(self, display_name: str = "Workspace"):
+    def ensure_realm(self, display_name: str = "Workspace", realm_id: str | None = None):
         with self._mutex:
             row = self.realm
             if row:
                 return row
-            rid, timestamp = new_id(), now()
+            rid, timestamp = realm_id or new_id(), now()
             self.conn.execute("INSERT INTO realm VALUES (?, ?, ?, ?)", (rid, display_name, timestamp, timestamp))
             return dict(self.conn.execute("SELECT * FROM realm WHERE id=?", (rid,)).fetchone())
 

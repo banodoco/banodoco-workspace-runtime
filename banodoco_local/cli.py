@@ -10,6 +10,7 @@ import sys
 from . import __version__
 from .bootstrap import BootstrapConfig, BootstrapError, SourceProfile, bootstrap, doctor
 from .paths import RuntimePaths
+from .runtime_boundary import LocalRuntimeBoundary
 
 
 class UnconfiguredBoundary:
@@ -64,9 +65,7 @@ def main(argv: list[str] | None = None) -> int:
             manifest = Path(configured) if configured else None
         config = BootstrapConfig(profile=args.profile, display_name=args.display_name, source_manifest=manifest)
         try:
-            # Product packaging wires the generated runtime client here.  A
-            # missing wire is a clear setup error, never a hidden local owner.
-            result = bootstrap(paths, UnconfiguredBoundary(), config)
+            result = bootstrap(paths, LocalRuntimeBoundary(), config)
         except BootstrapError as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -74,4 +73,3 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     parser().print_help()
     return 0
-
