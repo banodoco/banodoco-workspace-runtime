@@ -34,6 +34,11 @@ class MigrationConfig:
     # ordinary offline migrator keeps the older response-only fixture mode for
     # callers that do not have a read API.
     require_destination_verification: bool = False
+    # Rehearsals bind the migrator to the inventory captured by the freeze
+    # receipt.  Without this, a mutation at the ``before_migration`` seam
+    # becomes the new baseline and can go unnoticed.
+    expected_source_manifest_sha256: str | None = None
+    expected_source_facts_sha256: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
@@ -77,12 +82,29 @@ def _tree_size(root: Path) -> int:
 
 
 def _file_map(root: Path) -> dict[str, dict[str, Any]]:
-    """Return a content-addressed description of every regular file below root."""
-    return {
-        str(path.relative_to(root)): {"size": path.stat().st_size, "sha256": _sha256_file(path)}
-        for path in sorted(root.rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    }
+    """Return a root-complete description, including symlink identity.
+
+    Symlinks are never dereferenced for the archive manifest.  Recording the
+    literal target and whether its resolved target stays inside the source
+    root makes retarget/add/remove changes observable while allowing archive
+    creation to reject an escaping link before it can become an authority.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    root = root.resolve()
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            target = os.readlink(path)
+            resolved = path.resolve(strict=False)
+            try:
+                resolved.relative_to(root)
+                inside = True
+            except ValueError:
+                inside = False
+            result[relative] = {"kind": "symlink", "target": target, "resolved_inside_root": inside}
+        elif path.is_file():
+            result[relative] = {"kind": "file", "size": path.stat().st_size, "sha256": _sha256_file(path)}
+    return result
 
 
 def _files_digest(files: Mapping[str, Mapping[str, Any]]) -> str:
@@ -402,11 +424,21 @@ class Migrator:
         current = self.inventory()
         if current["source_manifest_sha256"] != expected:
             raise MigrationError(f"source changed at {seam}; discard the clone and restart rehearsal")
+        bound = self.config.expected_source_manifest_sha256
+        if bound is not None and current["source_manifest_sha256"] != bound:
+            raise MigrationError(f"source inventory no longer matches the bound freeze receipt at {seam}")
+        facts = self.config.expected_source_facts_sha256
+        if facts is not None and current["source_facts_sha256"] != facts:
+            raise MigrationError(f"source facts no longer match the bound freeze receipt at {seam}")
 
     def migrate(self) -> dict[str, Any]:
         with self.source_freeze() as freeze_info:
             self._report["source_freeze"] = freeze_info
             inventory = self.inventory()
+            if self.config.expected_source_manifest_sha256 is not None and inventory["source_manifest_sha256"] != self.config.expected_source_manifest_sha256:
+                raise MigrationError("source inventory does not match the bound freeze receipt before migration")
+            if self.config.expected_source_facts_sha256 is not None and inventory["source_facts_sha256"] != self.config.expected_source_facts_sha256:
+                raise MigrationError("source facts do not match the bound freeze receipt before migration")
             frozen_source_digest = inventory["source_manifest_sha256"]
             # Re-read before and after loading so rows and bytes can never be
             # combined from two source epochs.
@@ -441,6 +473,9 @@ class Migrator:
         return {"projects": len(data.get("projects", [])), "timelines": len(data.get("timelines", [])), "shots": len(data.get("shots", [])), "references": len(data.get("project_references", [])), "generations": len(data.get("generations", [])), "media": len(data.get("media", [])), "runs": len(data.get("runs", [])), "tasks": len(data.get("tasks", []))}
 
     def _archive(self, inventory: Mapping[str, Any]) -> Path:
+        escaping_source = [name for name, detail in inventory.get("files", {}).items() if detail.get("kind") == "symlink" and not detail.get("resolved_inside_root", False)]
+        if escaping_source:
+            raise MigrationError(f"source contains symlinks escaping source root: {escaping_source}")
         if self.config.archive_root.exists():
             manifest_path = self.config.archive_root / "manifest.json"
             try:
@@ -449,6 +484,9 @@ class Migrator:
             except (OSError, json.JSONDecodeError, MigrationError):
                 archived = None
                 manifest = {}
+            archived_escaping = [name for name, detail in (archived or {}).items() if detail.get("kind") == "symlink" and not detail.get("resolved_inside_root", False)]
+            if archived_escaping:
+                raise MigrationError(f"archive contains symlinks escaping source root: {archived_escaping}")
             if archived == inventory.get("files") and manifest.get("source_manifest_sha256") == inventory.get("source_manifest_sha256") and manifest.get("files_sha256") == _files_digest(archived or {}):
                 self._report["archive_reused"] = True
                 self._report["archive_peak_bytes"] = _tree_size(self.config.archive_root)
@@ -466,6 +504,9 @@ class Migrator:
             shutil.copytree(self.config.source_root, temporary / "source", symlinks=True)
             archived_files = _file_map(temporary / "source")
             self._report["archive_peak_bytes"] = _tree_size(temporary)
+            escaping = [name for name, detail in archived_files.items() if detail.get("kind") == "symlink" and not detail.get("resolved_inside_root", False)]
+            if escaping:
+                raise MigrationError(f"archive contains symlinks escaping source root: {escaping}")
             if archived_files != inventory["files"]:
                 raise MigrationError("source changed while archive was being copied; discard the clone and restart rehearsal")
             archived_db = temporary / "source" / self.database.relative_to(self.config.source_root)
@@ -473,7 +514,7 @@ class Migrator:
             (temporary / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
             (temporary / "ROLLBACK.md").write_text("# Astrid migration rollback\n\nThe original source is untouched. Stop the runtime, remove the activated realm, restore the verified source archive under `source/`, and rerun the legacy launcher only after review.\n\nArchive manifest: `manifest.json`.\n")
             for path in temporary.rglob("*"):
-                if path.is_file():
+                if path.is_file() and not path.is_symlink():
                     path.chmod(0o400)
             if _file_map(temporary / "source") != archived_files or _sha256_file(archived_db) != manifest["database_sha256"]:
                 raise MigrationError("archive bytes failed post-copy verification")
@@ -501,6 +542,11 @@ class Migrator:
             self._media_ids[str(row["id"])] = value
             if self._result_id(value, "object_id", "digest", "id") is None:
                 self._report.setdefault("unresolved", []).append({"kind": "media", "id": row.get("id"), "reason": "client returned no durable identity"})
+            project = self._project_ids.get(str(row.get("project_id")))
+            digest = self._result_id(value, "digest", "object_id", "id")
+            if project is not None and digest is not None and hasattr(self.client, "add_project_object"):
+                project_id = self._result_id(project, "project_id", "id")
+                self._invoke("add_project_object", project_id, digest, relation=str(row.get("media_kind") or "managed"))
         for row in data.get("timelines", []):
             project = self._project_ids[str(row["project_id"])]
             project_id = getattr(project, "project_id", project.get("project_id", project.get("id")) if isinstance(project, Mapping) else project)
@@ -544,7 +590,22 @@ class Migrator:
                 self._report.setdefault("unresolved", []).append({"kind": "reference", "id": row.get("id"), "reason": "client_missing_reference_operation"})
         for row in data.get("generations", []):
             if hasattr(self.client, "create_generation"):
-                generation = self._invoke("create_generation", dict(row), idempotency_key=f"astrid-migrate-generation-{row['id']}")
+                # The neutral generation schema intentionally keeps the
+                # legacy-only fields in metadata.  Preserve every authored
+                # value rather than reducing a generation to type/id alone.
+                payload = dict(row)
+                payload["metadata"] = {
+                    **(_json(row.get("metadata_json"), {}) or {}),
+                    "legacy_name": row.get("name"),
+                    "legacy_type": row.get("type"),
+                    "based_on_generation_id": row.get("based_on_generation_id"),
+                    "parent_generation_id": row.get("parent_generation_id"),
+                    "child_order": row.get("child_order"),
+                    "params": _json(row.get("params_json"), {}),
+                    "starred": row.get("starred"),
+                    "deleted_at": row.get("deleted_at"),
+                }
+                generation = self._invoke("create_generation", payload, idempotency_key=f"astrid-migrate-generation-{row['id']}")
                 if self._result_id(generation, "generation_id", "id") is not None:
                     self._import_counts["generations"] = self._import_counts.get("generations", 0) + 1
                 else:
@@ -570,6 +631,10 @@ class Migrator:
             run_id = self._result_id(task, "run_id")
             if run_id is not None:
                 self._run_ids[str(row.get("run_id") or run_id)] = run_id
+        if hasattr(self.client, "append_migration_event"):
+            for row in data.get("events", []):
+                payload = _json(row.get("payload_json"), row.get("payload", {}))
+                self._invoke("append_migration_event", str(row.get("kind") or row.get("event_type") or "migration.event"), payload)
 
     def _destination_reconciliation(self, data: Mapping[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
         reader = getattr(self.client, "destination_verification", None)
@@ -586,12 +651,45 @@ class Migrator:
         errors = []
         if not isinstance(truth, Mapping):
             return {"ok": False, "errors": [{"kind": "destination_verification", "reason": "destination snapshot must be a mapping"}]}
-        required_sections = ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "event_streams", "media_locations", "foreign_key_errors")
+        required_sections = ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "event_streams", "media_locations", "project_objects", "foreign_key_errors")
         missing_sections = [section for section in required_sections if section not in truth]
         if self.config.require_destination_verification and missing_sections:
             errors.append({"kind": "destination_verification", "reason": "snapshot is not a complete authority snapshot", "missing": missing_sections})
         projects = truth.get("projects", [])
         by_slug = {str(row.get("slug")): row for row in projects}
+        if self.config.require_destination_verification:
+            def _ids(rows, *keys):
+                return Counter(str(next((row.get(key) for key in keys if row.get(key) is not None), "")) for row in rows)
+            # Exact sets/counts are required for every migrated entity.  The
+            # old source-only loops accepted a destination that silently
+            # dropped a kind or added an unrelated row.
+            entity_specs = (
+                ("projects", "projects", ("slug", "id")),
+                ("timelines", "timelines", ("id",)),
+                ("shots", "timeline_shots", ("id",)),
+                ("project_references", "timeline_references", ("id",)),
+                ("generations", "generations", ("id",)),
+            )
+            for source_name, destination_name, keys in entity_specs:
+                expected_ids = _ids(data.get(source_name, []), *keys)
+                actual_ids = _ids(truth.get(destination_name, []), *keys)
+                if expected_ids != actual_ids:
+                    errors.append({"kind": source_name, "reason": "destination entity count or identity set differs", "missing": sorted((expected_ids - actual_ids).elements()), "unexpected": sorted((actual_ids - expected_ids).elements())})
+            for source_name, destination_name in (("runs", "runs"), ("tasks", "tasks")):
+                if len(data.get(source_name, [])) != len(truth.get(destination_name, [])):
+                    errors.append({"kind": source_name, "reason": "destination entity count differs", "source": len(data.get(source_name, [])), "destination": len(truth.get(destination_name, []))})
+            expected_objects = Counter(str(row.get("content_hash") or "").removeprefix("sha256:") for row in data.get("media", []))
+            actual_objects = Counter(str(row.get("digest") or row.get("content_hash") or "").removeprefix("sha256:") for row in truth.get("objects", []))
+            if expected_objects != actual_objects:
+                errors.append({"kind": "objects", "reason": "destination object count or content set differs", "missing": sorted((expected_objects - actual_objects).elements()), "unexpected": sorted((actual_objects - expected_objects).elements())})
+            actual_project_ids = {str(row.get("id")): str(row.get("slug")) for row in projects}
+            actual_relationships = Counter((actual_project_ids.get(str(row.get("project_id")), str(row.get("project_id"))), str(row.get("digest", "")).removeprefix("sha256:"), str(row.get("relation", "managed"))) for row in truth.get("project_objects", []))
+            # A source media row denotes a managed project-object relation;
+            # require its exact project ownership, not merely global CAS
+            # presence.
+            expected_relationships = Counter((str(next((p.get("slug") for p in data.get("projects", []) if str(p.get("id")) == str(m.get("project_id"))), m.get("project_id"))), str(m.get("content_hash", "")).removeprefix("sha256:"), str(m.get("media_kind") or "managed")) for m in data.get("media", []))
+            if expected_relationships != actual_relationships:
+                errors.append({"kind": "project_objects", "reason": "project-media relationships differ", "missing": [list(x) for x in (expected_relationships - actual_relationships).elements()], "unexpected": [list(x) for x in (actual_relationships - expected_relationships).elements()]})
         for source in data.get("projects", []):
             actual = by_slug.get(str(source.get("slug")))
             if not actual or str(actual.get("name")) != str(source.get("name")):
@@ -639,8 +737,16 @@ class Migrator:
             if actual_document is None or _json(actual_document.get("content_json"), None) != document:
                 errors.append({"kind": "timeline_document", "id": source.get("id"), "reason": "document content differs from destination truth"})
         for source in data.get("generations", []):
-            if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("generations", [])):
+            actual_generation = next((row for row in truth.get("generations", []) if str(row.get("id")) == str(source.get("id"))), None)
+            if actual_generation is None:
                 errors.append({"kind": "generation", "id": source.get("id"), "reason": "missing from destination truth"})
+            else:
+                metadata = actual_generation.get("metadata")
+                if metadata is None:
+                    metadata = _json(actual_generation.get("metadata_json"), {})
+                expected_fields = {"legacy_name": source.get("name"), "legacy_type": source.get("type"), "based_on_generation_id": source.get("based_on_generation_id"), "parent_generation_id": source.get("parent_generation_id"), "child_order": source.get("child_order"), "params": _json(source.get("params_json"), {}), "starred": source.get("starred"), "deleted_at": source.get("deleted_at")}
+                if not isinstance(metadata, Mapping) or any(metadata.get(key) != value for key, value in expected_fields.items()):
+                    errors.append({"kind": "generation", "id": source.get("id"), "reason": "generation authored fields differ", "expected": expected_fields, "actual": metadata})
         expected_tasks = len(data.get("tasks", []))
         if len(truth.get("tasks", [])) < expected_tasks:
             errors.append({"kind": "tasks", "reason": "destination task truth is incomplete"})
@@ -762,7 +868,7 @@ class Migrator:
                     else:
                         candidates.remove(digest)
                 destination_kinds = {str(row.get("kind", "")) for row in destination_events}
-                missing_represented = {kind: len(values) for kind, values in source_by_kind.items() if kind in destination_kinds and values}
+                missing_represented = {kind: len(values) for kind, values in source_by_kind.items() if values}
                 if missing_represented:
                     errors.append({"kind": "events", "reason": "destination event ledger is truncated", "remaining_source_events": missing_represented})
                 native_ids = [row.get("id") for row in destination_events]

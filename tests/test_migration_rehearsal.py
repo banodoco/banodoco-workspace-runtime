@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -175,3 +177,113 @@ def test_b10_restart_resumes_from_durable_journal_at_transition_seams(tmp_path, 
         assert transitions == [("prepared", "active"), ("active", "rolled_back"), ("rolled_back", "reactivated")]
     finally:
         runtime.close()
+
+
+def test_b10_strict_reconciliation_rejects_native_event_kind_loss():
+    raw = _raw_ledger()
+    # Both rows have native IDs, so this exercises the native branch where a
+    # kind omitted entirely used to evade the old intersection-only check.
+    visible = _ledger_snapshot([{"id": 1, "kind": raw["events"][0]["kind"], "payload_json": raw["events"][0]["payload_json"]}], raw["event_streams"])
+    wrapper = _RawLedgerWrapper(raw, events=visible["events"], streams=visible["event_streams"])
+    result = _ledger_migrator(wrapper)._destination_reconciliation({"events": raw["events"], "event_streams": raw["event_streams"]})
+    assert result["ok"] is False
+    assert any(error["reason"] == "destination event ledger is truncated" for error in result["errors"])
+
+
+def test_b10_generation_fields_and_project_media_relationship_are_preserved(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        report = run_rehearsal(MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0), RuntimeServiceAdapter(runtime), runtime=runtime)
+        generation = next(row for row in report["reconciliation"]["destination_truth"]["truth"]["generations"] if row["id"] == "gen-1")
+        assert json.loads(generation["metadata_json"])["legacy_name"] == "Opening generation"
+        relationships = report["reconciliation"]["destination_truth"]["truth"]["project_objects"]
+        assert len(relationships) == 1
+        assert relationships[0]["relation"] == "generic"
+    finally:
+        runtime.close()
+
+
+def test_b10_before_migration_mutation_rejected_against_freeze_receipt(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        def mutate(seam):
+            if seam == "before_migration":
+                (source / ".astrid" / "preferences.json").write_text('{"selected_project":"changed"}\n')
+        with pytest.raises(MigrationError, match="bound freeze receipt"):
+            run_rehearsal(MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0), RuntimeServiceAdapter(runtime), runtime=runtime, fault_injector=mutate)
+        assert not (tmp_path / "archive" / "manifest.json").exists()
+        assert not (tmp_path / "destination" / "activation-manifest.json").exists()
+    finally:
+        runtime.close()
+
+
+def test_b10_capacity_is_reserved_before_migration_writes(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="capacity reservation"):
+            run_rehearsal(MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=shutil.disk_usage(tmp_path).free + 1), RuntimeServiceAdapter(runtime), runtime=runtime)
+        journal = json.loads((tmp_path / "destination" / "migration-journal.json").read_text())
+        assert any(effect["name"] == "capacity_preflight_refused" for effect in journal["effects"])
+        assert not (tmp_path / "destination" / "activation-manifest.json").exists()
+    finally:
+        runtime.close()
+
+
+def test_b10_archive_manifest_binds_symlink_identity_and_retarget(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    (source / "media" / "alias.bin").symlink_to("clip.bin")
+    archive = tmp_path / "archive"
+    first = Migrator(MigrationConfig(source, archive, tmp_path / "destination"), _FakeClientForSymlink())
+    first._archive(first.inventory())
+    (source / "media" / "alias.bin").unlink()
+    (source / "media" / "alias.bin").symlink_to("missing.bin")
+    with pytest.raises(MigrationError, match="does not match"):
+        second = Migrator(MigrationConfig(source, archive, tmp_path / "destination-2"), _FakeClientForSymlink())
+        second._archive(second.inventory())
+
+
+def test_b10_tampered_restore_candidate_never_activates(tmp_path):
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        project = runtime.create_project({"name": "baseline", "slug": "baseline"})
+        backup = runtime.backup(tmp_path / "backup")
+        restored = runtime.restore(tmp_path / "backup", tmp_path / "candidate")
+        db = sqlite3.connect(tmp_path / "candidate" / "realm.sqlite3")
+        db.execute("INSERT INTO projects(id, realm_id, slug, name, metadata_json, version, created_at, updated_at, idempotency_key) VALUES ('tampered', ?, 'tampered', 'Tampered', '{}', 1, 'now', 'now', NULL)", (project["realm_id"],))
+        db.commit()
+        db.close()
+        adapter = RuntimeServiceAdapter(runtime)
+        with pytest.raises(MigrationError, match="candidate failed verification"):
+            adapter.activate_destination(tmp_path / "candidate", state="reactivated")
+        assert runtime.get_project("baseline")["slug"] == "baseline"
+    finally:
+        runtime.close()
+
+
+class _FakeClientForSymlink:
+    def create_project(self, name, *, slug=None, metadata=None, idempotency_key=None, legacy_id=None):
+        return {"project_id": "p"}
+
+    def ingest_object(self, data, **kwargs):
+        import hashlib
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        return {"object_id": digest, "digest": digest}
+
+    def create_timeline(self, project_id, timeline_id, **kwargs):
+        return {"timeline_id": timeline_id}
+
+    def create_shot(self, *args, **kwargs):
+        return {"shot_id": "shot-1"}
+
+    def create_reference(self, *args, **kwargs):
+        return {"reference_id": "ref-1"}
+
+    def create_generation(self, generation, **kwargs):
+        return {"generation_id": generation["id"]}

@@ -40,8 +40,8 @@ class RuntimeService:
     def close(self):
         self.store.close()
 
-    def backup(self, destination):
-        return create_backup(self.store, destination)
+    def backup(self, destination, *, binding=None):
+        return create_backup(self.store, destination, binding=binding)
 
     def restore(self, backup_dir, destination):
         return restore_backup(backup_dir, destination)

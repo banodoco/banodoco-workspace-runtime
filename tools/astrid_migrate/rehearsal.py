@@ -44,8 +44,11 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 def _tree_digest(root: Path) -> str:
     files = []
-    for path in sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink()):
-        files.append({"path": str(path.relative_to(root)), "size": path.stat().st_size, "sha256": _sha256_file(path)})
+    for path in sorted(p for p in root.rglob("*") if (p.is_file() or p.is_symlink())):
+        if path.is_symlink():
+            files.append({"path": str(path.relative_to(root)), "kind": "symlink", "target": os.readlink(path)})
+        else:
+            files.append({"path": str(path.relative_to(root)), "kind": "file", "size": path.stat().st_size, "sha256": _sha256_file(path)})
     return hashlib.sha256(_canonical(files)).hexdigest()
 
 
@@ -128,6 +131,10 @@ class RuntimeServiceAdapter:
     def ingest_object(self, data, *, media_type, idempotency_key=None, filename=None):
         return self.service.ingest_object(data, media_type=media_type, original_name=filename)
 
+    def add_project_object(self, project_id, digest, *, relation="managed"):
+        self.service.store.add_object_ref(str(project_id), str(digest).removeprefix("sha256:"), relation=relation)
+        return {"project_id": str(project_id), "digest": str(digest).removeprefix("sha256:"), "relation": relation}
+
     def create_timeline(self, project_id, timeline_id, *, idempotency_key=None):
         return self.service.create_timeline(project_id, timeline_id)
 
@@ -140,7 +147,13 @@ class RuntimeServiceAdapter:
     def create_generation(self, generation, *, idempotency_key=None):
         project_id = self.project_ids.get(str(generation["project_id"]), generation["project_id"])
         try:
-            return self.service.create_generation(project_id, {"generation_id": generation["id"], "type": generation.get("type", "generation"), "metadata": {}})
+            return self.service.create_generation(project_id, {
+                "generation_id": generation["id"],
+                "type": generation.get("type", "generation"),
+                "source_task_id": generation.get("task_id"),
+                "status": "deleted" if generation.get("deleted_at") else "created",
+                "metadata": generation.get("metadata") or {},
+            })
         except Exception as exc:
             # Generation IDs are the migration idempotency key in the runtime
             # contract. A retry after a crash reads the durable row.
@@ -157,6 +170,19 @@ class RuntimeServiceAdapter:
         value["project"] = self.project_ids.get(str(project), project)
         value["capability_digest"] = value.get("capability_digest") or "sha256:" + hashlib.sha256(str(value.get("capability_id") or value.get("capability")).encode()).hexdigest()
         return self.service.create_task(value)
+
+    def append_migration_event(self, kind, payload):
+        """Preserve a source event whose native runtime has no project stream."""
+        with self.service.store._mutex:
+            existing = self.service.store.conn.execute("SELECT 1 FROM events WHERE kind=? AND payload_json=? LIMIT 1", (str(kind), json.dumps(payload, sort_keys=True, separators=(",", ":")))).fetchone()
+            if existing:
+                return {"deduplicated": True}
+            run = self.service.store.conn.execute("SELECT id FROM runs ORDER BY created_at, id LIMIT 1").fetchone()
+            if not run:
+                return {"deduplicated": False, "skipped": True}
+            self.service.store._append_event(run[0], None, str(kind), payload)
+            self.service.store.conn.commit()
+            return {"deduplicated": False}
 
     def destination_snapshot(self):
         """Read destination truth from the runtime kernel, never local maps."""
@@ -228,9 +254,21 @@ class RuntimeServiceAdapter:
         """
         conn = self.service.store.conn
         keep = {table: {str(row.get("id", row.get("digest", ""))) for row in baseline.get(table, [])} for table in ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "documents", "attempts", "reservations", "recovery_checkpoints", "generation_variants", "timeline_shot_state", "timeline_reference_state", "timeline_revisions", "project_objects", "media_relations")}
+        keep_project_objects = {(str(row.get("project_id")), str(row.get("digest"))) for row in baseline.get("project_objects", [])}
+        keep_media_relations = {(str(row.get("project_id")), str(row.get("from_digest")), str(row.get("to_digest")), str(row.get("kind"))) for row in baseline.get("media_relations", [])}
         with self.service.store._transaction():
-            for table, key in (("events", "id"), ("recovery_checkpoints", "id"), ("reservations", "task_id"), ("attempts", "id"), ("tasks", "id"), ("generation_variants", "id"), ("generations", "id"), ("timeline_shot_state", "id"), ("timeline_reference_state", "id"), ("timeline_revisions", "timeline_id"), ("timeline_shots", "id"), ("timeline_references", "id"), ("project_documents", "id"), ("timelines", "id"), ("runs", "id"), ("projects", "id"), ("objects", "digest")):
+            for table, key in (("events", "id"), ("recovery_checkpoints", "id"), ("reservations", "task_id"), ("attempts", "id"), ("generation_variants", "id"), ("timeline_shot_state", "id"), ("timeline_reference_state", "id"), ("timeline_revisions", "timeline_id"), ("timeline_shots", "id"), ("timeline_references", "id"), ("project_documents", "id"), ("media_relations", "project_id"), ("project_objects", "project_id"), ("tasks", "id"), ("generations", "id"), ("timelines", "id"), ("runs", "id"), ("projects", "id"), ("objects", "digest")):
                 if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    continue
+                if table == "project_objects":
+                    for row in conn.execute("SELECT project_id, digest FROM project_objects").fetchall():
+                        if (str(row[0]), str(row[1])) not in keep_project_objects:
+                            conn.execute("DELETE FROM project_objects WHERE project_id=? AND digest=?", (row[0], row[1]))
+                    continue
+                if table == "media_relations":
+                    for row in conn.execute("SELECT project_id, from_digest, to_digest, kind FROM media_relations").fetchall():
+                        if tuple(map(str, row)) not in keep_media_relations:
+                            conn.execute("DELETE FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=?", tuple(row))
                     continue
                 baseline_key = keep.get("documents", set()) if table == "project_documents" else keep.get(table, set())
                 rows = conn.execute(f'SELECT "{key}" FROM "{table}"').fetchall()
@@ -255,12 +293,18 @@ class RuntimeServiceAdapter:
         target = self.service.store.root.resolve()
         if candidate == target or not (candidate / "realm.sqlite3").is_file() or not (candidate / "cas").is_dir():
             raise MigrationError("candidate is not a complete inactive realm")
-        from runtime_protocol.backup import verify_backup
+        from runtime_protocol.backup import verify_restore_candidate
         # Candidate restore directories carry a handoff, while backups carry a
         # manifest.  Both must be checked before touching the configured root.
         handoff = candidate / "activation-handoff.json"
         if not handoff.is_file():
             raise MigrationError("candidate realm has no activation handoff")
+        # Verify SQLite bytes, CAS set/content, schema/FKs, and backup realm
+        # identity before closing or renaming the active authority.
+        try:
+            candidate_verification = verify_restore_candidate(candidate)
+        except Exception as exc:
+            raise MigrationError(f"candidate failed verification before {state} activation") from exc
         old_service = self.service
         display_name = old_service.realm["display_name"]
         realm_id = old_service.realm["id"]
@@ -296,7 +340,7 @@ class RuntimeServiceAdapter:
             catalog = RealmCatalog(Path(support_root) / "catalog.json")
             catalog.register(realm_id=realm_id, display_name=display_name, data_root=str(target))
             catalog.select(realm_id)
-        return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": str(quarantine), "realm_id": realm_id}
+        return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": str(quarantine), "realm_id": realm_id, "candidate_verification": candidate_verification}
 
 
 class MigrationJournal:
@@ -503,17 +547,43 @@ class Rehearsal:
                 evidence_root=self.config.evidence_root,
                 capacity_margin_bytes=self.config.capacity_margin_bytes,
                 require_destination_verification=True,
+                expected_source_manifest_sha256=self.config.expected_source_manifest_sha256,
+                expected_source_facts_sha256=self.config.expected_source_facts_sha256,
             )
         migrator = Migrator(rehearsal_config, self.client)
         inventory = migrator.inventory()
-        freeze = {"packet": "B10.1", "state": "snapshot", "source_manifest_sha256": inventory["source_manifest_sha256"], "source_tree_sha256": _tree_digest(self.config.source_root), "source_facts_sha256": inventory["source_facts_sha256"], "writer_probe": "passed", "lock_held": False, "lockless_digest_revalidation": True, "created_at": time.time()}
+        # These values are an inventory epoch, not a narrative receipt.  Bind
+        # the subsequent migrator to the exact same values before its first
+        # target write.
+        freeze = {"packet": "B10.1", "state": "snapshot", "inventory_epoch": inventory["source_manifest_sha256"], "source_manifest_sha256": inventory["source_manifest_sha256"], "source_tree_sha256": _tree_digest(self.config.source_root), "source_facts_sha256": inventory["source_facts_sha256"], "writer_probe": "passed", "lock_held": False, "lockless_digest_revalidation": True, "created_at": time.time()}
         _write_json(evidence_root / "source-freeze-b10.json", freeze)
+        rehearsal_config = MigrationConfig(
+            self.config.source_root, self.config.archive_root, self.config.destination_root,
+            dry_run=self.config.dry_run, source_version=self.config.source_version,
+            freeze_probe=self.config.freeze_probe, evidence_root=self.config.evidence_root,
+            capacity_margin_bytes=self.config.capacity_margin_bytes,
+            require_destination_verification=True,
+            expected_source_manifest_sha256=freeze["source_manifest_sha256"],
+            expected_source_facts_sha256=freeze["source_facts_sha256"],
+        )
+        migrator = Migrator(rehearsal_config, self.client)
         preceding = _tree_size(self.config.source_root)
         margin = self.config.capacity_margin_bytes if self.config.capacity_margin_bytes is not None else max(int(preceding * 0.2), 10 * 1024**3)
         free = int(inventory["destination_free_bytes"])
-        required = preceding + margin
-        capacity = {"packet": "B10.5", "accepted_archive_bytes": preceding, "destination_db_cas_bytes": int(inventory["estimated_cas_bytes"]), "measured_peak_staging_bytes": 0, "isolated_restore_copy_bytes": 0, "evidence_export_allowance_bytes": 0, "margin_bytes": margin, "required_bytes": required, "available_bytes": free, "reserved": free >= required}
+        destination_bytes = _tree_size(self.config.destination_root)
+        # Reserve the whole peak set before migration starts.  The estimate is
+        # intentionally conservative: source clone/archive, current and
+        # projected destination, two backup copies, two restore candidates,
+        # evidence, and the explicit safety margin all coexist during the
+        # rehearsal.
+        archive_bytes = preceding
+        staging_bytes = archive_bytes + destination_bytes + destination_bytes + archive_bytes
+        restore_bytes = destination_bytes + archive_bytes + destination_bytes
+        evidence_bytes = max(_tree_size(evidence_root), 1024 * 1024)
+        required = preceding + archive_bytes + destination_bytes + staging_bytes + restore_bytes + evidence_bytes + margin
+        capacity = {"packet": "B10.5", "source_bytes": preceding, "archive_bytes": archive_bytes, "destination_bytes": destination_bytes, "accepted_archive_bytes": archive_bytes, "destination_db_cas_bytes": int(inventory["estimated_cas_bytes"]), "staging_bytes": staging_bytes, "restore_bytes": restore_bytes, "evidence_bytes": evidence_bytes, "measured_peak_staging_bytes": 0, "isolated_restore_copy_bytes": 0, "evidence_export_allowance_bytes": evidence_bytes, "margin_bytes": margin, "required_bytes": required, "available_bytes": free, "reserved": free >= required}
         if not capacity["reserved"]:
+            journal.effect("capacity_preflight_refused", required_bytes=required, available_bytes=free, capacity=capacity)
             raise MigrationError("B10.5 capacity reservation is insufficient")
         _write_json(evidence_root / "capacity-receipt-b10.json", capacity)
         _write_json(evidence_root / "writer-freeze-receipt-b10.json", freeze | {"packet": "B10.5", "procedure": "source clone is immutable; writer probe pending", "held_across_critical_operation": False, "lockless_digest_revalidation": True, "lock_count": 0})
@@ -590,7 +660,8 @@ class Rehearsal:
             capacity["measured_peak_staging_bytes"] = max([report.get("archive_peak_bytes", 0), *staging_peaks])
             capacity["isolated_restore_copy_bytes"] = max(_tree_size(restore_root), _tree_size(reactivation_root))
             capacity["evidence_export_allowance_bytes"] = _tree_size(evidence_root)
-            capacity["required_bytes"] = sum(capacity[key] for key in ("accepted_archive_bytes", "destination_db_cas_bytes", "measured_peak_staging_bytes", "isolated_restore_copy_bytes", "evidence_export_allowance_bytes", "margin_bytes"))
+            measured_required = sum(capacity[key] for key in ("accepted_archive_bytes", "destination_db_cas_bytes", "measured_peak_staging_bytes", "isolated_restore_copy_bytes", "evidence_export_allowance_bytes", "margin_bytes"))
+            capacity["required_bytes"] = max(int(capacity["required_bytes"]), measured_required)
             capacity["reserved"] = capacity["available_bytes"] >= capacity["required_bytes"]
             if not capacity["reserved"]:
                 raise MigrationError("B10.5 exact capacity reservation is insufficient after measured rehearsal")
@@ -623,13 +694,33 @@ class Rehearsal:
         return {"packet": "B10", "source_freeze": freeze, "capacity": capacity, "migration": report, "backup": backup_result, "pre_migration_backup": pre_backup, "candidate_backup": candidate_backup, "restore": restore_result, "reactivation": reactivation_result, "rollback_activation": rollback_activation if self.runtime is not None else None, "reactivation_activation": reactivation_activation if self.runtime is not None else None, "rollback_active_snapshot": rollback_active_snapshot if self.runtime is not None else None, "reactivation_active_snapshot": reactivation_active_snapshot if self.runtime is not None else None, "reconciliation": reconciliation, "journal": reactivated, "idempotent_reactivation": MigrationJournal(self.config.destination_root / "migration-journal.json").transition("reactivated", destination=str(self.config.destination_root), candidate_restore=reactivation_result) == reactivated, "rollback": rolled_back}
 
     def _backup_or_reuse(self, destination: Path):
+        expected = self._destination_binding()
         if destination.exists():
             try:
                 from runtime_protocol.backup import verify_backup
-                return verify_backup(destination)
+                result = verify_backup(destination)
+                actual = result["manifest"].get("destination_binding")
+                if actual != expected:
+                    raise MigrationError("existing backup is bound to a different destination realm/catalog/root")
+                return result
             except Exception as exc:
                 raise MigrationError(f"existing backup is not a verified reusable artifact: {destination}") from exc
-        return self.runtime.backup(destination)
+        return self.runtime.backup(destination, binding=expected)
+
+    def _destination_binding(self) -> dict[str, Any]:
+        """Identity of the exact authority whose prebackup may be reused."""
+        service = getattr(self.client, "service", None)
+        if service is None:
+            return {}
+        root = Path(service.store.root).resolve()
+        files = []
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and not path.is_symlink():
+                files.append({"path": str(path.relative_to(root)), "size": path.stat().st_size, "sha256": _sha256_file(path)})
+        root_digest = hashlib.sha256(_canonical(files)).hexdigest()
+        catalog = Path(service.support_root) / "catalog.json" if service.support_root else None
+        catalog_digest = _sha256_file(catalog) if catalog and catalog.is_file() else None
+        return {"realm_id": service.realm["id"], "root_digest": root_digest, "catalog_digest": catalog_digest, "root": str(root)}
 
     def _restore_or_reuse(self, backup: Path, destination: Path):
         if destination.exists():
@@ -644,7 +735,12 @@ class Rehearsal:
             source_manifest = verify_backup(backup)["manifest"]
             if value.get("source_manifest_sha256") != _sha256_file(backup / "manifest.json"):
                 raise MigrationError(f"existing restore destination came from a different backup: {destination}")
-            return {"destination": str(destination), "realm_id": value.get("realm_id"), "activation_handoff": str(handoff), "source_manifest_sha256": value.get("source_manifest_sha256"), "verification": source_manifest}
+            from runtime_protocol.backup import verify_restore_candidate
+            try:
+                candidate_verification = verify_restore_candidate(destination)
+            except Exception as exc:
+                raise MigrationError(f"existing restore destination failed verification: {destination}") from exc
+            return {"destination": str(destination), "realm_id": value.get("realm_id"), "activation_handoff": str(handoff), "source_manifest_sha256": value.get("source_manifest_sha256"), "verification": source_manifest, "candidate_verification": candidate_verification}
         return self.runtime.restore(backup, destination)
 
 

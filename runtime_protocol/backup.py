@@ -94,7 +94,58 @@ def verify_backup(backup_dir: str | Path) -> dict:
     return {"manifest": manifest, "cas_manifest": cas}
 
 
-def create_backup(store, destination: str | Path) -> dict:
+def verify_restore_candidate(candidate_dir: str | Path) -> dict:
+    """Verify a restored realm against its immutable backup handoff.
+
+    This must run immediately before every activation and reuse.  In
+    particular, a database edit (including an extra project) changes the
+    candidate digest and is rejected before the active realm is touched.
+    """
+    root = Path(candidate_dir).expanduser().resolve()
+    handoff_path = root / "activation-handoff.json"
+    database = root / "realm.sqlite3"
+    cas_root = root / "cas" / "sha256"
+    if not handoff_path.is_file() or not database.is_file() or not cas_root.is_dir():
+        raise ConflictError("restore candidate is incomplete")
+    try:
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConflictError("restore candidate handoff is invalid") from exc
+    source_backup = Path(str(handoff.get("source_backup", ""))).expanduser().resolve()
+    verified = verify_backup(source_backup)
+    source_manifest = verified["manifest"]
+    if handoff.get("realm_id") != source_manifest.get("realm_id"):
+        raise ConflictError("restore candidate realm does not match its backup")
+    candidate_db_hash = _sha256(database)
+    if handoff.get("candidate_database_sha256") != candidate_db_hash or candidate_db_hash != source_manifest.get("database_sha256"):
+        raise ConflictError("restore candidate SQLite bytes differ from its verified backup")
+    expected_objects = {str(item["digest"]): item for item in verified["cas_manifest"].get("objects", [])}
+    actual_objects = {}
+    for path in cas_root.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            digest = path.parent.name + path.name
+            actual_objects[digest] = path
+    if set(actual_objects) != set(expected_objects):
+        raise ConflictError("restore candidate CAS object set differs from its verified backup")
+    for digest, item in expected_objects.items():
+        path = actual_objects[digest]
+        if path.stat().st_size != int(item["size"]) or _sha256(path) != item["sha256"]:
+            raise ConflictError("restore candidate CAS bytes differ from its verified backup", details={"digest": digest})
+    from .store import RealmStore
+    restored = RealmStore(root, acquire_owner=False)
+    try:
+        report = restored.doctor()
+        if not report["ok"]:
+            raise ConflictError("restore candidate failed integrity checks", details=report)
+        realm = restored.realm
+    finally:
+        restored.close()
+    if realm["id"] != source_manifest.get("realm_id"):
+        raise ConflictError("restore candidate realm identity mismatch")
+    return {"handoff": handoff, "manifest": source_manifest, "doctor": report, "database_sha256": candidate_db_hash, "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
+
+
+def create_backup(store, destination: str | Path, *, binding: dict | None = None) -> dict:
     destination = Path(destination).expanduser().resolve()
     if destination.exists():
         raise ConflictError("backup destination already exists", details={"destination": str(destination)})
@@ -121,6 +172,8 @@ def create_backup(store, destination: str | Path) -> dict:
             atomic_json_write(temporary / "cas-manifest.json", cas)
             realm = store.realm
             manifest = {"format_version": 1, "created_at": now(), "schema_version": store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], "realm_id": realm["id"], "display_name": realm["display_name"], "database_sha256": _sha256(target_db), "cas_manifest_sha256": cas["manifest_sha256"]}
+            if binding is not None:
+                manifest["destination_binding"] = dict(binding)
             atomic_json_write(temporary / "manifest.json", manifest)
         temporary.rename(destination)
         return verify_backup(destination)
@@ -149,7 +202,7 @@ def restore_backup(backup_dir: str | Path, destination: str | Path) -> dict:
             realm = restored.realm
         finally:
             restored.close()
-        handoff = {"format_version": 1, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "prepared_at": now()}
+        handoff = {"format_version": 1, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _sha256(temporary / "realm.sqlite3"), "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
         atomic_json_write(temporary / "activation-handoff.json", handoff)
         temporary.rename(destination)
         return {"destination": str(destination), "realm_id": realm["id"], "activation_handoff": str(destination / "activation-handoff.json"), "source_manifest_sha256": handoff["source_manifest_sha256"], "verification": verified["manifest"]}
