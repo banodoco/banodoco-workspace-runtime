@@ -29,6 +29,18 @@ class Handshake:
 
 
 @dataclass(frozen=True)
+class Realm:
+    realm_id: str
+    display_name: str
+    version: int
+    created_at: str
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "Realm":
+        return cls(realm_id=value["realm_id"], display_name=value["display_name"], version=int(value["version"]), created_at=value["created_at"])
+
+
+@dataclass(frozen=True)
 class Project:
     project_id: str
     realm_id: str
@@ -193,6 +205,9 @@ class WorkspaceClient:
         result = Handshake(protocol=value["protocol"], schema_digest=value["schema_digest"], session_id=value["session_id"], actor_id=value["actor_id"], realm_id=value["realm_id"], scopes=tuple(value["scopes"]))
         self.handshake_info = result
         return result
+
+    def get_realm(self) -> Realm:
+        return Realm.from_json(self._json(self._request("GET", "/v1/realm")[2]))
 
     def create_project(self, name: str, *, idempotency_key: str) -> Project:
         _, _, body = self._request("POST", "/v1/projects", body=json.dumps({"name": name}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))

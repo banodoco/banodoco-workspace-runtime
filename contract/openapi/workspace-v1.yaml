@@ -24,6 +24,11 @@ paths:
         content: { application/json: { schema: { $ref: './schemas/handshake.json' } } }
       responses:
         '200': { description: Scoped session, content: { application/json: { schema: { $ref: '#/components/schemas/HandshakeResponse' } } } }
+  /v1/realm:
+    get:
+      operationId: getRealm
+      responses:
+        '200': { description: Current scoped realm, content: { application/json: { schema: { $ref: './schemas/realm.json' } } } }
   /v1/projects:
     get:
       operationId: listProjects

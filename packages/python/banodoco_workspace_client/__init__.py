@@ -9,8 +9,9 @@ from .generated import (
     Handshake,
     ManagedObject,
     Project,
+    Realm,
     Task,
     WorkspaceClient,
 )
 
-__all__ = ["ApiError", "ByteResponse", "Capability", "Event", "Executor", "Handshake", "ManagedObject", "Project", "Task", "WorkspaceClient"]
+__all__ = ["ApiError", "ByteResponse", "Capability", "Event", "Executor", "Handshake", "ManagedObject", "Project", "Realm", "Task", "WorkspaceClient"]

@@ -4,6 +4,7 @@ export type HeadersLike = Record<string, string>;
 export type Transport = (method: string, path: string, headers: HeadersLike, body?: Uint8Array) => Promise<{ status: number; headers: HeadersLike; body: Uint8Array }>;
 export interface Health { status: "ok" | "degraded"; protocol: typeof PROTOCOL; schema_digest: string; runtime_epoch: number }
 export interface Handshake { protocol: typeof PROTOCOL; schema_digest: string; session_id: string; actor_id: string; realm_id: string; scopes: string[] }
+export interface Realm { realm_id: string; display_name: string; version: number; created_at: string }
 export interface Project { project_id: string; realm_id: string; name: string; version: number; created_at: string; updated_at: string; archived?: boolean }
 export interface ManagedObject { object_id: string; digest: string; media_type: string; size: number; version: number; created_at: string; filename?: string }
 export interface ByteResponse { data: Uint8Array; status: number; headers: HeadersLike; etag?: string; content_range?: string }
@@ -36,6 +37,7 @@ export class WorkspaceClient {
   private json<T>(body: Uint8Array): T { return JSON.parse(new TextDecoder().decode(body)) as T }
   async health(): Promise<Health> { return this.json<Health>((await this.request("GET", "/v1/health")).body) }
   async handshake(client_name: string, client_version: string, requested_scopes: string[]): Promise<Handshake> { const v = this.json<Handshake>((await this.request("POST", "/v1/handshake", new TextEncoder().encode(JSON.stringify({ protocol: PROTOCOL, client_name, client_version, requested_scopes })), { "Content-Type": "application/json" })).body); this.handshakeInfo = v; return v }
+  async getRealm(): Promise<Realm> { return this.json<Realm>((await this.request("GET", "/v1/realm")).body) }
   async createProject(name: string, idempotencyKey: string): Promise<Project> { return this.json<Project>((await this.request("POST", "/v1/projects", new TextEncoder().encode(JSON.stringify({ name })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200, 201])).body) }
   async getProject(projectId: string): Promise<Project> { return this.json<Project>((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}`)).body) }
   async listProjects(cursor?: string, limit = 50): Promise<{ items: Project[]; next_cursor: string | null }> { return this.json((await this.request("GET", `/v1/projects?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).body) }

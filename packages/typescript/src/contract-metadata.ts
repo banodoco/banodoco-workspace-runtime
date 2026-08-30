@@ -1,5 +1,5 @@
 /** Generated contract metadata; do not edit by hand. */
 
 export const PROTOCOL = "workspace.v1" as const;
-export const SCHEMA_DIGEST = "sha256:6ada42e02f975ea767cd0d188b7f51568e08a8253875f8dcd75644ee97565420";
-export const OPERATIONS = ["health", "handshake", "listProjects", "createProject", "getProject", "createTimeline", "listTimelines", "getTimeline", "createShot", "getShot", "createReference", "getReference", "ingestObject", "getObject", "headObject", "admitTask", "claimTask", "getTask", "cancelTask", "retryTask", "getRun", "listEvents", "registerExecutor", "listCapabilities", "settleAttempt", "heartbeatAttempt"] as const;
+export const SCHEMA_DIGEST = "sha256:92a7ec05df9ee82945142e7f294b82236f9bb69e3e3f612adc04b67665b43bf5";
+export const OPERATIONS = ["health", "handshake", "getRealm", "listProjects", "createProject", "getProject", "createTimeline", "listTimelines", "getTimeline", "createShot", "getShot", "createReference", "getReference", "ingestObject", "getObject", "headObject", "admitTask", "claimTask", "getTask", "cancelTask", "retryTask", "getRun", "listEvents", "registerExecutor", "listCapabilities", "settleAttempt", "heartbeatAttempt"] as const;
