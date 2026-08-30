@@ -113,6 +113,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "workers"] and method == "POST":
             self._identity("worker:register")
             return self._send(201, self.runtime.register_worker(self._body()))
+        if len(path) == 4 and path[:2] == ["v1", "workers"] and path[3] == "heartbeat" and method == "POST":
+            self._identity("worker:execute")
+            return self._send(200, self.runtime.worker_heartbeat(path[2], self._body()))
         if len(path) >= 3 and path[:2] == ["v1", "projects"]:
             selector = path[2]
             if len(path) == 3:
@@ -184,11 +187,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime._task_resource(value) if canonical else value)
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
-            self._identity("worker:execute" if action in ("claim", "settle") else "tasks:write")
+            self._identity("worker:execute" if action in ("claim", "settle", "heartbeat") else "tasks:write")
             if method == "POST" and action == "claim":
                 return self._send(200, self.runtime.claim(task_id, self._body()))
             if method == "POST" and action == "settle":
                 return self._send(200, self.runtime.settle(task_id, self._body()))
+            if method == "POST" and action == "heartbeat":
+                return self._send(200, self.runtime.heartbeat(task_id, self._body()))
             if method == "POST" and action == "cancel":
                 if canonical:
                     return self._send(200, self.runtime.cancel_task_canonical(task_id, self._body()))
@@ -212,6 +217,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "capabilities"] and method == "GET":
             self._identity("worker:execute")
             return self._send(200, self.runtime.list_capabilities())
+        if path == ["v1", "capabilities"] and method == "POST":
+            self._identity("worker:register")
+            return self._send(201, self.runtime.register_capability(self._body()))
         if path == ["v1", "executors"] and method == "POST":
             self._identity("worker:register")
             return self._send(201, self.runtime.register_executor(self._body()))

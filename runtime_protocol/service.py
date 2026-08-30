@@ -19,11 +19,6 @@ class RuntimeService:
         # keeping them here lets old realms upgrade without a destructive
         # migration while making attempts and composition durable.
         self.store.conn.executescript("""
-        CREATE TABLE IF NOT EXISTS capabilities (
-          id TEXT PRIMARY KEY, definition_digest TEXT NOT NULL, status TEXT NOT NULL,
-          required_resource_keys_json TEXT NOT NULL, estimated_scratch_bytes INTEGER NOT NULL,
-          estimated_output_bytes INTEGER NOT NULL, unavailable_reason TEXT
-        );
         CREATE TABLE IF NOT EXISTS executors (
           id TEXT PRIMARY KEY, max_concurrency INTEGER NOT NULL,
           resource_keys_json TEXT NOT NULL, capabilities_json TEXT NOT NULL,
@@ -150,7 +145,8 @@ class RuntimeService:
 
     def create_task(self, body):
         capability = body.get("capability_id") or body.get("capability")
-        value = self.store.create_task(capability, {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest()), "spec": body.get("spec", {})}, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect") or body.get("expected_effect"))
+        digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
+        value = self.store.create_task(capability, {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect") or body.get("expected_effect"), digest)
         return value
 
     def task(self, task_id):
@@ -159,13 +155,23 @@ class RuntimeService:
     def _task_resource(self, value):
         task, run = value["task"], value["run"]
         spec = task.get("spec", {})
-        return {"task_id": task["id"], "run_id": run["id"], "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id")}
+        resource = {"task_id": task["id"], "run_id": run["id"], "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id")}
+        if task.get("waiting_reason"):
+            resource["waiting_reason"] = task["waiting_reason"]
+        if task.get("lease_fence"):
+            resource["lease_fence"] = task["lease_fence"]
+        if task.get("lease_expires_at"):
+            resource["lease_expires_at"] = task["lease_expires_at"]
+        return resource
 
     def claim(self, task_id, body):
         return self.store.claim_task(task_id, body.get("worker_id", "worker"), body.get("lease_token", ""))
 
     def settle(self, task_id, body):
-        return self.store.settle_task(task_id, body.get("lease_token", ""), body.get("result", {}), effect=body.get("effect"), output_objects=body.get("output_objects"))
+        return self.store.settle_task(task_id, body.get("lease_token", ""), body.get("result", {}), effect=body.get("effect"), output_objects=body.get("output_objects"), fence=body.get("fence"))
+
+    def heartbeat(self, task_id, body):
+        return self.store.heartbeat_task(task_id, body.get("lease_token", ""), fence=body.get("fence"), lease_seconds=body.get("lease_seconds", 30))
 
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
@@ -183,7 +189,8 @@ class RuntimeService:
         version = int(current["task"].get("attempt", 0)) + 1
         if expected is not None and int(expected) != version:
             raise ConflictError("stale task version", details={"expected": expected, "actual": version})
-        self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, worker_id=NULL, updated_at=? WHERE id=?", (now(), task_id))
+        self.store._release_reservations(task_id, current["task"].get("lease_token"))
+        self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, worker_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
         self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (now(), current["run"]["id"]))
         return self._task_resource(self.store.get_task(task_id))
 
@@ -191,21 +198,33 @@ class RuntimeService:
         return self.store.list_events(run_id)
 
     def register_worker(self, body):
-        return self.store.register_worker(body.get("worker_id", ""), body.get("capabilities", []), body.get("max_concurrency", 1), body.get("resource_keys", []))
+        return self.store.register_worker(body.get("worker_id", ""), body.get("capabilities", []), body.get("max_concurrency", 1), body.get("resource_keys", []), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"))
 
     def _ensure_default_capability(self):
         digest = "sha256:" + hashlib.sha256(b"render.basic").hexdigest()
-        self.store.conn.execute("INSERT OR IGNORE INTO capabilities VALUES (?, ?, 'ready', ?, 0, 1, NULL)", ("render.basic", digest, "[]"))
+        self.store.register_capability("render.basic", digest, required_resource_keys=[], estimated_output_bytes=1)
 
     def list_capabilities(self):
         rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
         return {"items": [{"capability_id": r["id"], "definition_digest": r["definition_digest"], "status": r["status"], "required_resource_keys": json.loads(r["required_resource_keys_json"]), "estimated_scratch_bytes": r["estimated_scratch_bytes"], "estimated_output_bytes": r["estimated_output_bytes"], "unavailable_reason": r["unavailable_reason"]} for r in rows]}
 
+    def register_capability(self, body):
+        value = self.store.register_capability(body.get("capability_id", ""), body.get("definition_digest", ""), required_resource_keys=body.get("required_resource_keys", []), status=body.get("status", "ready"), unavailable_reason=body.get("unavailable_reason"), estimated_scratch_bytes=body.get("estimated_scratch_bytes", 0), estimated_output_bytes=body.get("estimated_output_bytes", 0))
+        return {"capability_id": value["id"], "definition_digest": value["definition_digest"], "status": value["status"], "required_resource_keys": value["required_resource_keys"], "estimated_scratch_bytes": value["estimated_scratch_bytes"], "estimated_output_bytes": value["estimated_output_bytes"], "unavailable_reason": value.get("unavailable_reason")}
+
+    def worker_heartbeat(self, worker_id, body):
+        return self.store.heartbeat_worker(worker_id, ready=body.get("ready"), reason=body.get("reason"))
+
     def register_executor(self, body):
         if not body.get("executor_id"):
             raise ValidationError("executor_id is required")
-        self.store.conn.execute("INSERT OR REPLACE INTO executors VALUES (?, ?, ?, ?, ?, ?)", (body["executor_id"], int(body.get("max_concurrency", 1)), canonical_json(body.get("resource_keys", [])), canonical_json(body.get("capabilities", [])), body.get("protocol", "workspace.v1"), now()))
-        return {"executor_id": body["executor_id"], "max_concurrency": int(body.get("max_concurrency", 1)), "resource_keys": body.get("resource_keys", []), "capabilities": body.get("capabilities", []), "protocol": body.get("protocol", "workspace.v1")}
+        max_concurrency = int(body.get("max_concurrency", 1))
+        if max_concurrency < 1:
+            raise ValidationError("max_concurrency must be positive")
+        capabilities = body.get("capabilities", [])
+        self.store.register_worker(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"))
+        self.store.conn.execute("INSERT OR REPLACE INTO executors VALUES (?, ?, ?, ?, ?, ?)", (body["executor_id"], max_concurrency, canonical_json(body.get("resource_keys", [])), canonical_json(capabilities), body.get("protocol", "workspace.v1"), now()))
+        return {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready")}
 
     def claim_next(self, body):
         caps = set(body.get("capability_ids", []))
@@ -213,9 +232,13 @@ class RuntimeService:
         row = next((x for x in rows if not caps or x["capability"] in caps), None)
         if row is None:
             return None
-        attempt_id, lease_id, fence = new_id(), new_id(), 1
-        self.store.claim_task(row["id"], body["executor_id"], lease_id)
-        expires = now()
+        attempt_id, lease_id = new_id(), new_id()
+        value = self.store.claim_task(row["id"], body["executor_id"], lease_id)
+        if value["task"]["status"] != "running":
+            return {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
+        task = value["task"]
+        fence = int(task.get("lease_fence") or task.get("attempt") or 1)
+        expires = task.get("lease_expires_at") or now()
         self.store.conn.execute("INSERT INTO attempts VALUES (?, ?, ?, ?, ?, ?, 0)", (attempt_id, row["id"], lease_id, fence, body["executor_id"], expires))
         self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, row["id"]))
         return {"attempt_id": attempt_id, "task_id": row["id"], "lease_id": lease_id, "fence": fence, "lease_expires_at": expires}
@@ -225,7 +248,7 @@ class RuntimeService:
         if not row or row["settled"] or row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
             raise LeaseError("attempt lease is stale or already settled")
         result = {"outputs": body.get("outputs", [])}
-        value = self.store.settle_task(row["task_id"], row["lease_id"], result, effect=body.get("effect"))
+        value = self.store.settle_task(row["task_id"], row["lease_id"], result, effect=body.get("effect"), fence=body.get("fence"))
         self.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (attempt_id,))
         return self._task_resource(value)
 
@@ -233,7 +256,10 @@ class RuntimeService:
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         if not row or row["settled"] or row["lease_id"] != body.get("lease_id") or int(row["fence"]) != int(body.get("fence", 0)):
             raise LeaseError("attempt lease is stale or already settled")
-        return {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": now()}
+        value = self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30))
+        expires = value["task"].get("lease_expires_at")
+        self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
+        return {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires}
 
     def events_page(self, aggregate_id=None):
         rows = self.store.conn.execute("SELECT * FROM events ORDER BY id").fetchall()
