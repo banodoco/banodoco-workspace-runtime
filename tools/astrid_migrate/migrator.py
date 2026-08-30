@@ -26,11 +26,15 @@ class MigrationConfig:
     dry_run: bool = False
     source_version: str = "astrid-v10"
     freeze_probe: Callable[[], bool] | None = None
+    evidence_root: Path | None = None
+    capacity_margin_bytes: int | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
         object.__setattr__(self, "archive_root", Path(self.archive_root).expanduser().resolve())
         object.__setattr__(self, "destination_root", Path(self.destination_root).expanduser().resolve())
+        if self.evidence_root is not None:
+            object.__setattr__(self, "evidence_root", Path(self.evidence_root).expanduser().resolve())
 
 
 def _json(value: Any, default: Any):
@@ -54,6 +58,14 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _tree_size(root: Path) -> int:
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file() and not path.is_symlink())
 
 
 def _table_names(conn: sqlite3.Connection) -> list[str]:
@@ -112,7 +124,24 @@ class Migrator:
         self._timeline_ids: dict[str, Any] = {}
         self._media_ids: dict[str, Any] = {}
         self._reference_ids: dict[str, Any] = {}
+        self._task_ids: dict[str, Any] = {}
+        self._run_ids: dict[str, Any] = {}
+        self._document_ids: dict[str, Any] = {}
+        self._import_counts: dict[str, int] = {}
         self._report: dict[str, Any] = {}
+
+    def _source_manifest(self, inventory: Mapping[str, Any]) -> dict[str, Any]:
+        """Build the immutable, root-complete identity for this source."""
+        payload = {
+            "format_version": 1,
+            "source_root": str(self.config.source_root),
+            "source_version": self.config.source_version,
+            "database_sha256": inventory["database_sha256"],
+            "files": inventory["files"],
+            "row_counts": inventory["row_counts"],
+            "schema_migrations": inventory["schema_migrations"],
+        }
+        return payload | {"source_manifest_sha256": _sha256_bytes(_canonical(payload))}
 
     def inventory(self) -> dict[str, Any]:
         _assert_writer_free(self.config.source_root, self.database, self.config.freeze_probe)
@@ -158,7 +187,7 @@ class Migrator:
                 disposition.append({"realm": realm, "disposition": "readable_local" if path.is_file() and inside else "missing_or_outside_source", "relative_locator": str(path.resolve().relative_to(self.config.source_root)) if inside else "<outside-source>"})
             media_dispositions.append({"media_id": media.get("id"), "content_hash": media.get("content_hash"), "byte_size": media.get("byte_size"), "locations": disposition})
         known_columns = {"projects": {"id", "slug", "name", "settings_json", "event_head_seq", "created_at", "updated_at"}, "timelines": {"id", "project_id", "event_stream_id", "name", "document_json", "asset_registry_json", "created_at", "updated_at", "project_data_json"}, "shots": {"id", "project_id", "name", "sort_key", "metadata_json", "created_at", "updated_at"}, "project_references": {"id", "project_id", "kind", "name", "description", "metadata_json", "created_at", "updated_at", "archived_at"}, "media": {"id", "project_id", "media_kind", "mime_type", "byte_size", "content_hash", "metadata_json", "created_at"}, "media_locations": {"id", "media_id", "realm", "locator", "verified_at", "created_at"}, "media_references": {"id", "reference_id", "media_id", "role", "context_task_id", "ordinal", "is_primary", "metadata_json", "created_at"}, "media_relations": {"from_media_id", "to_media_id", "kind", "ordinal", "metadata_json", "created_at"}, "reference_links": {"from_reference_id", "to_reference_id", "kind", "metadata_json", "created_at"}, "generation_variants": {"id", "generation_id", "media_id", "variant_type", "name", "params_json", "is_primary", "starred", "viewed_at", "created_at"}, "generations": {"id", "project_id", "task_id", "type", "name", "based_on_generation_id", "parent_generation_id", "child_order", "params_json", "starred", "deleted_at", "created_at", "updated_at"}, "runs": {"id", "project_id", "event_stream_id", "kind", "status", "title", "input_json", "result_json", "started_at", "finished_at"}, "tasks": {"id", "project_id", "event_stream_id", "run_id", "run_ordinal", "capability", "spec_json", "spec_hash", "input_manifest_json", "status", "priority", "available_at", "max_attempts", "winning_attempt_id", "cancel_request_id", "cancel_requested_at", "created_at", "updated_at", "finished_at"}, "events": {"event_id", "project_id", "project_seq", "stream_id", "seq", "subject_type", "subject_id", "changes_json", "kind", "schema_version", "idempotency_key", "txn_id", "actor_kind", "payload_json", "created_at"}, "event_streams": {"id", "project_id", "stream_type", "aggregate_id", "head_seq", "created_at"}, "schema_migrations": {"pack", "version", "name", "checksum", "applied_at"}, "shot_items": {"id", "shot_id", "media_id", "sort_key", "source_frame", "metadata_json", "created_at"}, "task_dependencies": {"task_id", "depends_on_task_id", "kind", "ordinal"}, "task_outputs": {"task_id", "ordinal", "role", "media_id", "is_primary", "params_json", "created_at"}, "execution_attempts": {"id", "task_id", "attempt_no", "executor_id", "status", "status_version", "lease_id", "lease_expires_at", "heartbeat_counter", "last_heartbeat_at", "progress_json", "error_json", "created_at", "updated_at", "finished_at"}, "command_receipts": {"project_id", "idempotency_key", "request_hash", "command_kind", "txn_id", "primary_stream_id", "resulting_stream_seq", "first_project_seq", "last_project_seq", "event_ids_json", "result_json", "created_at"}, "evidence_items": {"id", "run_id", "task_id", "kind", "summary", "data_json", "media_id", "created_at"}, "runaway_transitions": {"id", "project_id", "run_id", "task_id", "ordinal", "start_ms", "duration_ms", "prompt", "metadata_json", "created_at"}}
-        supported_tables = {"projects", "timelines", "shots", "project_references", "media", "media_locations", "generations"}
+        supported_tables = {"projects", "timelines", "shots", "project_references", "media", "media_locations", "generations", "runs", "tasks", "event_streams", "events"}
         metadata_only_tables = {"schema_migrations"}
         unmapped = {}
         unsupported = {}
@@ -173,7 +202,7 @@ class Migrator:
             if table not in supported_tables and table not in metadata_only_tables and counts.get(table, 0):
                 unsupported[table] = {"rows": counts[table], "columns": sorted(columns)}
         free_bytes = shutil.disk_usage(self.config.destination_root.parent if self.config.destination_root.parent.exists() else self.config.source_root).free
-        self._report["inventory"] = {
+        inventory = {
             "source_root": str(self.config.source_root),
             "database": str(self.database),
             "source_version": self.config.source_version,
@@ -190,7 +219,10 @@ class Migrator:
             "unsupported_nonempty_tables": unsupported,
             "blockers": [],
         }
-        return self._report["inventory"]
+        inventory["source_manifest"] = self._source_manifest(inventory)
+        inventory["source_manifest_sha256"] = inventory["source_manifest"]["source_manifest_sha256"]
+        self._report["inventory"] = inventory
+        return inventory
 
     def _load(self) -> dict[str, list[dict[str, Any]]]:
         conn = sqlite3.connect(f"file:{self.database}?mode=ro", uri=True)
@@ -253,6 +285,21 @@ class Migrator:
                 return method(payload)
             raise
 
+    @staticmethod
+    def _result_id(value: Any, *keys: str) -> Any:
+        if isinstance(value, Mapping):
+            for key in keys:
+                if value.get(key) is not None:
+                    return value[key]
+            nested = value.get("task") or value.get("run") or value.get("project")
+            if isinstance(nested, Mapping):
+                return Migrator._result_id(nested, *keys)
+        for key in keys:
+            result = getattr(value, key, None)
+            if result is not None:
+                return result
+        return value
+
     def _media_bytes(self, media: Mapping[str, Any], locations: list[Mapping[str, Any]]) -> tuple[bytes, str]:
         candidates = [x for x in locations if str(x.get("media_id")) == str(media.get("id"))]
         if not candidates:
@@ -280,6 +327,13 @@ class Migrator:
 
     def migrate(self) -> dict[str, Any]:
         inventory = self.inventory()
+        frozen_source_digest = inventory["source_manifest_sha256"]
+        # Re-read the complete source identity immediately before any archive
+        # or client write.  A changed clone is rejected rather than producing
+        # an archive whose rows and bytes came from different source epochs.
+        current_inventory = self.inventory()
+        if current_inventory["source_manifest_sha256"] != frozen_source_digest:
+            raise MigrationError("source changed after B10 freeze; discard the clone and restart rehearsal")
         data = self._load()
         self.validate(data)
         if self.config.dry_run:
@@ -319,7 +373,7 @@ class Migrator:
         temporary = Path(tempfile.mkdtemp(prefix=f".{self.config.archive_root.name}.", dir=self.config.archive_root.parent))
         try:
             shutil.copytree(self.config.source_root, temporary / "source", symlinks=True)
-            manifest = {"format_version": 1, "source_version": self.config.source_version, "source_root": str(self.config.source_root), "files": inventory["files"], "database_sha256": inventory["database_sha256"], "created_at": time.time()}
+            manifest = {"format_version": 2, "source_version": self.config.source_version, "source_root": str(self.config.source_root), "files": inventory["files"], "database_sha256": inventory["database_sha256"], "source_manifest_sha256": inventory["source_manifest_sha256"], "source_manifest": inventory["source_manifest"], "created_at": time.time()}
             (temporary / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
             (temporary / "ROLLBACK.md").write_text("# Astrid migration rollback\n\nThe original source is untouched. Stop the runtime, remove the activated realm, restore the verified source archive under `source/`, and rerun the legacy launcher only after review.\n\nArchive manifest: `manifest.json`.\n")
             for path in temporary.rglob("*"):
@@ -336,10 +390,12 @@ class Migrator:
         locations = data.get("media_locations", [])
         media_payloads = [(row, *self._media_bytes(row, locations)) for row in data.get("media", [])]
         for row in data.get("projects", []):
-            value = self._invoke("create_project", str(row.get("name") or row.get("slug")), idempotency_key=f"astrid-migrate-project-{row['id']}")
+            name = str(row.get("name") or row.get("slug"))
+            try:
+                value = self.client.create_project(name, slug=str(row.get("slug") or ""), metadata=_json(row.get("settings_json"), {}), idempotency_key=f"astrid-migrate-project-{row['id']}", legacy_id=str(row["id"]))
+            except TypeError:
+                value = self._invoke("create_project", name, idempotency_key=f"astrid-migrate-project-{row['id']}")
             self._project_ids[str(row["id"])] = value
-        for row in data.get("media", []):
-            pass
         for row, raw, filename in media_payloads:
             value = self._invoke("ingest_object", raw, media_type=str(row.get("mime_type") or "application/octet-stream"), idempotency_key=f"astrid-migrate-media-{row['id']}", filename=filename)
             self._media_ids[str(row["id"])] = value
@@ -348,11 +404,20 @@ class Migrator:
             project_id = getattr(project, "project_id", project.get("project_id", project.get("id")) if isinstance(project, Mapping) else project)
             value = self._invoke("create_timeline", project_id, str(row["id"]), idempotency_key=f"astrid-migrate-timeline-{row['id']}")
             self._timeline_ids[str(row["id"])] = value
+            document = _json(row.get("document_json"), None)
+            if document is not None and hasattr(self.client, "create_document"):
+                body = {"document_id": f"timeline:{row['id']}", "kind": "timeline", "content": document}
+                try:
+                    doc = self.client.create_document(project_id, body)
+                except TypeError:
+                    doc = self.client.create_document(project_id, body["document_id"], body["kind"], body["content"])
+                self._document_ids[str(row["id"])] = self._result_id(doc, "document_id", "id")
         for row in data.get("shots", []):
             timeline_id = str(_json(row.get("metadata_json"), {}).get("timeline_id") or row.get("timeline_id") or "")
             if not timeline_id:
                 continue
             self._invoke("create_shot", timeline_id, {"shot_id": str(row["id"]), "start_ms": 0, "duration_ms": 1, "reference_ids": []}, idempotency_key=f"astrid-migrate-shot-{row['id']}")
+            self._import_counts["shots"] = self._import_counts.get("shots", 0) + 1
         for row in data.get("project_references", []):
             project_id = str(row["project_id"])
             timeline = next((x for x in data.get("timelines", []) if str(x.get("project_id")) == project_id), None)
@@ -367,15 +432,45 @@ class Migrator:
         for row in data.get("generations", []):
             if hasattr(self.client, "create_generation"):
                 self._invoke("create_generation", dict(row), idempotency_key=f"astrid-migrate-generation-{row['id']}")
+                self._import_counts["generations"] = self._import_counts.get("generations", 0) + 1
             else:
                 self._report.setdefault("unresolved", []).append({"kind": "generation", "id": row.get("id"), "reason": "client_missing_create_generation"})
+        for row in data.get("tasks", []):
+            project = self._project_ids.get(str(row.get("project_id")))
+            project_id = self._result_id(project, "project_id", "id") if project is not None else None
+            capability = str(row.get("capability") or "migration.legacy")
+            spec = _json(row.get("spec_json"), {})
+            key = f"astrid-migrate-task-{row['id']}"
+            if hasattr(self.client, "create_task"):
+                task = self._invoke("create_task", {"capability_id": capability, "capability": capability, "project": project_id, "project_id": project_id, "spec": spec, "idempotency_key": key})
+            elif hasattr(self.client, "admit_task"):
+                digest = "sha256:" + hashlib.sha256(capability.encode()).hexdigest()
+                task = self.client.admit_task(capability_id=capability, capability_digest=digest, input_object_ids=[], idempotency_key=key, project_id=project_id, spec=spec)
+            else:
+                self._report.setdefault("unresolved", []).append({"kind": "task", "id": row.get("id"), "reason": "client_missing_task_operation"})
+                continue
+            self._task_ids[str(row["id"])] = task
+            task_id = self._result_id(task, "task_id", "id")
+            run_id = self._result_id(task, "run_id")
+            if run_id is not None:
+                self._run_ids[str(row.get("run_id") or run_id)] = run_id
 
     def _reconcile(self, data, *, preview: bool) -> dict[str, Any]:
         expected = self._mapping_preview(data)
-        actual = {"projects": len(self._project_ids), "timelines": len(self._timeline_ids), "media": len(self._media_ids), "references": len(self._reference_ids)} if not preview else {}
+        actual = {"projects": len(self._project_ids), "timelines": len(self._timeline_ids), "shots": self._import_counts.get("shots", 0), "references": len(self._reference_ids), "generations": self._import_counts.get("generations", 0), "media": len(self._media_ids), "runs": len(self._run_ids), "tasks": len(self._task_ids), "documents": len(self._document_ids)} if not preview else {}
         unresolved = self._report.get("unresolved", [])
         blockers = list(self._report.get("inventory", {}).get("blockers", [])) + unresolved
-        return {"ok": not blockers, "expected": expected, "mapped": actual, "unresolved": unresolved, "blockers": blockers, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok"}
+        source_facts = {
+            "projects": data.get("projects", []),
+            "timelines": data.get("timelines", []),
+            "shots": data.get("shots", []),
+            "project_references": data.get("project_references", []),
+            "media": data.get("media", []),
+            "runs": data.get("runs", []),
+            "tasks": data.get("tasks", []),
+        }
+        source_facts_sha256 = _sha256_bytes(_canonical(source_facts))
+        return {"ok": not blockers, "expected": expected, "mapped": actual, "unresolved": unresolved, "blockers": blockers, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok", "source_facts_sha256": source_facts_sha256, "source_counts": expected, "mapped_counts": actual}
 
     def _activation(self, archive: Path, reconciliation: Mapping[str, Any]) -> Path:
         self.config.destination_root.mkdir(parents=True, exist_ok=True)

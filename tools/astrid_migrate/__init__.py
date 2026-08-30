@@ -6,5 +6,6 @@ generated-client-shaped object.
 """
 
 from .migrator import MigrationConfig, MigrationError, Migrator, migrate
+from .rehearsal import MigrationJournal, Rehearsal, RuntimeServiceAdapter, SyntheticFixture, build_synthetic_fixture, run_rehearsal
 
-__all__ = ["MigrationConfig", "MigrationError", "Migrator", "migrate"]
+__all__ = ["MigrationConfig", "MigrationError", "Migrator", "migrate", "MigrationJournal", "Rehearsal", "RuntimeServiceAdapter", "SyntheticFixture", "build_synthetic_fixture", "run_rehearsal"]
