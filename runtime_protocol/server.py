@@ -284,9 +284,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
             self._identity("worker:execute")
             action = path[3]
+            if action == "prepare-reboot": return self._send(200, self.runtime.prepare_reboot(self._body()))
+            if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body()))
             if action == "settle": return self._send(200, self.runtime.settle_attempt(path[2], self._body()))
             if action == "heartbeat": return self._send(200, self.runtime.heartbeat_attempt(path[2], self._body()))
             if action == "fail": return self._send(200, self.runtime.fail_attempt(path[2], self._body()))
+        if path in (["v1", "recovery", "reboot"], ["v1", "runtime", "reboot"]) and method == "POST":
+            self._identity("worker:execute")
+            return self._send(200, self.runtime.request_reboot(self._body()))
+        if path in (["v1", "recovery", "resume"], ["v1", "runtime", "resume"]) and method == "POST":
+            self._identity("worker:execute")
+            return self._send(200, self.runtime.resume_attempt(self._body()))
         if len(path) == 3 and path[:2] == ["v1", "generations"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_generation(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "generations"] and path[3] == "variants":

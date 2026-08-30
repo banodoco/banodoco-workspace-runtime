@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 LEASE_SECONDS = 30
 
 
@@ -128,6 +128,9 @@ class RealmStore:
             version = 6
         if version < 7:
             self._run_migration(7)
+            version = 7
+        if version < 8:
+            self._run_migration(8)
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
@@ -166,6 +169,14 @@ class RealmStore:
                     self._append_event(
                         task["run_id"], task["id"], "task.runtime_recovered",
                         {"previous_runtime_epoch": previous_epoch or None, "runtime_epoch": epoch, "previous_boot_id": previous_boot, "boot_id": boot_id, "stale_fence": int(task["lease_fence"] or 0), "attempt": int(task["attempt"] or 0), "recovery": "requeued"},
+                    )
+                # A checkpoint from an interrupted boot is now eligible for
+                # the explicit resume command, but its old attempt identity
+                # remains fenced and can never settle work itself.
+                if previous_epoch:
+                    self.conn.execute(
+                        "UPDATE recovery_checkpoints SET state='recovered', updated_at=? WHERE runtime_epoch=? AND state IN ('durable', 'reboot_requested')",
+                        (started_at, previous_epoch),
                     )
                 self.conn.execute("UPDATE runtime_lifecycle SET recovered_task_count=? WHERE id=1", (len(interrupted),))
             value = dict(self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone())
@@ -434,22 +445,41 @@ class RealmStore:
         with self._mutex:
             return [self._capability_result(row) for row in self.conn.execute("SELECT * FROM capabilities ORDER BY id")]
 
-    def set_worker_readiness(self, worker_id, *, ready, reason=None):
+    def _current_runtime_epoch(self):
+        row = self.conn.execute("SELECT runtime_epoch FROM runtime_lifecycle WHERE id=1").fetchone()
+        return int(row[0]) if row else 1
+
+    def _validate_runtime_epoch(self, supplied, *, identity):
+        current = self._current_runtime_epoch()
+        # Omitted epochs are treated as current for the v1 compatibility
+        # surface.  Once a caller supplies an epoch it is an identity fence.
+        if supplied is not None:
+            try:
+                supplied = int(supplied)
+            except (TypeError, ValueError) as exc:
+                raise LeaseError(f"{identity} runtime epoch is invalid") from exc
+            if supplied != current:
+                raise LeaseError(f"{identity} belongs to a stale runtime epoch", details={"expected": current, "actual": supplied})
+        return current
+
+    def set_worker_readiness(self, worker_id, *, ready, reason=None, runtime_epoch=None):
         if not worker_id:
             raise ValidationError("worker_id is required")
         if not isinstance(ready, bool):
             raise ValidationError("ready must be a boolean")
         with self._mutex:
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
             if not self.conn.execute("SELECT 1 FROM workers WHERE id=?", (worker_id,)).fetchone():
                 raise NotFoundError("worker not found")
-            self.conn.execute("UPDATE workers SET readiness=?, readiness_reason=?, last_seen_at=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "worker_not_ready"), now(), worker_id))
+            self.conn.execute("UPDATE workers SET readiness=?, readiness_reason=?, last_seen_at=?, runtime_epoch=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "worker_not_ready"), now(), epoch, worker_id))
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
             return self._worker_result(row)
 
-    def heartbeat_worker(self, worker_id, *, ready=None, reason=None):
+    def heartbeat_worker(self, worker_id, *, ready=None, reason=None, runtime_epoch=None):
         if not worker_id:
             raise ValidationError("worker_id is required")
         with self._mutex:
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
             if not row:
                 raise NotFoundError("worker not found")
@@ -457,7 +487,7 @@ class RealmStore:
                 if not isinstance(ready, bool):
                     raise ValidationError("ready must be a boolean")
                 self.conn.execute("UPDATE workers SET readiness=?, readiness_reason=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "worker_not_ready"), worker_id))
-            self.conn.execute("UPDATE workers SET last_seen_at=? WHERE id=?", (now(), worker_id))
+            self.conn.execute("UPDATE workers SET last_seen_at=?, runtime_epoch=? WHERE id=?", (now(), epoch, worker_id))
             return self._worker_result(self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone())
 
     def _worker_result(self, row):
@@ -481,10 +511,11 @@ class RealmStore:
         available = int(shutil.disk_usage(self.root).free)
         return {"ok": available >= required, "required_bytes": required, "available_bytes": available, "reason": None if available >= required else "insufficient_storage"}
 
-    def claim_task(self, task_id, worker_id, lease_token):
+    def claim_task(self, task_id, worker_id, lease_token, *, runtime_epoch=None):
         with self._mutex:
             if not worker_id or not lease_token:
                 raise ValidationError("worker_id and lease_token are required")
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
             with self._transaction():
                 self._reap_expired_leases()
                 task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -527,14 +558,15 @@ class RealmStore:
                 timestamp = now()
                 fence = int(task["lease_fence"] or 0) + 1
                 deadline = (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="milliseconds")
-                self.conn.execute("UPDATE tasks SET status='running', worker_id=?, lease_token=?, lease_fence=?, lease_expires_at=?, waiting_reason=NULL, attempt=attempt+1, updated_at=? WHERE id=? AND status='queued'", (worker_id, lease_token, fence, deadline, timestamp, task_id))
+                self.conn.execute("UPDATE tasks SET status='running', worker_id=?, lease_token=?, lease_fence=?, lease_expires_at=?, waiting_reason=NULL, attempt=attempt+1, runtime_epoch=?, updated_at=? WHERE id=? AND status='queued'", (worker_id, lease_token, fence, deadline, epoch, timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='running', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
+                self.conn.execute("UPDATE workers SET runtime_epoch=?, last_seen_at=? WHERE id=?", (epoch, timestamp, worker_id))
                 for key in self._required_resource_keys(task["capability"]):
-                    self.conn.execute("INSERT INTO reservations(task_id, resource_key, lease_token, created_at, released_at, worker_id, fence, lease_expires_at) VALUES (?, ?, ?, ?, NULL, ?, ?, ?) ON CONFLICT(task_id, resource_key) DO UPDATE SET lease_token=excluded.lease_token, created_at=excluded.created_at, released_at=NULL, worker_id=excluded.worker_id, fence=excluded.fence, lease_expires_at=excluded.lease_expires_at", (task_id, key, lease_token, timestamp, worker_id, fence, deadline))
+                    self.conn.execute("INSERT INTO reservations(task_id, resource_key, lease_token, created_at, released_at, worker_id, fence, lease_expires_at, runtime_epoch) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?) ON CONFLICT(task_id, resource_key) DO UPDATE SET lease_token=excluded.lease_token, created_at=excluded.created_at, released_at=NULL, worker_id=excluded.worker_id, fence=excluded.fence, lease_expires_at=excluded.lease_expires_at, runtime_epoch=excluded.runtime_epoch", (task_id, key, lease_token, timestamp, worker_id, fence, deadline, epoch))
                 self._append_event(task["run_id"], task_id, "task.claimed", {"worker_id": worker_id, "attempt": task["attempt"] + 1, "fence": fence, "resource_keys": self._required_resource_keys(task["capability"])})
                 return self.get_task(task_id)
 
-    def register_worker(self, worker_id, capabilities, max_concurrency=1, resource_keys=None, *, readiness="ready", readiness_reason=None):
+    def register_worker(self, worker_id, capabilities, max_concurrency=1, resource_keys=None, *, readiness="ready", readiness_reason=None, runtime_epoch=None):
         if not worker_id or max_concurrency < 1:
             raise ValidationError("worker_id and positive max_concurrency are required")
         if readiness not in {"ready", "not_ready"}:
@@ -554,8 +586,9 @@ class RealmStore:
         if any(not isinstance(key, str) or not key for key in keys):
             raise ValidationError("resource keys must be non-empty strings")
         with self._mutex:
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker")
             timestamp = now()
-            self.conn.execute("INSERT INTO workers(id, capabilities_json, max_concurrency, resource_keys_json, created_at, last_seen_at, readiness, readiness_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, last_seen_at=excluded.last_seen_at, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason", (worker_id, canonical_json(capability_ids), max_concurrency, canonical_json(keys), timestamp, timestamp, readiness, None if readiness == "ready" else (readiness_reason or "worker_not_ready")))
+            self.conn.execute("INSERT INTO workers(id, capabilities_json, max_concurrency, resource_keys_json, created_at, last_seen_at, readiness, readiness_reason, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, last_seen_at=excluded.last_seen_at, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, runtime_epoch=excluded.runtime_epoch", (worker_id, canonical_json(capability_ids), max_concurrency, canonical_json(keys), timestamp, timestamp, readiness, None if readiness == "ready" else (readiness_reason or "worker_not_ready"), epoch))
             row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
             return self._worker_result(row)
 
@@ -718,6 +751,7 @@ class RealmStore:
             "timeline_shots", "timeline_references", "timeline_revisions",
             "timeline_shot_state", "timeline_reference_state", "media_relations",
             "runtime_lifecycle",
+            "recovery_checkpoints",
             "realm_lifecycle",
         }
         actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

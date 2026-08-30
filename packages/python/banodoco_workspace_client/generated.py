@@ -249,10 +249,11 @@ class Executor:
     resource_keys: tuple[str, ...]
     capabilities: tuple[Capability, ...]
     protocol: str
+    runtime_epoch: int | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Executor":
-        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"])
+        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"], runtime_epoch=int(value["runtime_epoch"]) if value.get("runtime_epoch") is not None else None)
 
 
 def _decode_error(status: int, body: bytes) -> ApiError:
@@ -599,12 +600,16 @@ class WorkspaceClient:
 
     list_tasks = list_project_tasks
 
-    def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str) -> Mapping[str, Any] | None:
-        status, _, body = self._request("POST", "/v1/tasks/claim", body=json.dumps({"executor_id": executor_id, "capability_ids": capability_ids}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 204))
+    def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int | None = None) -> Mapping[str, Any] | None:
+        payload: dict[str, Any] = {"executor_id": executor_id, "capability_ids": capability_ids}
+        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
+        status, _, body = self._request("POST", "/v1/tasks/claim", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 204))
         return None if status == 204 else self._json(body)
 
-    def heartbeat_attempt(self, attempt_id: str, *, lease_id: str, fence: int, idempotency_key: str) -> Mapping[str, Any]:
-        _, _, body = self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/heartbeat", body=json.dumps({"lease_id": lease_id, "fence": fence}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
+    def heartbeat_attempt(self, attempt_id: str, *, lease_id: str, fence: int, idempotency_key: str, runtime_epoch: int | None = None) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence}
+        if runtime_epoch is not None: payload["runtime_epoch"] = runtime_epoch
+        _, _, body = self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/heartbeat", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return self._json(body)
 
     def cancel_task(self, task_id: str, *, idempotency_key: str, expected_version: int | None = None) -> Task:
