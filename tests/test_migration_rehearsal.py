@@ -45,6 +45,53 @@ def test_b10_rehearsal_preserves_evidence_and_reactivates_idempotently(tmp_path)
     assert (rollback_root / "activation-handoff.json").is_file()
 
 
+def test_b10_rehearsal_preserves_all_source_streams_and_relationships(tmp_path):
+    source = tmp_path / "legacy-clone"
+    fixture = build_synthetic_fixture(source)
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        report = run_rehearsal(
+            MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+            RuntimeServiceAdapter(runtime), runtime=runtime,
+        )
+        truth = report["reconciliation"]["destination_truth"]["truth"]
+        assert len(truth["event_streams"]) == 4
+        assert {row["id"] for row in truth["event_streams"]} == {"stream-project", "stream-tl", "stream-run", "stream-task"}
+        assert len(truth["event_mappings"]) == 2
+        assert {(row["source_event_id"], row["source_stream_id"], row["destination_stream_id"]) for row in truth["event_mappings"]} == {
+            ("event-project", "stream-project", "stream-project"),
+            ("event-task", "stream-task", "stream-task"),
+        }
+        assert report["reconciliation"]["destination_truth"]["ok"] is True
+    finally:
+        runtime.close()
+
+
+def test_b10_rehearsal_rejects_omitted_source_stream(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+
+    class OmittingAdapter(RuntimeServiceAdapter):
+        def import_event_stream(self, stream, **kwargs):
+            if stream.get("id") == "stream-tl":
+                return {"skipped": True}
+            return super().import_event_stream(stream, **kwargs)
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="reconciliation failed"):
+            run_rehearsal(
+                MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+                OmittingAdapter(runtime), runtime=runtime,
+            )
+        # Rehearsal cleanup removes the incomplete destination ledger; the
+        # failed migration must not leave a partially imported stream graph.
+        rows = runtime.store.conn.execute("SELECT source_stream_id FROM migration_event_streams").fetchall()
+        assert rows == []
+    finally:
+        runtime.close()
+
+
 def test_b10_journal_rejects_skipping_rollback(tmp_path):
     from tools.astrid_migrate import MigrationJournal, MigrationError
 

@@ -20,6 +20,7 @@ import time
 from typing import Any, Callable, Mapping
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _canonical, _sha256_file, _tree_size
+from runtime_protocol.util import now
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -128,6 +129,51 @@ class RuntimeServiceAdapter:
             self.project_ids[str(legacy_id)] = result["id"]
         return result
 
+    def import_event_stream(self, stream, *, idempotency_key=None):
+        """Persist one source stream and its explicit destination mapping.
+
+        Runtime-native events remain chained to runs.  Imported legacy streams
+        therefore live in a dedicated, durable ledger in the same runtime
+        database rather than being represented by a count or wrapper claim.
+        The source id is retained as the destination id in this adapter: the
+        mapping is still recorded and collision-checked, which makes retries
+        deterministic while preserving source relationships exactly.
+        """
+        source_id = str(stream.get("id", stream.get("stream_id", "")))
+        if not source_id:
+            raise ValueError("migration event stream requires an id")
+        try:
+            head_seq = int(stream.get("head_seq", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("migration event stream head_seq must be an integer") from exc
+        if head_seq < 0:
+            raise ValueError("migration event stream head_seq must be non-negative")
+        project_id = self.project_ids.get(str(stream.get("project_id")), stream.get("project_id"))
+        destination_id = source_id
+        values = (
+            source_id, destination_id, str(project_id) if project_id is not None else None,
+            str(stream.get("stream_type", stream.get("kind", ""))),
+            str(stream.get("aggregate_id", "")), head_seq, int(stream.get("_source_ordinal", 0)), stream.get("created_at"),
+            now(),
+        )
+        with self.service.store._mutex:
+            with self.service.store._transaction():
+                existing = self.service.store.conn.execute(
+                    "SELECT * FROM migration_event_streams WHERE source_stream_id=?", (source_id,)
+                ).fetchone()
+                if existing:
+                    if any(existing[key] != value for key, value in zip(
+                        ("destination_stream_id", "project_id", "stream_type", "aggregate_id", "head_seq"),
+                        (destination_id, values[2], values[3], values[4], head_seq),
+                    )):
+                        raise ValueError(f"migration stream mapping conflicts for {source_id}")
+                else:
+                    self.service.store.conn.execute(
+                        "INSERT INTO migration_event_streams(source_stream_id, destination_stream_id, project_id, stream_type, aggregate_id, head_seq, source_ordinal, source_created_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        values,
+                    )
+        return {"source_stream_id": source_id, "destination_stream_id": destination_id, "head_seq": head_seq}
+
     def ingest_object(self, data, *, media_type, idempotency_key=None, filename=None):
         return self.service.ingest_object(data, media_type=media_type, original_name=filename)
 
@@ -171,7 +217,53 @@ class RuntimeServiceAdapter:
         value["capability_digest"] = value.get("capability_digest") or "sha256:" + hashlib.sha256(str(value.get("capability_id") or value.get("capability")).encode()).hexdigest()
         return self.service.create_task(value)
 
-    def append_migration_event(self, kind, payload):
+    def append_migration_event(self, kind, payload, *, source_event=None, idempotency_key=None):
+        """Preserve a source event and its stream relationship durably.
+
+        ``source_event`` is required for migration ledger writes.  The legacy
+        two-argument form remains available for callers that only need to
+        append a runtime-native event.
+        """
+        if source_event is not None:
+            source_id = str(source_event.get("event_id", source_event.get("id", "")))
+            stream_id = str(source_event.get("stream_id", ""))
+            if not source_id or not stream_id:
+                raise ValueError("migration event requires event_id and stream_id")
+            try:
+                seq = int(source_event.get("seq", 0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("migration event seq must be an integer") from exc
+            if seq < 0:
+                raise ValueError("migration event seq must be non-negative")
+            encoded_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            with self.service.store._mutex:
+                with self.service.store._transaction():
+                    stream = self.service.store.conn.execute(
+                        "SELECT destination_stream_id FROM migration_event_streams WHERE source_stream_id=?", (stream_id,)
+                    ).fetchone()
+                    if not stream:
+                        raise ValueError(f"migration event references missing stream {stream_id}")
+                    destination_id = str(stream[0])
+                    existing = self.service.store.conn.execute(
+                        "SELECT * FROM migration_events WHERE source_event_id=?", (source_id,)
+                    ).fetchone()
+                    if existing:
+                        if any(existing[key] != value for key, value in (("destination_event_id", source_id), ("source_stream_id", stream_id), ("destination_stream_id", destination_id), ("seq", seq), ("kind", str(kind)), ("payload_json", encoded_payload))):
+                            raise ValueError(f"migration event mapping conflicts for {source_id}")
+                    else:
+                        self.service.store.conn.execute(
+                            "INSERT INTO migration_events(source_event_id, destination_event_id, source_stream_id, destination_stream_id, project_id, project_seq, seq, source_ordinal, subject_type, subject_id, changes_json, kind, schema_version, idempotency_key, txn_id, actor_kind, payload_json, source_created_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                source_id, source_id, stream_id, destination_id,
+                                source_event.get("project_id"), source_event.get("project_seq"), seq, int(source_event.get("_source_ordinal", 0)),
+                                source_event.get("subject_type"), source_event.get("subject_id"),
+                                source_event.get("changes_json"), str(kind), source_event.get("schema_version"),
+                                source_event.get("idempotency_key"), source_event.get("txn_id"),
+                                source_event.get("actor_kind"), encoded_payload, source_event.get("created_at"), now(),
+                            ),
+                        )
+            return {"source_event_id": source_id, "destination_event_id": source_id, "destination_stream_id": destination_id}
+
         """Preserve a source event whose native runtime has no project stream."""
         with self.service.store._mutex:
             existing = self.service.store.conn.execute("SELECT 1 FROM events WHERE kind=? AND payload_json=? LIMIT 1", (str(kind), json.dumps(payload, sort_keys=True, separators=(",", ":")))).fetchone()
@@ -207,6 +299,16 @@ class RuntimeServiceAdapter:
                 continue
             cas_objects.append({"digest": digest, "size": path.stat().st_size, "sha256": _sha256_file(path), "locator": str(path)})
         snapshot["cas_objects"] = cas_objects
+        # The migration ledger is a native, durable representation of the
+        # source stream graph.  Expose it in source-compatible columns for
+        # strict reconciliation, while retaining mapping rows for auditors.
+        migration_streams = [dict(row) for row in conn.execute("SELECT source_stream_id, destination_stream_id, project_id, stream_type, aggregate_id, head_seq, source_ordinal, source_created_at, created_at FROM migration_event_streams ORDER BY source_ordinal, source_stream_id")]
+        migration_events = [dict(row) for row in conn.execute("SELECT source_event_id, destination_event_id, source_stream_id, destination_stream_id, project_id, project_seq, seq, source_ordinal, subject_type, subject_id, changes_json, kind, schema_version, idempotency_key, txn_id, actor_kind, payload_json, source_created_at, created_at FROM migration_events ORDER BY source_ordinal, source_event_id")]
+        if migration_streams or migration_events:
+            snapshot["event_streams"] = [{"id": row["destination_stream_id"], "source_stream_id": row["source_stream_id"], "project_id": row["project_id"], "stream_type": row["stream_type"], "aggregate_id": row["aggregate_id"], "head_seq": row["head_seq"], "created_at": row["source_created_at"] or row["created_at"]} for row in migration_streams]
+            snapshot["events"] = [{"event_id": row["destination_event_id"], "source_event_id": row["source_event_id"], "project_id": row["project_id"], "project_seq": row["project_seq"], "stream_id": row["destination_stream_id"], "source_stream_id": row["source_stream_id"], "seq": row["seq"], "subject_type": row["subject_type"], "subject_id": row["subject_id"], "changes_json": row["changes_json"], "kind": row["kind"], "schema_version": row["schema_version"], "idempotency_key": row["idempotency_key"], "txn_id": row["txn_id"], "actor_kind": row["actor_kind"], "payload_json": row["payload_json"], "created_at": row["source_created_at"] or row["created_at"]} for row in migration_events]
+            snapshot["event_stream_mappings"] = migration_streams
+            snapshot["event_mappings"] = migration_events
         snapshot["database_sha256"] = _sha256_file(self.service.store.db_path)
         return snapshot
 
@@ -254,10 +356,12 @@ class RuntimeServiceAdapter:
         """
         conn = self.service.store.conn
         keep = {table: {str(row.get("id", row.get("digest", ""))) for row in baseline.get(table, [])} for table in ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "documents", "attempts", "reservations", "recovery_checkpoints", "generation_variants", "timeline_shot_state", "timeline_reference_state", "timeline_revisions", "project_objects", "media_relations")}
+        keep["migration_event_streams"] = {str(row.get("source_stream_id")) for row in baseline.get("event_stream_mappings", [])}
+        keep["migration_events"] = {str(row.get("source_event_id")) for row in baseline.get("event_mappings", [])}
         keep_project_objects = {(str(row.get("project_id")), str(row.get("digest"))) for row in baseline.get("project_objects", [])}
         keep_media_relations = {(str(row.get("project_id")), str(row.get("from_digest")), str(row.get("to_digest")), str(row.get("kind"))) for row in baseline.get("media_relations", [])}
         with self.service.store._transaction():
-            for table, key in (("events", "id"), ("recovery_checkpoints", "id"), ("reservations", "task_id"), ("attempts", "id"), ("generation_variants", "id"), ("timeline_shot_state", "id"), ("timeline_reference_state", "id"), ("timeline_revisions", "timeline_id"), ("timeline_shots", "id"), ("timeline_references", "id"), ("project_documents", "id"), ("media_relations", "project_id"), ("project_objects", "project_id"), ("tasks", "id"), ("generations", "id"), ("timelines", "id"), ("runs", "id"), ("projects", "id"), ("objects", "digest")):
+            for table, key in (("migration_events", "source_event_id"), ("migration_event_streams", "source_stream_id"), ("events", "id"), ("recovery_checkpoints", "id"), ("reservations", "task_id"), ("attempts", "id"), ("generation_variants", "id"), ("timeline_shot_state", "id"), ("timeline_reference_state", "id"), ("timeline_revisions", "timeline_id"), ("timeline_shots", "id"), ("timeline_references", "id"), ("project_documents", "id"), ("media_relations", "project_id"), ("project_objects", "project_id"), ("tasks", "id"), ("generations", "id"), ("timelines", "id"), ("runs", "id"), ("projects", "id"), ("objects", "digest")):
                 if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                     continue
                 if table == "project_objects":

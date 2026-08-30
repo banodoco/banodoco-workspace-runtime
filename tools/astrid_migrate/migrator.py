@@ -345,6 +345,21 @@ class Migrator:
             if not row.get("id") or str(row.get("project_id")) not in project_set:
                 raise MigrationError("reference has an invalid project reference")
         media_set = {str(row.get("id")) for row in data.get("media", [])}
+        stream_ids = [str(row.get("id", row.get("stream_id", ""))) for row in data.get("event_streams", [])]
+        if any(not stream_id for stream_id in stream_ids) or len(stream_ids) != len(set(stream_ids)):
+            raise MigrationError("event streams contain missing or duplicate IDs")
+        stream_heads = {stream_id: row.get("head_seq") for stream_id, row in zip(stream_ids, data.get("event_streams", []))}
+        for event in data.get("events", []):
+            stream_id = str(event.get("stream_id", ""))
+            if stream_id not in stream_heads:
+                raise MigrationError(f"event {event.get('event_id', event.get('id'))} references missing event stream {stream_id}")
+            try:
+                seq = int(event.get("seq", 0))
+                head = int(stream_heads[stream_id])
+            except (TypeError, ValueError) as exc:
+                raise MigrationError("event stream heads and event sequence numbers must be integers") from exc
+            if seq < 0 or seq > head:
+                raise MigrationError(f"event {event.get('event_id', event.get('id'))} is outside stream {stream_id} head")
         for row in data.get("media_locations", []):
             if str(row.get("media_id")) not in media_set:
                 raise MigrationError("media location has an invalid media reference")
@@ -537,6 +552,15 @@ class Migrator:
             self._project_ids[str(row["id"])] = value
             if self._result_id(value, "project_id", "id") is None:
                 self._report.setdefault("unresolved", []).append({"kind": "project", "id": row.get("id"), "reason": "client returned no durable identity"})
+        # Import the complete source stream graph before importing events so
+        # every event relationship is backed by a durable destination mapping.
+        # Clients without this optional operation retain the older event-only
+        # path; the runtime adapter implements it as a native migration ledger.
+        if data.get("event_streams") and hasattr(self.client, "import_event_stream"):
+            for ordinal, row in enumerate(data.get("event_streams", [])):
+                stream = dict(row)
+                stream["_source_ordinal"] = ordinal
+                self._invoke("import_event_stream", stream, idempotency_key=f"astrid-migrate-stream-{row.get('id', row.get('stream_id'))}")
         for row, raw, filename in media_payloads:
             value = self._invoke("ingest_object", raw, media_type=str(row.get("mime_type") or "application/octet-stream"), idempotency_key=f"astrid-migrate-media-{row['id']}", filename=filename)
             self._media_ids[str(row["id"])] = value
@@ -632,9 +656,17 @@ class Migrator:
             if run_id is not None:
                 self._run_ids[str(row.get("run_id") or run_id)] = run_id
         if hasattr(self.client, "append_migration_event"):
-            for row in data.get("events", []):
+            for ordinal, row in enumerate(data.get("events", [])):
                 payload = _json(row.get("payload_json"), row.get("payload", {}))
-                self._invoke("append_migration_event", str(row.get("kind") or row.get("event_type") or "migration.event"), payload)
+                source_event = dict(row)
+                source_event["_source_ordinal"] = ordinal
+                self._invoke(
+                    "append_migration_event",
+                    str(row.get("kind") or row.get("event_type") or "migration.event"),
+                    payload,
+                    source_event=source_event,
+                    idempotency_key=f"astrid-migrate-event-{row.get('event_id', row.get('id'))}",
+                )
 
     def _destination_reconciliation(self, data: Mapping[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
         reader = getattr(self.client, "destination_verification", None)
