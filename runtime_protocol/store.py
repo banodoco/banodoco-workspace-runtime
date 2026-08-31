@@ -236,13 +236,16 @@ class RealmStore:
         """Recover only event identities provably linked to the old result."""
         if row["command_kind"] == "task.create":
             run_id = (result.get("run") or {}).get("id")
-            event = self.conn.execute(
-                "SELECT id FROM events WHERE run_id=? AND kind='task.admitted' ORDER BY id LIMIT 1",
+            events = self.conn.execute(
+                "SELECT id FROM events WHERE run_id=? AND kind='task.admitted' ORDER BY id",
                 (run_id,),
-            ).fetchone()
-            if event:
-                count = self.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
-                return [str(event[0])], str(run_id), int(count)
+            ).fetchall()
+            if len(events) != 1:
+                raise ValidationError(
+                    "historical task.create receipt requires exactly one committed task.admitted event"
+                )
+            count = self.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
+            return [str(events[0][0])], str(run_id), int(count)
         return [], None, None
 
     def begin_runtime_session(self, boot_id):

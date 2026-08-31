@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.errors import ValidationError
 
 
 def _digest(capability: str) -> str:
@@ -30,9 +31,43 @@ def _make_pre016(root):
     service.close()
 
 
+def _make_schema15(root, event_mode="valid"):
+    """Create a real pre-016 table shape, then remove canonical additions."""
+    _make_pre016(root)
+    db = root / "realm.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("""
+        CREATE TABLE command_idempotency_legacy (
+            command_kind TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(command_kind, aggregate_id, idempotency_key)
+        )
+    """)
+    conn.execute(
+        "INSERT INTO command_idempotency_legacy SELECT command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at FROM command_idempotency"
+    )
+    conn.execute("DROP TABLE command_idempotency")
+    conn.execute("ALTER TABLE command_idempotency_legacy RENAME TO command_idempotency")
+    conn.execute("DROP TABLE IF EXISTS project_sequences")
+    conn.execute("DROP TABLE IF EXISTS canonical_receipt_backfills")
+    conn.execute("DELETE FROM schema_migrations WHERE version >= 16")
+    if event_mode == "missing":
+        conn.execute("DELETE FROM events WHERE kind='task.admitted'")
+    elif event_mode == "duplicate":
+        event = conn.execute("SELECT run_id, task_id, kind, payload_json, previous_hash, event_hash, created_at FROM events WHERE kind='task.admitted'").fetchone()
+        conn.execute("INSERT INTO events(run_id, task_id, kind, payload_json, previous_hash, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", event)
+    conn.commit()
+    conn.close()
+
+
 def test_pre016_receipts_backfill_once_and_replay_after_restart(tmp_path):
     root = tmp_path / "realm"
-    _make_pre016(root)
+    _make_schema15(root)
 
     first = RuntimeService(root)
     rows = first.store.conn.execute(
@@ -76,6 +111,9 @@ def test_receipt_backfill_failure_rolls_back_and_can_retry(tmp_path):
     _make_pre016(root)
     db = root / "realm.sqlite3"
     conn = sqlite3.connect(db)
+    original_task_result = conn.execute(
+        "SELECT result_json FROM command_idempotency WHERE command_kind='task.create'"
+    ).fetchone()[0]
     conn.execute(
         "UPDATE command_idempotency SET result_json=? WHERE command_kind='task.create'",
         ("not-json",),
@@ -89,10 +127,27 @@ def test_receipt_backfill_failure_rolls_back_and_can_retry(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM command_idempotency WHERE txn_id IS NOT NULL").fetchone()[0] == 0
     conn.execute(
         "UPDATE command_idempotency SET result_json=? WHERE command_kind='task.create'",
-        (json.dumps({"run": {"id": "missing"}, "task": {}}),),
+        (original_task_result,),
     )
     conn.commit()
     conn.close()
     repaired = RuntimeService(root)
     assert repaired.store.conn.execute("SELECT COUNT(*) FROM canonical_receipt_backfills").fetchone()[0] == 1
     repaired.close()
+
+
+@pytest.mark.parametrize("event_mode", ["missing", "duplicate"])
+def test_schema15_task_event_ambiguity_fails_closed_without_partial_backfill(tmp_path, event_mode):
+    root = tmp_path / event_mode
+    _make_schema15(root, event_mode)
+    with pytest.raises(ValidationError, match="exactly one"):
+        RuntimeService(root)
+    conn = sqlite3.connect(root / "realm.sqlite3")
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 16
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='canonical_receipt_backfills'"
+    ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM command_idempotency WHERE txn_id IS NOT NULL").fetchone()[0] == 0
+    expected_events = 0 if event_mode == "missing" else 2
+    assert conn.execute("SELECT COUNT(*) FROM events WHERE kind='task.admitted'").fetchone()[0] == expected_events
+    conn.close()
