@@ -110,7 +110,7 @@ paths:
   /v1/projects/{project_id}/documents:
     get:
       operationId: listDocuments
-      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Project documents, content: { application/json: { schema: { $ref: '#/components/schemas/DocumentPage' } } } } }
     post:
       operationId: createDocument
@@ -433,7 +433,7 @@ paths:
   /v1/runs/{run_id}/events:
     get:
       operationId: listRunEvents
-      parameters: [ { $ref: '#/components/parameters/RunId' } ]
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Ordered run events, content: { application/json: { schema: { $ref: '#/components/schemas/EventPage' } } } } }
   /v1/events:
     get:
@@ -449,6 +449,7 @@ paths:
   /v1/capabilities:
     get:
       operationId: listCapabilities
+      parameters: [ { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Capabilities, content: { application/json: { schema: { $ref: '#/components/schemas/CapabilityPage' } } } } }
     post:
       operationId: registerCapability
@@ -457,7 +458,7 @@ paths:
   /v1/projects/{project_id}/generations:
     get:
       operationId: listGenerations
-      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Project generations, content: { application/json: { schema: { $ref: '#/components/schemas/GenerationPage' } } } } }
     post:
       operationId: createGeneration
@@ -472,7 +473,7 @@ paths:
   /v1/generations/{generation_id}/variants:
     get:
       operationId: listVariants
-      parameters: [ { $ref: '#/components/parameters/GenerationId' } ]
+      parameters: [ { $ref: '#/components/parameters/GenerationId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Generation variants, content: { application/json: { schema: { $ref: '#/components/schemas/VariantPage' } } } } }
     post:
       operationId: createVariant
@@ -633,8 +634,8 @@ components:
     CapabilityPage:
       type: object
       additionalProperties: false
-      required: [items]
-      properties: { items: { type: array, items: { $ref: './schemas/worker.json#/definitions/Capability' } } }
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/worker.json#/definitions/Capability' } }, next_cursor: { type: [string, 'null'] } }
     CreateTimeline:
       type: object
       additionalProperties: false

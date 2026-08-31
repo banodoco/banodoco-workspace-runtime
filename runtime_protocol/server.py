@@ -151,7 +151,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if not key:
                     raise ProtocolError("Idempotency-Key header is required")
                 return self._send(201, self.runtime.create_timeline(path[2], body.get("timeline_id", ""), idempotency_key=key))
-            if method == "GET": return self._send(200, self.runtime.list_timelines(path[2]))
+            if method == "GET":
+                query = parse_qs(urlsplit(self.path).query)
+                return self._send(200, self.runtime.list_timelines(path[2], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timeline-documents" and method == "POST":
             self._identity("projects:write")
             key = self.headers.get("Idempotency-Key")
@@ -173,7 +175,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read")
             query = parse_qs(urlsplit(self.path).query)
             if path[3] == "history":
-                return self._send(200, self.runtime.list_timeline_history(path[2], limit=query.get("limit", [50])[0]))
+                return self._send(200, self.runtime.list_timeline_history(path[2], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
             if "from_version" not in query or "to_version" not in query:
                 raise ProtocolError("from_version and to_version are required")
             return self._send(200, self.runtime.diff_timeline(path[2], query["from_version"][0], query["to_version"][0]))
@@ -206,7 +208,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "projects"]:
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
-                return self._send(200, self.runtime.list_projects())
+                query = parse_qs(urlsplit(self.path).query)
+                return self._send(200, self.runtime.list_projects(cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
             if method == "POST":
                 body = self._project_mutation_body()
                 key = self.headers.get("Idempotency-Key")
@@ -229,7 +232,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     return self._send(200, self.runtime._project_resource(value))
             if len(path) == 4 and path[3] == "documents":
                 self._identity("projects:read" if method == "GET" else "projects:write")
-                if method == "GET": return self._send(200, self.runtime.list_documents(selector))
+                if method == "GET":
+                    query = parse_qs(urlsplit(self.path).query)
+                    return self._send(200, self.runtime.list_documents(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST": return self._send(201, self.runtime.create_document(selector, self._body()))
             if len(path) == 5 and path[3] == "documents" and method in ("GET", "PATCH"):
                 self._identity("projects:read" if method == "GET" else "projects:write")
@@ -237,13 +242,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.update_document(selector, path[4], self._body()))
             if len(path) == 4 and path[3] == "generations":
                 self._identity("projects:read" if method == "GET" else "projects:write")
-                if method == "GET": return self._send(200, self.runtime.list_generations(selector))
+                if method == "GET":
+                    query = parse_qs(urlsplit(self.path).query)
+                    return self._send(200, self.runtime.list_generations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST": return self._send(201, self.runtime.create_generation(selector, self._body()))
             if len(path) == 4 and path[3] == "objects":
                 self._identity("objects:read" if method == "GET" else "objects:write")
                 if method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
-                    return self._send(200, self.runtime.list_project_objects(selector, limit=query.get("limit", [50])[0]))
+                    return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST":
                     length = int(self.headers.get("Content-Length", "0"))
                     data = self.rfile.read(length)
@@ -252,13 +259,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 4 and path[3] in ("tasks", "runs") and method == "GET":
                 self._identity("tasks:read")
                 query = parse_qs(urlsplit(self.path).query)
-                value = self.runtime.list_project_tasks(selector, limit=query.get("limit", [50])[0]) if path[3] == "tasks" else self.runtime.list_project_runs(selector, limit=query.get("limit", [50])[0])
+                value = self.runtime.list_project_tasks(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]) if path[3] == "tasks" else self.runtime.list_project_runs(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0])
                 return self._send(200, value)
             if len(path) == 4 and path[3] in ("shots", "references") and method == "GET":
                 self._identity("projects:read")
                 query = parse_qs(urlsplit(self.path).query)
                 include_archived = query.get("include_archived", ["false"])[0].lower() == "true"
-                value = self.runtime.list_project_shots(selector, include_archived=include_archived, limit=query.get("limit", [50])[0]) if path[3] == "shots" else self.runtime.list_project_references(selector, include_archived=include_archived, limit=query.get("limit", [50])[0])
+                value = self.runtime.list_project_shots(selector, cursor=query.get("cursor", [None])[0], include_archived=include_archived, limit=query.get("limit", [50])[0]) if path[3] == "shots" else self.runtime.list_project_references(selector, cursor=query.get("cursor", [None])[0], include_archived=include_archived, limit=query.get("limit", [50])[0])
                 return self._send(200, value)
             if len(path) >= 5 and path[3] in ("shots", "references"):
                 kind, resource_id = path[3], path[4]
@@ -313,7 +320,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self._identity("objects:read" if method == "GET" else "objects:write")
                 if method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
-                    return self._send(200, self.runtime.list_media_relations(selector, limit=query.get("limit", [50])[0]))
+                    return self._send(200, self.runtime.list_media_relations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body()))
         if path == ["v1", "objects"] and method == "POST":
             self._identity("objects:write")
@@ -382,7 +389,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.retry_task(task_id, self._body()))
             if method == "GET" and action == "events":
                 task = self.runtime.store.get_task(task_id)
-                return self._send(200, self.runtime.events_page(task["run"]["id"]))
+                query = parse_qs(urlsplit(self.path).query)
+                return self._send(200, self.runtime.events_page(task["run"]["id"], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
             self._identity("worker:execute")
             action = path[3]
@@ -408,13 +416,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read"); return self._send(200, self.runtime.get_generation(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "generations"] and path[3] == "variants":
             self._identity("projects:read" if method == "GET" else "projects:write")
-            if method == "GET": return self._send(200, self.runtime.list_variants(path[2]))
+            if method == "GET":
+                query = parse_qs(urlsplit(self.path).query)
+                return self._send(200, self.runtime.list_variants(path[2], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
             if method == "POST": return self._send(201, self.runtime.create_variant(path[2], self._body()))
         if len(path) == 3 and path[:2] == ["v1", "variants"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_variant(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] == "events" and method == "GET":
             self._identity("tasks:read")
-            return self._send(200, self.runtime.events_page(path[2]))
+            query = parse_qs(urlsplit(self.path).query)
+            return self._send(200, self.runtime.events_page(path[2], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] in ("cancel", "retry") and method == "POST":
             self._identity("tasks:write")
             key = self.headers.get("Idempotency-Key")
@@ -434,7 +445,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             # a capability digest before creating a task, while registration
             # and execution remain restricted to worker scopes.
             self._identity("tasks:read")
-            return self._send(200, self.runtime.list_capabilities())
+            query = parse_qs(urlsplit(self.path).query)
+            return self._send(200, self.runtime.list_capabilities(cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if path == ["v1", "capabilities"] and method == "POST":
             self._identity("worker:register")
             return self._send(201, self.runtime.register_capability(self._body()))

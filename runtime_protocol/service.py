@@ -20,6 +20,62 @@ from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
+PAGE_DEFAULT_LIMIT = 50
+PAGE_MAX_LIMIT = 200
+
+
+def _page_args(cursor, limit):
+    """Validate the public page arguments and decode an opaque keyset cursor."""
+    if isinstance(limit, bool):
+        raise InvalidRequestError("limit must be an integer between 1 and 200")
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise InvalidRequestError("limit must be an integer between 1 and 200") from exc
+    if limit < 1 or limit > PAGE_MAX_LIMIT:
+        raise InvalidRequestError("limit must be an integer between 1 and 200")
+    if cursor in (None, ""):
+        return limit, None
+    if not isinstance(cursor, str):
+        raise InvalidRequestError("cursor must be a non-empty string")
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidRequestError("cursor is invalid") from exc
+    if not isinstance(value, dict) or value.get("v") != 1 or not isinstance(value.get("k"), list) or not value["k"]:
+        raise InvalidRequestError("cursor is invalid")
+    return limit, value
+
+
+def _page_cursor(scope, key):
+    raw = json.dumps({"v": 1, "s": scope, "k": list(key)}, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn):
+    limit, decoded = _page_args(cursor, limit)
+    if decoded is not None and decoded.get("s") != scope:
+        raise InvalidRequestError("cursor does not belong to this collection")
+    after = tuple(decoded["k"]) if decoded is not None else None
+    selected = []
+    for row in rows:
+        key = tuple(key_fn(row))
+        if after is not None:
+            if len(key) != len(after):
+                raise InvalidRequestError("cursor is invalid")
+            try:
+                before = key <= after
+            except TypeError as exc:
+                raise InvalidRequestError("cursor is invalid") from exc
+            if before:
+                continue
+        selected.append((key, resource_fn(row)))
+        if len(selected) > limit:
+            break
+    has_more = len(selected) > limit
+    selected = selected[:limit]
+    return {"items": [resource for _, resource in selected], "next_cursor": _page_cursor(scope, selected[-1][0]) if has_more else None}
 
 
 def _durable_mutation(function):
@@ -138,8 +194,11 @@ class RuntimeService:
     def get_project(self, selector):
         return self.store.get_project(selector)
 
-    def list_projects(self):
-        return {"items": [self._project_resource(value) for value in self.store.list_projects()["items"]], "next_cursor": None}
+    def list_projects(self, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+        rows = self.store.conn.execute("SELECT id, created_at FROM projects ORDER BY created_at, id").fetchall()
+        return _page_rows(rows, scope="projects", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=lambda row: self._project_resource(self.store.get_project(row["id"])))
 
     def select_project(self, actor_id, selector, *, scope="workspace", idempotency_key=None):
         value = self.store.select_project(actor_id, selector, scope, idempotency_key=idempotency_key)
@@ -310,10 +369,12 @@ class RuntimeService:
         event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
         return self._command_record("timeline_document.create", timeline_id, idempotency_key, request_hash, resource, project_id=project["id"], event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
 
-    def list_timelines(self, project_id):
+    def list_timelines(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT id FROM timelines WHERE project_id=? ORDER BY created_at", (project["id"],))
-        return {"items": [self._timeline_resource(x["id"]) for x in rows], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT id, created_at FROM timelines WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
+        return _page_rows(rows, scope=f"timelines:{project['id']}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=lambda row: self._timeline_resource(row["id"]))
 
     def _shot_resource(self, row):
         state = self.store.conn.execute("SELECT version, archived_at FROM timeline_shot_state WHERE id=?", (row["id"],)).fetchone()
@@ -325,33 +386,37 @@ class RuntimeService:
         timeline = self.store.conn.execute("SELECT project_id FROM timelines WHERE id=?", (row["timeline_id"],)).fetchone()
         return {"reference_id": row["id"], "timeline_id": row["timeline_id"], "project_id": timeline["project_id"], "object_id": row["object_id"], **({"role": row["role"]} if row["role"] else {}), "version": int(state["version"] if state else 1), "archived": bool(state and state["archived_at"])}
 
-    def list_project_tasks(self, project_id, *, limit=50):
+    def list_project_tasks(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        limit = max(1, min(int(limit), 200))
-        rows = self.store.conn.execute("SELECT id FROM tasks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?) ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
-        return {"items": [self._task_resource(self.store.get_task(row["id"])) for row in rows], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT id, created_at FROM tasks WHERE run_id IN (SELECT id FROM runs WHERE project_id=?) ORDER BY created_at, id", (project["id"],)).fetchall()
+        return _page_rows(rows, scope=f"tasks:{project['id']}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=lambda row: self._task_resource(self.store.get_task(row["id"])))
 
-    def list_project_runs(self, project_id, *, limit=50):
+    def list_project_runs(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        limit = max(1, min(int(limit), 200))
-        rows = self.store.conn.execute("SELECT id FROM runs WHERE project_id=? ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
-        return {"items": [self.run(row["id"]) for row in rows], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT id, created_at FROM runs WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
+        return _page_rows(rows, scope=f"runs:{project['id']}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=lambda row: self.run(row["id"]))
 
-    def list_project_shots(self, project_id, *, include_archived=False, limit=50):
+    def list_project_shots(self, project_id, *, cursor=None, include_archived=False, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        limit = max(1, min(int(limit), 200))
         query = "SELECT * FROM project_shots WHERE project_id=?"
         if not include_archived: query += " AND archived_at IS NULL"
-        rows = self.store.conn.execute(query + " ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
-        return {"items": [self._project_shot_resource(row) for row in rows], "next_cursor": None}
+        rows = self.store.conn.execute(query + " ORDER BY created_at, id", (project["id"],)).fetchall()
+        return _page_rows(rows, scope=f"project-shots:{project['id']}:{int(include_archived)}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=self._project_shot_resource)
 
-    def list_project_references(self, project_id, *, include_archived=False, limit=50):
+    def list_project_references(self, project_id, *, cursor=None, include_archived=False, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        limit = max(1, min(int(limit), 200))
         query = "SELECT * FROM project_references WHERE project_id=?"
         if not include_archived: query += " AND archived_at IS NULL"
-        rows = self.store.conn.execute(query + " ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
-        return {"items": [self._project_reference_resource(row) for row in rows], "next_cursor": None}
+        rows = self.store.conn.execute(query + " ORDER BY created_at, id", (project["id"],)).fetchall()
+        return _page_rows(rows, scope=f"project-references:{project['id']}:{int(include_archived)}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=self._project_reference_resource)
 
     @staticmethod
     def _require_object_body(body):
@@ -677,15 +742,16 @@ class RuntimeService:
             if not assoc: raise NotFoundError("media association not found")
             self.store.conn.execute("UPDATE media_references SET is_primary=0 WHERE reference_id=?", (reference_id,)); self.store.conn.execute("UPDATE media_references SET is_primary=1, role='canonical' WHERE id=?", (association_id,)); self.store.conn.execute("UPDATE project_references SET version=version+1, updated_at=? WHERE id=?", (now(), reference_id)); result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()); return self._command_record("reference.primary", reference_id, idempotency_key, request_hash, result, project_id=project["id"])
 
-    def list_timeline_history(self, timeline_id, *, limit=50):
+    def list_timeline_history(self, timeline_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         self._timeline_resource(timeline_id)
-        limit = max(1, min(int(limit), 200))
-        rows = self.store.conn.execute("SELECT * FROM timeline_revisions WHERE timeline_id=? ORDER BY version LIMIT ?", (timeline_id, limit)).fetchall()
-        items = [{"timeline_id": timeline_id, "version": int(row["version"]), "shots": json.loads(row["shots_json"]), "references": json.loads(row["references_json"]), "created_at": row["created_at"]} for row in rows]
-        if not items:
+        rows = self.store.conn.execute("SELECT * FROM timeline_revisions WHERE timeline_id=? ORDER BY version", (timeline_id,)).fetchall()
+        if not rows:
             current = self._timeline_resource(timeline_id)
-            items = [{"timeline_id": timeline_id, "version": current["version"], "shots": current["shots"], "references": current["references"], "created_at": now()}]
-        return {"items": items, "next_cursor": None}
+            rows = [{"version": current["version"], "shots_json": canonical_json(current["shots"]), "references_json": canonical_json(current["references"]), "created_at": now()}]
+        page = _page_rows(rows, scope=f"timeline-history:{timeline_id}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (int(row["version"]),),
+                          resource_fn=lambda row: {"timeline_id": timeline_id, "version": int(row["version"]), "shots": json.loads(row["shots_json"]), "references": json.loads(row["references_json"]), "created_at": row["created_at"]})
+        return page
 
     @staticmethod
     def _diff_items(before, after, key):
@@ -820,9 +886,12 @@ class RuntimeService:
             self.store.conn.execute("INSERT INTO project_documents VALUES (?, ?, ?, ?, 1, ?, ?)", (document_id, project["id"], kind, canonical_json(content), timestamp, timestamp))
             return self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
 
-    def list_documents(self, project_id):
+    def list_documents(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        return {"items": [self._document_resource(row) for row in self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? ORDER BY created_at, id", (project["id"],))], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
+        return _page_rows(rows, scope=f"documents:{project['id']}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=self._document_resource)
 
     def get_document(self, project_id, document_id):
         project = self.store.get_project(project_id)
@@ -869,9 +938,12 @@ class RuntimeService:
                 raise ConflictError("generation already exists", details={"generation_id": generation_id}) from exc
             return self._generation_resource(self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone())
 
-    def list_generations(self, project_id):
+    def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        return {"items": [self._generation_resource(row) for row in self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at, id", (project["id"],))], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
+        return _page_rows(rows, scope=f"generations:{project['id']}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=self._generation_resource)
 
     def get_generation(self, generation_id):
         row = self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone()
@@ -908,9 +980,12 @@ class RuntimeService:
             value["object_id"] = "sha256:" + value["object_id"]
         return value
 
-    def list_variants(self, generation_id):
+    def list_variants(self, generation_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         self.get_generation(generation_id)
-        return {"items": [self._variant_resource(row) for row in self.store.conn.execute("SELECT * FROM generation_variants WHERE generation_id=? ORDER BY created_at, id", (generation_id,))], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT * FROM generation_variants WHERE generation_id=? ORDER BY created_at, id", (generation_id,)).fetchall()
+        return _page_rows(rows, scope=f"variants:{generation_id}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
+                          resource_fn=self._variant_resource)
 
     def get_variant(self, variant_id):
         row = self.store.conn.execute("SELECT * FROM generation_variants WHERE id=?", (variant_id,)).fetchone()
@@ -1006,14 +1081,11 @@ class RuntimeService:
     def objects(self, project):
         return self.store.list_project_objects(project)
 
-    def list_project_objects(self, project, *, limit=50):
-        limit = max(1, min(int(limit), 200))
-        items = []
-        for row in self.store.list_project_objects(project)[:limit]:
-            item = self._object_resource(row)
-            item["relation"] = row["relation"]
-            items.append(item)
-        return {"items": items, "next_cursor": None}
+    def list_project_objects(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+        rows = self.store.list_project_objects(project)
+        return _page_rows(rows, scope=f"objects:{self.store.get_project(project)['id']}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["digest"])),
+                          resource_fn=lambda row: self._object_resource(row) | {"relation": row["relation"]})
 
     def create_media_relation(self, project, body):
         project_id = self.store.get_project(project)["id"]
@@ -1040,11 +1112,12 @@ class RuntimeService:
                 raise ConflictError("media relation already exists") from exc
         return {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "ordinal": ordinal, "metadata": metadata, "created_at": self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=? AND ordinal=?", (project_id, source, target, kind, ordinal)).fetchone()[0]}
 
-    def list_media_relations(self, project, *, limit=50):
+    def list_media_relations(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project_id = self.store.get_project(project)["id"]
-        limit = max(1, min(int(limit), 200))
-        rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY created_at, from_digest, to_digest, kind, ordinal LIMIT ?", (project_id, limit)).fetchall()
-        return {"items": [{"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]} for row in rows], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY created_at, from_digest, to_digest, kind, ordinal", (project_id,)).fetchall()
+        return _page_rows(rows, scope=f"media-relations:{project_id}", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["created_at"]), str(row["from_digest"]), str(row["to_digest"]), str(row["kind"]), int(row["ordinal"])),
+                          resource_fn=lambda row: {"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]})
 
     def create_task(self, body, *, enforce_readiness=False):
         if "capability" in body or "expected_effect" in body:
@@ -1128,9 +1201,11 @@ class RuntimeService:
         digest = "sha256:" + hashlib.sha256(b"render.basic").hexdigest()
         self.store.register_capability("render.basic", digest, required_resource_keys=[], estimated_output_bytes=1)
 
-    def list_capabilities(self):
+    def list_capabilities(self, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
-        return {"items": [{"capability_id": r["id"], "definition_digest": r["definition_digest"], "status": r["status"], "required_resource_keys": json.loads(r["required_resource_keys_json"]), "estimated_scratch_bytes": r["estimated_scratch_bytes"], "estimated_output_bytes": r["estimated_output_bytes"], "unavailable_reason": r["unavailable_reason"]} for r in rows]}
+        return _page_rows(rows, scope="capabilities", cursor=cursor, limit=limit,
+                          key_fn=lambda row: (str(row["id"]),),
+                          resource_fn=lambda r: {"capability_id": r["id"], "definition_digest": r["definition_digest"], "status": r["status"], "required_resource_keys": json.loads(r["required_resource_keys_json"]), "estimated_scratch_bytes": r["estimated_scratch_bytes"], "estimated_output_bytes": r["estimated_output_bytes"], "unavailable_reason": r["unavailable_reason"]})
 
     def register_capability(self, body):
         value = self.store.register_capability(body.get("capability_id", ""), body.get("definition_digest", ""), required_resource_keys=body.get("required_resource_keys", []), status=body.get("status", "ready"), unavailable_reason=body.get("unavailable_reason"), estimated_scratch_bytes=body.get("estimated_scratch_bytes", 0), estimated_output_bytes=body.get("estimated_output_bytes", 0))
@@ -1544,18 +1619,12 @@ class RuntimeService:
         return self._task_resource(value)
 
     def events_page(self, aggregate_id=None, *, cursor=None, limit=50):
-        try:
-            page_size = max(1, min(200, int(limit)))
-            after = int(cursor or 0)
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("cursor and limit must be valid integers") from exc
-        rows = self.store.conn.execute("SELECT * FROM events WHERE id>? ORDER BY id", (after,)).fetchall()
-        items = []
-        for row in rows:
-            if aggregate_id and aggregate_id not in (row["task_id"], row["run_id"]): continue
-            items.append({"event_id": str(row["id"]), "sequence": int(row["id"]), "cursor": str(row["id"]), "event_type": row["kind"], "aggregate_type": "task" if row["task_id"] else "run", "aggregate_id": row["task_id"] or row["run_id"], "payload": json.loads(row["payload_json"]), "occurred_at": row["created_at"]})
-        next_cursor = None
-        if len(items) > page_size:
-            items = items[:page_size]
-            next_cursor = items[-1]["cursor"]
-        return {"items": items, "next_cursor": next_cursor}
+        rows = self.store.conn.execute("SELECT * FROM events ORDER BY id").fetchall()
+        if aggregate_id:
+            rows = [row for row in rows if aggregate_id in (row["task_id"], row["run_id"])]
+        scope = f"events:{aggregate_id or '*'}"
+        return _page_rows(
+            rows, scope=scope, cursor=cursor, limit=limit,
+            key_fn=lambda row: (str(row["id"]),),
+            resource_fn=lambda row: {"event_id": str(row["id"]), "sequence": int(row["id"]), "cursor": str(row["id"]), "event_type": row["kind"], "aggregate_type": "task" if row["task_id"] else "run", "aggregate_id": row["task_id"] or row["run_id"], "payload": json.loads(row["payload_json"]), "occurred_at": row["created_at"]},
+        )

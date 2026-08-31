@@ -426,6 +426,18 @@ class WorkspaceClient:
             raise ApiError(0, "invalid_response", "expected JSON object")
         return value
 
+    @staticmethod
+    def _page(value: Mapping[str, Any]) -> tuple[list[Any], str | None]:
+        """Decode a page strictly; pagination fields are part of the contract."""
+        try:
+            items = value["items"]
+            next_cursor = value["next_cursor"]
+        except KeyError as exc:
+            raise ApiError(0, "invalid_response", "page must contain items and next_cursor") from exc
+        if not isinstance(items, list) or (next_cursor is not None and not isinstance(next_cursor, str)):
+            raise ApiError(0, "invalid_response", "page must contain list items and string-or-null next_cursor")
+        return items, next_cursor
+
     def _mutation_json(self, body: bytes) -> Mapping[str, Any]:
         value = self._json(body)
         if set(value) != {"data", "receipt"}:
@@ -506,9 +518,11 @@ class WorkspaceClient:
         payload = {"document_id": document_id, "kind": kind, "content": content}
         return ProjectDocument.from_json(self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/documents", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, expected=(200, 201))[2]))
 
-    def list_documents(self, project_id: str) -> tuple[list[ProjectDocument], str | None]:
-        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/documents")[2])
-        return [ProjectDocument.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+    def list_documents(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[ProjectDocument], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/documents" + query)[2])
+        items, next_cursor = self._page(value)
+        return [ProjectDocument.from_json(item) for item in items], next_cursor
 
     def get_document(self, project_id: str, document_id: str) -> ProjectDocument:
         return ProjectDocument.from_json(self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/documents/{_path_part(document_id)}")[2]))
@@ -574,7 +588,8 @@ class WorkspaceClient:
     def list_timelines(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines" + query)[2])
-        return list(value.get("items", [])), value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return list(items), next_cursor
 
     def get_timeline(self, timeline_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/timelines/{_path_part(timeline_id)}")[2])
@@ -582,7 +597,8 @@ class WorkspaceClient:
     def list_timeline_history(self, timeline_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/timelines/{_path_part(timeline_id)}/history" + query)[2])
-        return list(value.get("items", [])), value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return list(items), next_cursor
 
     def diff_timeline(self, timeline_id: str, *, from_version: int, to_version: int) -> Mapping[str, Any]:
         path = f"/v1/timelines/{_path_part(timeline_id)}/diff?from_version={int(from_version)}&to_version={int(to_version)}"
@@ -611,7 +627,8 @@ class WorkspaceClient:
     def list_project_shots(self, project_id: str, *, cursor: str | None = None, limit: int = 50, include_archived: bool = False) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}&include_archived={'true' if include_archived else 'false'}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/shots" + query)[2])
-        return list(value.get("items", [])), value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return list(items), next_cursor
 
     def create_project_shot(self, project_id: str, shot: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
         return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots", body=json.dumps(dict(shot), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
@@ -664,7 +681,8 @@ class WorkspaceClient:
     def list_project_references(self, project_id: str, *, cursor: str | None = None, limit: int = 50, include_archived: bool = False) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}&include_archived={'true' if include_archived else 'false'}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/references" + query)[2])
-        return list(value.get("items", [])), value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return list(items), next_cursor
 
     def create_project_reference(self, project_id: str, reference: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
         return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references", body=json.dumps(dict(reference), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
@@ -712,7 +730,8 @@ class WorkspaceClient:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         _, _, body = self._request("GET", "/v1/projects" + query)
         value = self._json(body)
-        return [Project.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return [Project.from_json(item) for item in items], next_cursor
 
     def select_project(self, project: str, *, scope: str = "workspace", idempotency_key: str | None = None) -> Mapping[str, Any]:
         payload = {"project": project, "scope": scope}
@@ -740,7 +759,8 @@ class WorkspaceClient:
     def list_project_objects(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[ManagedObject], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/objects" + query)[2])
-        return [ManagedObject.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return [ManagedObject.from_json(item) for item in items], next_cursor
 
 
     def create_media_relation(self, project_id: str, from_object_id: str, to_object_id: str, kind: str, *, metadata: Mapping[str, Any] | None = None, idempotency_key: str) -> Mapping[str, Any]:
@@ -751,7 +771,8 @@ class WorkspaceClient:
     def list_media_relations(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/media-relations" + query)[2])
-        return list(value.get("items", [])), value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return list(items), next_cursor
 
     def get_object(self, object_id: str, *, byte_range: tuple[int, int | None] | None = None) -> ByteResponse:
         headers: dict[str, str] = {}
@@ -787,7 +808,8 @@ class WorkspaceClient:
     def list_project_tasks(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Task], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/tasks" + query)[2])
-        return [Task.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return [Task.from_json(item) for item in items], next_cursor
 
 
     def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int) -> AttemptFence | ClaimWaiting | None:
@@ -846,22 +868,28 @@ class WorkspaceClient:
     def list_project_runs(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/runs" + query)[2])
-        return list(value.get("items", [])), value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return list(items), next_cursor
 
 
     def list_events(self, *, cursor: str | None = None, limit: int = 50, aggregate_id: str | None = None) -> tuple[list[Event], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "") + (f"&aggregate_id={_path_part(aggregate_id)}" if aggregate_id else "")
         _, _, body = self._request("GET", "/v1/events" + query)
         value = self._json(body)
-        return [Event.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+        items, next_cursor = self._page(value)
+        return [Event.from_json(item) for item in items], next_cursor
 
-    def list_run_events(self, run_id: str) -> tuple[list[Event], str | None]:
-        value = self._json(self._request("GET", f"/v1/runs/{_path_part(run_id)}/events")[2])
-        return [Event.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+    def list_run_events(self, run_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Event], str | None]:
+        query = (f"?limit={int(limit)}" if cursor or int(limit) != 50 else "") + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/runs/{_path_part(run_id)}/events" + query)[2])
+        items, next_cursor = self._page(value)
+        return [Event.from_json(item) for item in items], next_cursor
 
-    def list_generations(self, project_id: str) -> tuple[list[Generation], str | None]:
-        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/generations")[2])
-        return [Generation.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+    def list_generations(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Generation], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/generations" + query)[2])
+        items, next_cursor = self._page(value)
+        return [Generation.from_json(item) for item in items], next_cursor
 
     def create_generation(self, project_id: str, generation_id: str, *, metadata: Mapping[str, Any] | None = None, type: str = "generation", source_task_id: str | None = None) -> Generation:
         payload: dict[str, Any] = {"generation_id": generation_id, "type": type, "metadata": metadata or {}}
@@ -871,9 +899,11 @@ class WorkspaceClient:
     def get_generation(self, generation_id: str) -> Generation:
         return Generation.from_json(self._json(self._request("GET", f"/v1/generations/{_path_part(generation_id)}")[2]))
 
-    def list_variants(self, generation_id: str) -> tuple[list[GenerationVariant], str | None]:
-        value = self._json(self._request("GET", f"/v1/generations/{_path_part(generation_id)}/variants")[2])
-        return [GenerationVariant.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
+    def list_variants(self, generation_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[GenerationVariant], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/generations/{_path_part(generation_id)}/variants" + query)[2])
+        items, next_cursor = self._page(value)
+        return [GenerationVariant.from_json(item) for item in items], next_cursor
 
     def get_variant(self, variant_id: str) -> GenerationVariant:
         return GenerationVariant.from_json(self._json(self._request("GET", f"/v1/variants/{_path_part(variant_id)}")[2]))
@@ -887,9 +917,11 @@ class WorkspaceClient:
         _, _, body = self._request("POST", "/v1/executors", body=json.dumps(dict(executor), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
         return Executor.from_json(self._json(body))
 
-    def list_capabilities(self) -> list[Capability]:
-        _, _, body = self._request("GET", "/v1/capabilities")
-        return [Capability.from_json(item) for item in self._json(body).get("items", [])]
+    def list_capabilities(self, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Capability], str | None]:
+        query = (f"?limit={int(limit)}" if cursor or int(limit) != 50 else "") + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        _, _, body = self._request("GET", "/v1/capabilities" + query)
+        items, next_cursor = self._page(self._json(body))
+        return [Capability.from_json(item) for item in items], next_cursor
 
     def register_capability(self, capability_id: str, definition_digest: str, *, required_resource_keys: list[str] | None = None, status: str = "ready", estimated_scratch_bytes: int = 0, estimated_output_bytes: int = 0, unavailable_reason: str | None = None, idempotency_key: str | None = None) -> Capability:
         payload = {"capability_id": capability_id, "definition_digest": definition_digest, "status": status, "required_resource_keys": required_resource_keys or [], "estimated_scratch_bytes": estimated_scratch_bytes, "estimated_output_bytes": estimated_output_bytes, "unavailable_reason": unavailable_reason}

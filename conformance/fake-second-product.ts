@@ -44,7 +44,7 @@ export async function runSecondProduct(client: WorkspaceClient): Promise<Record<
   const executor: Executor = { executor_id: "second-product-executor", max_concurrency: 1, resource_keys: ["cpu"], capabilities: [capability], protocol: "workspace.v1" };
   await client.registerExecutor(executor, "second-product-executor-1");
   const capabilities = await client.listCapabilities();
-  if (!capabilities.some((item) => item.capability_id === capability.capability_id && item.status === "ready")) throw new Error("capability registration contract failed");
+  if (!capabilities.items.some((item) => item.capability_id === capability.capability_id && item.status === "ready")) throw new Error("capability registration contract failed");
   steps.push("register-capability-executor");
 
   const cancelled = await client.admitTask({ capability_id: capability.capability_id, capability_digest: capability.definition_digest, input_object_ids: [object.object_id] }, "second-product-cancel-1");
