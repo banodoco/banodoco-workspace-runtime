@@ -63,6 +63,23 @@ def test_invalid_range_is_rejected_before_transport() -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_generated_run_events_preserve_event_page_contract() -> None:
+    event = {
+        "event_id": "1", "sequence": 1, "cursor": "1",
+        "event_type": "task.admitted", "aggregate_type": "run",
+        "aggregate_id": "run-1", "payload": {},
+        "occurred_at": "2026-01-01T00:00:00Z",
+    }
+
+    def transport(method, path, headers, body):
+        assert method == "GET" and path == "/v1/runs/run-1/events"
+        return 200, {}, json.dumps({"items": [event], "next_cursor": None}).encode()
+
+    items, cursor = WorkspaceClient("http://runtime", transport=transport).list_run_events("run-1")
+    assert items[0].event_id == "1"
+    assert cursor is None
+
+
 def test_api_error_preserves_conflict_and_version_details() -> None:
     def transport(*args):
         return 409, {}, json.dumps({"code": "version_conflict", "message": "stale", "request_id": "req-1", "details": {"expected": 2, "actual": 3}}).encode()

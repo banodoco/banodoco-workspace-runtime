@@ -134,7 +134,7 @@ def test_project_patch_and_run_cancel_retry_are_durable_and_idempotent(daemon, t
     retried = client.retry_run(failed.run_id, idempotency_key="run-retry")
     assert retried["status"] == "queued"
     assert client.retry_run(failed.run_id, idempotency_key="run-retry")["status"] == "queued"
-    events = client.list_run_events(failed.run_id)
+    events, _cursor = client.list_run_events(failed.run_id)
     assert [event.event_type for event in events][-2:] == ["task.retried", "run.retried"]
     second = worker.claim_task(executor_id="mutation-worker", capability_ids=["render.basic"], idempotency_key="mutation-claim-2", runtime_epoch=worker.health().runtime_epoch)
     assert second["fence"] > first["fence"] and second["attempt_id"] != first["attempt_id"]

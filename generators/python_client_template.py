@@ -855,10 +855,9 @@ class WorkspaceClient:
         value = self._json(body)
         return [Event.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
 
-    def list_run_events(self, run_id: str) -> list[Event]:
-        value = json.loads(self._request("GET", f"/v1/runs/{_path_part(run_id)}/events")[2].decode("utf-8"))
-        values = value.get("items", []) if isinstance(value, dict) else value
-        return [Event.from_json(item) for item in values]
+    def list_run_events(self, run_id: str) -> tuple[list[Event], str | None]:
+        value = self._json(self._request("GET", f"/v1/runs/{_path_part(run_id)}/events")[2])
+        return [Event.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
 
     def list_generations(self, project_id: str) -> tuple[list[Generation], str | None]:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/generations")[2])

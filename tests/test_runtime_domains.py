@@ -88,7 +88,7 @@ def test_task_receipt_binds_committed_admission_event_and_canonical_sequence(tmp
             input_object_ids=[], project_id=project.project_id,
             idempotency_key="receipt-task", spec={},
         )
-        events = client.list_run_events(task.run_id)
+        events, _cursor = client.list_run_events(task.run_id)
         admitted = next(event for event in events if event.event_type == "task.admitted")
         assert task.receipt["event_ids"] == [admitted.event_id]
         assert task.receipt["receipt_id"].startswith("txn-")
@@ -200,7 +200,7 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="domain-task")
         run = client.get_run(task.run_id)
         assert task.task_id in run["task_ids"]
-        events = client.list_run_events(task.run_id)
+        events, _cursor = client.list_run_events(task.run_id)
         assert events[0].event_type == "task.admitted" and events[0].sequence < events[-1].sequence + 1
         client.cancel_task(task.task_id, idempotency_key="domain-cancel")
 
@@ -212,7 +212,8 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         assert attempt is not None
         failed = worker.fail_attempt(attempt["attempt_id"], lease_id=attempt["lease_id"], fence=attempt["fence"], error={"code": "worker_error"}, runtime_epoch=epoch, idempotency_key="failed-domain-settle")
         assert failed.task_id == failed_task.task_id and failed.state == "failed"
-        assert client.list_run_events(failed_task.run_id)[-1].event_type == "task.failed"
+        events, _cursor = client.list_run_events(failed_task.run_id)
+        assert events[-1].event_type == "task.failed"
     finally:
         daemon.stop()
 

@@ -31,6 +31,17 @@ test("generated TypeScript client preserves inclusive range and strong ETag", as
   assert.equal(response.status, 206); assert.equal(new TextDecoder().decode(response.data), "2345"); assert.equal(response.content_range, "bytes 2-5/10");
 });
 
+test("generated TypeScript client preserves the EventPage boundary", async () => {
+  const event = { event_id: "1", sequence: 1, cursor: "1", event_type: "task.admitted", aggregate_type: "run", aggregate_id: "run-1", payload: {}, occurred_at: "2026-01-01T00:00:00Z" };
+  const transport = async (method, path) => {
+    assert.equal(method, "GET");
+    assert.equal(path, "/v1/runs/run-1/events");
+    return { status: 200, headers: {}, body: json({ items: [event], next_cursor: null }) };
+  };
+  const page = await new WorkspaceClient("http://runtime", undefined, transport).listRunEvents("run-1");
+  assert.deepEqual(page, { items: [event], next_cursor: null });
+});
+
 test("generated TypeScript client exposes structured conflict errors", async () => {
   const transport = async () => ({ status: 409, headers: {}, body: json({ code: "version_conflict", message: "stale", request_id: "q", details: { actual: 2 } }) });
   await assert.rejects(() => new WorkspaceClient("http://runtime", undefined, transport).getProject("p"), (error) => error instanceof ApiError && error.code === "version_conflict" && error.details.actual === 2);
