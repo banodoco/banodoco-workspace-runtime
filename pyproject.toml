@@ -18,4 +18,4 @@ testpaths = ["tests"]
 addopts = "-ra"
 
 [tool.setuptools.packages.find]
-include = ["runtime_protocol*", "banodoco_local*"]
+include = ["runtime_protocol*", "banodoco_local*", "tools*"]

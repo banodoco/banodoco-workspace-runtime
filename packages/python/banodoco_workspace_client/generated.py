@@ -444,8 +444,12 @@ class WorkspaceClient:
         if expected_version is not None: payload["expected_version"] = expected_version
         return RealmLifecycle.from_json(self._json(self._request("POST", "/v1/realm/tombstone", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
 
-    def recover_realm(self, *, expected_version: int | None = None) -> RealmLifecycle:
-        payload = {} if expected_version is None else {"expected_version": expected_version}
+    def recover_realm(self, *, expected_realm_id: str | None = None, expected_version: int | None = None, confirmation: str | None = None, noninteractive: bool = False) -> RealmLifecycle:
+        payload: dict[str, Any] = {}
+        if expected_realm_id is not None: payload["expected_realm_id"] = expected_realm_id
+        if expected_version is not None: payload["expected_version"] = expected_version
+        if confirmation is not None: payload["confirmation"] = confirmation
+        if noninteractive: payload["noninteractive"] = True
         return RealmLifecycle.from_json(self._json(self._request("POST", "/v1/realm/recover", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
 
     def purge_realm(self, confirmation: str) -> Mapping[str, Any]:

@@ -1,1 +1,1 @@
-"""Runtime migration tooling package."""
+"""Packaged operator tools shipped with the neutral workspace runtime."""

@@ -10,6 +10,7 @@ SQLite, foreign keys, and every CAS hash pass verification.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -27,6 +28,23 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _authenticated_digest(payload: dict) -> str:
+    """Digest a JSON object using the runtime's canonical wire encoding."""
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _file_record(path: Path) -> dict:
+    return {"sha256": _sha256(path), "size": path.stat().st_size}
+
+
+def _manifest_digest_payload(manifest: dict) -> dict:
+    return {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+
+
+def _handoff_digest_payload(handoff: dict) -> dict:
+    return {key: value for key, value in handoff.items() if key != "handoff_sha256"}
 
 
 def _object_path(cas_root: Path, digest: str) -> Path:
@@ -66,17 +84,50 @@ def _verify_cas_manifest(root: Path, manifest: dict) -> None:
             raise ConflictError("backup CAS object failed verification", details={"digest": obj.get("digest")})
 
 
-def verify_backup(backup_dir: str | Path) -> dict:
+def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False) -> dict:
     root = Path(backup_dir).expanduser().resolve()
     manifest_path = root / "manifest.json"
     cas_manifest_path = root / "cas-manifest.json"
     database_path = root / "realm.sqlite3"
     if not manifest_path.is_file() or not cas_manifest_path.is_file() or not database_path.is_file():
         raise NotFoundError("backup is incomplete", details={"backup": str(root)})
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConflictError("backup manifest is invalid") from exc
+    if not isinstance(manifest, dict):
+        raise ConflictError("backup manifest must be an object")
+    format_version = manifest.get("format_version")
+    if format_version == 1:
+        if not allow_legacy:
+            raise ConflictError("legacy backup format requires explicit migration")
+        # Compatibility is deliberately opt-in.  New backups use the
+        # authenticated v2 envelope below and never take this path.
+        if manifest.get("database_sha256") != _sha256(database_path):
+            raise ConflictError("backup SQLite hash mismatch")
+    elif format_version == 2:
+        digest = manifest.get("manifest_sha256")
+        if not isinstance(digest, str) or not hmac.compare_digest(digest, _authenticated_digest(_manifest_digest_payload(manifest))):
+            raise ConflictError("backup manifest authentication failed")
+        realm_meta = manifest.get("realm")
+        schema_meta = manifest.get("schema")
+        files = manifest.get("files")
+        if not isinstance(realm_meta, dict) or not realm_meta.get("id") or not isinstance(schema_meta, dict) or not isinstance(schema_meta.get("version"), int) or not isinstance(files, dict):
+            raise ConflictError("backup manifest metadata is incomplete")
+        if manifest.get("realm_id") != realm_meta["id"] or manifest.get("schema_version") != schema_meta["version"]:
+            raise ConflictError("backup manifest metadata aliases mismatch")
+        for name, path in (("realm.sqlite3", database_path), ("cas-manifest.json", cas_manifest_path)):
+            record = files.get(name)
+            if not isinstance(record, dict) or record.get("sha256") != _sha256(path) or int(record.get("size", -1)) != path.stat().st_size:
+                raise ConflictError("backup file digest mismatch", details={"file": name})
+    else:
+        raise ConflictError("unsupported backup format", details={"format_version": format_version})
     if manifest.get("database_sha256") != _sha256(database_path):
         raise ConflictError("backup SQLite hash mismatch")
-    cas = json.loads(cas_manifest_path.read_text(encoding="utf-8"))
+    try:
+        cas = json.loads(cas_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConflictError("backup CAS manifest is invalid") from exc
     if manifest.get("cas_manifest_sha256") != cas.get("manifest_sha256"):
         raise ConflictError("backup CAS manifest hash mismatch")
     _verify_cas_manifest(root, cas)
@@ -114,6 +165,13 @@ def verify_restore_candidate(candidate_dir: str | Path) -> dict:
     source_backup = Path(str(handoff.get("source_backup", ""))).expanduser().resolve()
     verified = verify_backup(source_backup)
     source_manifest = verified["manifest"]
+    if handoff.get("format_version") != 2:
+        raise ConflictError("legacy restore handoff requires explicit migration")
+    handoff_digest = handoff.get("handoff_sha256")
+    if not isinstance(handoff_digest, str) or not hmac.compare_digest(handoff_digest, _authenticated_digest(_handoff_digest_payload(handoff))):
+        raise ConflictError("restore handoff authentication failed")
+    if handoff.get("source_manifest_sha256") != _sha256(source_backup / "manifest.json"):
+        raise ConflictError("restore handoff source manifest mismatch")
     if handoff.get("realm_id") != source_manifest.get("realm_id"):
         raise ConflictError("restore candidate realm does not match its backup")
     candidate_db_hash = _sha256(database)
@@ -171,9 +229,24 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                 shutil.copyfile(source_path, target_path)
             atomic_json_write(temporary / "cas-manifest.json", cas)
             realm = store.realm
-            manifest = {"format_version": 1, "created_at": now(), "schema_version": store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], "realm_id": realm["id"], "display_name": realm["display_name"], "database_sha256": _sha256(target_db), "cas_manifest_sha256": cas["manifest_sha256"]}
+            schema_version = store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            manifest = {
+                "format_version": 2,
+                "created_at": now(),
+                "realm": {"id": realm["id"], "display_name": realm["display_name"]},
+                "schema": {"version": schema_version},
+                "files": {"realm.sqlite3": _file_record(target_db), "cas-manifest.json": _file_record(temporary / "cas-manifest.json")},
+                # Stable aliases make the transition readable to existing
+                # operators while the authenticated envelope is authoritative.
+                "schema_version": schema_version,
+                "realm_id": realm["id"],
+                "display_name": realm["display_name"],
+                "database_sha256": _sha256(target_db),
+                "cas_manifest_sha256": cas["manifest_sha256"],
+            }
             if binding is not None:
                 manifest["destination_binding"] = dict(binding)
+            manifest["manifest_sha256"] = _authenticated_digest(manifest)
             atomic_json_write(temporary / "manifest.json", manifest)
         temporary.rename(destination)
         return verify_backup(destination)
@@ -202,7 +275,8 @@ def restore_backup(backup_dir: str | Path, destination: str | Path) -> dict:
             realm = restored.realm
         finally:
             restored.close()
-        handoff = {"format_version": 1, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _sha256(temporary / "realm.sqlite3"), "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
+        handoff = {"format_version": 2, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _sha256(temporary / "realm.sqlite3"), "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
+        handoff["handoff_sha256"] = _authenticated_digest(handoff)
         atomic_json_write(temporary / "activation-handoff.json", handoff)
         temporary.rename(destination)
         return {"destination": str(destination), "realm_id": realm["id"], "activation_handoff": str(destination / "activation-handoff.json"), "source_manifest_sha256": handoff["source_manifest_sha256"], "verification": verified["manifest"]}

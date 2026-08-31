@@ -90,7 +90,10 @@ def parser() -> argparse.ArgumentParser:
     resume.add_argument("--runtime-epoch", required=True, type=int)
     recovery = sub.add_parser("recovery", aliases=["recover"], help="recover the selected realm or inspect recovery state")
     _read_args(recovery)
+    recovery.add_argument("--expected-realm-id", "--realm-id", dest="expected_realm_id")
     recovery.add_argument("--expected-version", type=int)
+    recovery.add_argument("--confirm", dest="confirmation")
+    recovery.add_argument("--non-interactive", action="store_true")
     return root
 
 
@@ -229,7 +232,11 @@ def main(argv: list[str] | None = None) -> int:
         config = _config(args, paths)
         try:
             result = bootstrap(paths, LocalRuntimeBoundary(), config)
-        except BootstrapError as exc:
+        except Exception as exc:
+            # Operator-facing startup must be a stable boundary: client,
+            # import, protocol, filesystem, and OS failures are represented as
+            # one structured error with no traceback.  KeyboardInterrupt is a
+            # BaseException and intentionally remains interruptible.
             _emit({"ok": False, "error": str(exc)}, json_mode=True)
             return 1
         _emit(result, json_mode=args.json)
@@ -297,7 +304,11 @@ def main(argv: list[str] | None = None) -> int:
             _emit(value, json_mode=args.json)
             return 0
         if args.command in {"recovery", "recover"}:
-            value = _client(paths).recover_realm(expected_version=args.expected_version)
+            if not args.expected_realm_id or args.expected_version is None:
+                raise ValueError("recovery requires --expected-realm-id and --expected-version")
+            if bool(args.confirmation) == bool(args.non_interactive):
+                raise ValueError("recovery requires exactly one of --confirm 'RECOVER <realm_id>' or --non-interactive")
+            value = _client(paths).recover_realm(expected_realm_id=args.expected_realm_id, expected_version=args.expected_version, confirmation=args.confirmation, noninteractive=args.non_interactive)
             _emit(value, json_mode=args.json)
             return 0
     except (BootstrapError, ValueError, OSError) as exc:

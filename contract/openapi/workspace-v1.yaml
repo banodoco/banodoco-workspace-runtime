@@ -55,7 +55,7 @@ paths:
   /v1/realm/recover:
     post:
       operationId: recoverRealm
-      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/LifecycleRequest' } } } }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryRequest' } } } }
       responses: { '200': { description: Recovered realm tombstone, content: { application/json: { schema: { $ref: './schemas/realm-lifecycle.json' } } } } }
   /v1/realm/purge:
     post:
@@ -644,6 +644,15 @@ components:
       type: object
       additionalProperties: false
       properties: { reason: { type: string }, expected_version: { type: integer, minimum: 1 } }
+    RecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_realm_id, expected_version]
+      properties:
+        expected_realm_id: { type: string, minLength: 1 }
+        expected_version: { type: integer, minimum: 1 }
+        confirmation: { type: string, minLength: 1 }
+        noninteractive: { type: boolean }
     PurgeRealm:
       type: object
       additionalProperties: false

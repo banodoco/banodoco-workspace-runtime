@@ -61,7 +61,23 @@ class RuntimeService:
 
     def recover_realm(self, body=None):
         body = body or {}
-        return self.store.restore_tombstone(expected_version=body.get("expected_version"))
+        # Recovery is a destructive lifecycle transition.  Require an
+        # operator-scoped expectation before touching durable state, even when
+        # the realm is already active (the no-op path must be fenced too).
+        expected_realm_id = body.get("expected_realm_id") or body.get("realm_id")
+        expected_version = body.get("expected_version")
+        if not expected_realm_id or expected_version is None:
+            raise ValidationError("recovery requires expected_realm_id and expected_version")
+        if str(expected_realm_id) != str(self.realm["id"]):
+            raise ConflictError("recovery realm identity mismatch", details={"expected": expected_realm_id, "actual": self.realm["id"]})
+        noninteractive = body.get("noninteractive") is True
+        confirmation = body.get("confirmation")
+        required_confirmation = f"RECOVER {self.realm['id']}"
+        if bool(noninteractive) == bool(confirmation):
+            raise ValidationError(f"recovery requires exactly one of confirmation {required_confirmation!r} or noninteractive=true")
+        if not noninteractive and confirmation != required_confirmation:
+            raise ValidationError(f"recovery requires confirmation exactly {required_confirmation!r} or noninteractive=true")
+        return self.store.restore_tombstone(expected_version=expected_version)
 
     def purge(self, body=None):
         """Return the explicit offline purge boundary; never purge online."""
