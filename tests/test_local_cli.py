@@ -32,7 +32,7 @@ def test_parser_exposes_operator_lifecycle_without_legacy_verbs():
     required = {
         "migrate": ["--source", "s", "--archive", "a", "--destination", "d"],
         "rehearse": ["--source", "s", "--archive", "a", "--destination", "d"],
-        "backup": ["--out", "b"],
+        "backup": ["--destination", "b"],
         "restore": ["backup", "--destination", "d"],
         "checkpoint": ["--attempt-id", "a", "--lease-id", "l", "--fence", "1", "--runtime-epoch", "1", "--nonce", "n", "--authorization", "n"],
         "prepare-reboot": ["--attempt-id", "a", "--lease-id", "l", "--fence", "1", "--runtime-epoch", "1"],

@@ -105,9 +105,9 @@ class SourceProfile:
             raise BootstrapError(f"Source profile must be {expected_profile!r}, got {profile!r}.")
         runtime_checkout = str(value.get("runtime_checkout", ""))
         source_checkout = str(value.get("source_checkout", ""))
-        if not runtime_checkout or not source_checkout:
+        if not source_checkout:
             raise BootstrapError(
-                "Source profile is incomplete; configure runtime_checkout and source_checkout "
+                "Source profile is incomplete; configure source_checkout "
                 "in the editable source manifest."
             )
         command = value.get("runtime_command", ())

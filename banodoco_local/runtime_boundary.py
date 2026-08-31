@@ -117,14 +117,16 @@ class LocalRuntimeBoundary:
         self._detached_pid: int | None = None
 
     @staticmethod
-    def _validate_checkout(source: SourceProfile) -> Path:
-        checkout = Path(source.runtime_checkout).expanduser().resolve()
-        if not checkout.is_dir() or not (checkout / "runtime_protocol").is_dir():
-            raise BootstrapError(f"Runtime checkout is not an editable runtime source: {checkout}")
+    def _validate_source(source: SourceProfile) -> None:
+        """Validate only the explicitly configured product source.
+
+        The runtime and generated client are installed dependencies.  A
+        checkout path is provenance for the editable source profile, never an
+        import or launch fallback for the neutral runtime.
+        """
         source_checkout = Path(source.source_checkout).expanduser().resolve()
         if not source_checkout.exists():
             raise BootstrapError(f"Source checkout from the editable profile does not exist: {source_checkout}")
-        return checkout
 
     def configure_source(self, source: SourceProfile) -> None:
         self._source = source
@@ -143,15 +145,19 @@ class LocalRuntimeBoundary:
         return path
 
     def _argv(self, source: SourceProfile, *, realm_id: str, realm_root: Path, support_root: Path, display_name: str, owner_lock: Path, token_file: Path) -> list[str]:
-        checkout = self._validate_checkout(source)
+        self._validate_source(source)
         if source.runtime_command:
             argv = list(source.runtime_command)
         else:
             python = sys.executable
             if source.runtime_environment:
                 candidate = Path(source.runtime_environment).expanduser().resolve() / "bin" / "python"
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    python = str(candidate)
+                if not candidate.is_file() or not os.access(candidate, os.X_OK):
+                    raise BootstrapError(
+                        "Configured runtime environment is missing its installed Python: "
+                        f"{candidate}"
+                    )
+                python = str(candidate)
             argv = [python, "-m", "runtime_protocol", "start"]
         replacements = {
             "{realm_id}": realm_id,
@@ -184,13 +190,13 @@ class LocalRuntimeBoundary:
         bootstrap_token = os.urandom(32).hex()
         token_file = self._token_file(support_root, bootstrap_token)
         argv = self._argv(source_profile, realm_id=realm_id, realm_root=realm_root, support_root=support_root, display_name=self._display_name, owner_lock=owner_lock, token_file=token_file)
-        checkout = self._validate_checkout(source_profile)
         log_path = support_root / "runtime.log"
         log = log_path.open("ab")
         try:
-            env = dict(os.environ)
-            env["PYTHONPATH"] = str(checkout) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-            self._process = subprocess.Popen(argv, cwd=str(checkout), env=env, stdout=subprocess.DEVNULL, stderr=log, text=True, start_new_session=True)
+            # Do not derive imports from either checkout.  The selected
+            # runtime_environment is an installed environment and the child
+            # inherits the host's already-configured environment unchanged.
+            self._process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=log, text=True, start_new_session=True)
         except Exception:
             log.close()
             token_file.unlink(missing_ok=True)
@@ -266,13 +272,8 @@ class LocalRuntimeBoundary:
     def connect(self, *, endpoint: str, credential: str) -> RuntimeConnection:
         try:
             from banodoco_workspace_client import WorkspaceClient
-        except ImportError:
-            checkout = self._source and Path(self._source.runtime_checkout).expanduser().resolve()
-            if checkout:
-                client_root = checkout / "packages" / "python"
-                if str(client_root) not in sys.path:
-                    sys.path.insert(0, str(client_root))
-            from banodoco_workspace_client import WorkspaceClient
+        except ImportError as exc:
+            raise BootstrapError("The installed generated workspace client is unavailable; install banodoco-workspace-client.") from exc
         connection = RuntimeConnection(endpoint, credential, self._bootstrap_credential)
         connection._client = WorkspaceClient(endpoint, credential)
         return connection

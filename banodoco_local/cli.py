@@ -7,7 +7,6 @@ from dataclasses import asdict, is_dataclass
 import json
 import os
 from pathlib import Path
-import sys
 from typing import Any, Mapping
 
 from . import __version__
@@ -53,7 +52,7 @@ def parser() -> argparse.ArgumentParser:
 
     backup = sub.add_parser("backup", help="create a verified backup through the runtime")
     _read_args(backup)
-    backup.add_argument("--out", "--destination", dest="destination", required=True, type=Path)
+    backup.add_argument("--destination", required=True, type=Path)
     restore = sub.add_parser("restore", help="restore a verified backup into an inactive destination")
     _read_args(restore)
     restore.add_argument("backup", type=Path)
@@ -72,7 +71,7 @@ def parser() -> argparse.ArgumentParser:
     checkpoint.add_argument("--nonce", required=True)
     checkpoint.add_argument("--authorization", required=True)
     checkpoint.add_argument("--state", default="{}", help="checkpoint JSON object or @path")
-    prepare = sub.add_parser("prepare-reboot", aliases=["prepare"], help="issue or reuse a nonce for checkpoint recovery")
+    prepare = sub.add_parser("prepare-reboot", help="issue or reuse a nonce for checkpoint recovery")
     _read_args(prepare)
     _attempt_args(prepare)
     reboot = sub.add_parser("reboot", help="execute a prepared recovery reboot (disabled by default)")
@@ -88,9 +87,9 @@ def parser() -> argparse.ArgumentParser:
     resume.add_argument("--nonce", required=True)
     resume.add_argument("--authorization", required=True)
     resume.add_argument("--runtime-epoch", required=True, type=int)
-    recovery = sub.add_parser("recovery", aliases=["recover"], help="recover the selected realm or inspect recovery state")
+    recovery = sub.add_parser("recovery", help="recover the selected realm or inspect recovery state")
     _read_args(recovery)
-    recovery.add_argument("--expected-realm-id", "--realm-id", dest="expected_realm_id")
+    recovery.add_argument("--expected-realm-id", dest="expected_realm_id")
     recovery.add_argument("--expected-version", type=int)
     recovery.add_argument("--confirm", dest="confirmation")
     recovery.add_argument("--non-interactive", action="store_true")
@@ -110,9 +109,9 @@ def _read_args(command: argparse.ArgumentParser) -> None:
 
 
 def _migration_args(command: argparse.ArgumentParser) -> None:
-    command.add_argument("--source", "--source-root", dest="source_root", required=True, type=Path)
-    command.add_argument("--archive", "--archive-root", dest="archive_root", required=True, type=Path)
-    command.add_argument("--destination", "--destination-root", dest="destination_root", required=True, type=Path)
+    command.add_argument("--source", dest="source_root", required=True, type=Path)
+    command.add_argument("--archive", dest="archive_root", required=True, type=Path)
+    command.add_argument("--destination", dest="destination_root", required=True, type=Path)
     command.add_argument("--dry-run", action="store_true", help="validate and report without importing or activating")
 
 
@@ -183,19 +182,10 @@ def _client(paths: RuntimePaths):
     discovery = read_json(paths.discovery_path)
     if not discovery or not discovery.get("endpoint"):
         raise BootstrapError("No runtime discovery is available; run banodoco-local up --profile astrid.")
-    checkout = os.environ.get("BANODOCO_LOCAL_RUNTIME_CHECKOUT")
-    if not checkout:
-        catalog = read_json(paths.catalog_path) or {}
-        profile = (catalog.get("source_profiles") or {}).get("astrid") or {}
-        checkout = profile.get("runtime_checkout")
-    if checkout:
-        client_root = Path(str(checkout)).expanduser().resolve() / "packages" / "python"
-        if client_root.is_dir() and str(client_root) not in sys.path:
-            sys.path.insert(0, str(client_root))
     try:
         from banodoco_workspace_client import WorkspaceClient
     except ImportError as exc:
-        raise BootstrapError("The generated workspace client is unavailable for this runtime checkout.") from exc
+        raise BootstrapError("The installed generated workspace client is unavailable; install banodoco-workspace-client.") from exc
     return WorkspaceClient(str(discovery["endpoint"]), _credential(paths))
 
 
@@ -292,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
             value = client.checkpoint_attempt(args.attempt_id, lease_id=args.lease_id, fence=args.fence, nonce=args.nonce, authorization=args.authorization, state=_load_state(args.state), runtime_epoch=args.runtime_epoch)
             _emit(value, json_mode=args.json)
             return 0
-        if args.command in {"prepare-reboot", "prepare"}:
+        if args.command == "prepare-reboot":
             value = _client(paths).prepare_reboot(args.attempt_id, lease_id=args.lease_id, fence=args.fence, runtime_epoch=args.runtime_epoch)
             _emit(value, json_mode=args.json)
             return 0
@@ -306,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
             value = _client(paths).resume_attempt(checkpoint_id=args.checkpoint_id, nonce=args.nonce, authorization=args.authorization, runtime_epoch=args.runtime_epoch)
             _emit(value, json_mode=args.json)
             return 0
-        if args.command in {"recovery", "recover"}:
+        if args.command == "recovery":
             if not args.expected_realm_id or args.expected_version is None:
                 raise ValueError("recovery requires --expected-realm-id and --expected-version")
             if bool(args.confirmation) == bool(args.non_interactive):

@@ -322,19 +322,19 @@ def _connection_from_fd(root_fd: int, name: str) -> sqlite3.Connection:
         os.close(fd)
 
 
-def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None) -> dict:
+def verify_backup(backup_dir: str | Path, *, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None) -> dict:
     """Verify a backup while retaining its lexical parent for the whole read."""
     root = absolute_path(backup_dir)
     own_identity = directory_identity is None
     identity = directory_identity or capture_parent(root)
     try:
-        return _verify_backup_pinned(root, allow_legacy=allow_legacy, key=key, key_path=key_path, directory_identity=identity)
+        return _verify_backup_pinned(root, key=key, key_path=key_path, directory_identity=identity)
     finally:
         if own_identity:
             close_pinned(identity)
 
 
-def _verify_backup_pinned(backup_dir: str | Path, *, allow_legacy: bool = False, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any]) -> dict:
+def _verify_backup_pinned(backup_dir: str | Path, *, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any]) -> dict:
     root = absolute_path(backup_dir)
     backup_fd = -1
     try:
@@ -352,12 +352,7 @@ def _verify_backup_pinned(backup_dir: str | Path, *, allow_legacy: bool = False,
         if not isinstance(manifest, dict):
             raise ConflictError("backup manifest must be an object")
         format_version = manifest.get("format_version")
-        if format_version == 1:
-            if not allow_legacy:
-                raise ConflictError("legacy backup format requires explicit migration")
-            if manifest.get("database_sha256") != _sha256_at(backup_fd, "realm.sqlite3")[0]:
-                raise ConflictError("backup SQLite hash mismatch")
-        elif format_version == 2:
+        if format_version == 2:
             digest = manifest.get("manifest_sha256")
             mac = manifest.get("manifest_hmac")
             if not isinstance(digest, str) or not hmac.compare_digest(digest, _authenticated_digest(_manifest_digest_payload(manifest))):
@@ -377,6 +372,8 @@ def _verify_backup_pinned(backup_dir: str | Path, *, allow_legacy: bool = False,
                 actual_hash, actual_size = _sha256_at(backup_fd, name)
                 if not isinstance(record, dict) or record.get("sha256") != actual_hash or int(record.get("size", -1)) != actual_size:
                     raise ConflictError("backup file digest mismatch", details={"file": name})
+        elif format_version == 1:
+            raise ConflictError("legacy backup format requires explicit migration")
         else:
             raise ConflictError("unsupported backup format", details={"format_version": format_version})
         if manifest.get("database_sha256") != _sha256_at(backup_fd, "realm.sqlite3")[0]:

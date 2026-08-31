@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import threading
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
 from .errors import RuntimeErrorBase, AuthorizationError, NotFoundError, ProtocolError, InvalidRequestError
-from migration_boundary import BoundaryError
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -26,7 +24,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         return self.server.runtime  # type: ignore[attr-defined]
 
     def _identity(self, scope):
-        if self.path.split("?", 1)[0] in ("/health", "/v1/health"):
+        if self.path.split("?", 1)[0] == "/v1/health":
             return {"actor": "health", "scopes": ["health"]}
         value = self.headers.get("Authorization", "")
         if not value.startswith("Bearer "):
@@ -65,7 +63,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
 
     def _error(self, exc):
-        if isinstance(exc, (RuntimeErrorBase, BoundaryError)):
+        if isinstance(exc, RuntimeErrorBase):
             self._send(exc.status, error=exc.as_dict())
         else:
             self._send(500, error={"code": "internal_error", "message": "internal runtime error"})
@@ -73,7 +71,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
-        if path in (["health"], ["v1", "health"]):
+        if path == ["v1", "health"]:
             return self._send(200, self.runtime.health())
         if path == ["v1", "credentials"] and method == "POST":
             self._identity("credentials:provision")
@@ -125,21 +123,28 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if not body.get("backup") or not body.get("destination"):
                 raise ProtocolError("backup and destination are required")
             return self._send(201, self.runtime.restore(body["backup"], body["destination"]))
-        if path == ["v1", "projects", "selection"] and method in ("GET", "PUT", "POST"):
+        if path == ["v1", "projects", "selection"] and method in ("GET", "PUT"):
             identity = self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
                 return self._send(200, self.runtime.current_project(identity["actor"]))
-            body = self._body()
+            body = self._project_mutation_body()
             if not isinstance(body, dict) or not body.get("project"):
                 raise ProtocolError("project is required")
-            key = self.headers.get("Idempotency-Key") or body.get("idempotency_key") or uuid.uuid4().hex
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
             value = self.runtime.select_project(identity["actor"], body["project"], scope=body.get("scope", "workspace"), idempotency_key=key)
             project_id = value["project"]["project_id"]
             aggregate_id = f"{identity['actor']}:{value['scope']}"
             return self._send(200, {"data": value, "receipt": self.runtime.committed_receipt("project.select", aggregate_id, key, project_id=project_id)})
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timelines":
             self._identity("projects:read" if method == "GET" else "projects:write")
-            if method == "POST": return self._send(201, self.runtime.create_timeline(path[2], self._body().get("timeline_id", "")))
+            if method == "POST":
+                body = self._project_mutation_body()
+                key = self.headers.get("Idempotency-Key")
+                if not key:
+                    raise ProtocolError("Idempotency-Key header is required")
+                return self._send(201, self.runtime.create_timeline(path[2], body.get("timeline_id", "")))
             if method == "GET": return self._send(200, self.runtime.list_timelines(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timeline-documents" and method == "POST":
             self._identity("projects:write")
@@ -194,24 +199,20 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if method == "GET":
                 return self._send(200, self.runtime.list_projects())
             if method == "POST":
-                body = self._body()
-                key = self.headers.get("Idempotency-Key") or body.get("idempotency_key") or uuid.uuid4().hex
+                body = self._project_mutation_body()
+                key = self.headers.get("Idempotency-Key")
+                if not key:
+                    raise ProtocolError("Idempotency-Key header is required")
                 value = self.runtime.create_project(body, idempotency_key=key)
                 resource = self.runtime._project_resource(value)
                 return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("project.create", value["id"], key, project_id=value["id"])})
-        if path == ["v1", "workers"] and method == "POST":
-            self._identity("worker:register")
-            return self._send(201, self.runtime.register_worker(self._body()))
-        if len(path) == 4 and path[:2] == ["v1", "workers"] and path[3] == "heartbeat" and method == "POST":
-            self._identity("worker:execute")
-            return self._send(200, self.runtime.worker_heartbeat(path[2], self._body()))
         if len(path) >= 3 and path[:2] == ["v1", "projects"]:
             selector = path[2]
             if len(path) == 3:
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET":
                     return self._send(200, self.runtime._project_resource(self.runtime.get_project(selector)))
-                if method in ("PATCH", "PUT"):
+                if method == "PATCH":
                     key = self.headers.get("Idempotency-Key")
                     if not key:
                         raise ProtocolError("Idempotency-Key header is required")
@@ -254,13 +255,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 kind, resource_id = path[3], path[4]
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 key = self.headers.get("Idempotency-Key")
-                if method in ("PATCH", "POST") and path[5:] in ([], ["archive"], ["recover"]):
+                if method == "PATCH" and path[5:] == []:
                     body = self._project_mutation_body()
-                    if path[5:] == ["archive"] or path[5:] == ["recover"]:
-                        if not key: raise ProtocolError("Idempotency-Key header is required")
-                        value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"]) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"])
-                    else:
-                        value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key)
+                    value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key)
+                    return self._send(200, value)
+                if method == "POST" and path[5:] in (["archive"], ["recover"]):
+                    body = self._project_mutation_body()
+                    if not key: raise ProtocolError("Idempotency-Key header is required")
+                    value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"]) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"])
                     return self._send(200, value)
                 if method == "GET" and not path[5:]:
                     return self._send(200, self.runtime.get_project_shot(selector, resource_id) if kind == "shots" else self.runtime.get_project_reference(selector, resource_id))
@@ -336,8 +338,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(status, headers=headers, body=data[start:end+1])
         if path == ["v1", "tasks"] and method == "POST":
             self._identity("tasks:write")
-            body = self._body()
-            body["idempotency_key"] = self.headers.get("Idempotency-Key") or body.get("idempotency_key") or uuid.uuid4().hex
+            body = self._project_mutation_body()
+            body["idempotency_key"] = self.headers.get("Idempotency-Key")
+            if not body["idempotency_key"]:
+                raise ProtocolError("Idempotency-Key header is required")
             # Admission authority lives here, inside the owner process.  The
             # readiness check and row creation share the store transaction;
             # a client precheck can never race an unavailable registration.
@@ -359,11 +363,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime._task_resource(value))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
-            self._identity("worker:execute" if action in ("claim", "heartbeat") else "tasks:write")
-            if method == "POST" and action == "claim":
-                return self._send(200, self.runtime._task_resource(self.runtime.claim(task_id, self._body())))
-            if method == "POST" and action == "heartbeat":
-                return self._send(200, self.runtime.heartbeat(task_id, self._body()))
+            self._identity("tasks:write")
             if method == "POST" and action == "cancel":
                 return self._send(200, self.runtime.cancel_task_canonical(task_id, self._body()))
             if method == "POST" and action == "retry":
@@ -386,10 +386,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if action == "settle": return self._send(200, self.runtime.settle_attempt(path[2], self._body()))
             if action == "heartbeat": return self._send(200, self.runtime.heartbeat_attempt(path[2], self._body()))
             if action == "fail": return self._send(200, self.runtime.fail_attempt(path[2], self._body()))
-        if path in (["v1", "recovery", "reboot"], ["v1", "runtime", "reboot"]) and method == "POST":
+        if path == ["v1", "recovery", "reboot"] and method == "POST":
             self._identity("worker:execute")
             return self._send(200, self.runtime.request_reboot(self._body()))
-        if path in (["v1", "recovery", "resume"], ["v1", "runtime", "resume"]) and method == "POST":
+        if path == ["v1", "recovery", "resume"] and method == "POST":
             self._identity("worker:execute")
             return self._send(200, self.runtime.resume_attempt(self._body()))
         if len(path) == 3 and path[:2] == ["v1", "generations"] and method == "GET":

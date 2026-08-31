@@ -65,9 +65,3 @@ class InvalidRequestError(RuntimeErrorBase):
 
     code = "invalid_request"
     status = 400
-
-# Public neutral boundary aliases.  The offline migrator uses the same error
-# objects without importing runtime implementation modules.
-from migration_boundary import AuthorizationError as AuthorizationError
-from migration_boundary import ConflictError as ConflictError
-from migration_boundary import ValidationError as ValidationError

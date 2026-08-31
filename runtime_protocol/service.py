@@ -82,7 +82,7 @@ class RuntimeService:
         # Recovery is a destructive lifecycle transition.  Require an
         # operator-scoped expectation before touching durable state, even when
         # the realm is already active (the no-op path must be fenced too).
-        expected_realm_id = body.get("expected_realm_id") or body.get("realm_id")
+        expected_realm_id = body.get("expected_realm_id")
         expected_version = body.get("expected_version")
         if not expected_realm_id or expected_version is None:
             raise ValidationError("recovery requires expected_realm_id and expected_version")
@@ -133,7 +133,7 @@ class RuntimeService:
         name = str(body.get("name") or "")
         slug = str(body.get("slug") or "-".join(name.lower().split()))
         slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in slug).strip("-") or "project"
-        return self.store.create_project(slug, name, body.get("metadata"), idempotency_key=idempotency_key or body.get("idempotency_key"))
+        return self.store.create_project(slug, name, body.get("metadata"), idempotency_key=idempotency_key)
 
     def get_project(self, selector):
         return self.store.get_project(selector)
@@ -1190,7 +1190,9 @@ class RuntimeService:
         """
         attempt = self.store.conn.execute("SELECT recovery_nonce, recovery_nonce_expires_at, recovery_nonce_used FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         nonce = attempt["recovery_nonce"] if attempt else None
-        authorization = body.get("authorization") or body.get("authorization_nonce")
+        if "authorization_nonce" in body:
+            raise ValidationError("authorization_nonce is not supported; use authorization")
+        authorization = body.get("authorization")
         supplied = body.get("nonce")
         if not nonce:
             raise ValidationError("prepare_reboot is required before recovery")
@@ -1415,7 +1417,9 @@ class RuntimeService:
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         current = self.store._current_runtime_epoch()
         self._validate_attempt_lease(row, body, current)
-        failure = body.get("error") or body.get("reason") or {"code": "executor_failed"}
+        if "reason" in body:
+            raise ValidationError("reason is not supported; use error")
+        failure = body.get("error") or {"code": "executor_failed"}
         value = self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"], attempt_id=attempt_id)
         return self._task_resource(value)
 
