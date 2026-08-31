@@ -13,6 +13,7 @@ import pytest
 from runtime_protocol.cas import ContentAddressedStore
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError, OwnerBusyError, ValidationError
+from banodoco_workspace_client import ApiError, WorkspaceClient
 from http_helpers import Api
 
 
@@ -56,6 +57,50 @@ def test_project_managed_object_and_fake_worker_end_to_end(daemon):
     assert settled["state"] == "succeeded"
     events = client.events(task["run_id"])
     assert [event["event_type"] for event in events["items"]] == ["task.admitted", "task.claimed", "task.completed"]
+
+
+def test_project_patch_and_run_cancel_retry_are_durable_and_idempotent(daemon, tmp_path):
+    client = WorkspaceClient(daemon.endpoint, daemon.token)
+    project = client.create_project("mutations", idempotency_key="mutation-project")
+    updated = client.update_project(project.project_id, idempotency_key="project-update", expected_version=1, name="Mutated")
+    assert updated.version == 2 and updated.name == "Mutated"
+    assert client.update_project(project.project_id, idempotency_key="project-update", expected_version=1, name="Mutated").version == 2
+    with pytest.raises(ApiError) as stale:
+        client.update_project(project.project_id, idempotency_key="project-stale", expected_version=1, name="stale")
+    assert stale.value.status == 409
+
+    digest = "sha256:" + hashlib.sha256(b"render.basic").hexdigest()
+    cancelled = client.admit_task(capability_id="render.basic", capability_digest=digest, input_object_ids=[], project_id=project.project_id, idempotency_key="cancel-child")
+    run = client.cancel_run(cancelled.run_id, idempotency_key="run-cancel")
+    assert run["status"] == "cancelled"
+    assert client.get_task(cancelled.task_id).state == "cancelled"
+    assert client.cancel_run(cancelled.run_id, idempotency_key="run-cancel")["status"] == "cancelled"
+    with pytest.raises(ApiError) as conflict:
+        client.cancel_run(cancelled.run_id, idempotency_key="run-cancel-conflict")
+    assert conflict.value.status == 409
+
+    failed = client.admit_task(capability_id="render.basic", capability_digest=digest, input_object_ids=[], project_id=project.project_id, idempotency_key="retry-child")
+    client.register_executor({"executor_id": "mutation-worker", "max_concurrency": 1, "resource_keys": [], "capabilities": [{"capability_id": "render.basic", "definition_digest": digest, "status": "ready", "required_resource_keys": [], "estimated_scratch_bytes": 0, "estimated_output_bytes": 1}], "protocol": "workspace.v1"}, idempotency_key="mutation-worker")
+    worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
+    first = worker.claim_task(executor_id="mutation-worker", capability_ids=["render.basic"], idempotency_key="mutation-claim-1", runtime_epoch=worker.health().runtime_epoch)
+    assert first is not None
+    worker.fail_attempt(first["attempt_id"], lease_id=first["lease_id"], fence=first["fence"], error={"reason": "probe"}, runtime_epoch=first["runtime_epoch"], idempotency_key="mutation-fail")
+    retried = client.retry_run(failed.run_id, idempotency_key="run-retry")
+    assert retried["status"] == "queued"
+    assert client.retry_run(failed.run_id, idempotency_key="run-retry")["status"] == "queued"
+    events = client.list_run_events(failed.run_id)
+    assert [event.event_type for event in events][-2:] == ["task.retried", "run.retried"]
+    second = worker.claim_task(executor_id="mutation-worker", capability_ids=["render.basic"], idempotency_key="mutation-claim-2", runtime_epoch=worker.health().runtime_epoch)
+    assert second["fence"] > first["fence"] and second["attempt_id"] != first["attempt_id"]
+
+    daemon.stop()
+    restarted = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        replay = WorkspaceClient(restarted.endpoint, restarted.token)
+        assert replay.retry_run(failed.run_id, idempotency_key="run-retry")["status"] == "queued"
+        assert replay.get_project(project.project_id).name == "Mutated"
+    finally:
+        restarted.stop()
 
 
 def test_restart_reconnect_and_catalog_discovery(daemon, tmp_path):

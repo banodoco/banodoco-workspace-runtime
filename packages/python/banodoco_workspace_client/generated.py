@@ -467,12 +467,12 @@ class WorkspaceClient:
         _, _, body = self._request("GET", f"/v1/projects/{_path_part(project_id)}")
         return Project.from_json(self._json(body))
 
-    def update_project(self, project_id: str, *, expected_version: int | None = None, name: str | None = None, metadata: Mapping[str, Any] | None = None) -> Project:
+    def update_project(self, project_id: str, *, idempotency_key: str, expected_version: int | None = None, name: str | None = None, metadata: Mapping[str, Any] | None = None) -> Project:
         payload: dict[str, Any] = {}
         if expected_version is not None: payload["expected_version"] = expected_version
         if name is not None: payload["name"] = name
         if metadata is not None: payload["metadata"] = metadata
-        _, _, body = self._request("PATCH", f"/v1/projects/{_path_part(project_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
+        _, _, body = self._request("PATCH", f"/v1/projects/{_path_part(project_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return Project.from_json(self._json(body))
 
     def create_document(self, project_id: str, document_id: str, kind: str, content: Any) -> ProjectDocument:
@@ -752,6 +752,15 @@ class WorkspaceClient:
 
     def get_run(self, run_id: str) -> Mapping[str, Any]:
         _, _, body = self._request("GET", f"/v1/runs/{_path_part(run_id)}")
+        return self._json(body)
+
+    def cancel_run(self, run_id: str, *, idempotency_key: str) -> Mapping[str, Any]:
+        _, _, body = self._request("POST", f"/v1/runs/{_path_part(run_id)}/cancel", body=b"{}", headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
+        return self._json(body)
+
+    def retry_run(self, run_id: str, *, idempotency_key: str, selected_task_ids: list[str] | None = None) -> Mapping[str, Any]:
+        payload = {} if selected_task_ids is None else {"selected_task_ids": selected_task_ids}
+        _, _, body = self._request("POST", f"/v1/runs/{_path_part(run_id)}/retry-failed", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return self._json(body)
 
     def list_project_runs(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:

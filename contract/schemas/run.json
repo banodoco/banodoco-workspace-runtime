@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/run.json",
+  "title": "Run state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "project_id", "capability", "status", "spec", "created_at", "updated_at", "task_ids"],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "project_id": { "type": ["string", "null"] },
+    "capability": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "enum": ["queued", "running", "completed", "failed", "cancelled"] },
+    "spec": { "type": "object", "additionalProperties": true },
+    "idempotency_key": { "type": ["string", "null"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "task_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+  }
+}

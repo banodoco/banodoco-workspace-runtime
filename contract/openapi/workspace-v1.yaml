@@ -83,6 +83,15 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
       responses:
         '200': { description: Project, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
+    patch:
+      operationId: updateProject
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/UpdateProject' } } }
+      responses:
+        '200': { description: Updated project, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
   /v1/projects/{project_id}/documents:
     get:
       operationId: listDocuments
@@ -297,7 +306,19 @@ paths:
     get:
       operationId: getRun
       parameters: [ { $ref: '#/components/parameters/RunId' } ]
-      responses: { '200': { description: Run, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+      responses: { '200': { description: Run, content: { application/json: { schema: { $ref: './schemas/run.json' } } } } }
+  /v1/runs/{run_id}/cancel:
+    post:
+      operationId: cancelRun
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/RunAction' } } } }
+      responses: { '200': { description: Cancelled run, content: { application/json: { schema: { $ref: './schemas/run.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/runs/{run_id}/retry-failed:
+    post:
+      operationId: retryRun
+      parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/RunAction' } } } }
+      responses: { '200': { description: Retried failed children, content: { application/json: { schema: { $ref: './schemas/run.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/runs/{run_id}/events:
     get:
       operationId: listRunEvents
@@ -432,6 +453,18 @@ components:
       additionalProperties: false
       required: [name]
       properties: { name: { type: string, minLength: 1, maxLength: 512 }, slug: { type: string, minLength: 1, maxLength: 128 }, metadata: { type: object, additionalProperties: true } }
+    UpdateProject:
+      type: object
+      additionalProperties: false
+      properties:
+        expected_version: { type: integer, minimum: 1 }
+        name: { type: string, minLength: 1, maxLength: 512 }
+        metadata: { type: object, additionalProperties: true }
+    RunAction:
+      type: object
+      additionalProperties: false
+      properties:
+        selected_task_ids: { type: array, items: { type: string, minLength: 1 }, uniqueItems: true }
     ProjectPage:
       type: object
       additionalProperties: false

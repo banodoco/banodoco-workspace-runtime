@@ -177,7 +177,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "GET":
                     return self._send(200, self.runtime._project_resource(self.runtime.get_project(selector)))
                 if method in ("PATCH", "PUT"):
-                    value = self.runtime.update_project(selector, self._body())
+                    key = self.headers.get("Idempotency-Key")
+                    if not key:
+                        raise ProtocolError("Idempotency-Key header is required")
+                    value = self.runtime.update_project(selector, self._body(), idempotency_key=key)
                     return self._send(200, self.runtime._project_resource(value))
             if len(path) == 4 and path[3] == "documents":
                 self._identity("projects:read" if method == "GET" else "projects:write")
@@ -313,6 +316,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] == "events" and method == "GET":
             self._identity("tasks:read")
             return self._send(200, self.runtime.events_page(path[2]))
+        if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] in ("cancel", "retry-failed", "retry") and method == "POST":
+            self._identity("tasks:write")
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
+            body = self._body()
+            if path[3] == "cancel":
+                return self._send(200, self.runtime.cancel_run(path[2], body, idempotency_key=key))
+            return self._send(200, self.runtime.retry_run(path[2], body, idempotency_key=key))
         if path == ["v1", "events"] and method == "GET":
             self._identity("tasks:read")
             query = parse_qs(urlsplit(self.path).query)

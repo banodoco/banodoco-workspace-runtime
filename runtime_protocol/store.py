@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 LEASE_SECONDS = 30
 
 
@@ -143,6 +143,9 @@ class RealmStore:
             version = 11
         if version < 12:
             self._run_migration(12)
+            version = 12
+        if version < 13:
+            self._run_migration(13)
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
@@ -300,9 +303,16 @@ class RealmStore:
     def list_projects(self):
         return {"items": [self._project(row["id"]) for row in self.conn.execute("SELECT id FROM projects ORDER BY created_at")], "next_cursor": None}
 
-    def update_project(self, selector: str, *, name=None, metadata=None, expected_version=None):
+    def update_project(self, selector: str, *, name=None, metadata=None, expected_version=None, idempotency_key=None):
         with self._mutex:
             current = self._project(selector)
+            request_hash = hashlib.sha256(canonical_json({"name": name, "metadata": metadata, "expected_version": expected_version}).encode()).hexdigest()
+            if idempotency_key:
+                prior = self.conn.execute("SELECT * FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?", ("project.update", current["id"], idempotency_key)).fetchone()
+                if prior:
+                    if prior["request_hash"] != request_hash:
+                        raise ConflictError("idempotency key was already used with different input")
+                    return json.loads(prior["result_json"])
             if expected_version is not None and expected_version != current["version"]:
                 raise ConflictError("stale project version", details={"expected": expected_version, "actual": current["version"]})
             changed_name = current["name"] if name is None else name
@@ -310,7 +320,10 @@ class RealmStore:
             timestamp = now()
             self.conn.execute("UPDATE projects SET name=?, metadata_json=?, version=version+1, updated_at=? WHERE id=?",
                               (changed_name, canonical_json(changed_meta), timestamp, current["id"]))
-            return self._project(current["id"])
+            result = self._project(current["id"])
+            if idempotency_key:
+                self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("project.update", current["id"], idempotency_key, request_hash, canonical_json(result), timestamp))
+            return result
 
     def add_object_ref(self, project: str, digest: str, relation="managed"):
         with self._mutex:
@@ -731,11 +744,84 @@ class RealmStore:
             if task["status"] in ("completed", "cancelled"):
                 return self.get_task(task_id)
             with self._transaction():
-                self.conn.execute("UPDATE tasks SET status='cancelled', lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
+                self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, worker_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
                 self._append_event(task["run_id"], task_id, "task.cancelled", {})
                 return self.get_task(task_id)
+
+    def cancel_run(self, run_id, *, idempotency_key=None):
+        """Cancel every non-terminal child of a queued/running run atomically."""
+        with self._mutex:
+            run = self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise NotFoundError("run not found")
+            request_hash = hashlib.sha256(b"{}").hexdigest()
+            if idempotency_key:
+                prior = self.conn.execute("SELECT * FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?", ("run.cancel", run_id, idempotency_key)).fetchone()
+                if prior:
+                    if prior["request_hash"] != request_hash:
+                        raise ConflictError("idempotency key was already used with different input")
+                    return json.loads(prior["result_json"])
+            if run["status"] not in {"queued", "running"}:
+                raise ConflictError("run is not cancellable", details={"status": run["status"]})
+            with self._transaction():
+                timestamp = now()
+                children = self.conn.execute("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at, id", (run_id,)).fetchall()
+                cancelled = []
+                for task in children:
+                    if task["status"] in {"completed", "failed", "cancelled"}:
+                        continue
+                    self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, worker_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
+                    self._release_reservations(task["id"], task["lease_token"])
+                    self._append_event(run_id, task["id"], "task.cancelled", {"reason": "run.cancelled"})
+                    cancelled.append(task["id"])
+                self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (timestamp, run_id))
+                self._append_event(run_id, None, "run.cancelled", {"task_ids": cancelled})
+            result = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            if idempotency_key:
+                self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.cancel", run_id, idempotency_key, request_hash, canonical_json(result), now()))
+            return result
+
+    def retry_run(self, run_id, *, selected_task_ids=None, idempotency_key=None):
+        """Requeue failed children of a failed run, preserving task identity."""
+        with self._mutex:
+            run = self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not run:
+                raise NotFoundError("run not found")
+            selected = None if selected_task_ids is None else sorted({str(value) for value in selected_task_ids})
+            request_hash = hashlib.sha256(canonical_json({"selected_task_ids": selected}).encode()).hexdigest()
+            if idempotency_key:
+                prior = self.conn.execute("SELECT * FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?", ("run.retry", run_id, idempotency_key)).fetchone()
+                if prior:
+                    if prior["request_hash"] != request_hash:
+                        raise ConflictError("idempotency key was already used with different input")
+                    return json.loads(prior["result_json"])
+            if run["status"] != "failed":
+                raise ConflictError("run is not retryable", details={"status": run["status"]})
+            with self._transaction():
+                timestamp = now()
+                query = "SELECT * FROM tasks WHERE run_id=? ORDER BY created_at, id"
+                children = self.conn.execute(query, (run_id,)).fetchall()
+                eligible = [task for task in children if task["status"] == "failed" and (selected is None or task["id"] in selected)]
+                if selected is not None:
+                    unknown = sorted(set(selected) - {task["id"] for task in children})
+                    if unknown:
+                        raise NotFoundError("run child task not found", details={"task_ids": unknown})
+                if not eligible:
+                    raise ConflictError("run has no eligible failed children", details={"selected_task_ids": selected or []})
+                retried = []
+                for task in eligible:
+                    self._release_reservations(task["id"], task["lease_token"])
+                    self.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, worker_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
+                    self._append_event(run_id, task["id"], "task.retried", {"from_status": "failed", "attempt": int(task["attempt"] or 0) + 1, "reason": "run.retry"})
+                    retried.append(task["id"])
+                self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, run_id))
+                self._append_event(run_id, None, "run.retried", {"task_ids": retried})
+            result = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+            if idempotency_key:
+                self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.retry", run_id, idempotency_key, request_hash, canonical_json(result), now()))
+            return result
 
     def fail_task(self, task_id, lease_token, failure, *, fence=None):
         with self._mutex:

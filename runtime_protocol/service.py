@@ -129,8 +129,8 @@ class RuntimeService:
     def list_projects(self):
         return {"items": [self._project_resource(value) for value in self.store.list_projects()["items"]], "next_cursor": None}
 
-    def update_project(self, selector, body):
-        return self.store.update_project(selector, name=body.get("name"), metadata=body.get("metadata"), expected_version=body.get("expected_version"))
+    def update_project(self, selector, body, *, idempotency_key=None):
+        return self.store.update_project(selector, name=body.get("name"), metadata=body.get("metadata"), expected_version=body.get("expected_version"), idempotency_key=idempotency_key)
 
     def _project_resource(self, value):
         return {"project_id": value["id"], "realm_id": value["realm_id"], "slug": value["slug"], "name": value["name"], "metadata": value.get("metadata", {}), "version": value["version"], "created_at": value["created_at"], "updated_at": value["updated_at"], "archived": False}
@@ -653,6 +653,19 @@ class RuntimeService:
 
     def events(self, run_id):
         return self.store.list_events(run_id)
+
+    def cancel_run(self, run_id, body=None, *, idempotency_key=None):
+        return self._run_resource(self.store.cancel_run(run_id, idempotency_key=idempotency_key))
+
+    def retry_run(self, run_id, body=None, *, idempotency_key=None):
+        body = body or {}
+        return self._run_resource(self.store.retry_run(run_id, selected_task_ids=body.get("selected_task_ids"), idempotency_key=idempotency_key))
+
+    def _run_resource(self, value):
+        result = dict(value)
+        result["spec"] = json.loads(result.pop("spec_json"))
+        result["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (result["id"],))]
+        return result
 
     def register_worker(self, body):
         return self.store.register_worker(body.get("worker_id", ""), body.get("capabilities", []), body.get("max_concurrency", 1), body.get("resource_keys", []), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=body.get("runtime_epoch"))
