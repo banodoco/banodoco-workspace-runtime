@@ -29,6 +29,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.util import atomic_json_write, canonical_json, new_id
 
 from .migrator import MigrationError, _sha256_file
+from .capacity import CapacityPlan, CapacityReservation, StorageDomain
 from .rehearsal import RuntimeServiceAdapter, _tree_digest
 
 
@@ -172,6 +173,12 @@ def issue_b13_authorizations(*, selected_realm_id: str | None = None, ttl_second
 
 def _canonical_digest(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _tree_size(root: Path) -> int:
+    if not root.exists():
+        return 0
+    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file() and not path.is_symlink())
 
 
 def _semantic_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -363,9 +370,79 @@ class B13Recovery:
         journal.effect(name, authorization_id=authorization_id, nonce_sha256=digest, realm_id=realm_id)
 
     def _write(self, name: str, value: Mapping[str, Any]) -> Path:
+        reservation = getattr(self, "_capacity_reservation", None)
+        if reservation is not None:
+            reservation.recheck()
         path = self.evidence_root / name
         atomic_json_write(path, dict(value))
         return path
+
+    def _capacity_plan(self) -> tuple[CapacityPlan, dict[str, Any]]:
+        """Estimate every B13 output against its actual storage domain."""
+        active_root = _absolute_path(self.active_runtime.store.root)
+        active_bytes = _tree_size(active_root)
+        evidence_bytes = max(_tree_size(self.evidence_root), 1024 * 1024)
+        allocations = (
+            ("active_runtime", active_root, 0),
+            ("recovery_base_backup", self.recovery_base_backup, active_bytes),
+            ("rollback_archive", self.rollback_archive, 0),
+            ("evidence", self.evidence_root, evidence_bytes),
+            ("disposable", self.disposable_root, active_bytes),
+            ("final_rollback_candidate", self.evidence_root / "b13-final-rollback-candidate", active_bytes),
+            ("final_reactivation_candidate", self.evidence_root / "b13-final-reactivation-candidate", active_bytes),
+        )
+        if self.source_root is not None:
+            allocations += (("source", self.source_root, 0),)
+        plan = CapacityPlan.from_allocations(allocations, margin_bytes=0)
+        receipt = plan.receipt(packet="B13.2", components={"active_bytes": active_bytes, "evidence_bytes": evidence_bytes, "reservation_scope": "filesystem-device-and-mount"})
+        receipt["domain_count"] = len(receipt["domains"])
+        return plan, receipt
+
+    def _acquire_capacity(self, journal: RecoveryJournal) -> CapacityReservation:
+        plan, receipt = self._capacity_plan()
+        capacity_path = self.evidence_root / "capacity-receipt-b13.json"
+        effect = journal.effects().get("capacity-reservation")
+        if effect:
+            payload = effect.get("payload", {})
+            if payload.get("domain_ids") != sorted(plan.domains):
+                raise MigrationError("B13.2 capacity reservation conflicts with its durable receipt")
+            if not capacity_path.is_file() or payload.get("receipt_sha256") != _sha256_file(capacity_path):
+                raise MigrationError("B13.2 capacity receipt is missing or changed")
+            stored = json.loads(capacity_path.read_text(encoding="utf-8"))
+            if stored.get("reserved") is not True:
+                raise MigrationError("B13.2 capacity receipt is not reserved")
+            # Reconstruct the original reservation amounts.  Existing output
+            # bytes naturally grow after the first checkpoint; replay must
+            # retain the durable peak estimate rather than charging them a
+            # second time, while still proving that every domain identity and
+            # output root is unchanged.
+            stored_domains = stored.get("domains", [])
+            stored_shape = [{key: row.get(key) for key in ("domain_id", "device", "mount", "probe_path")} | {"root_labels": sorted(dict(row.get("roots", {})))} for row in stored_domains]
+            current_shape = [{key: row.get(key) for key in ("domain_id", "device", "mount", "probe_path")} | {"root_labels": sorted(dict(row.get("roots", {})))} for row in receipt.get("domains", [])]
+            if stored_shape != current_shape:
+                raise MigrationError("B13.2 capacity receipt storage domain changed")
+            replay_plan = CapacityPlan({}, int(stored.get("margin_bytes", 0)))
+            for record in stored_domains:
+                domain = StorageDomain.identify(record.get("probe_path", ""))
+                if domain.key != record.get("domain_id") or int(domain.device) != int(record.get("device")) or domain.mount != record.get("mount"):
+                    raise MigrationError("B13.2 capacity receipt storage domain changed")
+                domain.roots = {str(key): int(value) for key, value in dict(record.get("roots", {})).items()}
+                domain.required_bytes = int(record.get("required_bytes"))
+                replay_plan.domains[domain.key] = domain
+            plan = replay_plan
+        else:
+            # Acquire first. The receipt itself is a lifecycle write and must
+            # be covered by the same storage-domain lock.
+            reservation_id = secrets.token_urlsafe(18)
+            reservation = CapacityReservation.acquire(plan=plan, reservation_id=reservation_id)
+            receipt["reserved"] = True
+            self._write("capacity-receipt-b13.json", receipt)
+            journal.effect("capacity-reservation", reservation_id=reservation_id, domain_ids=sorted(plan.domains), required_bytes=receipt["required_bytes"], receipt_sha256=_sha256_file(capacity_path))
+            return reservation
+        reservation_id = str(effect["payload"].get("reservation_id") or "")
+        if not reservation_id:
+            raise MigrationError("B13.2 capacity reservation has no durable identity")
+        return CapacityReservation.acquire(plan=plan, reservation_id=reservation_id)
 
     def _verify_backup(self, path: Path, realm_id: str) -> dict[str, Any]:
         if _has_symlink_component(path):
@@ -400,7 +477,12 @@ class B13Recovery:
             except Exception as exc:
                 raise MigrationError(f"B13.2 pre-existing restore candidate is not reusable: {destination}") from exc
         else:
+            reservation = getattr(self, "_capacity_reservation", None)
+            if reservation is not None:
+                reservation.recheck()
             journal._inject(f"before_{seam}")
+            if reservation is not None:
+                reservation.recheck()
             restore_backup(backup, destination)
             journal._inject(f"after_{seam}")
             verification = verify_restore_candidate(destination)
@@ -600,6 +682,9 @@ class B13Recovery:
             self._validate_purge_classification(target, realm_id, base)
             target_identity = _stat_identity(target)
             parent_identity = _stat_identity(target.parent)
+            reservation = getattr(self, "_capacity_reservation", None)
+            if reservation is not None:
+                reservation.recheck()
             target_store = RealmStore(target, acquire_owner=True)
             try:
                 lifecycle = target_store.realm_lifecycle()
@@ -636,11 +721,16 @@ class B13Recovery:
         # replacement directory, inode, marker, or symlinked parent must never
         # be accepted merely because purge-started was already journaled.
         self._revalidate_purge_target(target, realm_id, payload)
+        reservation = getattr(self, "_capacity_reservation", None)
+        if reservation is not None:
+            reservation.recheck()
         journal._inject("before_purge")
         # Fault/restart hooks are an adversarial boundary: validate again after
         # the hook and immediately before the destructive syscall so a
         # replacement cannot be deleted on the resume path.
         self._revalidate_purge_target(target, realm_id, payload)
+        if reservation is not None:
+            reservation.recheck()
         if os.path.lexists(str(target)):
             shutil.rmtree(target)
         if os.path.lexists(str(target)):
@@ -817,7 +907,12 @@ class B13Recovery:
         # rather than swapping it again and advancing the runtime epoch twice.
         if self._active_matches_candidate(candidate, realm_id):
             return {"state": state, "reused": True, "candidate": str(candidate), "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "realm_id": realm_id}
+        reservation = getattr(self, "_capacity_reservation", None)
+        if reservation is not None:
+            reservation.recheck()
         journal._inject(f"before_{seam}")
+        if reservation is not None:
+            reservation.recheck()
         result = RuntimeServiceAdapter(self.active_runtime).activate_destination(candidate, state=state)
         journal._inject(f"after_{seam}")
         if self.active_runtime.realm["id"] != realm_id or not self.active_runtime.doctor()["ok"]:
@@ -930,6 +1025,10 @@ class B13Recovery:
         artifacts = self._activation_catalog_identity(realm_id)
         if identity.get("activation_catalog_identity") != artifacts:
             raise MigrationError("B13.2 terminal replay activation or catalog identity changed")
+        release = journal.effects().get("capacity-release")
+        reservation_effect = journal.effects().get("capacity-reservation")
+        if not release or not reservation_effect or release.get("payload", {}).get("reservation_id") != reservation_effect.get("payload", {}).get("reservation_id"):
+            raise MigrationError("B13.2 terminal capacity reservation was not durably released")
         return {"packet": "B13.2", "journal": current, "identity": dict(identity), "idempotent": True, "active_runtime": self.active_runtime}
 
     def _request_binding(self, realm_id: str) -> dict[str, Any]:
@@ -954,6 +1053,22 @@ class B13Recovery:
         }
 
     def run(self) -> dict[str, Any]:
+        """Run B13.2 while holding all affected storage-domain reservations."""
+        # Terminal replay has no writes and the prior run has already sealed
+        # its release receipt, so do not reacquire a capacity lease here.
+        journal = RecoveryJournal(self.evidence_root / "migration-journal-b13.json", crash_at=self.crash_at, fault_injector=self.fault_injector)
+        if journal.read()["state"] == "reactivated":
+            return self._terminal_replay(journal, str(self.active_runtime.realm["id"]))
+        if _has_symlink_component(self.disposable_root):
+            raise MigrationError("B13.2 disposable target must be a fresh ordinary path")
+        reservation = self._acquire_capacity(journal)
+        self._capacity_reservation = reservation
+        try:
+            return self._run_reserved()
+        finally:
+            reservation.release()
+
+    def _run_reserved(self) -> dict[str, Any]:
         realm_id = str(self.active_runtime.realm["id"])
         for authorization_id in B13_AUTHORIZATION_IDS:
             self._validate_auth(authorization_id, realm_id)
@@ -972,6 +1087,7 @@ class B13Recovery:
             if self.recovery_base_backup.exists():
                 self._verify_backup(self.recovery_base_backup, realm_id)
             else:
+                self._capacity_reservation.recheck()
                 self.active_runtime.backup(self.recovery_base_backup)
             base = self._verify_backup(self.recovery_base_backup, realm_id)
             rollback = self._verify_backup(self.rollback_archive, realm_id)
@@ -1113,6 +1229,9 @@ class B13Recovery:
                 raise MigrationError("B13.2 final reactivation does not match the pre-R2 active identity")
             self._write("activated-destination-b13.json", identity)
             journal.effect("final-identity", identity=identity)
+            reservation = getattr(self, "_capacity_reservation", None)
+            if reservation is not None:
+                journal.effect("capacity-release", reservation_id=reservation.reservation_id, reason="terminal")
             final = journal.transition("reactivated", activation=reactivated, identity=identity)
             return {"packet": "B13.2", "journal": final, "recovery_base": journal.effects().get("recovery-base", {}).get("payload"), "purge": journal.effects().get("purge-complete", {}).get("payload"), "reboot": journal.effects().get("reboot-complete", {}).get("payload"), "rollback": rollback_identity if "rollback_identity" in locals() else None, "reactivation": reactivated, "identity": identity, "active_runtime": self.active_runtime, "idempotent": False}
 

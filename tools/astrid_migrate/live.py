@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
-import fcntl
 import hashlib
 import json
 import os
@@ -30,6 +29,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.util import canonical_json
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _sha256_file, _tree_size
+from .capacity import CapacityPlan, CapacityReservation, StorageDomain
 from .rehearsal import MigrationJournal, RuntimeServiceAdapter, _tree_digest, _write_json
 
 
@@ -111,54 +111,9 @@ def _has_symlink_component(path: str | Path) -> bool:
     return False
 
 
-class _CapacityReservation:
-    """A process-exclusive, durable capacity lease for one B12 journey.
-
-    The lease does not pretend to allocate bytes that the filesystem cannot
-    reserve atomically.  It serializes migrations and rechecks free space at
-    every write boundary; the receipt records the exact conservative peak
-    estimate and the observed free-space values.
-    """
-
-    def __init__(self, handle, path: Path, reservation_id: str, required_bytes: int):
-        self.handle = handle
-        self.path = path
-        self.reservation_id = reservation_id
-        self.required_bytes = int(required_bytes)
-
-    @classmethod
-    def acquire(cls, *, path: Path, reservation_id: str, required_bytes: int, minimum_free_bytes: int) -> "_CapacityReservation":
-        path = _absolute_path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = path.open("a+")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError) as exc:
-            handle.close()
-            raise MigrationError("B12.1 capacity reservation is already held") from exc
-        reservation = cls(handle, path, reservation_id, required_bytes)
-        try:
-            reservation.recheck(minimum_free_bytes=minimum_free_bytes)
-        except Exception:
-            reservation.release()
-            raise
-        return reservation
-
-    def recheck(self, *, minimum_free_bytes: int | None = None) -> int:
-        free = int(shutil.disk_usage(self.path.parent).free)
-        required = self.required_bytes if minimum_free_bytes is None else int(minimum_free_bytes)
-        if free < required:
-            raise MigrationError(f"B12.1 capacity reservation failed immediate recheck: free={free}, required={required}")
-        return free
-
-    def release(self) -> None:
-        if self.handle is None:
-            return
-        try:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.handle.close()
-            self.handle = None
+# Kept as a private compatibility alias for callers that used the original
+# B12 implementation-level class.
+_CapacityReservation = CapacityReservation
 
 
 def issue_live_authorizations(*, source_manifest_sha256: str | None = None, selected_realm_id: str | None = None, ttl_seconds: int = 3600) -> dict[str, dict[str, Any]]:
@@ -304,9 +259,29 @@ class LiveMigration:
         evidence_bytes = max(_tree_size(evidence_root), 1024 * 1024)
         margin = self.config.capacity_margin_bytes if self.config.capacity_margin_bytes is not None else max(int(source_bytes * 0.2), 10 * 1024**3)
         components = {"source_bytes": source_bytes, "archive_bytes": archive_bytes, "active_backup_bytes": active_backup_bytes, "destination_bytes": destination_bytes, "destination_backup_bytes": destination_backup_bytes, "candidate_bytes": candidate_bytes, "rollback_bytes": rollback_bytes, "reactivation_bytes": reactivation_bytes, "cas_bytes": estimated_cas, "evidence_bytes": evidence_bytes, "margin_bytes": margin}
-        required = sum(int(value) for value in components.values())
-        available = int(inventory["destination_free_bytes"])
-        receipt = {"packet": "B12.1", **components, "required_bytes": required, "available_bytes": available, "reserved": available >= required}
+        # Every output is charged to the filesystem where that output is
+        # written.  A shared filesystem therefore gets one aggregate pool;
+        # split filesystems are independently fail-closed.
+        archive_parent = self.config.archive_root.parent
+        allocations = (
+            ("source", self.config.source_root, 0),
+            ("archive", self.config.archive_root, archive_bytes),
+            ("active_backup", archive_parent / f"{self.config.archive_root.name}-live-pre-migration-backup", active_backup_bytes),
+            ("destination", self.config.destination_root, destination_bytes),
+            ("destination_backup", archive_parent / f"{self.config.archive_root.name}-live-destination-backup", destination_backup_bytes),
+            ("candidate", archive_parent / f"{self.config.archive_root.name}-live-candidate", candidate_bytes),
+            ("rollback", archive_parent / f"{self.config.archive_root.name}-live-rollback", rollback_bytes),
+            ("reactivation", archive_parent / f"{self.config.archive_root.name}-live-reactivated", reactivation_bytes),
+            ("evidence", evidence_root, evidence_bytes),
+            ("active_runtime", self.active_runtime.store.root, 0),
+        )
+        plan = CapacityPlan.from_allocations(allocations, margin_bytes=margin)
+        # Retain the locked plan for the current journey.  The durable receipt
+        # is still plain JSON; interrupted replay reconstructs it below.
+        object.__setattr__(self, "_capacity_plan", plan)
+        receipt = plan.receipt(packet="B12.1", components=components)
+        receipt["domain_count"] = len(receipt["domains"])
+        receipt["reservation_scope"] = "filesystem-device-and-mount"
         if not receipt["reserved"]:
             raise MigrationError("B12.1 capacity reservation is insufficient")
         return receipt
@@ -749,29 +724,41 @@ class LiveMigration:
                 capacity = self._read_json(capacity_path)
                 if capacity_effect.get("payload", {}).get("receipt_sha256") != _sha256_file(capacity_path) or capacity.get("reserved") is not True:
                     raise MigrationError("B12 durable capacity receipt is missing or changed")
+                plan = CapacityPlan({}, int(capacity.get("margin_bytes", 0)))
+                for record in capacity.get("domains", []):
+                    if not isinstance(record, Mapping) or not record.get("domain_id"):
+                        raise MigrationError("B12 durable capacity receipt has no storage-domain identity")
+                    domain = StorageDomain.identify(record.get("probe_path", ""))
+                    if domain.key != record.get("domain_id") or int(domain.device) != int(record.get("device")) or domain.mount != record.get("mount"):
+                        raise MigrationError("B12 durable capacity receipt storage domain changed")
+                    domain.roots = {str(key): int(value) for key, value in dict(record.get("roots", {})).items()}
+                    domain.required_bytes = int(record.get("required_bytes"))
+                    plan.domains[domain.key] = domain
             else:
                 capacity = self._capacity(inventory, evidence_root)
-                _write_json(capacity_path, capacity)
-                journal.effect("capacity-receipt", path=str(capacity_path), receipt_sha256=_sha256_file(capacity_path), required_bytes=capacity["required_bytes"], available_bytes=capacity["available_bytes"])
-            capacity_lock_path = self.config.destination_root.parent / f".{self.config.destination_root.name}.capacity-b12.lock"
-            if _has_symlink_component(capacity_lock_path):
-                raise MigrationError("B12.1 capacity reservation path contains a symlink component")
+                plan = self._capacity_plan
             reservation_effect = self._existing_effect(journal, "capacity-reservation")
             if reservation_effect:
                 reservation_payload = reservation_effect.get("payload", {})
-                if reservation_payload.get("required_bytes") != capacity["required_bytes"] or reservation_payload.get("path") != str(capacity_lock_path):
+                if reservation_payload.get("required_bytes") != capacity["required_bytes"] or reservation_payload.get("domain_ids") != sorted(plan.domains):
                     raise MigrationError("B12 capacity reservation conflicts with its durable receipt")
                 reservation_id = str(reservation_payload["reservation_id"])
             else:
                 reservation_id = secrets.token_urlsafe(18)
-            reservation = _CapacityReservation.acquire(path=capacity_lock_path, reservation_id=reservation_id, required_bytes=int(capacity["required_bytes"]), minimum_free_bytes=int(capacity["required_bytes"]))
+            reservation = _CapacityReservation.acquire(plan=plan, reservation_id=reservation_id)
             stack.callback(reservation.release)
             immediate_free = reservation.recheck()
+            if not capacity_effect:
+                # The receipt is itself a lifecycle write; publish it only
+                # after the storage-domain lock and immediate free-space
+                # recheck have succeeded.
+                _write_json(capacity_path, capacity)
+                journal.effect("capacity-receipt", path=str(capacity_path), receipt_sha256=_sha256_file(capacity_path), required_bytes=capacity["required_bytes"], available_bytes=capacity["available_bytes"])
             if reservation_effect:
                 if reservation_effect.get("payload", {}).get("recheck_available_bytes") is None:
                     raise MigrationError("B12 capacity reservation receipt is incomplete")
             else:
-                journal.effect("capacity-reservation", path=str(reservation.path), reservation_id=reservation_id, required_bytes=int(capacity["required_bytes"]), recheck_available_bytes=immediate_free)
+                journal.effect("capacity-reservation", path=str(reservation.path) if reservation.path else None, domain_ids=sorted(plan.domains), reservation_id=reservation_id, required_bytes=int(capacity["required_bytes"]), recheck_available_bytes=immediate_free)
             if current["state"] == "prepared":
                 freeze_path = evidence_root / "source-freeze-b12.json"
                 freeze_effect = self._existing_effect(journal, "source-freeze")
