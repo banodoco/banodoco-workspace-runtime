@@ -40,6 +40,33 @@ def test_projects_and_events_are_complete_keyset_pages(tmp_path: Path) -> None:
     service.close()
 
 
+def test_project_objects_cursor_is_deterministic_when_created_at_ties(tmp_path: Path) -> None:
+    service = RuntimeService(tmp_path)
+    project = service.create_project({"name": "Objects", "slug": "objects"}, idempotency_key="objects-project")
+    digests = ["c" * 64, "a" * 64, "b" * 64]
+    for index, digest in enumerate(digests):
+        service.store.record_object(digest, index + 1, "application/octet-stream")
+        service.store.add_object_ref(project["id"], digest)
+
+    # Force the tie that naturally occurs when several objects are ingested in
+    # one timestamp tick. The secondary digest ordering must carry pagination.
+    with service.store._transaction():
+        service.store.conn.execute("UPDATE objects SET created_at=?", ("2026-01-01T00:00:00Z",))
+
+    seen = []
+    cursor = None
+    while True:
+        page = service.list_project_objects(project["id"], cursor=cursor, limit=1)
+        seen.extend(item["digest"].removeprefix("sha256:") for item in page["items"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+
+    assert seen == sorted(digests)
+    assert len(seen) == len(set(seen)) == len(digests)
+    service.close()
+
+
 def test_cursor_scope_and_shape_are_typed_400_errors(tmp_path: Path) -> None:
     service = RuntimeService(tmp_path)
     service.create_project({"name": "Project", "slug": "project"}, idempotency_key="project")

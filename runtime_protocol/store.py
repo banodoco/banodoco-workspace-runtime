@@ -591,7 +591,10 @@ class RealmStore:
 
     def list_project_objects(self, project: str):
         p = self._project(project)
-        rows = self.conn.execute("SELECT o.*, po.relation FROM objects o JOIN project_objects po ON po.digest=o.digest WHERE po.project_id=? ORDER BY o.created_at", (p["id"],)).fetchall()
+        # The service cursor is keyed by ``(created_at, digest)``. Keep the
+        # storage order identical so objects sharing a timestamp cannot move
+        # between pages or be skipped when a cursor is resumed.
+        rows = self.conn.execute("SELECT o.*, po.relation FROM objects o JOIN project_objects po ON po.digest=o.digest WHERE po.project_id=? ORDER BY o.created_at, o.digest", (p["id"],)).fetchall()
         return [dict(row) for row in rows]
 
     def record_object(self, digest, size, media_type, original_name=None):
