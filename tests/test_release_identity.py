@@ -71,11 +71,13 @@ def test_runtime_cli_consumes_exact_seed_directory_manifest(tmp_path: Path) -> N
 def test_runtime_b11_local_submodule_is_pinned(tmp_path: Path) -> None:
     sub = _git_repo(tmp_path / "sub-root"); checkout = _git_repo(tmp_path / "main-root")
     subprocess.run(["git", "-C", str(checkout), "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/sub"], check=True, stdout=subprocess.DEVNULL)
-    (checkout / "generator.py").write_text("import argparse, pathlib\np=argparse.ArgumentParser(); p.add_argument('--contract'); p.add_argument('--schema-manifest'); p.add_argument('--output-root'); a=p.parse_args(); pathlib.Path(a.output_root, 'out').write_bytes(b'ok')\n")
+    (checkout / "generator.py").write_text("import argparse, pathlib\np=argparse.ArgumentParser(); p.add_argument('--contract'); p.add_argument('--schema-manifest'); p.add_argument('--component-manifest'); p.add_argument('--output-root'); a=p.parse_args(); pathlib.Path(a.output_root, 'out').write_bytes(pathlib.Path(a.component_manifest).read_bytes())\n")
     subprocess.run(["git", "-C", str(checkout), "add", "."], check=True); subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "submodule generator"], check=True)
     row = resolve_component("NEUTRAL-RUNTIME", checkout)
-    observed = run_b11_1([row], [{"generator_id": "GEN", "component_id": "NEUTRAL-RUNTIME", "checkout": str(checkout), "entrypoint_path": "generator.py"}], contract_bytes=b"{}", schema_manifest_bytes=b"{}", output_root=tmp_path)
+    component = b'{"manifest_id":"GENERATOR-CONFORMANCE-ID"}\n'
+    observed = run_b11_1([row], [{"generator_id": "GEN", "component_id": "NEUTRAL-RUNTIME", "checkout": str(checkout), "entrypoint_path": "generator.py"}], contract_bytes=b"{}", schema_manifest_bytes=b"{}", component_manifest_bytes=component, output_root=tmp_path)
     assert observed[0]["generator_observation_rows"][0]["output_digests"]
+    assert __import__("hashlib").sha256(component).hexdigest() in observed[0]["generator_observation_rows"][0]["input_digests"]
     outside = tmp_path.parent / "runtime-b11-outside-submodule"
     subprocess.run(["git", "-C", str(checkout), "config", "-f", ".gitmodules", "submodule.vendor/sub.url", str(outside)], check=True)
     subprocess.run(["git", "-C", str(checkout), "add", ".gitmodules"], check=True); subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "malicious submodule url"], check=True)

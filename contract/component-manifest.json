@@ -1,0 +1,131 @@
+{
+  "clients": [
+    {
+      "generator": "GENERATOR-PYTHON-ASTRID",
+      "language": "python",
+      "metadata_output": "contract-metadata.py",
+      "metadata_source": "generated/runtime_client_metadata.py",
+      "output": "runtime_client.py",
+      "source": "generated/runtime_client.py"
+    },
+    {
+      "generator": "GENERATOR-TYPESCRIPT-CONFORMANCE",
+      "language": "typescript",
+      "metadata_output": "contract-metadata.ts",
+      "metadata_source": "clients/typescript/contract-metadata.ts",
+      "output": "generated.ts",
+      "source": "clients/typescript/generated.ts"
+    }
+  ],
+  "contract": {
+    "openapi": "openapi/workspace-v1.yaml",
+    "schema_manifest": "manifest.json"
+  },
+  "fixtures": [
+    {
+      "name": "event.json",
+      "value": {
+        "aggregate_id": "task-neutral-1",
+        "aggregate_type": "task",
+        "cursor": "cursor-1",
+        "event_id": "event-neutral-1",
+        "event_type": "task.admitted",
+        "occurred_at": "2026-08-30T00:00:00Z",
+        "payload": {
+          "state": "queued"
+        },
+        "sequence": 1
+      }
+    },
+    {
+      "name": "handshake.json",
+      "value": {
+        "actor_id": "actor-neutral-1",
+        "protocol": "workspace.v1",
+        "realm_id": "realm-neutral-1",
+        "schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "scopes": [
+          "project:read",
+          "project:write"
+        ],
+        "session_id": "session-neutral-1"
+      }
+    },
+    {
+      "name": "managed-object.json",
+      "value": {
+        "created_at": "2026-08-30T00:00:00Z",
+        "digest": "sha256:84d898da8f5e8c5f6e5f4f0f5d4a37a2fa8eea7ddf9b7e4f0f6a2ef7f4e4b0d5",
+        "filename": "clip.bin",
+        "media_type": "application/octet-stream",
+        "object_id": "object-neutral-1",
+        "size": 4,
+        "version": 1
+      }
+    },
+    {
+      "name": "project.json",
+      "value": {
+        "archived": false,
+        "created_at": "2026-08-30T00:00:00Z",
+        "metadata": {},
+        "name": "Neutral project",
+        "project_id": "project-neutral-1",
+        "realm_id": "realm-neutral-1",
+        "slug": "neutral-project",
+        "updated_at": "2026-08-30T00:00:00Z",
+        "version": 1
+      }
+    },
+    {
+      "name": "settlement.json",
+      "value": {
+        "attempt_id": "attempt-neutral-1",
+        "effect": {
+          "effect_type": "publish_generation",
+          "expected_version": 1,
+          "payload": {
+            "generation_id": "generation-neutral-1"
+          },
+          "target_id": "project-neutral-1"
+        },
+        "fence": 1,
+        "lease_id": "lease-neutral-1",
+        "outputs": [
+          {
+            "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "kind": "object",
+            "media_type": "video/mp4",
+            "name": "render",
+            "size": 4
+          }
+        ],
+        "runtime_epoch": 1
+      }
+    },
+    {
+      "name": "task.json",
+      "value": {
+        "attempt_id": null,
+        "capability_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "capability_id": "render.basic",
+        "created_at": "2026-08-30T00:00:00Z",
+        "idempotency_key": "task-neutral-1",
+        "input_object_ids": [
+          "object-neutral-1"
+        ],
+        "protocol": "workspace.v1",
+        "run_id": "run-neutral-1",
+        "runtime_epoch": 1,
+        "schema_version": "1",
+        "state": "queued",
+        "task_id": "task-neutral-1",
+        "updated_at": "2026-08-30T00:00:00Z",
+        "version": 1
+      }
+    }
+  ],
+  "manifest_id": "GENERATOR-CONFORMANCE-ID",
+  "protocol": "workspace.v1",
+  "schema_version": 1
+}
