@@ -89,6 +89,40 @@ def _open_directory_chain(path: Path) -> int:
         raise
 
 
+class _ActivationIdentity(dict):
+    """Process-local activation identity that owns its retained parent FD."""
+
+    __slots__ = ("_retained_parent_fd",)
+
+    def __init__(self, value: Mapping[str, Any], parent_fd: int):
+        super().__init__(value)
+        self._retained_parent_fd = parent_fd
+
+    def get(self, key, default=None):
+        if key == "_parent_fd":
+            return self._retained_parent_fd
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        if key == "_parent_fd":
+            return self._retained_parent_fd
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        if key == "_parent_fd":
+            self._retained_parent_fd = value
+            return
+        super().__setitem__(key, value)
+
+    def __del__(self):  # pragma: no cover - exercised by interpreter cleanup
+        fd = getattr(self, "_retained_parent_fd", None)
+        if fd is not None:
+            try:
+                os.close(int(fd))
+            except OSError:
+                pass
+
+
 def capture_write_path(path: str | Path) -> dict[str, Any]:
     """Capture the ordinary parent identity for a new material write.
 
@@ -186,19 +220,24 @@ def capture_activation_path(path: str | Path) -> dict[str, Any]:
         parent = parent.parent
     if parent.is_symlink() or not parent.is_dir():
         raise MigrationError(f"activation parent is not an ordinary directory: {parent}")
+    # Keep this descriptor open.  Re-opening ``parent`` after a lexical
+    # identity check reintroduces the exact rename/symlink TOCTOU this fence
+    # is intended to close.  Callers hand the identity to the material
+    # activation operation, which consumes the descriptor with *at(2)
+    # operations and closes it when the boundary is complete.
     try:
         parent_fd = _open_directory_chain(parent)
         parent_identity = os.fstat(parent_fd)
     except OSError as exc:
-        raise MigrationError(f"activation parent cannot be opened safely: {parent}") from exc
-    finally:
         try:
             os.close(parent_fd)
         except (UnboundLocalError, OSError):
             pass
+        raise MigrationError(f"activation parent cannot be opened safely: {parent}") from exc
     if not stat.S_ISDIR(parent_identity.st_mode):
+        os.close(parent_fd)
         raise MigrationError(f"activation parent is not an ordinary directory: {parent}")
-    record: dict[str, Any] = {
+    record: dict[str, Any] = _ActivationIdentity({
         "path": str(target),
         "parent": str(parent),
         "target_parent": str(target_parent),
@@ -207,13 +246,24 @@ def capture_activation_path(path: str | Path) -> dict[str, Any]:
         "parent_st_dev": int(parent_identity.st_dev),
         "parent_st_ino": int(parent_identity.st_ino),
         "parent_st_mode": int(parent_identity.st_mode),
-    }
+    }, parent_fd)
     if record["target_absent"]:
         return record
     try:
-        target_fd = _open_directory_chain(target)
+        # The target is normally a direct child of the pinned parent.  Open
+        # it relative to that descriptor so a concurrent parent swap cannot
+        # redirect the identity observation.
+        if target.parent == parent:
+            target_fd = os.open(
+                target.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        else:
+            target_fd = _open_directory_chain(target)
         target_identity = os.fstat(target_fd)
     except OSError as exc:
+        os.close(parent_fd)
         raise MigrationError(f"activation target cannot be opened safely: {target}") from exc
     finally:
         try:
@@ -221,6 +271,7 @@ def capture_activation_path(path: str | Path) -> dict[str, Any]:
         except (UnboundLocalError, OSError):
             pass
     if not stat.S_ISDIR(target_identity.st_mode):
+        os.close(parent_fd)
         raise MigrationError(f"activation target is not an ordinary directory: {target}")
     record.update(
         target_st_dev=int(target_identity.st_dev),
@@ -244,28 +295,61 @@ def revalidate_activation_path(path: str | Path, identity: Mapping[str, Any]) ->
     elif not os.path.lexists(str(target_parent)):
         raise MigrationError(f"activation parent disappeared before material write: {target_parent}")
     parent = Path(str(identity["parent"]))
+    parent_fd = identity.get("_parent_fd")
     try:
-        parent_fd = _open_directory_chain(parent)
-        current_parent = os.fstat(parent_fd)
+        if parent_fd is None:
+            # A material operation must never fall back to reopening a path
+            # after validation.  Older serialized identities are therefore
+            # intentionally rejected; the caller must capture a fresh one.
+            raise MigrationError("activation boundary has no retained parent descriptor")
+        current_parent = os.fstat(int(parent_fd))
+    except MigrationError:
+        raise
     except OSError as exc:
         raise MigrationError(f"activation parent changed before material write: {parent}") from exc
-    finally:
-        try:
-            os.close(parent_fd)
-        except (UnboundLocalError, OSError):
-            pass
     if not stat.S_ISDIR(current_parent.st_mode) or any(
         int(getattr(current_parent, key)) != int(identity[f"parent_{key}"])
         for key in ("st_dev", "st_ino", "st_mode")
     ):
         raise MigrationError(f"activation parent identity changed before material write: {parent}")
-    target_absent = not os.path.lexists(str(target))
+    # The descriptor proves which inode the *at(2) operation will use.  Also
+    # compare the lexical name so a same-type replacement is rejected before
+    # publication (a symlink check alone would miss that case).
+    try:
+        named_parent = os.stat(target_parent, follow_symlinks=False)
+    except OSError as exc:
+        raise MigrationError(f"activation parent changed before material write: {target_parent}") from exc
+    if not stat.S_ISDIR(named_parent.st_mode) or any(
+        int(getattr(named_parent, key)) != int(identity[f"parent_{key}"])
+        for key in ("st_dev", "st_ino", "st_mode")
+    ):
+        raise MigrationError(f"activation parent identity changed before material write: {target_parent}")
+    # For the ordinary (and material activation) shape, inspect the target
+    # relative to the retained parent FD.  This observation and the eventual
+    # rename therefore address the same directory inode.
+    if target.parent == parent:
+        try:
+            os.stat(target.name, dir_fd=int(parent_fd), follow_symlinks=False)
+            target_absent = False
+        except FileNotFoundError:
+            target_absent = True
+        except OSError as exc:
+            raise MigrationError(f"activation target changed before material write: {target}") from exc
+    else:
+        target_absent = not os.path.lexists(str(target))
     if target_absent != bool(identity.get("target_absent")):
         raise MigrationError(f"activation target presence changed before material write: {target}")
     if target_absent:
         return
     try:
-        target_fd = _open_directory_chain(target)
+        if target.parent == parent:
+            target_fd = os.open(
+                target.name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=int(parent_fd),
+            )
+        else:
+            target_fd = _open_directory_chain(target)
         current_target = os.fstat(target_fd)
     except OSError as exc:
         raise MigrationError(f"activation target changed before material write: {target}") from exc
@@ -279,6 +363,65 @@ def revalidate_activation_path(path: str | Path, identity: Mapping[str, Any]) ->
         for key in ("st_dev", "st_ino", "st_mode")
     ):
         raise MigrationError(f"activation target identity changed before material write: {target}")
+
+
+def revalidate_activation_parent(path: str | Path, identity: Mapping[str, Any]) -> int:
+    """Validate and return the retained parent FD after target publication.
+
+    The target inode is intentionally *not* checked here: a successful
+    activation has replaced it.  The parent identity still must match both
+    lexically and by descriptor, otherwise a subsequent service reopen could
+    follow an attacker-provided symlinked parent.
+    """
+    target = _absolute_path(path)
+    target_parent = target.parent
+    if identity.get("path") != str(target) or identity.get("target_parent") != str(target_parent):
+        raise MigrationError(f"activation path identity changed: {target}")
+    parent = Path(str(identity["parent"]))
+    if bool(identity.get("parent_was_missing")) or parent != target_parent:
+        raise MigrationError(f"activation parent shape changed before publication: {target}")
+    if _has_symlink_component(target_parent) or not os.path.lexists(str(target_parent)):
+        raise MigrationError(f"activation parent changed before publication: {target_parent}")
+    parent_fd = identity.get("_parent_fd")
+    if parent_fd is None:
+        raise MigrationError("activation boundary has no retained parent descriptor")
+    try:
+        current = os.fstat(int(parent_fd))
+    except OSError as exc:
+        raise MigrationError(f"activation parent descriptor is unavailable: {parent}") from exc
+    if not stat.S_ISDIR(current.st_mode) or any(
+        int(getattr(current, key)) != int(identity[f"parent_{key}"])
+        for key in ("st_dev", "st_ino", "st_mode")
+    ):
+        raise MigrationError(f"activation parent identity changed before publication: {parent}")
+    try:
+        named_parent = os.stat(target_parent, follow_symlinks=False)
+    except OSError as exc:
+        raise MigrationError(f"activation parent changed before publication: {target_parent}") from exc
+    if not stat.S_ISDIR(named_parent.st_mode) or any(
+        int(getattr(named_parent, key)) != int(identity[f"parent_{key}"])
+        for key in ("st_dev", "st_ino", "st_mode")
+    ):
+        raise MigrationError(f"activation parent identity changed before publication: {target_parent}")
+    return int(parent_fd)
+
+
+def close_activation_path(identity: Mapping[str, Any] | None) -> None:
+    """Close process-local descriptors carried by an activation identity."""
+    if not isinstance(identity, Mapping):
+        return
+    fd = identity.get("_parent_fd")
+    if fd is None:
+        return
+    try:
+        os.close(int(fd))
+    except OSError:
+        pass
+    # Most callers pass a dict; clear it to make accidental reuse fail closed.
+    try:
+        identity["_parent_fd"] = None  # type: ignore[index]
+    except (TypeError, AttributeError):
+        pass
 
 
 def _mount_identity(directory: Path, device: int) -> str:
@@ -489,4 +632,4 @@ class CapacityReservation:
             pass
 
 
-__all__ = ["CapacityPlan", "CapacityReservation", "StorageDomain", "capture_write_path", "revalidate_write_path", "capture_activation_path", "revalidate_activation_path"]
+__all__ = ["CapacityPlan", "CapacityReservation", "StorageDomain", "capture_write_path", "revalidate_write_path", "capture_activation_path", "revalidate_activation_path", "revalidate_activation_parent", "close_activation_path"]

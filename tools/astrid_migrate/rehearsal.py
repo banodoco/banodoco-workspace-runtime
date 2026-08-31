@@ -15,12 +15,20 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import tempfile
 import time
 from typing import Any, Callable, Mapping
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _canonical, _sha256_file, _tree_size
-from .capacity import _has_symlink_component, capture_activation_path, revalidate_activation_path
+from .capacity import (
+    _has_symlink_component,
+    _open_directory_chain,
+    capture_activation_path,
+    close_activation_path,
+    revalidate_activation_parent,
+    revalidate_activation_path,
+)
 from runtime_protocol.util import now
 
 
@@ -52,6 +60,156 @@ def _tree_digest(root: Path) -> str:
         else:
             files.append({"path": str(path.relative_to(root)), "kind": "file", "size": path.stat().st_size, "sha256": _sha256_file(path)})
     return hashlib.sha256(_canonical(files)).hexdigest()
+
+
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _exists_at(directory_fd: int, name: str) -> bool:
+    """Check one directory entry without resolving a path component."""
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _copy_file_at(source_fd: int, source_name: str, destination_fd: int, destination_name: str) -> None:
+    """Copy one regular file using only descriptors and relative names."""
+    source = os.open(source_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=source_fd)
+    destination = -1
+    try:
+        source_stat = os.fstat(source)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise MigrationError(f"activation source is not a regular file: {source_name}")
+        destination = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            stat.S_IRUSR | stat.S_IWUSR,
+            dir_fd=destination_fd,
+        )
+        while True:
+            chunk = os.read(source, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination, view)
+                view = view[written:]
+        os.fchmod(destination, stat.S_IMODE(source_stat.st_mode))
+        os.fsync(destination)
+    finally:
+        try:
+            os.close(source)
+        finally:
+            if destination >= 0:
+                os.close(destination)
+
+
+def _copy_tree_at(source_fd: int, source_name: str, destination_fd: int, destination_name: str) -> None:
+    """Recursively copy a tree while refusing symlinks and path reopening."""
+    source = os.open(source_name, _DIR_FLAGS, dir_fd=source_fd)
+    try:
+        os.mkdir(destination_name, 0o700, dir_fd=destination_fd)
+        destination = os.open(destination_name, _DIR_FLAGS, dir_fd=destination_fd)
+        try:
+            for entry in os.scandir(source):
+                name = entry.name
+                entry_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    raise MigrationError(f"activation source contains a symlink: {source_name}/{name}")
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    _copy_tree_at(source, name, destination, name)
+                elif stat.S_ISREG(entry_stat.st_mode):
+                    _copy_file_at(source, name, destination, name)
+                else:
+                    raise MigrationError(f"activation source contains an unsupported file: {source_name}/{name}")
+            os.fsync(destination)
+        finally:
+            os.close(destination)
+    finally:
+        os.close(source)
+
+
+def _remove_tree_at(directory_fd: int, name: str) -> None:
+    """Remove a temporary activation tree through its pinned parent FD."""
+    try:
+        child = os.open(name, _DIR_FLAGS, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return
+    try:
+        for entry in os.scandir(child):
+            child_name = entry.name
+            entry_stat = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(entry_stat.st_mode):
+                _remove_tree_at(child, child_name)
+            elif stat.S_ISREG(entry_stat.st_mode) or stat.S_ISLNK(entry_stat.st_mode):
+                os.unlink(child_name, dir_fd=child)
+            else:
+                raise MigrationError(f"activation temporary contains an unsupported file: {name}/{child_name}")
+    finally:
+        os.close(child)
+    os.rmdir(name, dir_fd=directory_fd)
+
+
+def _mkdir_at(directory_fd: int, prefix: str) -> tuple[str, int]:
+    """Create a private temporary directory below a pinned parent."""
+    for attempt in range(100):
+        name = f"{prefix}{os.getpid()}-{time.time_ns()}-{attempt}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        return name, os.open(name, _DIR_FLAGS, dir_fd=directory_fd)
+    raise MigrationError("activation temporary directory could not be allocated")
+
+
+def _rename_at(directory_fd: int, source_name: str, destination_name: str) -> None:
+    """Atomic same-directory rename plus directory durability."""
+    try:
+        os.rename(source_name, destination_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except OSError as exc:
+        raise MigrationError(f"atomic activation rename failed: {source_name} -> {destination_name}") from exc
+
+
+def _pin_candidate(candidate: Path) -> tuple[int, int, os.stat_result, os.stat_result]:
+    """Pin candidate parent/root before verification and source reads."""
+    parent_fd = _open_directory_chain(candidate.parent)
+    try:
+        parent_stat = os.fstat(parent_fd)
+        root_fd = os.open(candidate.name, _DIR_FLAGS, dir_fd=parent_fd)
+        root_stat = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            os.close(root_fd)
+            raise MigrationError(f"candidate realm is not an ordinary directory: {candidate}")
+        return parent_fd, root_fd, parent_stat, root_stat
+    except Exception:
+        os.close(parent_fd)
+        raise
+
+
+def _assert_pinned_candidate(candidate: Path, parent_fd: int, root_fd: int, parent_stat: os.stat_result, root_stat: os.stat_result) -> None:
+    """Reject candidate parent/root swaps observed during verification."""
+    if _has_symlink_component(candidate.parent):
+        raise MigrationError(f"candidate parent changed to a symlink: {candidate.parent}")
+    current_parent = os.fstat(parent_fd)
+    current_root = os.fstat(root_fd)
+    if (current_parent.st_dev, current_parent.st_ino, current_parent.st_mode) != (parent_stat.st_dev, parent_stat.st_ino, parent_stat.st_mode):
+        raise MigrationError(f"candidate parent identity changed: {candidate.parent}")
+    if (current_root.st_dev, current_root.st_ino, current_root.st_mode) != (root_stat.st_dev, root_stat.st_ino, root_stat.st_mode):
+        raise MigrationError(f"candidate identity changed: {candidate}")
+
+
+def _retarget_runtime_paths(runtime: Any, target: Path) -> None:
+    """Move path metadata to the published name; open DB/locks stay pinned."""
+    store = runtime.store
+    store.root = target
+    store.lock_path = target / "owner.lock"
+    store.db_path = target / "realm.sqlite3"
+    store.cas_root = target / "cas" / "sha256"
+    store.staging_root = target / "staging"
+    runtime.cas.root = store.cas_root
 
 
 @dataclass(frozen=True)
@@ -477,105 +635,151 @@ class RuntimeServiceAdapter:
         target = Path(os.path.abspath(os.path.expanduser(os.fspath(self.service.store.root))))
         if target_identity is None:
             target_identity = capture_activation_path(target)
-        revalidate_activation_path(target, target_identity)
-        if _has_symlink_component(candidate):
-            raise MigrationError("candidate realm path contains a symlink component")
-        if candidate == target or not (candidate / "realm.sqlite3").is_file() or not (candidate / "cas").is_dir():
-            raise MigrationError("candidate is not a complete inactive realm")
-        from runtime_protocol.backup import verify_restore_candidate
-        # Candidate restore directories carry a handoff, while backups carry a
-        # manifest.  Both must be checked before touching the configured root.
-        handoff = candidate / "activation-handoff.json"
-        if not handoff.is_file():
-            raise MigrationError("candidate realm has no activation handoff")
-        # Verify SQLite bytes, CAS set/content, schema/FKs, and backup realm
-        # identity before closing or renaming the active authority.
-        try:
-            candidate_verification = verify_restore_candidate(candidate)
-        except Exception as exc:
-            raise MigrationError(f"candidate failed verification before {state} activation") from exc
-        # Candidate verification can read a large CAS. Revalidate once more at
-        # the final authority seam so a parent/target swap during that read is
-        # fail-closed before closing the live service or writing any material.
-        revalidate_activation_path(target, target_identity)
+        parent_fd = int(target_identity.get("_parent_fd", -1))
+        if parent_fd < 0:
+            raise MigrationError("activation boundary has no retained parent descriptor")
+
+        candidate_parent_fd = candidate_fd = quarantine_fd = temporary_fd = -1
+        temporary_name = quarantine_name = None
+        published = False
+        reopened = None
         old_service = self.service
-        display_name = old_service.realm["display_name"]
-        realm_id = old_service.realm["id"]
-        # A candidate backup contains the epoch at the time it was captured,
-        # not the epoch of the authority being replaced.  Preserve the
-        # monotonic runtime epoch across an activation swap so stale clients
-        # cannot become valid again merely because a rollback restored an
-        # older SQLite image.
-        previous_runtime_epoch = int(old_service.health()["runtime_epoch"])
-        support_root = old_service.support_root
-        # When no separate support root is configured, the authenticated
-        # backup key lives beside the active realm. Preserve that private key
-        # across the root swap: restore handoffs remain HMAC-bound to the same
-        # operator key after rollback/reactivation. Never copy a symlink or a
-        # non-regular path into the new authority.
-        operator_key = None
-        if support_root is None:
-            candidate_key = old_service.store.root / ".operator-backup-key"
-            if candidate_key.is_file() and not candidate_key.is_symlink():
-                operator_key = candidate_key
-        revalidate_activation_path(target, target_identity)
-        old_service.close()
-        quarantine = target.parent / f".{target.name}.inactive-{state}-{time.time_ns()}"
-        revalidate_activation_path(target, target_identity)
-        target.rename(quarantine)
-        temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.activate-", dir=target.parent))
         try:
-            shutil.copy2(candidate / "realm.sqlite3", temporary / "realm.sqlite3")
-            shutil.copytree(candidate / "cas", temporary / "cas")
-            shutil.copy2(handoff, temporary / "activation-handoff.json")
-            if operator_key is not None:
-                shutil.copy2(quarantine / ".operator-backup-key", temporary / ".operator-backup-key")
-            # Rehearsal control state is not part of a realm backup.  Carry it
-            # across the authority swap so a crash after the swap can resume
-            # from the same journal/evidence rather than starting over.
-            # The candidate's activation manifest is produced by the
-            # destination migration and must follow that candidate into the
-            # active authority.  If a legacy rehearsal has no candidate
-            # manifest, retain the old control-state copy as a compatibility
-            # fallback.
-            candidate_activation_manifest = candidate / "activation-manifest.json"
-            if candidate_activation_manifest.is_file():
-                shutil.copy2(candidate_activation_manifest, temporary / "activation-manifest.json")
+            revalidate_activation_path(target, target_identity)
+            if _has_symlink_component(candidate):
+                raise MigrationError("candidate realm path contains a symlink component")
+            if candidate == target:
+                raise MigrationError("candidate is not a complete inactive realm")
+            # Pin the candidate parent/root before its large verification read.
+            # All later source reads use this descriptor, so a candidate parent
+            # rename cannot redirect activation to an attacker-controlled tree.
+            try:
+                candidate_parent_fd, candidate_fd, candidate_parent_stat, candidate_stat = _pin_candidate(candidate)
+            except OSError as exc:
+                raise MigrationError(f"candidate realm cannot be opened safely: {candidate}") from exc
+            if not _exists_at(candidate_fd, "realm.sqlite3") or not _exists_at(candidate_fd, "cas"):
+                raise MigrationError("candidate is not a complete inactive realm")
+            from runtime_protocol.backup import verify_restore_candidate
+            # Candidate restore directories carry a handoff, while backups carry
+            # a manifest.  Both must be checked before touching the authority.
+            if not _exists_at(candidate_fd, "activation-handoff.json"):
+                raise MigrationError("candidate realm has no activation handoff")
+            try:
+                candidate_verification = verify_restore_candidate(candidate)
+            except Exception as exc:
+                raise MigrationError(f"candidate failed verification before {state} activation") from exc
+            _assert_pinned_candidate(candidate, candidate_parent_fd, candidate_fd, candidate_parent_stat, candidate_stat)
+            # Verification can read a large CAS. Revalidate once more at the
+            # final authority seam so swaps are rejected before closing live.
+            revalidate_activation_path(target, target_identity)
+            display_name = old_service.realm["display_name"]
+            realm_id = old_service.realm["id"]
+            previous_runtime_epoch = int(old_service.health()["runtime_epoch"])
+            support_root = old_service.support_root
+
+            # Keep the entire publication in the original parent inode.  In
+            # particular, do not use Path.rename/mkdtemp: both resolve the
+            # parent path again after validation.
+            quarantine_name = f".{target.name}.inactive-{state}-{time.time_ns()}"
+            _rename_at(parent_fd, target.name, quarantine_name)
+            quarantine_fd = os.open(quarantine_name, _DIR_FLAGS, dir_fd=parent_fd)
+            temporary_name, temporary_fd = _mkdir_at(parent_fd, f".{target.name}.activate-")
+            _copy_file_at(candidate_fd, "realm.sqlite3", temporary_fd, "realm.sqlite3")
+            _copy_tree_at(candidate_fd, "cas", temporary_fd, "cas")
+            _copy_file_at(candidate_fd, "activation-handoff.json", temporary_fd, "activation-handoff.json")
+            if _exists_at(quarantine_fd, ".operator-backup-key"):
+                _copy_file_at(quarantine_fd, ".operator-backup-key", temporary_fd, ".operator-backup-key")
+            # Rehearsal control state is not part of a realm backup. Carry it
+            # across the authority swap through the old-root descriptor.
+            if _exists_at(candidate_fd, "activation-manifest.json"):
+                _copy_file_at(candidate_fd, "activation-manifest.json", temporary_fd, "activation-manifest.json")
             for name in ("migration-journal.json", "migration-evidence"):
-                source = quarantine / name
-                if source.is_dir():
-                    shutil.copytree(source, temporary / name)
-                elif source.is_file():
-                    shutil.copy2(source, temporary / name)
-            if not (temporary / "activation-manifest.json").exists():
-                source = quarantine / "activation-manifest.json"
-                if source.is_file():
-                    shutil.copy2(source, temporary / "activation-manifest.json")
-            temporary.rename(target)
+                if _exists_at(quarantine_fd, name):
+                    source_stat = os.stat(name, dir_fd=quarantine_fd, follow_symlinks=False)
+                    if stat.S_ISDIR(source_stat.st_mode):
+                        _copy_tree_at(quarantine_fd, name, temporary_fd, name)
+                    elif stat.S_ISREG(source_stat.st_mode):
+                        _copy_file_at(quarantine_fd, name, temporary_fd, name)
+                    else:
+                        raise MigrationError(f"activation control state is not ordinary: {name}")
+            if not _exists_at(temporary_fd, "activation-manifest.json") and _exists_at(quarantine_fd, "activation-manifest.json"):
+                _copy_file_at(quarantine_fd, "activation-manifest.json", temporary_fd, "activation-manifest.json")
+            os.fsync(temporary_fd)
+            os.close(temporary_fd)
+            temporary_fd = -1
+
+            # Open the new runtime while its root is still named by the
+            # descriptor-pinned parent. RuntimeService/RealmStore performs
+            # startup writes; fchdir makes their relative path resolve to the
+            # pinned directory rather than an attacker-swapped absolute path.
+            from runtime_protocol.service import RuntimeService
+            cwd_fd = os.open(".", _DIR_FLAGS)
+            try:
+                os.fchdir(parent_fd)
+                reopened = RuntimeService(temporary_name, display_name=display_name, realm_id=realm_id, support_root=support_root)
+            finally:
+                try:
+                    os.fchdir(cwd_fd)
+                finally:
+                    os.close(cwd_fd)
+            reopened_epoch = int(reopened.health()["runtime_epoch"])
+            expected_epoch = previous_runtime_epoch + 1
+            if reopened_epoch != expected_epoch:
+                with reopened.store._mutex:
+                    with reopened.store._transaction():
+                        reopened.store.conn.execute(
+                            "UPDATE runtime_lifecycle SET runtime_epoch=? WHERE id=1",
+                            (expected_epoch,),
+                        )
+                reopened._runtime_state = reopened.store.runtime_lifecycle()
+
+            # The old root was moved to quarantine above through the retained
+            # parent descriptor. Its open SQLite/lock descriptors remain
+            # valid while the replacement is prepared; close the owner only
+            # after all candidate/control-state copies are complete.
+            old_service.close()
+            _rename_at(parent_fd, temporary_name, target.name)
+            published = True
+            # The target inode is now intentionally different; validate only
+            # the parent boundary before any path-based reopen or retargeting.
+            revalidate_activation_parent(target, target_identity)
+            _retarget_runtime_paths(reopened, target)
+            old_service.__dict__.update(reopened.__dict__)
+            self.service = old_service
+            if support_root is not None:
+                from runtime_protocol.catalog import RealmCatalog
+                catalog = RealmCatalog(Path(support_root) / "catalog.json")
+                catalog.register(realm_id=realm_id, display_name=display_name, data_root=str(target))
+                catalog.select(realm_id)
+            return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": str(target.parent / quarantine_name), "realm_id": realm_id, "candidate_verification": candidate_verification}
         except Exception:
-            shutil.rmtree(temporary, ignore_errors=True)
-            quarantine.rename(target)
+            if reopened is not None and not published:
+                try:
+                    reopened.close()
+                except Exception:
+                    pass
+            if temporary_name is not None and not published:
+                try:
+                    if temporary_fd >= 0:
+                        os.close(temporary_fd)
+                        temporary_fd = -1
+                    _remove_tree_at(parent_fd, temporary_name)
+                except (OSError, MigrationError):
+                    pass
+            if quarantine_name is not None and not published:
+                try:
+                    _rename_at(parent_fd, quarantine_name, target.name)
+                except (OSError, MigrationError):
+                    pass
             raise
-        from runtime_protocol.service import RuntimeService
-        reopened = RuntimeService(target, display_name=display_name, realm_id=realm_id, support_root=support_root)
-        reopened_epoch = int(reopened.health()["runtime_epoch"])
-        expected_epoch = previous_runtime_epoch + 1
-        if reopened_epoch != expected_epoch:
-            with reopened.store._mutex:
-                with reopened.store._transaction():
-                    reopened.store.conn.execute(
-                        "UPDATE runtime_lifecycle SET runtime_epoch=? WHERE id=1",
-                        (expected_epoch,),
-                    )
-            reopened._runtime_state = reopened.store.runtime_lifecycle()
-        old_service.__dict__.update(reopened.__dict__)
-        self.service = old_service
-        if support_root is not None:
-            from runtime_protocol.catalog import RealmCatalog
-            catalog = RealmCatalog(Path(support_root) / "catalog.json")
-            catalog.register(realm_id=realm_id, display_name=display_name, data_root=str(target))
-            catalog.select(realm_id)
-        return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": str(quarantine), "realm_id": realm_id, "candidate_verification": candidate_verification}
+        finally:
+            for fd in (candidate_fd, candidate_parent_fd, quarantine_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            close_activation_path(target_identity)
 
 
 class MigrationJournal:
