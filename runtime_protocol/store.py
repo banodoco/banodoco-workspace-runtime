@@ -7,7 +7,7 @@ import sqlite3
 import shutil
 import threading
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -826,12 +826,20 @@ class RealmStore:
         available = int(shutil.disk_usage(self.root).free)
         return {"ok": available >= required, "required_bytes": required, "available_bytes": available, "reason": None if available >= required else "insufficient_storage"}
 
-    def claim_task(self, task_id, worker_id, lease_token, *, runtime_epoch=None):
+    def claim_task(self, task_id, worker_id, lease_token, *, runtime_epoch=None, _transactional=True):
+        """Claim one exact task, optionally as part of a larger mutation.
+
+        ``claim_next`` must persist task claim, attempt fence, and its
+        idempotency record in one transaction.  The private switch keeps the
+        original exact-task API atomic while allowing that enclosing command
+        to reuse the same claim checks without a nested ``BEGIN``.
+        """
         with self._mutex:
             if not worker_id or not lease_token:
                 raise ValidationError("worker_id and lease_token are required")
             epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id, required=True)
-            with self._transaction():
+            transaction = self._transaction() if _transactional else nullcontext()
+            with transaction:
                 self._reap_expired_leases()
                 task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
                 if not task:

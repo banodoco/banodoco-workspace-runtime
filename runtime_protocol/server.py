@@ -144,7 +144,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 key = self.headers.get("Idempotency-Key")
                 if not key:
                     raise ProtocolError("Idempotency-Key header is required")
-                return self._send(201, self.runtime.create_timeline(path[2], body.get("timeline_id", "")))
+                return self._send(201, self.runtime.create_timeline(path[2], body.get("timeline_id", ""), idempotency_key=key))
             if method == "GET": return self._send(200, self.runtime.list_timelines(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timeline-documents" and method == "POST":
             self._identity("projects:write")
@@ -351,7 +351,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, body.get("idempotency_key"), project_id=project_id)})
         if path == ["v1", "tasks", "claim"] and method == "POST":
             self._identity("worker:execute")
-            result = self.runtime.claim_next(self._body())
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
+            result = self.runtime.claim_next(self._body(), idempotency_key=key)
             if result is None:
                 return self._send(204, body=b"")
             return self._send(200, result)

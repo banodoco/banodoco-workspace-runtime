@@ -6,6 +6,7 @@ import os
 import threading
 import urllib.error
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ def daemon(tmp_path):
         instance.stop()
 
 
-def test_project_managed_object_and_fake_worker_end_to_end(daemon):
+def test_project_managed_object_and_fake_executor_end_to_end(daemon):
     client = Api(daemon.endpoint, daemon.token)
     health = client.health()
     assert health["status"] == "ok"
@@ -48,7 +49,7 @@ def test_project_managed_object_and_fake_worker_end_to_end(daemon):
     assert range_headers["Content-Range"] == f"bytes 0-6/{len(source)}"
     task = client.create_task("render.basic", {"text": "hello"}, project="demo", idempotency_key="task-1")
     task_id = task["task_id"]
-    client.register_worker("fake", ["render.basic"], resource_keys=["cpu"])
+    client.register_executor("fake", ["render.basic"], resource_keys=["cpu"], idempotency_key="executor-fake")
     worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
     claimed = worker.claim_task(executor_id="fake", capability_ids=["render.basic"], idempotency_key="claim-1", runtime_epoch=worker.health().runtime_epoch)
     assert claimed is not None and claimed["task_id"] == task_id
@@ -60,6 +61,48 @@ def test_project_managed_object_and_fake_worker_end_to_end(daemon):
     assert settled.state == "succeeded"
     events = client.events(task["run_id"])
     assert [event["event_type"] for event in events["items"]] == ["task.admitted", "task.claimed", "task.completed"]
+
+
+def test_timeline_create_replays_receipt_and_conflicts_on_changed_request(daemon, tmp_path):
+    client = WorkspaceClient(daemon.endpoint, daemon.token)
+    project = client.create_project("timeline-idempotency", idempotency_key="timeline-project")
+    first = client.create_timeline(project.project_id, "timeline-a", idempotency_key="timeline-create")
+    replay = client.create_timeline(project.project_id, "timeline-a", idempotency_key="timeline-create")
+    assert first == replay
+    assert first.receipt["command_kind"] == "timeline.create"
+    with pytest.raises(ApiError) as changed:
+        client.create_timeline(project.project_id, "timeline-b", idempotency_key="timeline-create")
+    assert changed.value.status == 409
+    daemon.stop()
+    restarted = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        after_restart = WorkspaceClient(restarted.endpoint, restarted.token).create_timeline(project.project_id, "timeline-a", idempotency_key="timeline-create")
+        assert after_restart == first
+        assert restarted.service.store.conn.execute("SELECT COUNT(*) FROM timelines").fetchone()[0] == 1
+    finally:
+        restarted.stop()
+
+
+def test_claim_requires_key_and_duplicate_or_changed_requests_replay_or_conflict(daemon):
+    client = Api(daemon.endpoint, daemon.token)
+    project = client.create_project("claim-idempotency", "Claim Idempotency", idempotency_key="claim-project")
+    task = client.create_task("render.basic", {"text": "claim"}, project=project["project_id"], idempotency_key="claim-task")
+    client.register_executor("claim-executor", ["render.basic"], idempotency_key="claim-executor")
+    epoch = client.health()["runtime_epoch"]
+    body = {"executor_id": "claim-executor", "capability_ids": ["render.basic"], "runtime_epoch": epoch}
+    with pytest.raises(RuntimeError) as missing:
+        client.request("POST", "/v1/tasks/claim", body)
+    assert missing.value.status == 400
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: client.request("POST", "/v1/tasks/claim", body, headers={"Idempotency-Key": "claim-command"}), range(2)))
+    first, replay = results
+    assert replay == first
+    claimed_task_id = first["task_id"] if "task_id" in first else first["task"]["task_id"]
+    assert claimed_task_id == task["task_id"]
+    with pytest.raises(RuntimeError) as changed:
+        client.request("POST", "/v1/tasks/claim", {**body, "capability_ids": []}, headers={"Idempotency-Key": "claim-command"})
+    assert changed.value.status == 409
+    assert client.request("GET", f"/v1/tasks/{task['task_id']}")["state"] == "running"
 
 
 def test_project_patch_and_run_cancel_retry_are_durable_and_idempotent(daemon, tmp_path):
@@ -257,7 +300,7 @@ def test_stale_lease_and_undeclared_effect_are_rejected(daemon):
     effect = {"effect_type": "project.update", "target_id": project["project_id"], "expected_version": 1, "payload": {"name": "Settled Effect"}}
     task = client.create_task("render.basic", {}, project=project["project_id"], expected_effect=effect)
     task_id = task["task_id"]
-    client.register_worker("effect-worker", ["render.basic"])
+    client.register_executor("effect-worker", ["render.basic"], idempotency_key="executor-effect")
     worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
     attempt = worker.claim_task(executor_id="effect-worker", capability_ids=["render.basic"], idempotency_key="effect-claim", runtime_epoch=worker.health().runtime_epoch)
     assert attempt is not None

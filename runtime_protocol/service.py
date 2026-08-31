@@ -246,14 +246,34 @@ class RuntimeService:
                 self._record_timeline_revision(timeline_id, resource)
             return resource
 
-    def create_timeline(self, project_id, timeline_id):
-        if not timeline_id:
+    @_durable_mutation
+    def create_timeline(self, project_id, timeline_id, *, idempotency_key=None):
+        if not isinstance(timeline_id, str) or not timeline_id:
             raise ValidationError("timeline_id is required")
         project = self.store.get_project(project_id)
-        self.store.conn.execute("INSERT OR IGNORE INTO timelines(id, project_id, version, created_at, archived_at) VALUES (?, ?, 1, ?, NULL)", (timeline_id, project["id"], now()))
+        request_hash = hashlib.sha256(canonical_json({
+            "project_id": project["id"], "timeline_id": timeline_id,
+        }).encode()).hexdigest()
+        # A create request has no pre-existing aggregate, so keep its key in
+        # one operation namespace and bind project/timeline identity in the
+        # request hash. Reusing a key for any changed request is a conflict;
+        # a retry gets the exact committed resource and receipt.
+        replay = self._command_replay("timeline.create", "timelines", idempotency_key, request_hash, project_id=project["id"])
+        if replay is not None:
+            return replay
+        if self.store.conn.execute("SELECT 1 FROM timelines WHERE id=?", (timeline_id,)).fetchone():
+            raise ConflictError("timeline already exists", details={"timeline_id": timeline_id})
+        timestamp = now()
+        self.store.conn.execute("INSERT INTO timelines(id, project_id, version, created_at, archived_at) VALUES (?, ?, 1, ?, NULL)", (timeline_id, project["id"], timestamp))
         resource = self._timeline_resource(timeline_id)
         self._record_timeline_revision(timeline_id, resource)
-        return resource
+        event_id = self.store._append_timeline_event(timeline_id, "timeline.created", {"project_id": project["id"]})
+        event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
+        return self._command_record(
+            "timeline.create", "timelines", idempotency_key, request_hash,
+            resource, project_id=project["id"], event_ids=(event_id,),
+            primary_stream_id=timeline_id, resulting_stream_seq=event_seq,
+        )
 
     @_durable_mutation
     def create_timeline_document(self, project_id, body, *, idempotency_key=None):
@@ -1094,25 +1114,75 @@ class RuntimeService:
         self.store.conn.execute("INSERT OR REPLACE INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)", (body["executor_id"], max_concurrency, canonical_json(body.get("resource_keys", [])), canonical_json(capabilities), body.get("protocol", "workspace.v1"), now(), epoch))
         return {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
 
-    def claim_next(self, body):
-        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"), required=True)
-        caps = set(body.get("capability_ids", []))
-        rows = self.store.conn.execute("SELECT id, capability FROM tasks WHERE status='queued' ORDER BY created_at").fetchall()
-        row = next((x for x in rows if not caps or x["capability"] in caps), None)
+    @_durable_mutation
+    def claim_next(self, body, *, idempotency_key=None):
+        """Atomically select, claim, fence, and record a canonical claim.
+
+        A claim has no task path, so its command aggregate is the endpoint's
+        claim namespace.  The request hash binds executor, capabilities, and
+        runtime epoch; a replay can never consume a second queued task.
+        """
+        if not isinstance(body, dict):
+            raise InvalidRequestError("request body must be a JSON object")
+        executor_id = body.get("executor_id")
+        capability_ids = body.get("capability_ids")
+        runtime_epoch = body.get("runtime_epoch")
+        if not isinstance(executor_id, str) or not executor_id:
+            raise ValidationError("executor_id is required")
+        if not isinstance(capability_ids, list) or any(not isinstance(value, str) or not value for value in capability_ids) or len(set(capability_ids)) != len(capability_ids):
+            raise ValidationError("capability_ids must be a list of unique non-empty strings")
+        if runtime_epoch is not None and (isinstance(runtime_epoch, bool) or not isinstance(runtime_epoch, int) or runtime_epoch < 1):
+            raise ValidationError("runtime_epoch must be a positive integer")
+        request_hash = hashlib.sha256(canonical_json({
+            "executor_id": executor_id, "capability_ids": capability_ids,
+            "runtime_epoch": runtime_epoch,
+        }).encode()).hexdigest()
+        prior = None
+        if idempotency_key:
+            prior = self.store.conn.execute(
+                "SELECT request_hash, result_json FROM command_idempotency WHERE command_kind='task.claim' AND aggregate_id='claim' AND idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+        if prior:
+            if prior["request_hash"] != request_hash:
+                raise ConflictError("idempotency key was already used with different input")
+            value = json.loads(prior["result_json"])
+            return value
+
+        # Keep the store's epoch-fencing error for direct service callers;
+        # HTTP callers are schema-validated at the boundary.
+        epoch = self.store._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id, required=True)
+        caps = set(capability_ids)
+        rows = self.store.conn.execute("SELECT id, capability FROM tasks WHERE status='queued' ORDER BY created_at, id").fetchall()
+        row = next((item for item in rows if not caps or item["capability"] in caps), None)
         if row is None:
+            # Persist the empty outcome too.  Otherwise a retry after another
+            # task is admitted would silently claim new work.
+            if idempotency_key:
+                self.store.conn.execute(
+                    "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, 'claim', ?, ?, 'null', ?)",
+                    ("task.claim", idempotency_key, request_hash, now()),
+                )
             return None
         attempt_id, lease_id = new_id(), new_id()
-        value = self.store.claim_task(row["id"], body["executor_id"], lease_id, runtime_epoch=epoch)
+        value = self.store.claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
         if value["task"]["status"] != "running":
-            return {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
-        task = value["task"]
-        fence = int(task.get("lease_fence") or task.get("attempt") or 1)
-        expires = task.get("lease_expires_at") or now()
-        self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, row["id"], lease_id, fence, body["executor_id"], expires, epoch))
-        self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, row["id"]))
-        # Return the immutable admitted spec alongside the lease.  Workers
-        # must execute exactly what was claimed, without a racy second read.
-        return {"attempt_id": attempt_id, "task_id": row["id"], "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "spec": dict(task.get("spec") or {})}
+            result = {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
+        else:
+            task = value["task"]
+            fence = int(task.get("lease_fence") or task.get("attempt") or 1)
+            expires = task.get("lease_expires_at") or now()
+            self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, row["id"], lease_id, fence, executor_id, expires, epoch))
+            self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, row["id"]))
+            # Return the immutable admitted spec alongside the lease. Workers
+            # must execute exactly what was claimed, without a racy second read.
+            result = {"attempt_id": attempt_id, "task_id": row["id"], "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "spec": dict(task.get("spec") or {})}
+        if idempotency_key:
+            self.store.conn.execute(
+                "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, 'claim', ?, ?, ?, ?)",
+                ("task.claim", idempotency_key, request_hash, canonical_json(result), now()),
+            )
+        return result
 
     def settle_attempt(self, attempt_id, body):
         # The identity/fence and effect preconditions must precede CAS writes.

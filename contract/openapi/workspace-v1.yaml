@@ -147,7 +147,7 @@ paths:
       operationId: createTimeline
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateTimeline' } } } }
-      responses: { '201': { description: Timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } } }
+      responses: { '201': { description: Timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
     get:
       operationId: listTimelines
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
