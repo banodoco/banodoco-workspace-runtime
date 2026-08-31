@@ -9,7 +9,7 @@ test("generated TypeScript client performs scoped handshake and idempotent proje
   const transport = async (method, path, headers, body) => {
     calls.push({ method, path, headers, body });
     if (path === "/v1/handshake") return { status: 200, headers: {}, body: json({ protocol: "workspace.v1", schema_digest: `sha256:${"a".repeat(64)}`, session_id: "s", actor_id: "a", realm_id: "r", scopes: ["project:write"] }) };
-    if (path === "/v1/projects") return { status: 201, headers: {}, body: json({ project_id: "p", realm_id: "r", name: "Neutral", version: 1, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }) };
+    if (path === "/v1/projects") return { status: 201, headers: {}, body: json({ data: { project_id: "p", realm_id: "r", name: "Neutral", version: 1, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" }, receipt: { receipt_id: "runtime-command-1", command_kind: "project.create", idempotency_key: "idempotency-1", request_hash: `sha256:${"a".repeat(64)}`, project_id: "p", project_seq: [1, 1], event_ids: [], result: {}, created_at: "2026-01-01T00:00:00Z" } }) };
     throw new Error(`unexpected ${method} ${path}`);
   };
   const client = new WorkspaceClient("http://runtime", "token", transport);
@@ -17,6 +17,7 @@ test("generated TypeScript client performs scoped handshake and idempotent proje
   const project = await client.createProject("Neutral", "idempotency-1");
   assert.equal(session.realm_id, "r");
   assert.equal(project.project_id, "p");
+  assert.equal(project.receipt.command_kind, "project.create");
   assert.equal(calls[1].headers.Authorization, "Bearer token");
   assert.equal(calls[1].headers["Idempotency-Key"], "idempotency-1");
 });

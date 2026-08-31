@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
@@ -130,7 +131,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             body = self._body()
             if not isinstance(body, dict) or not body.get("project"):
                 raise ProtocolError("project is required")
-            return self._send(200, self.runtime.select_project(identity["actor"], body["project"], scope=body.get("scope", "workspace")))
+            key = self.headers.get("Idempotency-Key") or body.get("idempotency_key") or uuid.uuid4().hex
+            value = self.runtime.select_project(identity["actor"], body["project"], scope=body.get("scope", "workspace"), idempotency_key=key)
+            project_id = value["project"]["project_id"]
+            aggregate_id = f"{identity['actor']}:{value['scope']}"
+            return self._send(200, {"data": value, "receipt": self.runtime.committed_receipt("project.select", aggregate_id, key, project_id=project_id)})
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timelines":
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "POST": return self._send(201, self.runtime.create_timeline(path[2], self._body().get("timeline_id", "")))
@@ -183,7 +188,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.list_projects())
             if method == "POST":
                 body = self._body()
-                return self._send(201, self.runtime._project_resource(self.runtime.create_project(body, idempotency_key=self.headers.get("Idempotency-Key"))))
+                key = self.headers.get("Idempotency-Key") or body.get("idempotency_key") or uuid.uuid4().hex
+                value = self.runtime.create_project(body, idempotency_key=key)
+                resource = self.runtime._project_resource(value)
+                return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("project.create", value["id"], key, project_id=value["id"])})
         if path == ["v1", "workers"] and method == "POST":
             self._identity("worker:register")
             return self._send(201, self.runtime.register_worker(self._body()))
@@ -322,11 +330,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "tasks"] and method == "POST":
             self._identity("tasks:write")
             body = self._body()
-            body["idempotency_key"] = self.headers.get("Idempotency-Key") or body.get("idempotency_key")
+            body["idempotency_key"] = self.headers.get("Idempotency-Key") or body.get("idempotency_key") or uuid.uuid4().hex
             # Admission authority lives here, inside the owner process.  The
             # readiness check and row creation share the store transaction;
             # a client precheck can never race an unavailable registration.
-            return self._send(201, self.runtime._task_resource(self.runtime.create_task(body, enforce_readiness=True)))
+            value = self.runtime.create_task(body, enforce_readiness=True)
+            resource = self.runtime._task_resource(value)
+            project_id = value["run"].get("project_id") or "unscoped"
+            return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, body.get("idempotency_key"), project_id=project_id)})
         if path == ["v1", "tasks", "claim"] and method == "POST":
             self._identity("worker:execute")
             result = self.runtime.claim_next(self._body())

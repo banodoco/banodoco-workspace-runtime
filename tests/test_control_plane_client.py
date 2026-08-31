@@ -20,7 +20,7 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
             admission = json.loads(body)
             assert admission["capability_digest"] == "sha256:" + "b" * 64
             assert admission["input_object_ids"] == ["obj"]
-            return 201, {}, json.dumps(TASK).encode()
+            return 201, {}, json.dumps({"data": TASK, "receipt": {"receipt_id": "runtime-command-1", "command_kind": "task.create", "idempotency_key": "task-1", "request_hash": "sha256:" + "a" * 64, "project_id": "runtime-realm", "project_seq": [1, 1], "event_ids": [], "result": {}, "created_at": "2026-01-01T00:00:00Z"}}).encode()
         if path.endswith("/cancel"):
             assert headers["Idempotency-Key"] == "cancel-1"
             assert json.loads(body) == {"expected_version": 1}

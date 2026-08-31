@@ -140,8 +140,8 @@ class RuntimeService:
     def list_projects(self):
         return {"items": [self._project_resource(value) for value in self.store.list_projects()["items"]], "next_cursor": None}
 
-    def select_project(self, actor_id, selector, *, scope="workspace"):
-        value = self.store.select_project(actor_id, selector, scope)
+    def select_project(self, actor_id, selector, *, scope="workspace", idempotency_key=None):
+        value = self.store.select_project(actor_id, selector, scope, idempotency_key=idempotency_key)
         return {
             "actor_id": value["actor_id"],
             "scope": value["scope"],
@@ -330,6 +330,21 @@ class RuntimeService:
             "result": result,
             "created_at": row["created_at"],
         }
+
+    def committed_receipt(self, command_kind, aggregate_id, idempotency_key, *, project_id):
+        """Return the receipt persisted with a successful mutation.
+
+        This reads the command ledger; it never derives a receipt from client
+        state or caches one in the service process.
+        """
+        if not idempotency_key:
+            return None
+        row = self.store.conn.execute(
+            "SELECT rowid, command_kind, idempotency_key, request_hash, result_json, created_at "
+            "FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
+            (command_kind, aggregate_id, idempotency_key),
+        ).fetchone()
+        return self._receipt_payload(row, project_id=project_id) if row else None
 
     def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None):
         if not idempotency_key:

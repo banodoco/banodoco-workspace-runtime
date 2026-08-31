@@ -4,6 +4,7 @@ import hashlib
 import json
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -33,8 +34,42 @@ def test_actor_project_selection_is_runtime_owned_and_persistent(tmp_path):
         reconnect = WorkspaceClient(daemon.endpoint, daemon.token)
         assert reconnect.current_project()["project"]["project_id"] == second.project_id
         assert first.project_id != second.project_id
+        assert selected.receipt["command_kind"] == "project.select"
     finally:
         daemon.stop()
+
+
+def test_receipts_are_identical_across_concurrent_replay_and_restart(tmp_path):
+    realm = tmp_path / "realm"
+    support = tmp_path / "support"
+    daemon = RuntimeDaemon(realm, support_root=support).start()
+    try:
+        def create_once():
+            client = WorkspaceClient(daemon.endpoint, daemon.token)
+            return client.create_project("Concurrent", slug="concurrent", idempotency_key="concurrent-project")
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda _: create_once(), range(6)))
+        assert {json.dumps(result.receipt, sort_keys=True) for result in results} == {json.dumps(results[0].receipt, sort_keys=True)}
+        project = results[0]
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        selected = client.select_project(project.project_id, idempotency_key="concurrent-select")
+        task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], project_id=project.project_id, idempotency_key="concurrent-task", spec={})
+        assert selected.receipt["command_kind"] == "project.select"
+        assert task.receipt["command_kind"] == "task.create"
+        daemon.stop()
+        restarted = RuntimeDaemon(realm, support_root=support).start()
+        try:
+            replay = WorkspaceClient(restarted.endpoint, restarted.token).create_project("Concurrent", slug="concurrent", idempotency_key="concurrent-project")
+            assert replay.receipt == project.receipt
+            assert restarted.service.store.conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 1
+            assert restarted.service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0] == 3
+        finally:
+            restarted.stop()
+            daemon = None
+    finally:
+        if daemon is not None:
+            daemon.stop()
 
 
 def test_unready_capability_rejected_before_any_ledger_rows(tmp_path):

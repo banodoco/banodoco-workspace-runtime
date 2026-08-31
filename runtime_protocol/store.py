@@ -296,19 +296,41 @@ class RealmStore:
             raise ValidationError("name is required")
         with self._mutex:
             realm = self.ensure_realm()
-            if idempotency_key:
-                prior = self.conn.execute("SELECT * FROM projects WHERE realm_id=? AND idempotency_key=?", (realm["id"], idempotency_key)).fetchone()
-                if prior:
-                    if prior["slug"] != slug or prior["name"] != name or json.loads(prior["metadata_json"]) != (metadata or {}):
-                        raise ConflictError("idempotency key was already used with different input")
-                    return self._project(prior["id"])
-            try:
-                pid, timestamp = new_id(), now()
-                self.conn.execute("INSERT INTO projects(id, realm_id, slug, name, metadata_json, version, created_at, updated_at, idempotency_key) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
-                                  (pid, realm["id"], slug, name, canonical_json(metadata or {}), timestamp, timestamp, idempotency_key))
-            except sqlite3.IntegrityError as exc:
-                raise ConflictError("project slug already exists") from exc
-            return self._project(pid)
+            request_hash = hashlib.sha256(canonical_json({"slug": slug, "name": name, "metadata": metadata or {}}).encode()).hexdigest()
+            with self._transaction():
+                if idempotency_key:
+                    receipt = self.conn.execute(
+                        "SELECT result_json, request_hash FROM command_idempotency "
+                        "WHERE command_kind='project.create' AND idempotency_key=?",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if receipt:
+                        if receipt["request_hash"] != request_hash:
+                            raise ConflictError("idempotency key was already used with different input")
+                        return json.loads(receipt["result_json"])
+                    prior = self.conn.execute("SELECT * FROM projects WHERE realm_id=? AND idempotency_key=?", (realm["id"], idempotency_key)).fetchone()
+                    if prior:
+                        if prior["slug"] != slug or prior["name"] != name or json.loads(prior["metadata_json"]) != (metadata or {}):
+                            raise ConflictError("idempotency key was already used with different input")
+                        result = self._project(prior["id"])
+                        self.conn.execute(
+                            "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            ("project.create", prior["id"], idempotency_key, request_hash, canonical_json(result), prior["created_at"]),
+                        )
+                        return result
+                try:
+                    pid, timestamp = new_id(), now()
+                    self.conn.execute("INSERT INTO projects(id, realm_id, slug, name, metadata_json, version, created_at, updated_at, idempotency_key) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                                      (pid, realm["id"], slug, name, canonical_json(metadata or {}), timestamp, timestamp, idempotency_key))
+                except sqlite3.IntegrityError as exc:
+                    raise ConflictError("project slug already exists") from exc
+                result = self._project(pid)
+                if idempotency_key:
+                    self.conn.execute(
+                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        ("project.create", pid, idempotency_key, request_hash, canonical_json(result), result["created_at"]),
+                    )
+                return result
 
     def get_project(self, selector: str):
         with self._mutex:
@@ -317,7 +339,7 @@ class RealmStore:
     def list_projects(self):
         return {"items": [self._project(row["id"]) for row in self.conn.execute("SELECT id FROM projects ORDER BY created_at")], "next_cursor": None}
 
-    def select_project(self, actor_id: str, selector: str, scope: str = "workspace"):
+    def select_project(self, actor_id: str, selector: str, scope: str = "workspace", *, idempotency_key=None):
         """Persist a project routing selection for one authenticated actor.
 
         Selection is runtime state, not a product-local preference file.  The
@@ -332,12 +354,29 @@ class RealmStore:
             project = self._project(selector)
             timestamp = now()
             with self._transaction():
+                request_hash = hashlib.sha256(canonical_json({"actor_id": actor_id, "scope": scope, "project_id": project["id"]}).encode()).hexdigest()
+                aggregate_id = f"{actor_id}:{scope}"
+                if idempotency_key:
+                    prior = self.conn.execute(
+                        "SELECT result_json, request_hash FROM command_idempotency WHERE command_kind='project.select' AND aggregate_id=? AND idempotency_key=?",
+                        (aggregate_id, idempotency_key),
+                    ).fetchone()
+                    if prior:
+                        if prior["request_hash"] != request_hash:
+                            raise ConflictError("idempotency key was already used with different input")
+                        return json.loads(prior["result_json"])
                 self.conn.execute(
                     "INSERT INTO project_selections(actor_id, scope, project_id, updated_at) VALUES (?, ?, ?, ?) "
                     "ON CONFLICT(actor_id, scope) DO UPDATE SET project_id=excluded.project_id, updated_at=excluded.updated_at",
                     (actor_id, scope, project["id"], timestamp),
                 )
-            return {"actor_id": actor_id, "scope": scope, "project": self._project(project["id"]), "updated_at": timestamp}
+                result = {"actor_id": actor_id, "scope": scope, "project": self._project(project["id"]), "updated_at": timestamp}
+                if idempotency_key:
+                    self.conn.execute(
+                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        ("project.select", aggregate_id, idempotency_key, request_hash, canonical_json(result), timestamp),
+                    )
+                return result
 
     def current_project(self, actor_id: str):
         """Return the actor's effective selection (workspace precedes user)."""
@@ -399,13 +438,29 @@ class RealmStore:
         with self._mutex:
             project_id = self._project(project)["id"] if project else None
             with self._transaction():
+                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": spec, "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
+                aggregate_id = project_id or "unscoped"
+                if idempotency_key:
+                    receipt = self.conn.execute(
+                        "SELECT result_json, request_hash FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+                        (aggregate_id, idempotency_key),
+                    ).fetchone()
+                    if receipt:
+                        if receipt["request_hash"] != request_hash:
+                            raise ConflictError("idempotency key was already used with different input")
+                        return json.loads(receipt["result_json"])
                 if idempotency_key:
                     old = self.conn.execute("SELECT * FROM runs WHERE project_id IS ? AND idempotency_key=?", (project_id, idempotency_key)).fetchone()
                     if old:
                         if old["spec_json"] != canonical_json(spec) or old["capability"] != capability:
                             raise ConflictError("idempotency key was already used with different input")
                         task = self.conn.execute("SELECT * FROM tasks WHERE run_id=?", (old["id"],)).fetchone()
-                        return self._task_result(old, task)
+                        result = self._task_result(old, task)
+                        self.conn.execute(
+                            "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            ("task.create", aggregate_id, idempotency_key, request_hash, canonical_json(result), old["created_at"]),
+                        )
+                        return result
                 registered = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (capability,)).fetchone()
                 if registered:
                     registered_digest = registered["definition_digest"]
@@ -439,7 +494,13 @@ class RealmStore:
                 self._append_event(run_id, task_id, "task.admitted", {"capability": capability})
                 run = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
                 task = dict(self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
-                return self._task_result(run, task)
+                result = self._task_result(run, task)
+                if idempotency_key:
+                    self.conn.execute(
+                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        ("task.create", aggregate_id, idempotency_key, request_hash, canonical_json(result), timestamp),
+                    )
+                return result
 
     def _task_result(self, run, task):
         result = dict(task)

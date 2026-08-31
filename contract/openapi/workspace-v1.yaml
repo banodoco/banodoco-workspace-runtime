@@ -75,7 +75,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/CreateProject' } } }
       responses:
-        '201': { description: Created, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
+        '201': { description: Created with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
         '409': { $ref: '#/components/responses/Conflict' }
   /v1/projects/{project_id}:
     get:
@@ -105,7 +105,7 @@ paths:
         required: true
         content: { application/json: { schema: { $ref: '#/components/schemas/SelectProject' } } }
       responses:
-        '200': { description: Persisted actor-scoped selection, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectSelection' } } } }
+        '200': { description: Persisted actor-scoped selection with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
         '404': { $ref: '#/components/responses/NotFound' }
   /v1/projects/{project_id}/documents:
     get:
@@ -383,7 +383,7 @@ paths:
       operationId: admitTask
       parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AdmitTask' } } } }
-      responses: { '201': { description: Admitted task, content: { application/json: { schema: { $ref: './schemas/task.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '201': { description: Admitted task with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/tasks/claim:
     post:
       operationId: claimTask

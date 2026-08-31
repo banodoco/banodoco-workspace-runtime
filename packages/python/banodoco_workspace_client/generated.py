@@ -377,6 +377,13 @@ class MutationResult(dict):
         super().__init__(data)
         self.receipt = receipt
 
+    def __getattr__(self, name: str) -> Any:
+        """Preserve generated resource attribute access on mutation results."""
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
 
 class WorkspaceClient:
     """Small stdlib HTTP client generated from the neutral OpenAPI contract.
@@ -419,12 +426,13 @@ class WorkspaceClient:
 
     def _mutation_json(self, body: bytes) -> Mapping[str, Any]:
         value = self._json(body)
-        if set(value) >= {"data", "receipt"}:
-            data = value.get("data")
-            if not isinstance(data, Mapping):
-                raise ApiError(0, "invalid_response", "expected mutation data object")
-            return MutationResult(data, value.get("receipt"))
-        return value
+        if set(value) != {"data", "receipt"}:
+            raise ApiError(0, "invalid_response", "mutation response must contain data and committed receipt")
+        data = value.get("data")
+        receipt = value.get("receipt")
+        if not isinstance(data, Mapping) or not isinstance(receipt, Mapping):
+            raise ApiError(0, "invalid_response", "mutation response must contain data and committed receipt")
+        return MutationResult(data, receipt)
 
     def health(self) -> Health:
         _, _, body = self._request("GET", "/v1/health")
@@ -473,12 +481,12 @@ class WorkspaceClient:
         payload = {"confirmation": confirmation}
         return self._json(self._request("POST", "/v1/realm/purge", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
 
-    def create_project(self, name: str, *, idempotency_key: str, slug: str | None = None, metadata: Mapping[str, Any] | None = None) -> Project:
+    def create_project(self, name: str, *, idempotency_key: str, slug: str | None = None, metadata: Mapping[str, Any] | None = None) -> MutationResult:
         payload: dict[str, Any] = {"name": name}
         if slug is not None: payload["slug"] = slug
         if metadata is not None: payload["metadata"] = metadata
         _, _, body = self._request("POST", "/v1/projects", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
-        return Project.from_json(self._json(body))
+        return self._mutation_json(body)
 
     def get_project(self, project_id: str) -> Project:
         _, _, body = self._request("GET", f"/v1/projects/{_path_part(project_id)}")
@@ -721,7 +729,7 @@ class WorkspaceClient:
         headers = {"Content-Type": "application/json"}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        return self._json(self._request("PUT", "/v1/projects/selection", body=json.dumps(payload, separators=(",", ":")).encode(), headers=headers)[2])
+        return self._mutation_json(self._request("PUT", "/v1/projects/selection", body=json.dumps(payload, separators=(",", ":")).encode(), headers=headers)[2])
 
     def current_project(self) -> Mapping[str, Any]:
         return self._json(self._request("GET", "/v1/projects/selection")[2])
@@ -776,14 +784,14 @@ class WorkspaceClient:
         status, response_headers, body = self._request("HEAD", f"/v1/objects/{_path_part(object_id)}", headers=headers, expected=(200, 206))
         return ByteResponse(body, status, response_headers)
 
-    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None, project_id: str | None = None, spec: Mapping[str, Any] | None = None) -> Task:
+    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None, project_id: str | None = None, spec: Mapping[str, Any] | None = None) -> MutationResult:
         payload: dict[str, Any] = {"capability_id": capability_id, "capability_digest": capability_digest, "schema_version": schema_version, "input_object_ids": input_object_ids}
         if settlement_effect is not None:
             payload["settlement_effect"] = settlement_effect
         if project_id is not None: payload["project"] = project_id
         if spec is not None: payload["spec"] = spec
         _, _, body = self._request("POST", "/v1/tasks", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
-        return Task.from_json(self._json(body))
+        return self._mutation_json(body)
 
     def get_task(self, task_id: str) -> Task:
         _, _, body = self._request("GET", f"/v1/tasks/{_path_part(task_id)}")

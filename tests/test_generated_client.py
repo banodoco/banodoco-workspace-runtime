@@ -20,7 +20,7 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
         if path == "/v1/handshake":
             return 200, {}, json.dumps({"protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "session_id": "session-1", "actor_id": "actor-1", "realm_id": "realm-1", "scopes": ["realm:read", "project:write"]}).encode()
         if path == "/v1/projects" and method == "POST":
-            return 201, {}, json.dumps({"project_id": "project-1", "realm_id": "realm-1", "name": "Neutral", "version": 1, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}).encode()
+            return 201, {}, json.dumps({"data": {"project_id": "project-1", "realm_id": "realm-1", "name": "Neutral", "version": 1, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}, "receipt": {"receipt_id": "runtime-command-1", "command_kind": "project.create", "idempotency_key": "create-1", "request_hash": "sha256:" + "a" * 64, "project_id": "project-1", "project_seq": [1, 1], "event_ids": [], "result": {}, "created_at": "2026-01-01T00:00:00Z"}}).encode()
         raise AssertionError((method, path))
 
     client = WorkspaceClient("http://runtime", "token", transport=transport)
@@ -29,6 +29,7 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
     assert session.realm_id == "realm-1"
     project = client.create_project("Neutral", idempotency_key="create-1")
     assert project.project_id == "project-1"
+    assert project.receipt["command_kind"] == "project.create"
     assert calls[-1][2]["Authorization"] == "Bearer token"
     assert calls[-1][2]["Idempotency-Key"] == "create-1"
 
