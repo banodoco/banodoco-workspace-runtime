@@ -11,6 +11,12 @@ from .errors import RuntimeErrorBase, AuthorizationError, NotFoundError, Protoco
 class RuntimeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # The default TCPServer backlog is only five. A cold runtime receives a
+    # burst of executor/client requests during launch, and an overflow resets
+    # otherwise valid loopback connections before the handler can return the
+    # durable idempotent replay. Keep a bounded backlog sized for the local
+    # control-plane fan-in.
+    request_queue_size = 64
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):

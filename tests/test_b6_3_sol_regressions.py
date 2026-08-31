@@ -12,7 +12,7 @@ from runtime_protocol.util import durable_json_bytes
 
 def _setup(tmp_path, *, reboot_executor=None):
     service = RuntimeService(tmp_path / "realm", reboot_executor=reboot_executor)
-    service.register_worker({"worker_id": "worker", "capabilities": ["render.basic"]})
+    service.register_executor({"executor_id": "worker", "capabilities": ["render.basic"]})
     service.create_task({"capability_id": "render.basic", "spec": {}, "idempotency_key": "sol-b63"})
     epoch = service.health()["runtime_epoch"]
     attempt = service.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": epoch})

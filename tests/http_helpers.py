@@ -48,7 +48,6 @@ class Api:
     def read_object(self, digest, *, range_header=None): return self.request("GET", f"/v1/objects/{digest}", headers={"Range": range_header} if range_header else None)
     def create_task(self, capability, spec, *, project=None, idempotency_key=None, expected_effect=None): return self.request("POST", "/v1/tasks", {"capability_id": capability, "capability_digest": "sha256:" + __import__("hashlib").sha256(capability.encode()).hexdigest(), "input_object_ids": [], "spec": spec, "project": project, "settlement_effect": expected_effect}, headers={"Idempotency-Key": idempotency_key or "test-task"})["data"]
     def task(self, task_id): return self.request("GET", f"/v1/tasks/{task_id}")
-    def claim(self, task_id, worker_id, lease_token): return self.request("POST", f"/v1/tasks/{task_id}/claim", {"worker_id": worker_id, "lease_token": lease_token, "runtime_epoch": self.health()["runtime_epoch"]})
     def events(self, run_id): return self.request("GET", f"/v1/runs/{run_id}/events")
     def register_executor(self, executor_id, capabilities, *, max_concurrency=1, resource_keys=None, idempotency_key=None):
         descriptors = []

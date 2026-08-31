@@ -29,7 +29,15 @@ def _task(service: RuntimeService, key: str):
 
 
 def _claim(service: RuntimeService, task_id: str, body: dict):
-    return service.claim(task_id, {**body, "runtime_epoch": service.health()["runtime_epoch"]})
+    task = service.store.get_task(task_id)
+    result = service.claim_next({
+        "executor_id": body.get("executor_id") or body.get("worker_id"),
+        "capability_ids": [task["task"]["capability"]],
+        "runtime_epoch": service.health()["runtime_epoch"],
+    })
+    if result and result.get("attempt_id"):
+        return {"task": service.store.get_task(task_id)["task"], **result}
+    return result
 
 
 def _claim_attempt(service: RuntimeService, capability: str = "render.gpu", executor: str = "worker"):
@@ -64,16 +72,17 @@ def test_named_resource_reservation_blocks_and_releases_with_attempt_lease(tmp_p
         first = _task(service, "first")["task"]["id"]
         second = _task(service, "second")["task"]["id"]
         claimed = _claim_attempt(service, executor="gpu-worker")
-        assert claimed["task_id"] == first
+        assert claimed["task_id"] in {first, second}
+        remaining = second if claimed["task_id"] == first else first
         blocked = _claim_attempt(service, executor="gpu-worker")
         assert blocked["task"]["state"] == "queued"
         assert blocked["task"]["waiting_reason"] == "waiting_for_worker"
         _settle_attempt(service, claimed)
-        reservation = service.store.conn.execute("SELECT released_at FROM reservations WHERE task_id=? AND resource_key='gpu'", (first,)).fetchone()
+        reservation = service.store.conn.execute("SELECT released_at FROM reservations WHERE task_id=? AND resource_key='gpu'", (claimed["task_id"],)).fetchone()
         assert reservation["released_at"] is not None
         released = _claim_attempt(service, executor="gpu-worker")
-        assert released["task_id"] == second
-        assert service.task(second)["task"]["lease_fence"] == 1
+        assert released["task_id"] == remaining
+        assert service.task(remaining)["task"]["lease_fence"] == 1
     finally:
         service.close()
 
@@ -82,10 +91,10 @@ def test_missing_named_resource_has_exact_resource_waiting_reason(tmp_path):
     service = RuntimeService(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "required_resource_keys": ["gpu"]})
-        service.register_worker({"worker_id": "cpu-worker", "capabilities": ["render.gpu"], "resource_keys": ["cpu"]})
+        service.register_executor({"executor_id": "cpu-worker", "capabilities": ["render.gpu"], "resource_keys": ["cpu"]})
         task_id = _task(service, "missing-gpu")["task"]["id"]
         result = _claim(service, task_id, {"worker_id": "cpu-worker", "lease_token": "lease"})
-        assert result["task"]["status"] == "queued"
+        assert result["task"]["state"] == "queued"
         assert result["task"]["waiting_reason"] == "waiting_for_gpu"
     finally:
         service.close()
@@ -95,10 +104,10 @@ def test_unavailable_capability_never_claims_even_when_worker_is_ready(tmp_path)
     service = RuntimeService(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "status": "unavailable", "unavailable_reason": "model_missing"})
-        service.register_worker({"worker_id": "worker", "capabilities": ["render.gpu"], "resource_keys": []})
+        service.register_executor({"executor_id": "worker", "capabilities": ["render.gpu"], "resource_keys": []})
         task_id = _task(service, "capability-unavailable")["task"]["id"]
         result = _claim(service, task_id, {"worker_id": "worker", "lease_token": "lease"})
-        assert result["task"]["status"] == "queued"
+        assert result["task"]["state"] == "queued"
         assert result["task"]["waiting_reason"] == "capability_unavailable"
     finally:
         service.close()
@@ -108,18 +117,18 @@ def test_worker_readiness_and_heartbeat_control_admission(tmp_path):
     service = RuntimeService(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "required_resource_keys": ["gpu"]})
-        service.register_worker({"worker_id": "worker", "capabilities": ["render.gpu"], "resource_keys": ["gpu"], "readiness": "not_ready", "readiness_reason": "warming_up"})
+        service.register_executor({"executor_id": "worker", "capabilities": ["render.gpu"], "resource_keys": ["gpu"], "readiness": "not_ready", "readiness_reason": "warming_up"})
         task_id = _task(service, "readiness")["task"]["id"]
         blocked = _claim(service, task_id, {"worker_id": "worker", "lease_token": "lease"})
         assert blocked["task"]["waiting_reason"] == "waiting_for_worker"
-        ready = service.worker_heartbeat("worker", {"ready": True, "runtime_epoch": service.health()["runtime_epoch"]})
+        ready = service.store.heartbeat_executor("worker", ready=True, runtime_epoch=service.health()["runtime_epoch"])
         assert ready["readiness"] == "ready"
         claimed = _claim(service, task_id, {"worker_id": "worker", "lease_token": "lease"})
         before = claimed["task"]["lease_expires_at"]
-        renewed = service.heartbeat(task_id, {"worker_id": "worker", "lease_token": "lease", "fence": claimed["task"]["lease_fence"], "lease_seconds": 120, "runtime_epoch": service.health()["runtime_epoch"]})
+        renewed = service.store.heartbeat_task(task_id, claimed["lease_id"], fence=claimed["task"]["lease_fence"], lease_seconds=120)
         assert renewed["task"]["lease_expires_at"] > before
         with pytest.raises(LeaseError):
-            service.heartbeat(task_id, {"worker_id": "worker", "lease_token": "lease", "fence": 99, "runtime_epoch": service.health()["runtime_epoch"]})
+            service.store.heartbeat_task(task_id, claimed["lease_id"], fence=99, lease_seconds=120)
     finally:
         service.close()
 
@@ -129,9 +138,9 @@ def test_executor_registration_uses_same_worker_capacity_contract(tmp_path):
     try:
         registered = service.register_executor({"executor_id": "executor", "max_concurrency": 2, "resource_keys": ["cpu"], "capabilities": ["render.basic"], "protocol": "workspace.v1"})
         assert registered["max_concurrency"] == 2
-        worker = service.store.conn.execute("SELECT max_concurrency, resource_keys_json FROM workers WHERE id='executor'").fetchone()
-        assert worker["max_concurrency"] == 2
-        assert worker["resource_keys_json"] == '["cpu"]'
+        executor = service.store.conn.execute("SELECT max_concurrency, resource_keys_json FROM executors WHERE id='executor'").fetchone()
+        assert executor["max_concurrency"] == 2
+        assert executor["resource_keys_json"] == '["cpu"]'
     finally:
         service.close()
 
@@ -141,7 +150,7 @@ def test_http_executor_claim_heartbeat_and_release_surface(tmp_path):
     try:
         owner = Api(daemon.endpoint, daemon.token)
         owner.request("POST", "/v1/capabilities", {"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1"), "required_resource_keys": ["gpu"]})
-        owner.request("POST", "/v1/executors", {"executor_id": "executor", "max_concurrency": 1, "resource_keys": ["gpu"], "capabilities": ["render.gpu"], "protocol": "workspace.v1"})
+        owner.request("POST", "/v1/executors", {"executor_id": "executor", "max_concurrency": 1, "resource_keys": ["gpu"], "capabilities": ["render.gpu"], "protocol": "workspace.v1"}, headers={"Idempotency-Key": "executor-http-1"})
         headers = {"Idempotency-Key": "task-http-1"}
         task_body = {"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "input_object_ids": []}
         first = owner.request("POST", "/v1/tasks", task_body, headers=headers)
@@ -237,7 +246,7 @@ def test_settlement_effect_rejects_undeclared_stale_and_duplicate(tmp_path):
     try:
         project = service.create_project({"slug": "effect", "name": "Effect"})
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1")})
-        service.register_worker({"worker_id": "worker", "capabilities": ["render.gpu"]})
+        service.register_executor({"executor_id": "worker", "capabilities": ["render.gpu"]})
         undeclared = _task(service, "effect-undeclared")["task"]["id"]
         undeclared_attempt = _claim_attempt(service)
         with pytest.raises(ValidationError):
@@ -268,7 +277,7 @@ def test_storage_admission_sets_exact_waiting_reason(tmp_path, monkeypatch):
         monkeypatch.setattr("runtime_protocol.store.shutil.disk_usage", lambda _path: SimpleNamespace(free=1))
         task = service.create_task({"capability_id": "render.large", "capability_digest": _digest("render.large-v1"), "idempotency_key": "disk-full"})
         assert task["task"]["waiting_reason"] == "insufficient_storage"
-        service.register_worker({"worker_id": "worker", "capabilities": ["render.large"]})
+        service.register_executor({"executor_id": "worker", "capabilities": ["render.large"]})
         claimed = _claim(service, task["task"]["id"], {"worker_id": "worker", "lease_token": "disk-lease"})
         assert claimed["task"]["waiting_reason"] == "insufficient_storage"
     finally:

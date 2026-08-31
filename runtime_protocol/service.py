@@ -383,12 +383,17 @@ class RuntimeService:
         """
         if not idempotency_key:
             return None
-        row = self.store.conn.execute(
-            "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
-            "first_project_seq, last_project_seq, event_ids_json, created_at "
-            "FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
-            (command_kind, aggregate_id, idempotency_key),
-        ).fetchone()
+        # HTTP handlers share the owner's SQLite connection. Serialize this
+        # post-mutation read with the writer lock so another handler cannot
+        # interleave a transaction on the same connection between the
+        # mutation and receipt lookup, yielding a spurious null receipt.
+        with self.store._mutex:
+            row = self.store.conn.execute(
+                "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
+                "first_project_seq, last_project_seq, event_ids_json, created_at "
+                "FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
+                (command_kind, aggregate_id, idempotency_key),
+            ).fetchone()
         return self._receipt_payload(row, project_id=project_id) if row else None
 
     def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None):
@@ -1075,13 +1080,6 @@ class RuntimeService:
             resource["result"] = task["result"]
         return resource
 
-    def claim(self, task_id, body):
-        return self.store.claim_task(task_id, body.get("worker_id", "worker"), body.get("lease_token", ""), runtime_epoch=body.get("runtime_epoch"))
-
-    def heartbeat(self, task_id, body):
-        self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="worker", identity_id=body.get("worker_id"), required=True)
-        return self.store.heartbeat_task(task_id, body.get("lease_token", ""), fence=body.get("fence"), lease_seconds=body.get("lease_seconds", 30))
-
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
 
@@ -1105,7 +1103,7 @@ class RuntimeService:
             with self.store._transaction():
                 timestamp = now()
                 self.store._release_reservations(task_id, current["task"].get("lease_token"))
-                self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, worker_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
+                self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
                 self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, current["run"]["id"]))
                 self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
             return self._task_resource(self.store.get_task(task_id))
@@ -1126,9 +1124,6 @@ class RuntimeService:
         result["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (result["id"],))]
         return result
 
-    def register_worker(self, body):
-        return self.store.register_worker(body.get("worker_id", ""), body.get("capabilities", []), body.get("max_concurrency", 1), body.get("resource_keys", []), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=body.get("runtime_epoch"))
-
     def _ensure_default_capability(self):
         digest = "sha256:" + hashlib.sha256(b"render.basic").hexdigest()
         self.store.register_capability("render.basic", digest, required_resource_keys=[], estimated_output_bytes=1)
@@ -1140,9 +1135,6 @@ class RuntimeService:
     def register_capability(self, body):
         value = self.store.register_capability(body.get("capability_id", ""), body.get("definition_digest", ""), required_resource_keys=body.get("required_resource_keys", []), status=body.get("status", "ready"), unavailable_reason=body.get("unavailable_reason"), estimated_scratch_bytes=body.get("estimated_scratch_bytes", 0), estimated_output_bytes=body.get("estimated_output_bytes", 0))
         return {"capability_id": value["id"], "definition_digest": value["definition_digest"], "status": value["status"], "required_resource_keys": value["required_resource_keys"], "estimated_scratch_bytes": value["estimated_scratch_bytes"], "estimated_output_bytes": value["estimated_output_bytes"], "unavailable_reason": value.get("unavailable_reason")}
-
-    def worker_heartbeat(self, worker_id, body):
-        return self.store.heartbeat_worker(worker_id, ready=body.get("ready"), reason=body.get("reason"), runtime_epoch=body.get("runtime_epoch"))
 
     @_durable_mutation
     def register_executor(self, body, *, idempotency_key=None):
@@ -1161,11 +1153,14 @@ class RuntimeService:
         replay = self._command_replay("executor.register", aggregate_id, idempotency_key, request_hash)
         if replay is not None:
             return replay
+        # Fence the identity before checking duplicate state or registering
+        # capability descriptors. A stale executor request must have no
+        # observable side effect and must fail as an epoch error, even when
+        # its identity is already present in the canonical registry.
+        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"))
         if self.store.conn.execute("SELECT 1 FROM executors WHERE id=?", (body["executor_id"],)).fetchone():
             raise ConflictError("executor already exists", details={"executor_id": body["executor_id"]})
-        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"))
-        self.store.register_worker(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch)
-        self.store.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)", (body["executor_id"], max_concurrency, canonical_json(body.get("resource_keys", [])), canonical_json(capabilities), body.get("protocol", "workspace.v1"), now(), epoch))
+        self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch)
         result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result)
 
@@ -1220,7 +1215,7 @@ class RuntimeService:
                 )
             return None
         attempt_id, lease_id = new_id(), new_id()
-        value = self.store.claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
+        value = self.store._claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
         if value["task"]["status"] != "running":
             result = {"task": self._task_resource(value), "waiting_reason": value["task"].get("waiting_reason") or "waiting_for_worker"}
         else:
@@ -1513,7 +1508,7 @@ class RuntimeService:
             # Claim this exact task.  Never use claim_next here: a mismatch
             # must not consume an unrelated queued task.
             lease_id = new_id()
-            claim = self.store.claim_task(row["task_id"], row["executor_id"], lease_id, runtime_epoch=current)
+            claim = self.store._claim_task(row["task_id"], row["executor_id"], lease_id, runtime_epoch=current)
             task = claim["task"]
             if task.get("status") != "running" or task.get("id") != row["task_id"]:
                 raise ConflictError("checkpoint task is not queued for resume")

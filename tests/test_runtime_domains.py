@@ -48,8 +48,13 @@ def test_receipts_are_identical_across_concurrent_replay_and_restart(tmp_path):
             client = WorkspaceClient(daemon.endpoint, daemon.token)
             return client.create_project("Concurrent", slug="concurrent", idempotency_key="concurrent-project")
 
+        # Repeat the fan-in race so a transient SQLite/HTTP 500 cannot hide
+        # behind a single lucky scheduling. Every round must replay the exact
+        # same canonical receipt and leave exactly one project row.
+        results = []
         with ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(lambda _: create_once(), range(6)))
+            for _ in range(20):
+                results.extend(pool.map(lambda _: create_once(), range(6)))
         assert {json.dumps(result.receipt, sort_keys=True) for result in results} == {json.dumps(results[0].receipt, sort_keys=True)}
         project = results[0]
         client = WorkspaceClient(daemon.endpoint, daemon.token)

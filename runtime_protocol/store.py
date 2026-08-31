@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 LEASE_SECONDS = 30
 
 
@@ -171,6 +171,9 @@ class RealmStore:
         if version < 18:
             self._run_migration(18)
             version = 18
+        if version < 19:
+            self._run_migration(19)
+            version = 19
 
     def _run_receipt_backfill_migration(self):
         """Backfill pre-016 rows inside one retryable migration transaction."""
@@ -278,7 +281,7 @@ class RealmStore:
                 ).fetchall()
                 for task in interrupted:
                     self.conn.execute(
-                        "UPDATE tasks SET status='queued', worker_id=NULL, lease_token=NULL, lease_expires_at=NULL, attempt_id=NULL, waiting_reason='runtime_recovery', updated_at=? WHERE id=? AND status='running'",
+                        "UPDATE tasks SET status='queued', executor_id=NULL, lease_token=NULL, lease_expires_at=NULL, attempt_id=NULL, waiting_reason='runtime_recovery', updated_at=? WHERE id=? AND status='running'",
                         (started_at, task["id"]),
                     )
                     self.conn.execute(
@@ -716,7 +719,7 @@ class RealmStore:
             if not expired:
                 continue
             timestamp = now()
-            self.conn.execute("UPDATE tasks SET status='queued', worker_id=NULL, lease_token=NULL, lease_expires_at=NULL, waiting_reason='waiting_for_worker', updated_at=? WHERE id=?", (timestamp, row["id"]))
+            self.conn.execute("UPDATE tasks SET status='queued', executor_id=NULL, lease_token=NULL, lease_expires_at=NULL, waiting_reason='waiting_for_worker', updated_at=? WHERE id=?", (timestamp, row["id"]))
             self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=? AND status='running'", (timestamp, row["run_id"]))
             self._release_reservations(row["id"], row["lease_token"])
             self._append_event(row["run_id"], row["id"], "task.lease_expired", {"waiting_reason": "waiting_for_worker"})
@@ -759,12 +762,7 @@ class RealmStore:
         # omitted epoch is ambiguous and is rejected rather than allowing a
         # stale client to mutate the new session.
         if supplied is None and identity_id:
-            table = "executors" if identity == "executor" else "workers"
-            row = self.conn.execute(f"SELECT runtime_epoch FROM {table} WHERE id=?", (identity_id,)).fetchone()
-            # The legacy worker claim route uses the worker registry directly;
-            # it is still an executor identity for epoch-fencing purposes.
-            if row is None and identity == "executor":
-                row = self.conn.execute("SELECT runtime_epoch FROM workers WHERE id=?", (identity_id,)).fetchone()
+            row = self.conn.execute("SELECT runtime_epoch FROM executors WHERE id=?", (identity_id,)).fetchone()
             if row and int(row[0]) != current:
                 raise LeaseError(f"{identity} runtime epoch is required after restart", details={"expected": current})
         # For a supplied epoch, always apply the identity fence.
@@ -777,42 +775,42 @@ class RealmStore:
                 raise LeaseError(f"{identity} belongs to a stale runtime epoch", details={"expected": current, "actual": supplied})
         return current
 
-    def set_worker_readiness(self, worker_id, *, ready, reason=None, runtime_epoch=None):
-        if not worker_id:
-            raise ValidationError("worker_id is required")
+    def set_executor_readiness(self, executor_id, *, ready, reason=None, runtime_epoch=None):
+        if not executor_id:
+            raise ValidationError("executor_id is required")
         if not isinstance(ready, bool):
             raise ValidationError("ready must be a boolean")
         with self._mutex:
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id, required=True)
-            if not self.conn.execute("SELECT 1 FROM workers WHERE id=?", (worker_id,)).fetchone():
-                raise NotFoundError("worker not found")
-            self.conn.execute("UPDATE workers SET readiness=?, readiness_reason=?, last_seen_at=?, runtime_epoch=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "worker_not_ready"), now(), epoch, worker_id))
-            row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
-            return self._worker_result(row)
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id, required=True)
+            if not self.conn.execute("SELECT 1 FROM executors WHERE id=?", (executor_id,)).fetchone():
+                raise NotFoundError("executor not found")
+            self.conn.execute("UPDATE executors SET readiness=?, readiness_reason=?, last_seen_at=?, runtime_epoch=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "executor_not_ready"), now(), epoch, executor_id))
+            row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+            return self._executor_result(row)
 
-    def heartbeat_worker(self, worker_id, *, ready=None, reason=None, runtime_epoch=None):
-        if not worker_id:
-            raise ValidationError("worker_id is required")
+    def heartbeat_executor(self, executor_id, *, ready=None, reason=None, runtime_epoch=None):
+        if not executor_id:
+            raise ValidationError("executor_id is required")
         with self._mutex:
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id, required=True)
-            row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id, required=True)
+            row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             if not row:
-                raise NotFoundError("worker not found")
+                raise NotFoundError("executor not found")
             if ready is not None:
                 if not isinstance(ready, bool):
                     raise ValidationError("ready must be a boolean")
-                self.conn.execute("UPDATE workers SET readiness=?, readiness_reason=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "worker_not_ready"), worker_id))
-            self.conn.execute("UPDATE workers SET last_seen_at=?, runtime_epoch=? WHERE id=?", (now(), epoch, worker_id))
-            return self._worker_result(self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone())
+                self.conn.execute("UPDATE executors SET readiness=?, readiness_reason=? WHERE id=?", ("ready" if ready else "not_ready", None if ready else (reason or "executor_not_ready"), executor_id))
+            self.conn.execute("UPDATE executors SET last_seen_at=?, runtime_epoch=? WHERE id=?", (now(), epoch, executor_id))
+            return self._executor_result(self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone())
 
-    def _worker_result(self, row):
+    def _executor_result(self, row):
         result = dict(row)
         result["capabilities"] = json.loads(result.pop("capabilities_json"))
         result["resource_keys"] = json.loads(result.pop("resource_keys_json"))
         result.setdefault("readiness", "ready")
         return result
 
-    def _worker_capability_ids(self, row):
+    def _executor_capability_ids(self, row):
         values = json.loads(row["capabilities_json"])
         return {item if isinstance(item, str) else item.get("capability_id", item.get("id")) for item in values}
 
@@ -826,7 +824,7 @@ class RealmStore:
         available = int(shutil.disk_usage(self.root).free)
         return {"ok": available >= required, "required_bytes": required, "available_bytes": available, "reason": None if available >= required else "insufficient_storage"}
 
-    def claim_task(self, task_id, worker_id, lease_token, *, runtime_epoch=None, _transactional=True):
+    def _claim_task(self, task_id, executor_id, lease_token, *, runtime_epoch=None, _transactional=True):
         """Claim one exact task, optionally as part of a larger mutation.
 
         ``claim_next`` must persist task claim, attempt fence, and its
@@ -835,9 +833,9 @@ class RealmStore:
         to reuse the same claim checks without a nested ``BEGIN``.
         """
         with self._mutex:
-            if not worker_id or not lease_token:
-                raise ValidationError("worker_id and lease_token are required")
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id, required=True)
+            if not executor_id or not lease_token:
+                raise ValidationError("executor_id and lease_token are required")
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id, required=True)
             transaction = self._transaction() if _transactional else nullcontext()
             with transaction:
                 self._reap_expired_leases()
@@ -846,12 +844,12 @@ class RealmStore:
                     raise NotFoundError("task not found")
                 if task["status"] != "queued":
                     raise ConflictError("task is not claimable", details={"status": task["status"]})
-                worker = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
+                executor = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
                 capability = self.conn.execute("SELECT status FROM capabilities WHERE id=?", (task["capability"],)).fetchone()
                 waiting_reason = None
-                if not worker:
+                if not executor:
                     waiting_reason = "waiting_for_worker"
-                elif worker["readiness"] != "ready":
+                elif executor["readiness"] != "ready":
                     waiting_reason = "waiting_for_worker"
                 elif not capability and task["capability_digest"] is not None:
                     raise ConflictError("capability is not registered", details={"capability_id": task["capability"]})
@@ -859,19 +857,19 @@ class RealmStore:
                     waiting_reason = "capability_unavailable"
                 elif not self.storage_preflight(task["capability"])["ok"]:
                     waiting_reason = "insufficient_storage"
-                elif task["capability"] not in self._worker_capability_ids(worker):
+                elif task["capability"] not in self._executor_capability_ids(executor):
                     waiting_reason = "waiting_for_worker"
                 else:
-                    active = self.conn.execute("SELECT COUNT(*) FROM tasks WHERE worker_id=? AND status='running'", (worker_id,)).fetchone()[0]
-                    if active >= worker["max_concurrency"]:
+                    active = self.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
+                    if active >= executor["max_concurrency"]:
                         waiting_reason = "waiting_for_worker"
                     else:
-                        available = set(json.loads(worker["resource_keys_json"]))
+                        available = set(json.loads(executor["resource_keys_json"]))
                         for key in self._required_resource_keys(task["capability"]):
                             if key not in available:
                                 waiting_reason = self._waiting_for_resource(key)
                                 break
-                            occupied = self.conn.execute("SELECT 1 FROM reservations WHERE worker_id=? AND resource_key=? AND released_at IS NULL LIMIT 1", (worker_id, key)).fetchone()
+                            occupied = self.conn.execute("SELECT 1 FROM reservations WHERE executor_id=? AND resource_key=? AND released_at IS NULL LIMIT 1", (executor_id, key)).fetchone()
                             if occupied:
                                 waiting_reason = self._waiting_for_resource(key)
                                 break
@@ -881,25 +879,24 @@ class RealmStore:
                 timestamp = now()
                 fence = int(task["lease_fence"] or 0) + 1
                 deadline = (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="milliseconds")
-                self.conn.execute("UPDATE tasks SET status='running', worker_id=?, lease_token=?, lease_fence=?, lease_expires_at=?, waiting_reason=NULL, attempt=attempt+1, runtime_epoch=?, updated_at=? WHERE id=? AND status='queued'", (worker_id, lease_token, fence, deadline, epoch, timestamp, task_id))
+                self.conn.execute("UPDATE tasks SET status='running', executor_id=?, lease_token=?, lease_fence=?, lease_expires_at=?, waiting_reason=NULL, attempt=attempt+1, runtime_epoch=?, updated_at=? WHERE id=? AND status='queued'", (executor_id, lease_token, fence, deadline, epoch, timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='running', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
-                self.conn.execute("UPDATE workers SET runtime_epoch=?, last_seen_at=? WHERE id=?", (epoch, timestamp, worker_id))
+                self.conn.execute("UPDATE executors SET runtime_epoch=?, last_seen_at=? WHERE id=?", (epoch, timestamp, executor_id))
                 for key in self._required_resource_keys(task["capability"]):
-                    self.conn.execute("INSERT INTO reservations(task_id, resource_key, lease_token, created_at, released_at, worker_id, fence, lease_expires_at, runtime_epoch) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?) ON CONFLICT(task_id, resource_key) DO UPDATE SET lease_token=excluded.lease_token, created_at=excluded.created_at, released_at=NULL, worker_id=excluded.worker_id, fence=excluded.fence, lease_expires_at=excluded.lease_expires_at, runtime_epoch=excluded.runtime_epoch", (task_id, key, lease_token, timestamp, worker_id, fence, deadline, epoch))
-                self._append_event(task["run_id"], task_id, "task.claimed", {"worker_id": worker_id, "attempt": task["attempt"] + 1, "fence": fence, "resource_keys": self._required_resource_keys(task["capability"])})
+                    self.conn.execute("INSERT INTO reservations(task_id, resource_key, lease_token, created_at, released_at, executor_id, fence, lease_expires_at, runtime_epoch) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?) ON CONFLICT(task_id, resource_key) DO UPDATE SET lease_token=excluded.lease_token, created_at=excluded.created_at, released_at=NULL, executor_id=excluded.executor_id, fence=excluded.fence, lease_expires_at=excluded.lease_expires_at, runtime_epoch=excluded.runtime_epoch", (task_id, key, lease_token, timestamp, executor_id, fence, deadline, epoch))
+                self._append_event(task["run_id"], task_id, "task.claimed", {"executor_id": executor_id, "attempt": task["attempt"] + 1, "fence": fence, "resource_keys": self._required_resource_keys(task["capability"])})
                 return self.get_task(task_id)
 
-    def register_worker(self, worker_id, capabilities, max_concurrency=1, resource_keys=None, *, readiness="ready", readiness_reason=None, runtime_epoch=None):
-        if not worker_id or max_concurrency < 1:
-            raise ValidationError("worker_id and positive max_concurrency are required")
+    def upsert_executor(self, executor_id, capabilities, max_concurrency=1, resource_keys=None, *, protocol="workspace.v1", readiness="ready", readiness_reason=None, runtime_epoch=None):
+        if not executor_id or max_concurrency < 1:
+            raise ValidationError("executor_id and positive max_concurrency are required")
         if readiness not in {"ready", "not_ready"}:
             raise ValidationError("readiness must be ready or not_ready")
         with self._mutex:
             # Epoch fencing is deliberately the first operation under the
-            # owner lock.  In particular, do not inspect/register capability
-            # descriptors before rejecting a stale or omitted epoch: a stale
-            # worker must have zero capability and worker side effects.
-            epoch = self._validate_runtime_epoch(runtime_epoch, identity="worker", identity_id=worker_id)
+            # owner lock. A stale executor must have zero capability or
+            # registration side effects.
+            epoch = self._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id)
             capability_values = list(capabilities or [])
             capability_ids = []
             descriptors = []
@@ -922,9 +919,9 @@ class RealmStore:
             for capability_id, value in descriptors:
                 self.register_capability(capability_id, value["definition_digest"], required_resource_keys=value.get("required_resource_keys"), status=value.get("status", "ready"), unavailable_reason=value.get("unavailable_reason"), estimated_scratch_bytes=value.get("estimated_scratch_bytes", 0), estimated_output_bytes=value.get("estimated_output_bytes", 0))
             timestamp = now()
-            self.conn.execute("INSERT INTO workers(id, capabilities_json, max_concurrency, resource_keys_json, created_at, last_seen_at, readiness, readiness_reason, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, last_seen_at=excluded.last_seen_at, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, runtime_epoch=excluded.runtime_epoch", (worker_id, canonical_json(capability_ids), max_concurrency, canonical_json(keys), timestamp, timestamp, readiness, None if readiness == "ready" else (readiness_reason or "worker_not_ready"), epoch))
-            row = self.conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
-            return self._worker_result(row)
+            self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp))
+            row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+            return self._executor_result(row)
 
     def _validate_settlement_effect(self, effect):
         if not isinstance(effect, dict):
@@ -1015,7 +1012,7 @@ class RealmStore:
             with self._transaction():
                 self.conn.execute("UPDATE tasks SET lease_expires_at=?, updated_at=? WHERE id=?", (deadline, now(), task_id))
                 self.conn.execute("UPDATE reservations SET lease_expires_at=? WHERE task_id=? AND lease_token=? AND released_at IS NULL", (deadline, task_id, lease_token))
-                self.conn.execute("UPDATE workers SET last_seen_at=? WHERE id=?", (now(), task["worker_id"]))
+                self.conn.execute("UPDATE executors SET last_seen_at=? WHERE id=?", (now(), task["executor_id"]))
             return self.get_task(task_id)
 
     def cancel_task(self, task_id):
@@ -1026,7 +1023,7 @@ class RealmStore:
             if task["status"] in ("completed", "cancelled"):
                 return self.get_task(task_id)
             with self._transaction():
-                self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, worker_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
+                self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
                 self._append_event(task["run_id"], task_id, "task.cancelled", {})
@@ -1054,7 +1051,7 @@ class RealmStore:
                 for task in children:
                     if task["status"] in {"completed", "failed", "cancelled"}:
                         continue
-                    self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, worker_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
+                    self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
                     self._release_reservations(task["id"], task["lease_token"])
                     self._append_event(run_id, task["id"], "task.cancelled", {"reason": "run.cancelled"})
                     cancelled.append(task["id"])
@@ -1102,7 +1099,7 @@ class RealmStore:
                 retried = []
                 for task in eligible:
                     self._release_reservations(task["id"], task["lease_token"])
-                    self.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, worker_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
+                    self.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
                     self._append_event(run_id, task["id"], "task.retried", {"from_status": "failed", "attempt": int(task["attempt"] or 0) + 1, "reason": "run.retry"})
                     retried.append(task["id"])
                 self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, run_id))
@@ -1160,7 +1157,7 @@ class RealmStore:
         fk = [tuple(row) for row in fk_rows]
         expected_tables = {
             "realm", "projects", "objects", "project_objects", "runs", "tasks",
-            "events", "workers", "reservations", "capabilities", "schema_migrations",
+            "events", "executors", "reservations", "capabilities", "schema_migrations",
             "project_documents", "generations", "generation_variants", "timelines",
             "timeline_shots", "timeline_references", "timeline_revisions",
             "timeline_shot_state", "timeline_reference_state", "media_relations",
