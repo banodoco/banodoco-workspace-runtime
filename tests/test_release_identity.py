@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from runtime_protocol.release_identity import ReleaseIdentityError, create_candidate_core_identity, create_pre_live_identity, load_receipt
+from runtime_protocol.release_identity import ReleaseIdentityError, build_prelive_manifest, create_candidate_core_identity, create_pre_live_identity, load_receipt
 
 
 def _git_repo(root: Path) -> Path:
@@ -35,3 +35,13 @@ def test_runtime_identity_rejects_dirty_checkout(tmp_path: Path) -> None:
     with pytest.raises(ReleaseIdentityError, match="uncommitted"):
         create_pre_live_identity({"NEUTRAL-RUNTIME": repo})
 
+
+def test_runtime_manifest_rejects_missing_seeds(tmp_path: Path) -> None:
+    with pytest.raises(ReleaseIdentityError, match="missing"):
+        build_prelive_manifest({})
+
+
+def test_runtime_receipt_cannot_be_written_inside_component(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    with pytest.raises(ReleaseIdentityError, match="inside"):
+        create_pre_live_identity({"NEUTRAL-RUNTIME": repo}, output=repo / "receipt.json")
