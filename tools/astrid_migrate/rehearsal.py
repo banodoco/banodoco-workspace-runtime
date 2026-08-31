@@ -28,7 +28,9 @@ from .capacity import (
     revalidate_activation_parent,
     revalidate_activation_path,
 )
-from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory
+from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, validate_parent as _validate_parent
+from runtime_protocol.backup import _open_relative, _connection_from_fd, _sha256_at
+from runtime_protocol.dirfd import pin_directory as _pin_directory
 from runtime_protocol.util import now
 
 
@@ -41,6 +43,65 @@ def _write_json(path: Path, value: Mapping[str, Any], *, identity: Mapping[str, 
     finally:
         if own:
             _close_pinned(pinned)
+
+
+def _read_json_pinned(path: Path, *, identity: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    target = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    own_identity = identity is None
+    identity = identity or _capture_parent(target)
+    fd = -1
+    try:
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        parent = Path(str(identity["parent"]))
+        fd = _open_relative(int(identity["_parent_fd"]), target.relative_to(parent))
+        value = os.fstat(fd)
+        if not stat.S_ISREG(value.st_mode):
+            raise MigrationError(f"migration journal is not a regular file: {target}")
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+        result = json.loads(bytes(data).decode("utf-8"))
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        if not isinstance(result, dict):
+            raise MigrationError(f"migration journal is not an object: {target}")
+        return result
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise MigrationError(f"migration journal is corrupt or interrupted: {target}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if own_identity:
+            _close_pinned(identity)
+
+
+def _hash_file_pinned(path: Path) -> str:
+    target = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+    identity = _capture_parent(target)
+    fd = -1
+    try:
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        parent = Path(str(identity["parent"]))
+        fd = _open_relative(int(identity["_parent_fd"]), target.relative_to(parent))
+        value = os.fstat(fd)
+        if not stat.S_ISREG(value.st_mode):
+            raise MigrationError(f"artifact is not a regular file: {target}")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        return digest.hexdigest()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        _close_pinned(identity)
 
 
 def _tree_digest(root: Path) -> str:
@@ -520,12 +581,18 @@ class RuntimeServiceAdapter:
         snapshot["documents"] = rows("project_documents")
         snapshot["media_locations"] = [{"digest": row["digest"], "realm": "cas", "locator": str(self.service.cas.root / row["digest"][:2] / row["digest"][2:])} for row in snapshot.get("objects", [])]
         cas_objects = []
-        for row in snapshot.get("objects", []):
-            digest = str(row["digest"])
-            path = self.service.cas.root / digest[:2] / digest[2:]
-            if not path.is_file():
-                continue
-            cas_objects.append({"digest": digest, "size": path.stat().st_size, "sha256": _sha256_file(path), "locator": str(path)})
+        cas_identity, cas_fd, _ = _pin_directory(self.service.cas.root)
+        try:
+            for row in snapshot.get("objects", []):
+                digest = str(row["digest"])
+                try:
+                    actual_hash, actual_size = _sha256_at(cas_fd, f"{digest[:2]}/{digest[2:]}")
+                except OSError:
+                    continue
+                cas_objects.append({"digest": digest, "size": actual_size, "sha256": actual_hash, "locator": str(self.service.cas.root / digest[:2] / digest[2:])})
+        finally:
+            os.close(cas_fd)
+            _close_pinned(cas_identity)
         snapshot["cas_objects"] = cas_objects
         # The migration ledger is a native, durable representation of the
         # source stream graph.  Expose it in source-compatible columns for
@@ -828,11 +895,11 @@ class MigrationJournal:
         return hashlib.sha256(_canonical(body)).hexdigest()
 
     def _read(self) -> dict[str, Any]:
-        if not self.path.is_file():
-            return {"format_version": 1, "generation": 0, "state": "prepared", "entries": []}
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            value = _read_json_pinned(self.path, identity=self._path_identity)
+        except FileNotFoundError:
+            return {"format_version": 1, "generation": 0, "state": "prepared", "entries": []}
+        except (OSError, json.JSONDecodeError, MigrationError) as exc:
             raise MigrationError("migration journal is corrupt or interrupted") from exc
         if not isinstance(value, dict) or value.get("format_version") != 1 or not isinstance(value.get("entries"), list) or not isinstance(value.get("effects", []), list):
             raise MigrationError("migration journal has an invalid envelope")
@@ -1174,11 +1241,14 @@ class Rehearsal:
             # insufficient if rollback still contains imported entities or if
             # the candidate cannot be reactivated.
             def restored_counts(path):
-                db = sqlite3.connect(path / "realm.sqlite3")
+                identity, root_fd, _ = _pin_directory(path)
+                db = _connection_from_fd(root_fd, "realm.sqlite3")
                 try:
                     return {table: int(db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]) for table in ("projects", "runs", "tasks", "objects")}
                 finally:
                     db.close()
+                    os.close(root_fd)
+                    _close_pinned(identity)
             rollback_counts = restored_counts(restore_root)
             reactivation_counts = restored_counts(reactivation_root)
             if any(rollback_counts.values()):
@@ -1227,21 +1297,22 @@ class Rehearsal:
                 files.append({"path": str(path.relative_to(root)), "size": path.stat().st_size, "sha256": _sha256_file(path)})
         root_digest = hashlib.sha256(_canonical(files)).hexdigest()
         catalog = Path(service.support_root) / "catalog.json" if service.support_root else None
-        catalog_digest = _sha256_file(catalog) if catalog and catalog.is_file() else None
+        try:
+            catalog_digest = _hash_file_pinned(catalog) if catalog else None
+        except FileNotFoundError:
+            catalog_digest = None
         return {"realm_id": service.realm["id"], "root_digest": root_digest, "catalog_digest": catalog_digest, "root": str(root)}
 
     def _restore_or_reuse(self, backup: Path, destination: Path):
         if destination.exists():
-            handoff = destination / "activation-handoff.json"
-            if not handoff.is_file():
-                raise MigrationError(f"existing restore destination has no activation handoff: {destination}")
             try:
-                value = json.loads(handoff.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                handoff = destination / "activation-handoff.json"
+                value = _read_json_pinned(handoff)
+            except (FileNotFoundError, OSError, json.JSONDecodeError, MigrationError) as exc:
                 raise MigrationError(f"existing restore destination is not resumable: {destination}") from exc
             from runtime_protocol.backup import verify_backup
             source_manifest = verify_backup(backup)["manifest"]
-            if value.get("source_manifest_sha256") != _sha256_file(backup / "manifest.json"):
+            if value.get("source_manifest_sha256") != _hash_file_pinned(backup / "manifest.json"):
                 raise MigrationError(f"existing restore destination came from a different backup: {destination}")
             from runtime_protocol.backup import verify_restore_candidate
             try:

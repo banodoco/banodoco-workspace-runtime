@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 import stat
 import time
+import hashlib
+import json
 from typing import Any, Mapping
 
 from .errors import ConflictError
@@ -122,6 +124,51 @@ def _leaf_name(value: str | Path) -> str:
     if not text or Path(text).name != text or text in (".", ".."):
         raise ConflictError("filesystem entry name must be one direct child")
     return text
+
+
+def read_bytes_at(directory_fd: int, name: str | Path) -> bytes:
+    """Read one regular file below a retained directory descriptor."""
+    fd = os.open(_leaf_name(name), os.O_RDONLY | _NOFOLLOW, dir_fd=int(directory_fd))
+    try:
+        value = os.fstat(fd)
+        if not stat.S_ISREG(value.st_mode):
+            raise ConflictError(f"filesystem entry is not a regular file: {name}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_json_at(directory_fd: int, name: str | Path) -> Any:
+    """Decode JSON from a descriptor-relative regular file."""
+    try:
+        value = json.loads(read_bytes_at(directory_fd, name).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ConflictError(f"filesystem JSON artifact is invalid: {name}") from exc
+    return value
+
+
+def sha256_at(directory_fd: int, name: str | Path) -> tuple[str, int]:
+    """Hash one descriptor-relative regular file and return digest and size."""
+    fd = os.open(_leaf_name(name), os.O_RDONLY | _NOFOLLOW, dir_fd=int(directory_fd))
+    try:
+        value = os.fstat(fd)
+        if not stat.S_ISREG(value.st_mode):
+            raise ConflictError(f"filesystem entry is not a regular file: {name}")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest(), int(value.st_size)
+    finally:
+        os.close(fd)
 
 
 def _nearest_existing(path: Path) -> tuple[Path, bool]:

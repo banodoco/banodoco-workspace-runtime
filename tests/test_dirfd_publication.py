@@ -7,6 +7,8 @@ import pytest
 
 import runtime_protocol.backup as backup_module
 from runtime_protocol.dirfd import atomic_json_write
+from runtime_protocol.dirfd import capture_parent, close_pinned
+from runtime_protocol.catalog import RealmCatalog
 import tools.astrid_migrate.migrator as migrator_module
 import tools.astrid_migrate.rehearsal as rehearsal_module
 from runtime_protocol.service import RuntimeService
@@ -167,3 +169,84 @@ def test_atomic_publication_survives_concurrent_parent_swap_loop(tmp_path):
             real_parent.rename(parent)
     assert not any(outside.iterdir())
     assert all(path.is_file() for path in parent.iterdir())
+
+
+def test_backup_verification_read_is_pinned_against_parent_replacement(tmp_path):
+    active = RuntimeService(tmp_path / "active")
+    backup = tmp_path / "backup"
+    active.backup(backup)
+    identity = capture_parent(backup)
+    parent = backup.parent
+    replacement = parent.with_name(parent.name + "-replacement")
+    try:
+        parent.rename(replacement)
+        parent.mkdir()
+        with pytest.raises(ConflictError, match="identity|parent|symlink"):
+            backup_module.verify_backup(backup, directory_identity=identity)
+        assert active.health()["status"] == "ok"
+    finally:
+        close_pinned(identity)
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+        if replacement.exists():
+            replacement.rename(parent)
+        active.close()
+
+
+def test_backup_manifest_file_replacement_at_read_syscall_fails_closed(tmp_path, monkeypatch):
+    active = RuntimeService(tmp_path / "active")
+    backup = tmp_path / "backup"
+    active.backup(backup)
+    original_open = backup_module.os.open
+    replaced = False
+
+    def hostile(name, flags, *args, **kwargs):
+        nonlocal replaced
+        if name == "manifest.json" and not replaced:
+            replaced = True
+            (backup / "manifest.json").write_text("{}", encoding="utf-8")
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(backup_module.os, "open", hostile)
+    try:
+        with pytest.raises(ConflictError):
+            backup_module.verify_backup(backup)
+        assert replaced and active.health()["status"] == "ok"
+    finally:
+        active.close()
+
+
+@pytest.mark.parametrize("journal_factory", [MigrationJournal, RecoveryJournal])
+def test_journal_read_is_pinned_against_parent_replacement(tmp_path, journal_factory):
+    parent = tmp_path / "journal-parent"
+    parent.mkdir()
+    path = parent / "journal.json"
+    journal = journal_factory(path)
+    journal.bind(request="bound")
+    replacement = parent.with_name(parent.name + "-replacement")
+    parent.rename(replacement)
+    parent.mkdir()
+    try:
+        with pytest.raises((ConflictError, MigrationError), match="identity|parent|symlink|journal"):
+            journal.read() if isinstance(journal, RecoveryJournal) else journal._read()
+    finally:
+        del journal
+        parent.rmdir()
+        replacement.rename(parent)
+
+
+def test_catalog_read_rejects_ordinary_parent_replacement(tmp_path):
+    parent = tmp_path / "support"
+    parent.mkdir()
+    catalog_path = parent / "catalog.json"
+    catalog = RealmCatalog(catalog_path)
+    catalog.register(realm_id="realm-1", display_name="Realm", data_root=str(tmp_path / "realm"))
+    replacement = parent.with_name(parent.name + "-replacement")
+    parent.rename(replacement)
+    parent.mkdir()
+    try:
+        with pytest.raises(ConflictError, match="identity|parent|symlink"):
+            catalog.read()
+    finally:
+        parent.rmdir()
+        replacement.rename(parent)

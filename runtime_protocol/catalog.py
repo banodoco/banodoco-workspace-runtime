@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 from typing import Mapping, Any
 
 from .util import atomic_json_write, new_id, now
+from .dirfd import capture_parent, close_pinned, validate_parent
+from .backup import _open_relative
 
 
 def process_birth_identity(pid: int | None = None) -> str | None:
@@ -47,16 +50,50 @@ class RealmCatalog:
 
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser().resolve()
+        self._path_identity = None
 
-    def read(self) -> dict:
-        if not self.path.exists():
+    def __del__(self):  # pragma: no cover - interpreter cleanup
+        try:
+            close_pinned(self._path_identity)
+        except Exception:
+            pass
+
+    def read(self, *, path_identity: Mapping[str, Any] | None = None) -> dict:
+        if path_identity is not None:
+            own = False
+            identity = path_identity
+        else:
+            if self._path_identity is None:
+                self._path_identity = capture_parent(self.path)
+            own = False
+            identity = self._path_identity
+        fd = -1
+        try:
+            validate_parent(self.path, identity, allow_parent_appeared=True)
+            parent = Path(str(identity["parent"]))
+            fd = _open_relative(int(identity["_parent_fd"]), self.path.relative_to(parent))
+            value = os.fstat(fd)
+            if not stat.S_ISREG(value.st_mode):
+                raise ValueError("catalog is not a regular file")
+            data = bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                data.extend(chunk)
+            result = json.loads(bytes(data).decode("utf-8"))
+            validate_parent(self.path, identity, allow_parent_appeared=True)
+            return result
+        except FileNotFoundError:
             return {"version": 1, "realms": [], "selected_realm_id": None}
-        with self.path.open(encoding="utf-8") as stream:
-            value = json.load(stream)
-        return value
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if own:
+                close_pinned(identity)
 
     def register(self, *, realm_id: str, display_name: str, data_root: str, path_identity: Mapping[str, Any] | None = None) -> dict:
-        catalog = self.read()
+        catalog = self.read(path_identity=path_identity)
         realms = [r for r in catalog.get("realms", []) if r.get("realm_id") != realm_id]
         realms.append({"realm_id": realm_id, "display_name": display_name, "data_root": str(Path(data_root).resolve()), "registered_at": now()})
         catalog.update(version=1, realms=realms, selected_realm_id=catalog.get("selected_realm_id") or realm_id)
@@ -64,7 +101,7 @@ class RealmCatalog:
         return catalog
 
     def select(self, realm_id: str, *, path_identity: Mapping[str, Any] | None = None) -> dict:
-        catalog = self.read()
+        catalog = self.read(path_identity=path_identity)
         if not any(row.get("realm_id") == realm_id for row in catalog.get("realms", [])):
             raise KeyError(realm_id)
         catalog["selected_realm_id"] = realm_id

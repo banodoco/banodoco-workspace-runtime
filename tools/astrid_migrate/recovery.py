@@ -15,17 +15,18 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import secrets
 import sqlite3
 import time
 from typing import Any, Callable, Mapping
 
-from runtime_protocol.backup import restore_backup, verify_backup, verify_restore_candidate
+from runtime_protocol.backup import restore_backup, verify_backup, verify_restore_candidate, _json_at, _open_relative, _sha256_at, _connection_from_fd
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.util import canonical_json, new_id
-from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at
+from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_parent as _validate_parent, pin_directory as _pin_directory
 
 from .migrator import MigrationError, _sha256_file
 from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path
@@ -54,6 +55,70 @@ def _has_symlink_component(path: Path) -> bool:
         if current.is_symlink():
             return True
     return False
+
+
+def _read_json_pinned(path: str | Path, *, identity: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Read a JSON artifact through a retained lexical parent descriptor."""
+    target = _absolute_path(path)
+    own_identity = identity is None
+    identity = identity or _capture_parent(target)
+    fd = -1
+    try:
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        parent = Path(str(identity["parent"]))
+        fd = _open_relative(int(identity["_parent_fd"]), target.relative_to(parent))
+        # The target is already pinned; decode its bytes without reopening a
+        # pathname.
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+        value = json.loads(bytes(data).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise MigrationError(f"B13.2 JSON artifact is not an object: {target}")
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        return value
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise MigrationError(f"B13.2 JSON artifact is invalid: {target}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if own_identity:
+            _close_pinned(identity)
+
+
+def _hash_file_pinned(path: str | Path) -> str:
+    target = _absolute_path(path)
+    identity = _capture_parent(target)
+    fd = -1
+    try:
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        parent = Path(str(identity["parent"]))
+        fd = _open_relative(int(identity["_parent_fd"]), target.relative_to(parent))
+        digest = hashlib.sha256()
+        value = os.fstat(fd)
+        if not stat.S_ISREG(value.st_mode):
+            raise MigrationError(f"B13.2 artifact is not a regular file: {target}")
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        _validate_parent(target, identity, allow_parent_appeared=True)
+        return digest.hexdigest()
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise MigrationError(f"B13.2 artifact cannot be hashed: {target}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        _close_pinned(identity)
 
 
 def _host_boot_identity() -> str:
@@ -118,17 +183,16 @@ def _catalog_paths(value: Any, *, key: str = "") -> list[tuple[str, str]]:
     return result
 
 
-def _database_snapshot_sha256(path: Path) -> str:
+def _database_snapshot_sha256(path: Path, *, connection: sqlite3.Connection) -> str:
     """Hash a consistent SQLite view, including committed WAL frames."""
     path = _absolute_path(path)
     parent_identity = _capture_parent(path)
     parent_fd = int(parent_identity.get("_parent_fd"))
-    source = None
+    source = connection
     temporary_name = None
     temporary_fd = -1
     cwd_fd = -1
     try:
-        source = sqlite3.connect(str(path), timeout=10)
         temporary_name, temporary_fd = _mkdir_temp_at(parent_fd, ".b13-db-snapshot-")
         cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
@@ -160,8 +224,6 @@ def _database_snapshot_sha256(path: Path) -> str:
                 os.fchdir(cwd_fd)
             finally:
                 os.close(cwd_fd)
-        if source is not None:
-            source.close()
         if temporary_fd >= 0:
             os.close(temporary_fd)
         if temporary_name is not None:
@@ -173,16 +235,25 @@ def _database_snapshot_sha256(path: Path) -> str:
         _close_pinned(parent_identity)
 
 
-def _database_semantic_sha256(path: Path) -> str:
+def _database_semantic_sha256(path: Path, *, connection: sqlite3.Connection | None = None) -> str:
     """Hash realm data while ignoring startup-owned runtime control rows."""
-    connection = sqlite3.connect(str(path))
+    identity = root_fd = -1
+    own_connection = connection is None
+    if connection is None:
+        identity, root_fd, _ = _pin_directory(Path(path).parent)
+        connection = _connection_from_fd(root_fd, Path(path).name)
     connection.row_factory = sqlite3.Row
     try:
         ignored = {"runtime_lifecycle", "capabilities", "sqlite_sequence"}
         tables = [str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name") if row[0] not in ignored]
         value = {table: [dict(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')] for table in tables}
     finally:
-        connection.close()
+        if own_connection:
+            connection.close()
+        if root_fd >= 0:
+            os.close(root_fd)
+        if identity != -1:
+            _close_pinned(identity)
     return _canonical_digest(value)
 
 
@@ -261,11 +332,11 @@ class RecoveryJournal:
         return _canonical_digest({key: item for key, item in value.items() if key not in {"entry_sha256", "effect_sha256"}})
 
     def read(self) -> dict[str, Any]:
-        if not self.path.is_file():
-            return {"format_version": 1, "generation": 0, "state": "prepared", "entries": [], "effects": []}
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            value = _read_json_pinned(self.path, identity=self._path_identity)
+        except FileNotFoundError:
+            return {"format_version": 1, "generation": 0, "state": "prepared", "entries": [], "effects": []}
+        except (OSError, ValueError, MigrationError) as exc:
             raise MigrationError("B13.2 recovery journal is corrupt or interrupted") from exc
         if not isinstance(value, dict) or value.get("format_version") != 1 or not isinstance(value.get("entries"), list) or not isinstance(value.get("effects"), list):
             raise MigrationError("B13.2 recovery journal has an invalid envelope")
@@ -451,9 +522,13 @@ class B13Recovery:
             payload = effect.get("payload", {})
             if payload.get("domain_ids") != sorted(plan.domains):
                 raise MigrationError("B13.2 capacity reservation conflicts with its durable receipt")
-            if not capacity_path.is_file() or payload.get("receipt_sha256") != _sha256_file(capacity_path):
+            try:
+                stored = _read_json_pinned(capacity_path)
+                stored_sha256 = _hash_file_pinned(capacity_path)
+            except FileNotFoundError as exc:
+                raise MigrationError("B13.2 capacity receipt is missing or changed") from exc
+            if payload.get("receipt_sha256") != stored_sha256:
                 raise MigrationError("B13.2 capacity receipt is missing or changed")
-            stored = json.loads(capacity_path.read_text(encoding="utf-8"))
             if stored.get("reserved") is not True:
                 raise MigrationError("B13.2 capacity receipt is not reserved")
             # Reconstruct the original reservation amounts.  Existing output
@@ -483,7 +558,7 @@ class B13Recovery:
             try:
                 receipt["reserved"] = True
                 self._write("capacity-receipt-b13.json", receipt)
-                journal.effect("capacity-reservation", reservation_id=reservation_id, domain_ids=sorted(plan.domains), required_bytes=receipt["required_bytes"], receipt_sha256=_sha256_file(capacity_path))
+                journal.effect("capacity-reservation", reservation_id=reservation_id, domain_ids=sorted(plan.domains), required_bytes=receipt["required_bytes"], receipt_sha256=_hash_file_pinned(capacity_path))
                 return reservation
             except Exception:
                 reservation.release()
@@ -576,20 +651,19 @@ class B13Recovery:
             return result
         if _has_symlink_component(catalog):
             raise MigrationError("B13.2 cannot classify a disposable target through a symlinked catalog")
-        if not os.path.lexists(str(catalog)):
-            raise MigrationError("B13.2 cannot classify a disposable target without its catalog")
-        if not catalog.is_file():
-            raise MigrationError("B13.2 disposable target catalog is not a regular file")
         try:
-            catalog_value = json.loads(catalog.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            catalog_value = _read_json_pinned(catalog)
+            catalog_sha256 = _hash_file_pinned(catalog)
+        except FileNotFoundError as exc:
+            raise MigrationError("B13.2 cannot classify a disposable target without its catalog") from exc
+        except (OSError, ValueError, MigrationError) as exc:
             raise MigrationError("B13.2 cannot classify a disposable target against an invalid catalog") from exc
         if not isinstance(catalog_value, Mapping):
             raise MigrationError("B13.2 disposable target catalog is not an object")
         realms = catalog_value.get("realms")
         if not isinstance(realms, list) or not isinstance(catalog_value.get("selected_realm_id"), str) or not catalog_value.get("selected_realm_id", "").strip():
             raise MigrationError("B13.2 disposable target catalog is incomplete")
-        result["catalog_sha256"] = _sha256_file(catalog)
+        result["catalog_sha256"] = catalog_sha256
         selected_realm = catalog_value.get("selected_realm_id")
         for row in realms:
             if not isinstance(row, Mapping):
@@ -685,11 +759,9 @@ class B13Recovery:
 
     def _read_purge_marker(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         marker = Path(str(payload.get("marker_path", "")))
-        if _has_symlink_component(marker) or not marker.is_file():
-            raise MigrationError("B13.2 purge marker is missing or unsafe")
         try:
-            value = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            value = _read_json_pinned(marker)
+        except (FileNotFoundError, OSError, ValueError, MigrationError) as exc:
             raise MigrationError("B13.2 purge marker is unreadable") from exc
         if not isinstance(value, dict) or _canonical_digest(value) != payload.get("marker_sha256"):
             raise MigrationError("B13.2 purge marker digest changed")
@@ -966,7 +1038,7 @@ class B13Recovery:
             # capability metadata). Compare the candidate's semantic realm
             # content, not the main SQLite file, so a WAL-only user mutation
             # cannot make an activation appear reusable.
-            if _database_semantic_sha256(current.store.db_path) != _database_semantic_sha256(candidate / "realm.sqlite3"):
+            if _database_semantic_sha256(current.store.db_path, connection=current.store.conn) != _database_semantic_sha256(candidate / "realm.sqlite3"):
                 return False
             return self._cas_content_map(_absolute_path(current.store.root)) == self._cas_content_map(candidate)
         except Exception:
@@ -1002,31 +1074,32 @@ class B13Recovery:
         if _has_symlink_component(activation_path):
             raise MigrationError("B13.2 activation manifest path contains a symlink")
         activation = {"status": "not_configured", "sha256": None}
-        if activation_path.exists():
-            if not activation_path.is_file():
-                raise MigrationError("B13.2 activation manifest is not a regular file")
+        try:
+            value = _read_json_pinned(activation_path)
+            activation_sha256 = _hash_file_pinned(activation_path)
+        except FileNotFoundError:
+            value = None
+        if value is not None:
             try:
-                value = json.loads(activation_path.read_text(encoding="utf-8"))
+                if not isinstance(value, Mapping) or value.get("state") != "activated":
+                    raise MigrationError("B13.2 activation manifest identity is invalid")
             except (OSError, ValueError) as exc:
                 raise MigrationError("B13.2 activation manifest is unreadable") from exc
-            if not isinstance(value, Mapping) or value.get("state") != "activated":
-                raise MigrationError("B13.2 activation manifest identity is invalid")
             if not isinstance(value.get("destination_root"), str) or not value.get("destination_root", "").strip():
                 raise MigrationError("B13.2 activation manifest has no destination identity")
-            activation = {"status": "ready", "sha256": _sha256_file(activation_path), "state": value.get("state"), "destination_root": value.get("destination_root")}
+            activation = {"status": "ready", "sha256": activation_sha256, "state": value.get("state"), "destination_root": value.get("destination_root")}
         catalog = {"status": "not_configured", "sha256": None}
         if self.active_runtime.support_root is not None:
             path = _absolute_path(self.active_runtime.support_root) / "catalog.json"
-            if _has_symlink_component(path) or not path.is_file():
-                raise MigrationError("B13.2 catalog is missing")
             try:
-                value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
+                value = _read_json_pinned(path)
+                catalog_sha256 = _hash_file_pinned(path)
+            except (FileNotFoundError, OSError, ValueError, MigrationError) as exc:
                 raise MigrationError("B13.2 catalog is unreadable") from exc
             rows = [row for row in value.get("realms", []) if isinstance(row, Mapping) and row.get("realm_id") == realm_id]
             if value.get("selected_realm_id") != realm_id or len(rows) != 1 or _absolute_path(rows[0].get("data_root", "")) != root:
                 raise MigrationError("B13.2 catalog selection or data-root identity changed")
-            catalog = {"status": "ready", "sha256": _sha256_file(path), "selected_realm_id": realm_id, "data_root": str(root)}
+            catalog = {"status": "ready", "sha256": catalog_sha256, "selected_realm_id": realm_id, "data_root": str(root)}
         return {"activation_manifest": activation, "catalog": catalog}
 
     def _verify_purge_terminal(self, identity: Mapping[str, Any], realm_id: str) -> None:
@@ -1046,12 +1119,13 @@ class B13Recovery:
         self._read_purge_marker(payload)
         self._revalidate_purge_target(target, realm_id, payload)
         receipt_path = self.evidence_root / "purge-receipt-b13.json"
-        if _has_symlink_component(receipt_path) or not receipt_path.is_file() or identity.get("purge_receipt_sha256") != _sha256_file(receipt_path):
-            raise MigrationError("B13.2 terminal purge receipt is missing or changed")
         try:
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise MigrationError("B13.2 terminal purge receipt is unreadable") from exc
+            receipt = _read_json_pinned(receipt_path)
+            receipt_sha256 = _hash_file_pinned(receipt_path)
+        except (FileNotFoundError, OSError, ValueError, MigrationError) as exc:
+            raise MigrationError("B13.2 terminal purge receipt is missing or changed") from exc
+        if identity.get("purge_receipt_sha256") != receipt_sha256:
+            raise MigrationError("B13.2 terminal purge receipt is missing or changed")
         if not isinstance(receipt, Mapping) or receipt.get("purged") is not True or receipt.get("target") != payload.get("target") or receipt.get("marker_sha256") != payload.get("marker_sha256"):
             raise MigrationError("B13.2 terminal purge receipt does not prove target absence")
 
@@ -1092,9 +1166,9 @@ class B13Recovery:
         current_epoch = int(self.active_runtime.health()["runtime_epoch"])
         same_session = identity.get("runtime_session_id") == getattr(self.active_runtime, "runtime_session_id", None)
         if same_session or current_epoch <= identity_epoch:
-            if identity.get("database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path):
+            if identity.get("database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path, connection=self.active_runtime.store.conn):
                 raise MigrationError("B13.2 terminal replay conflicts with active live database identity")
-        elif identity.get("database_semantic_sha256") != _database_semantic_sha256(self.active_runtime.store.db_path):
+        elif identity.get("database_semantic_sha256") != _database_semantic_sha256(self.active_runtime.store.db_path, connection=self.active_runtime.store.conn):
             raise MigrationError("B13.2 terminal replay conflicts with active durable database state")
         if identity.get("cas_manifest_sha256") != _canonical_digest(sorted([{key: item.get(key) for key in ("digest", "size", "sha256")} for item in snapshot.get("cas_objects", [])], key=lambda item: str(item.get("digest")))):
             raise MigrationError("B13.2 terminal replay conflicts with active CAS content")
@@ -1194,16 +1268,17 @@ class B13Recovery:
                 if base_receipt.get("classification") != dict(classification):
                     raise MigrationError("B13.2 recovery-base classification conflicts with its durable receipt")
                 receipt_path = self.evidence_root / "b13-recovery-base.json"
-                if receipt_path.is_file():
-                    try:
-                        if json.loads(receipt_path.read_text(encoding="utf-8")) != {"packet": "B13.2", **base_receipt}:
-                            raise MigrationError("B13.2 recovery-base receipt conflicts with its durable effect")
-                    except (OSError, ValueError) as exc:
-                        raise MigrationError("B13.2 recovery-base receipt is unreadable") from exc
-                else:
+                try:
+                    existing_receipt = _read_json_pinned(receipt_path)
+                except FileNotFoundError:
                     self._write("b13-recovery-base.json", base_receipt)
+                except (OSError, ValueError, MigrationError) as exc:
+                    raise MigrationError("B13.2 recovery-base receipt is unreadable") from exc
+                else:
+                    if existing_receipt != {"packet": "B13.2", **base_receipt}:
+                        raise MigrationError("B13.2 recovery-base receipt conflicts with its durable effect")
             else:
-                base_receipt = {"packet": "B13.2", "realm_id": realm_id, "active_root": str(self.active_runtime.store.root), "recovery_base_backup": str(self.recovery_base_backup), "recovery_base_manifest_sha256": _sha256_file(self.recovery_base_backup / "manifest.json"), "rollback_archive": str(self.rollback_archive), "rollback_archive_manifest_sha256": _sha256_file(self.rollback_archive / "manifest.json"), "active_runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "classification": classification}
+                base_receipt = {"packet": "B13.2", "realm_id": realm_id, "active_root": str(self.active_runtime.store.root), "recovery_base_backup": str(self.recovery_base_backup), "recovery_base_manifest_sha256": _hash_file_pinned(self.recovery_base_backup / "manifest.json"), "rollback_archive": str(self.rollback_archive), "rollback_archive_manifest_sha256": _hash_file_pinned(self.rollback_archive / "manifest.json"), "active_runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "classification": classification}
                 self._write("b13-recovery-base.json", base_receipt)
                 journal.effect("recovery-base", **base_receipt)
             self._restore_or_reuse(self.recovery_base_backup, self.disposable_root, realm_id=realm_id, journal=journal, effect_name="disposable-restore", seam="disposable_restore")
@@ -1217,18 +1292,18 @@ class B13Recovery:
             purge = self._purge_disposable(journal, realm_id, classification)
             purge_receipt_path = self.evidence_root / "purge-receipt-b13.json"
             purge_receipt = {"packet": "B13.2", **purge}
-            if os.path.lexists(str(purge_receipt_path)):
-                if _has_symlink_component(purge_receipt_path) or not purge_receipt_path.is_file():
-                    raise MigrationError("B13.2 durable purge receipt is not a regular file")
-                try:
-                    existing_receipt = json.loads(purge_receipt_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError) as exc:
-                    raise MigrationError("B13.2 durable purge receipt is unreadable") from exc
+            try:
+                existing_receipt = _read_json_pinned(purge_receipt_path)
+            except FileNotFoundError:
+                existing_receipt = None
+            except (OSError, ValueError, MigrationError) as exc:
+                raise MigrationError("B13.2 durable purge receipt is unreadable") from exc
+            if existing_receipt is not None:
                 if existing_receipt != purge_receipt:
                     raise MigrationError("B13.2 durable purge receipt conflicts with the purge effect")
             else:
                 self._write("purge-receipt-b13.json", purge_receipt)
-            journal.transition("purged", purge_receipt_sha256=_sha256_file(purge_receipt_path))
+            journal.transition("purged", purge_receipt_sha256=_hash_file_pinned(purge_receipt_path))
             current = journal.read()
 
         if current["state"] == "purged":
@@ -1237,7 +1312,7 @@ class B13Recovery:
                 checkpoint_payload = checkpoint["payload"]
             else:
                 snapshot = RuntimeServiceAdapter(self.active_runtime).destination_snapshot()
-                checkpoint_payload = {"packet": "B13.2", "checkpoint_id": new_id(), "realm_id": realm_id, "active_root": str(self.active_runtime.store.root.resolve()), "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "runtime_session_id_before": self._runtime_session(self.active_runtime), "boot_identity_before": self._boot_identity(), "authorization_nonce_sha256": self._nonce_digest(self.authorizations["AUTH-REBOOT-R2"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(snapshot)), "recovery_base_manifest_sha256": _sha256_file(self.recovery_base_backup / "manifest.json"), "rollback_archive_manifest_sha256": _sha256_file(self.rollback_archive / "manifest.json"), "created_at": time.time()}
+                checkpoint_payload = {"packet": "B13.2", "checkpoint_id": new_id(), "realm_id": realm_id, "active_root": str(self.active_runtime.store.root.resolve()), "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "runtime_session_id_before": self._runtime_session(self.active_runtime), "boot_identity_before": self._boot_identity(), "authorization_nonce_sha256": self._nonce_digest(self.authorizations["AUTH-REBOOT-R2"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(snapshot)), "recovery_base_manifest_sha256": _hash_file_pinned(self.recovery_base_backup / "manifest.json"), "rollback_archive_manifest_sha256": _hash_file_pinned(self.rollback_archive / "manifest.json"), "created_at": time.time()}
                 self._write("checkpoint-r2.json", checkpoint_payload)
                 journal.effect("checkpoint", **checkpoint_payload)
             self._consume_auth(journal, "AUTH-REBOOT-R2", realm_id)
@@ -1277,7 +1352,7 @@ class B13Recovery:
                 rollback = self._activate(candidate, "rolled_back", realm_id=realm_id, journal=journal, seam="final_rollback_activation")
                 journal.effect("final-rollback-activation", activation=rollback, destination=str(candidate), runtime_epoch=int(self.active_runtime.health()["runtime_epoch"]))
             rollback_snapshot = RuntimeServiceAdapter(self.active_runtime).destination_snapshot()
-            rollback_identity = {"realm_id": realm_id, "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(rollback_snapshot)), "database_sha256": _database_snapshot_sha256(self.active_runtime.store.db_path)}
+            rollback_identity = {"realm_id": realm_id, "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(rollback_snapshot)), "database_sha256": _database_snapshot_sha256(self.active_runtime.store.db_path, connection=self.active_runtime.store.conn)}
             self._write("activated-destination-b13-rollback.json", {"packet": "B13.2", "state": "rolled_back", **rollback_identity})
             journal.transition("rolled_back", activation=rollback, identity=rollback_identity)
             current = journal.read()
@@ -1306,7 +1381,7 @@ class B13Recovery:
             checkpoint = journal.effects()["checkpoint"]["payload"]
             purge_receipt_path = self.evidence_root / "purge-receipt-b13.json"
             artifacts = self._activation_catalog_identity(realm_id)
-            identity = {"packet": "B13.2", "state": "reactivated", "realm_id": realm_id, "root": str(self.active_runtime.store.root.resolve()), "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "runtime_session_id": self.active_runtime.runtime_session_id, "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(final_snapshot)), "database_sha256": _database_snapshot_sha256(self.active_runtime.store.db_path), "database_semantic_sha256": _database_semantic_sha256(self.active_runtime.store.db_path), "cas_manifest_sha256": _canonical_digest(sorted([{key: item.get(key) for key in ("digest", "size", "sha256")} for item in final_snapshot.get("cas_objects", [])], key=lambda item: str(item.get("digest")))), "recovery_base_manifest_sha256": checkpoint["recovery_base_manifest_sha256"], "rollback_archive_manifest_sha256": checkpoint["rollback_archive_manifest_sha256"], "purge_receipt_sha256": _sha256_file(purge_receipt_path), "purged_disposable_root": str(self.disposable_root), "activation_catalog_identity": artifacts, "integrity_ok": bool(self.active_runtime.doctor()["ok"])}
+            identity = {"packet": "B13.2", "state": "reactivated", "realm_id": realm_id, "root": str(self.active_runtime.store.root.resolve()), "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "runtime_session_id": self.active_runtime.runtime_session_id, "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(final_snapshot)), "database_sha256": _database_snapshot_sha256(self.active_runtime.store.db_path, connection=self.active_runtime.store.conn), "database_semantic_sha256": _database_semantic_sha256(self.active_runtime.store.db_path, connection=self.active_runtime.store.conn), "cas_manifest_sha256": _canonical_digest(sorted([{key: item.get(key) for key in ("digest", "size", "sha256")} for item in final_snapshot.get("cas_objects", [])], key=lambda item: str(item.get("digest")))), "recovery_base_manifest_sha256": checkpoint["recovery_base_manifest_sha256"], "rollback_archive_manifest_sha256": checkpoint["rollback_archive_manifest_sha256"], "purge_receipt_sha256": _hash_file_pinned(purge_receipt_path), "purged_disposable_root": str(self.disposable_root), "activation_catalog_identity": artifacts, "integrity_ok": bool(self.active_runtime.doctor()["ok"])}
             if not identity["integrity_ok"] or identity["semantic_snapshot_sha256"] != checkpoint["semantic_snapshot_sha256"]:
                 raise MigrationError("B13.2 final reactivation does not match the pre-R2 active identity")
             self._write("activated-destination-b13.json", identity)
