@@ -51,6 +51,11 @@ class RuntimePaths:
 
         return cls.current_mac(Path(root))
 
+    @property
+    def activation_trust_path(self) -> Path:
+        """Owner-only trust anchor kept outside all realm/migration artifacts."""
+        return self.runtime_support / "activation-trust.json"
+
     def ensure_support_dirs(self) -> None:
         for directory in (
             self.app_support,

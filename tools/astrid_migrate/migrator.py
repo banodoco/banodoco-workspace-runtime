@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -87,6 +88,7 @@ class MigrationConfig:
     runtime_version: str = "workspace.v1"
     schema_version: str = "workspace-schema-v1"
     importer_version: str = "t5"
+    activation_trust_key: bytes | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
@@ -98,13 +100,7 @@ class MigrationConfig:
         object.__setattr__(self, "destination_root", Path(os.path.abspath(os.path.expanduser(str(self.destination_root)))))
         if self.evidence_root is not None:
             object.__setattr__(self, "evidence_root", Path(self.evidence_root).expanduser().resolve())
-        if self.activation_registry_root is None:
-            # A normal realm lives below ``runtime/realms/<realm-id>`` and
-            # its neutral activation registry is a sibling of ``realms``.
-            # Deriving this keeps the offline migrator honest even when it is
-            # invoked directly rather than through banodoco-local.
-            object.__setattr__(self, "activation_registry_root", self.destination_root.parent.parent / "activations")
-        else:
+        if self.activation_registry_root is not None:
             object.__setattr__(self, "activation_registry_root", Path(self.activation_registry_root).expanduser().resolve())
 
 
@@ -1403,6 +1399,11 @@ class Migrator:
             format_version = 1
             payload = {"format_version": format_version, "state": "activated", "source_archive": str(archive), "source_archive_sha256": _sha256_file(archive / "manifest.json"), "source_version": self.config.source_version, "destination_root": str(destination), "reconciliation": reconciliation, "rollback_archive": str(archive), "created_at": time.time()}
         else:
+            trust_key = self.config.activation_trust_key
+            if self.config.activation_registry_root is not None and (trust_key is None or len(trust_key) < 32):
+                raise MigrationError(
+                    "activation trust anchor is required before publishing a v2 activation"
+                )
             archive_manifest = archive / "manifest.json"
             source_manifest = json.loads(archive_manifest.read_text(encoding="utf-8"))
             objects, object_hash = self._cas_inventory(destination)
@@ -1435,6 +1436,12 @@ class Migrator:
                 "importer_version": self.config.importer_version, "reconciliation": reconciliation,
                 "rollback_archive": str(archive.resolve()), "created_at": time.time(),
             }
+            if trust_key is not None and len(trust_key) >= 32:
+                activation_fields["activation_signature"] = hmac.new(
+                    trust_key,
+                    _canonical({key: item for key, item in activation_fields.items() if key != "activation_signature"}),
+                    hashlib.sha256,
+                ).hexdigest()
             payload = activation_fields
         target = self.config.destination_root / "activation-manifest.json"
         # Keep the destination realm authority pinned for the complete

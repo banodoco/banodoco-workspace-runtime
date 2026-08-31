@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import shutil
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,7 @@ from banodoco_local.bootstrap import (
     LegacyRootCollisionError,
     SourceProfile,
     _canonical_json,
+    _durable_activation_trust_key,
     _verified_activation_manifest,
     bootstrap,
 )
@@ -25,6 +29,7 @@ PROFILE = SourceProfile(
     runtime_checkout="/checkouts/runtime",
     source_checkout="/checkouts/astrid",
 )
+TRUST_KEY = "a" * 64
 
 
 class CountingBoundary:
@@ -54,6 +59,9 @@ def _prepare(tmp_path: Path):
     archive = tmp_path / "archive"
     destination = tmp_path / "destination"
     paths = RuntimePaths.sandbox(tmp_path / "support")
+    paths.ensure_support_dirs()
+    atomic_write_json(paths.activation_trust_path, {"version": 1, "key_hex": TRUST_KEY})
+    trust_key = _durable_activation_trust_key(paths, provision=True)
     runtime = RuntimeService(destination, realm_id="realm-proof")
     try:
         migrate(
@@ -62,6 +70,7 @@ def _prepare(tmp_path: Path):
                 archive,
                 destination,
                 activation_registry_root=paths.activations_dir,
+                activation_trust_key=trust_key,
             ),
             RuntimeServiceAdapter(runtime),
         )
@@ -82,12 +91,22 @@ def _prepare(tmp_path: Path):
 
 def _resign(record: dict) -> None:
     unsigned = {key: value for key, value in record.items() if key != "registry_sha256"}
-    record["registry_sha256"] = __import__("hashlib").sha256(_canonical_json(unsigned)).hexdigest()
+    record["registry_sha256"] = hashlib.sha256(_canonical_json(unsigned)).hexdigest()
+
+
+def _resign_activation(value: dict) -> None:
+    unsigned = {key: item for key, item in value.items() if key != "activation_signature"}
+    value["activation_signature"] = hmac.new(
+        bytes.fromhex(TRUST_KEY), _canonical_json(unsigned), hashlib.sha256
+    ).hexdigest()
 
 
 @pytest.mark.parametrize(
     "mutation",
-    ["empty_digest", "destination", "archive", "report", "database", "cas", "missing_registry", "dangling_legacy"],
+    [
+        "empty_digest", "destination", "archive", "archive_copy", "report", "report_copy",
+        "database", "cas", "missing_registry", "dangling_legacy",
+    ],
 )
 def test_legacy_collision_rejects_every_mutated_activation_before_start(tmp_path, mutation):
     paths, archive, destination = _prepare(tmp_path)
@@ -106,8 +125,35 @@ def test_legacy_collision_rejects_every_mutated_activation_before_start(tmp_path
         value = json.loads(manifest.read_text())
         value["source_version"] = "forged"
         manifest.write_text(json.dumps(value))
+    elif mutation == "archive_copy":
+        copied = tmp_path / "archive-copy"
+        shutil.copytree(archive, copied)
+        identity = copied.stat()
+        activation = destination / "activation-manifest.json"
+        activation_value = json.loads(activation.read_text())
+        for value in (record, activation_value):
+            value["source_archive"] = str(copied.resolve())
+            value["source_archive_identity"] = {
+                "st_dev": identity.st_dev, "st_ino": identity.st_ino, "st_mode": identity.st_mode,
+            }
+            value["rollback_archive"] = str(copied.resolve())
+        activation.write_text(json.dumps(activation_value, sort_keys=True, indent=2) + "\n")
+        record["activation_manifest_sha256"] = hashlib.sha256(activation.read_bytes()).hexdigest()
+        _resign(record)
+        registry.write_text(json.dumps(record))
     elif mutation == "report":
         (destination / "migration-report.json").write_text("{}")
+    elif mutation == "report_copy":
+        copied = tmp_path / "report-copy.json"
+        shutil.copy2(destination / "migration-report.json", copied)
+        activation = destination / "activation-manifest.json"
+        activation_value = json.loads(activation.read_text())
+        activation_value["migration_report"] = str(copied.resolve())
+        activation.write_text(json.dumps(activation_value, sort_keys=True, indent=2) + "\n")
+        record["migration_report"] = str(copied.resolve())
+        record["activation_manifest_sha256"] = hashlib.sha256(activation.read_bytes()).hexdigest()
+        _resign(record)
+        registry.write_text(json.dumps(record))
     elif mutation == "database":
         db = destination / "realm.sqlite3"
         db.write_bytes(db.read_bytes() + b"tampered")
@@ -151,9 +197,73 @@ def test_verified_activation_allows_completed_migration_and_restart(tmp_path):
     assert result.status == "started"
 
 
+def test_durable_activation_anchor_survives_reboot_without_environment_key(tmp_path):
+    paths, _archive, _destination = _prepare(tmp_path)
+    assert _verified_activation_manifest(paths) is True
+
+
+def test_missing_activation_anchor_stays_before_boundary(tmp_path):
+    paths, _archive, _destination = _prepare(tmp_path)
+    paths.activation_trust_path.unlink()
+    boundary = CountingBoundary()
+    with pytest.raises(LegacyRootCollisionError) as error:
+        bootstrap(paths, boundary, BootstrapConfig(source_profile=PROFILE))
+    assert boundary.starts == 0
+    assert LEGACY_NEXT_ACTION.format(legacy_root=paths.home / ".astrid") in str(error.value)
+
+
+def test_dry_run_does_not_provision_activation_anchor(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path)
+    assert _durable_activation_trust_key(paths, provision=False) is None
+    assert not paths.activation_trust_path.exists()
+
+
+@pytest.mark.parametrize("replacement", [{"version": 1, "key_hex": "b" * 64}, {"version": 1, "key_hex": "invalid"}])
+def test_replaced_activation_anchor_stays_before_boundary(tmp_path, replacement):
+    paths, _archive, _destination = _prepare(tmp_path)
+    atomic_write_json(paths.activation_trust_path, replacement)
+    boundary = CountingBoundary()
+    with pytest.raises(LegacyRootCollisionError) as error:
+        bootstrap(paths, boundary, BootstrapConfig(source_profile=PROFILE))
+    assert boundary.starts == 0
+    assert LEGACY_NEXT_ACTION.format(legacy_root=paths.home / ".astrid") in str(error.value)
+
+
+def test_activation_anchor_mode_is_part_of_the_trust_boundary(tmp_path):
+    paths, _archive, _destination = _prepare(tmp_path)
+    paths.activation_trust_path.chmod(0o644)
+    boundary = CountingBoundary()
+    with pytest.raises(LegacyRootCollisionError) as error:
+        bootstrap(paths, boundary, BootstrapConfig(source_profile=PROFILE))
+    assert boundary.starts == 0
+    assert LEGACY_NEXT_ACTION.format(legacy_root=paths.home / ".astrid") in str(error.value)
+
+
 def test_verified_activation_is_required_even_for_dangling_legacy_root(tmp_path):
     paths, _archive, _destination = _prepare(tmp_path)
     legacy = paths.home / ".astrid"
     legacy.rmdir()
     legacy.symlink_to(paths.home / "missing-legacy-root")
     assert _verified_activation_manifest(paths) is True
+
+
+@pytest.mark.parametrize("bad_reconciliation", [[], "forged", None])
+def test_malformed_reconciliation_is_typed_collision_not_raw_exception(
+    tmp_path, bad_reconciliation
+):
+    paths, _archive, destination = _prepare(tmp_path)
+    registry = paths.activations_dir / "realm-proof.json"
+    record = json.loads(registry.read_text())
+    activation = destination / "activation-manifest.json"
+    activation_value = json.loads(activation.read_text())
+    activation_value["reconciliation"] = bad_reconciliation
+    _resign_activation(activation_value)
+    activation.write_text(json.dumps(activation_value, sort_keys=True, indent=2) + "\n")
+    record["reconciliation"] = bad_reconciliation
+    record["activation_manifest_sha256"] = hashlib.sha256(activation.read_bytes()).hexdigest()
+    _resign(record)
+    registry.write_text(json.dumps(record))
+
+    with pytest.raises(LegacyRootCollisionError) as error:
+        bootstrap(paths, CountingBoundary(), BootstrapConfig(source_profile=PROFILE))
+    assert LEGACY_NEXT_ACTION.format(legacy_root=paths.home / ".astrid") in str(error.value)

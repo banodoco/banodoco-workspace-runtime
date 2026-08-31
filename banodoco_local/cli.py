@@ -11,7 +11,7 @@ import sys
 from typing import Any, Mapping
 
 from . import __version__
-from .bootstrap import BootstrapConfig, BootstrapError, SourceProfile, bootstrap, connect, doctor, restart
+from .bootstrap import BootstrapConfig, BootstrapError, SourceProfile, _durable_activation_trust_key, bootstrap, connect, doctor, restart
 from .io import read_json
 from .paths import RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
@@ -218,7 +218,8 @@ def _migrate(args: argparse.Namespace, paths: RuntimePaths, *, dry_run: bool) ->
     # only the generated client, never a RealmStore or direct SQLite handle.
     from tools.astrid_migrate import MigrationConfig, migrate
     client = _client(paths) if read_json(paths.discovery_path) else None
-    return migrate(MigrationConfig(args.source_root, args.archive_root, args.destination_root, dry_run=dry_run, activation_registry_root=paths.activations_dir), client)
+    trust_key = _durable_activation_trust_key(paths, provision=not dry_run)
+    return migrate(MigrationConfig(args.source_root, args.archive_root, args.destination_root, dry_run=dry_run, activation_registry_root=paths.activations_dir, activation_trust_key=trust_key), client)
 
 
 def main(argv: list[str] | None = None) -> int:

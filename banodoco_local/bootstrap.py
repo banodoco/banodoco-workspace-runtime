@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,8 @@ from .paths import RuntimePaths
 
 PROTOCOL_VERSION = "workspace.v1"
 SCHEMA_VERSION = "workspace-schema-v1"
+RUNTIME_VERSION = PROTOCOL_VERSION
+IMPORTER_VERSION = "t5"
 CATALOG_VERSION = 1
 DISCOVERY_VERSION = 1
 LEGACY_NEXT_ACTION = (
@@ -212,6 +215,43 @@ def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def _durable_activation_trust_key(paths: RuntimePaths, *, provision: bool = False) -> bytes | None:
+    """Read or provision the owner-only activation trust anchor.
+
+    This file lives in runtime support, outside the migration archive,
+    destination realm, and activation registry.  A migration may create it
+    once, but neither bootstrap nor migration ever derive it from artifacts.
+    """
+    path = paths.activation_trust_path
+    try:
+        if path.is_symlink() or not path.is_file():
+            value = None
+        else:
+            metadata = path.stat()
+            owner_uid = getattr(os, "getuid", lambda: metadata.st_uid)()
+            if metadata.st_uid != owner_uid or stat.S_IMODE(metadata.st_mode) != 0o600:
+                return None
+            value = read_json(path)
+    except OSError:
+        value = None
+    if isinstance(value, Mapping) and value.get("version") == 1:
+        encoded = value.get("key_hex")
+        if isinstance(encoded, str):
+            try:
+                key = bytes.fromhex(encoded)
+            except ValueError:
+                key = None
+            if key is not None and len(key) >= 32:
+                return key
+    if not provision:
+        # An absent support key is an unverified activation. Only the durable
+        # owner-only anchor can authorize a legacy-root waiver.
+        return None
+    key = secrets.token_bytes(32)
+    atomic_write_json(path, {"version": 1, "key_hex": key.hex()})
+    return key
+
+
 def _sha256_regular(path: Path) -> str:
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
@@ -297,6 +337,9 @@ def _source_tree_digest(root: Path) -> str:
 
 def _verified_activation_manifest(paths: RuntimePaths) -> bool:
     """Verify a complete activation registry against every referenced byte."""
+    trust_key = _durable_activation_trust_key(paths)
+    if trust_key is None:
+        return False
     if paths.activations_dir.is_symlink() or not paths.activations_dir.is_dir():
         return False
     try:
@@ -319,10 +362,14 @@ def _verified_activation_manifest(paths: RuntimePaths) -> bool:
                         "destination_database_sha256", "cas_inventory_sha256", "cas_inventory",
                         "migration_report", "migration_report_sha256", "activation_manifest",
                         "activation_manifest_sha256", "runtime_version", "schema_version",
-                        "protocol_version", "importer_version", "source_version", "reconciliation")
+                        "protocol_version", "importer_version", "source_version", "reconciliation",
+                        "activation_signature")
             if any(not isinstance(value.get(key), (str, dict, list)) or value[key] in ("", None) for key in required):
                 continue
-            if value["protocol_version"] != PROTOCOL_VERSION or value["schema_version"] != SCHEMA_VERSION:
+            if (value["protocol_version"] != PROTOCOL_VERSION
+                    or value["schema_version"] != SCHEMA_VERSION
+                    or value["runtime_version"] != RUNTIME_VERSION
+                    or value["importer_version"] != IMPORTER_VERSION):
                 continue
             hex_fields = ("source_archive_sha256", "source_manifest_sha256", "source_archive_tree_sha256",
                           "destination_database_sha256", "cas_inventory_sha256", "migration_report_sha256",
@@ -350,6 +397,8 @@ def _verified_activation_manifest(paths: RuntimePaths) -> bool:
             if not archive.is_dir() or _sha256_regular(archive / "manifest.json") != value["source_archive_sha256"]:
                 continue
             archive_manifest = _read_json_regular(archive / "manifest.json")
+            if not isinstance(archive_manifest, Mapping):
+                continue
             if (archive_manifest.get("source_version") != value["source_version"]
                     or archive_manifest.get("source_manifest_sha256") != value["source_manifest_sha256"]
                     or archive_manifest.get("archive_source_tree_sha256") != value["source_archive_tree_sha256"]
@@ -357,13 +406,26 @@ def _verified_activation_manifest(paths: RuntimePaths) -> bool:
                     or _source_tree_digest(archive / "source") != value["source_archive_tree_sha256"]):
                 continue
             report_value = _read_json_regular(report)
+            if not isinstance(report_value, Mapping):
+                continue
             if hashlib.sha256(_canonical_json(report_value)).hexdigest() != value["migration_report_sha256"]:
                 continue
             activation_value = _read_json_regular(activation)
+            if not isinstance(activation_value, Mapping):
+                continue
             activation_expected = {key: item for key, item in value.items() if key not in {"registry_version", "registry_sha256", "activation_manifest", "activation_manifest_sha256"}}
             if activation_value != activation_expected:
                 continue
-            if activation_value.get("state") != "activated" or activation_value.get("reconciliation", {}).get("ok") is not True:
+            signature = activation_value.get("activation_signature")
+            unsigned_activation = {key: item for key, item in activation_value.items() if key != "activation_signature"}
+            expected_signature = hmac.new(trust_key, _canonical_json(unsigned_activation), hashlib.sha256).hexdigest()
+            if (not isinstance(signature, str)
+                    or not hmac.compare_digest(signature, expected_signature)):
+                continue
+            reconciliation = activation_value.get("reconciliation")
+            if (activation_value.get("state") != "activated"
+                    or not isinstance(reconciliation, Mapping)
+                    or reconciliation.get("ok") is not True):
                 continue
             with sqlite3.connect((destination / "realm.sqlite3").as_uri() + "?mode=ro", uri=True) as db:
                 realm = db.execute("SELECT id FROM realm LIMIT 1").fetchone()
@@ -547,6 +609,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         raise LegacyRootCollisionError(LEGACY_NEXT_ACTION.format(legacy_root=collision))
 
     paths.ensure_support_dirs()
+    _durable_activation_trust_key(paths, provision=True)
     catalog = _read_catalog(paths)
     realm = _selected_realm(catalog)
     diagnostics: list[str] = []
