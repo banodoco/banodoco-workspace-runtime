@@ -358,11 +358,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime._task_resource(value))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
-            self._identity("worker:execute" if action in ("claim", "settle", "heartbeat") else "tasks:write")
+            self._identity("worker:execute" if action in ("claim", "heartbeat") else "tasks:write")
             if method == "POST" and action == "claim":
                 return self._send(200, self.runtime._task_resource(self.runtime.claim(task_id, self._body())))
-            if method == "POST" and action == "settle":
-                return self._send(200, self.runtime._task_resource(self.runtime.settle(task_id, self._body())))
             if method == "POST" and action == "heartbeat":
                 return self._send(200, self.runtime.heartbeat(task_id, self._body()))
             if method == "POST" and action == "cancel":

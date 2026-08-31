@@ -1,12 +1,12 @@
 {
   "clients": [
     {
-      "generator": "GENERATOR-PYTHON-ASTRID",
+      "generator": "GENERATOR-PYTHON-INREPO",
       "language": "python",
-      "metadata_output": "contract-metadata.py",
-      "metadata_source": "generated/runtime_client_metadata.py",
-      "output": "runtime_client.py",
-      "source": "generated/runtime_client.py"
+      "metadata_output": "packages/python/banodoco_workspace_client/contract_metadata.py",
+      "metadata_source": "packages/python/banodoco_workspace_client/contract_metadata.py",
+      "output": "packages/python/banodoco_workspace_client/generated.py",
+      "source": "generators/python_client_template.py"
     },
     {
       "generator": "GENERATOR-TYPESCRIPT-CONFORMANCE",

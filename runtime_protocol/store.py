@@ -703,9 +703,8 @@ class RealmStore:
     def _reap_expired_leases(self):
         """Return expired attempts to the queue and release their resources.
 
-        Called inside the caller's transaction.  The old worker claim/settle
-        API remains valid; expiry only affects attempts that carry the v2 lease
-        deadline.
+        Called inside the caller's transaction; expiry only affects attempts
+        that carry the v2 lease deadline.
         """
         current = datetime.now(timezone.utc)
         rows = self.conn.execute("SELECT id, run_id, lease_token, lease_expires_at FROM tasks WHERE status='running' AND lease_expires_at IS NOT NULL").fetchall()
@@ -955,7 +954,7 @@ class RealmStore:
         if changed.rowcount != 1:
             raise ConflictError("stale settlement effect target version")
 
-    def settle_task(self, task_id, lease_token, result, *, effect=None, output_objects=None, fence=None, attempt_id=None):
+    def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
@@ -983,10 +982,9 @@ class RealmStore:
                     self._apply_settlement_effect(effect)
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
-                if attempt_id is not None:
-                    self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
+                self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
-                self._append_event(task["run_id"], task_id, "task.completed", {"result": result, "effect": effect, "objects": output_objects or []})
+                self._append_event(task["run_id"], task_id, "task.completed", {"result": result, "effect": effect, "objects": result.get("outputs", [])})
                 return self.get_task(task_id)
 
     def heartbeat_task(self, task_id, lease_token, *, fence=None, lease_seconds=LEASE_SECONDS):

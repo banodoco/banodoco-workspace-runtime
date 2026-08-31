@@ -102,3 +102,27 @@ def test_generator_is_reproducible() -> None:
     root = Path(__file__).parents[1]
     subprocess.run([sys.executable, str(root / "generators" / "generate.py")], check=True, cwd=root)
     subprocess.run([sys.executable, str(root / "generators" / "generate.py"), "--check"], check=True, cwd=root)
+
+
+def test_python_client_source_is_tracked_and_generated_check_is_not_self_referential(tmp_path: Path) -> None:
+    root = Path(__file__).parents[1]
+    component = json.loads((root / "contract" / "component-manifest.json").read_text())
+    python_component = next(item for item in component["clients"] if item["generator"] == "GENERATOR-PYTHON-INREPO")
+    template = root / "generators" / "python_client_template.py"
+    output = root / "packages" / "python" / "banodoco_workspace_client" / "generated.py"
+    assert (root / python_component["source"]).is_file()
+    assert (root / python_component["output"]).resolve() == output.resolve()
+    assert template.is_file()
+    assert "__SCHEMA_DIGEST__" in template.read_text()
+    original = output.read_bytes()
+    isolated = tmp_path / "generated.py"
+    isolated.write_bytes(original + b"\n# mutation\n")
+    check = subprocess.run(
+        [sys.executable, str(root / "generators" / "generate.py"), "--check", "--python-output", str(isolated)],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode != 0
+    subprocess.run([sys.executable, str(root / "generators" / "generate.py"), "--python-output", str(isolated)], check=True, cwd=root)
+    assert isolated.read_bytes() == output.read_bytes() == original

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Update the checked-in contract metadata from the canonical inputs.
+"""Render checked-in contract metadata and the Python client from canonical inputs.
 
 The release/conformance client generators consume the same component manifest;
-this small repository-local command keeps the package metadata bound to that
-manifest as well.  Client source and fixtures are rendered by the language
-generators, while ``--check`` remains a read-only stale-artifact check.
+this small repository-local command keeps the package artifacts bound to that
+manifest as well.  The Python client is rendered from the tracked template;
+``--check`` remains a read-only stale-artifact check.
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from typing import Any, Mapping
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "contract" / "manifest.json"
 COMPONENT_MANIFEST = ROOT / "contract" / "component-manifest.json"
+PYTHON_CLIENT_TEMPLATE = ROOT / "generators" / "python_client_template.py"
+PYTHON_CLIENT_OUTPUT = ROOT / "packages" / "python" / "banodoco_workspace_client" / "generated.py"
 
 
 def _regular(path: Path, label: str) -> bytes:
@@ -63,6 +65,26 @@ def operation_index(manifest_path: Path = MANIFEST) -> list[str]:
     return [line.split(":", 1)[1].strip() for line in text.splitlines() if re.match(r"^\s+operationId:", line)]
 
 
+def render_python_client(manifest_path: Path = MANIFEST) -> str:
+    """Render the checked-in Python client from its tracked template.
+
+    The template is deliberately separate from the output: ``--check`` must
+    detect a mutated generated client rather than merely re-reading it.  The
+    contract digest and operation projection are embedded so the artifact is
+    also bound to the canonical OpenAPI/schema inputs.
+    """
+    template = _regular(PYTHON_CLIENT_TEMPLATE, "Python client template").decode("utf-8")
+    if "__SCHEMA_DIGEST__" not in template or "__OPERATIONS__" not in template:
+        raise SystemExit("Python client template is missing generator placeholders")
+    operations = operation_index(manifest_path)
+    if not operations or len(operations) != len(set(operations)):
+        raise SystemExit("contract operation projection must be non-empty and unique")
+    rendered = template.replace("Authoritative Python client template; rendered by generators/generate.py.", "Generated from contract/openapi/workspace-v1.yaml; do not edit by hand.")
+    rendered = rendered.replace("__SCHEMA_DIGEST__", contract_digest(manifest_path))
+    rendered = rendered.replace("__OPERATIONS__", repr(tuple(operations)))
+    return rendered
+
+
 def render(manifest_path: Path = MANIFEST, component_path: Path = COMPONENT_MANIFEST) -> dict[str, str]:
     component_bytes, component = _component(component_path)
     digest = contract_digest(manifest_path)
@@ -88,9 +110,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="fail if generated metadata differs")
     parser.add_argument("--component-manifest", default=str(COMPONENT_MANIFEST))
+    parser.add_argument("--python-output", default=str(PYTHON_CLIENT_OUTPUT), help="Python client output path (for isolated checks)")
     args = parser.parse_args()
-    for relative, content in render(component_path=Path(args.component_manifest).expanduser()).items():
-        path = ROOT / relative
+    generated = render(component_path=Path(args.component_manifest).expanduser())
+    generated["packages/python/banodoco_workspace_client/generated.py"] = render_python_client()
+    for relative, content in generated.items():
+        path = Path(args.python_output).expanduser().resolve() if relative == "packages/python/banodoco_workspace_client/generated.py" else ROOT / relative
         if args.check:
             if not path.exists() or path.read_text(encoding="utf-8") != content:
                 print(f"stale generated file: {relative}")

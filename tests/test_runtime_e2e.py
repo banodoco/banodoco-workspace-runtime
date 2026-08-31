@@ -48,13 +48,16 @@ def test_project_managed_object_and_fake_worker_end_to_end(daemon):
     assert range_headers["Content-Range"] == f"bytes 0-6/{len(source)}"
     task = client.create_task("render.basic", {"text": "hello"}, project="demo", idempotency_key="task-1")
     task_id = task["task_id"]
-    lease = "lease-1"
     client.register_worker("fake", ["render.basic"], resource_keys=["cpu"])
-    worker = Api(daemon.endpoint, daemon.worker_token)
-    claimed = worker.claim(task_id, worker_id="fake", lease_token=lease)
-    assert claimed["state"] == "running"
-    settled = worker.settle(task_id, lease, {"text": "hello", "digest": digest})
-    assert settled["state"] == "succeeded"
+    worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
+    claimed = worker.claim_task(executor_id="fake", capability_ids=["render.basic"], idempotency_key="claim-1", runtime_epoch=worker.health().runtime_epoch)
+    assert claimed is not None and claimed["task_id"] == task_id
+    settled = worker.settle_attempt(
+        claimed["attempt_id"],
+        {"lease_id": claimed["lease_id"], "fence": claimed["fence"], "runtime_epoch": claimed["runtime_epoch"], "outputs": [{"digest": digest}]},
+        idempotency_key="settle-1",
+    )
+    assert settled.state == "succeeded"
     events = client.events(task["run_id"])
     assert [event["event_type"] for event in events["items"]] == ["task.admitted", "task.claimed", "task.completed"]
 
@@ -255,13 +258,14 @@ def test_stale_lease_and_undeclared_effect_are_rejected(daemon):
     task = client.create_task("render.basic", {}, project=project["project_id"], expected_effect=effect)
     task_id = task["task_id"]
     client.register_worker("effect-worker", ["render.basic"])
-    worker = Api(daemon.endpoint, daemon.worker_token)
-    worker.claim(task_id, worker_id="effect-worker", lease_token="good")
-    with pytest.raises(RuntimeError):
-        worker.settle(task_id, "bad", {})
-    with pytest.raises(RuntimeError):
-        worker.settle(task_id, "good", {}, effect={"kind": "other"})
-    settled = worker.settle(task_id, "good", {}, effect=effect)
-    assert settled["state"] == "succeeded"
+    worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
+    attempt = worker.claim_task(executor_id="effect-worker", capability_ids=["render.basic"], idempotency_key="effect-claim", runtime_epoch=worker.health().runtime_epoch)
+    assert attempt is not None
+    with pytest.raises(ApiError):
+        worker.settle_attempt(attempt["attempt_id"], {"lease_id": "bad", "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"], "outputs": []}, idempotency_key="effect-bad-lease")
+    with pytest.raises(ApiError):
+        worker.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"], "outputs": [], "effect": {"kind": "other"}}, idempotency_key="effect-bad-effect")
+    settled = worker.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"], "outputs": [], "effect": effect}, idempotency_key="effect-settle")
+    assert settled.state == "succeeded"
     updated = client.get_project(project["project_id"])
     assert updated["name"] == "Settled Effect" and updated["version"] == 2

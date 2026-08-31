@@ -32,6 +32,26 @@ def _claim(service: RuntimeService, task_id: str, body: dict):
     return service.claim(task_id, {**body, "runtime_epoch": service.health()["runtime_epoch"]})
 
 
+def _claim_attempt(service: RuntimeService, capability: str = "render.gpu", executor: str = "worker"):
+    return service.claim_next({
+        "executor_id": executor,
+        "capability_ids": [capability],
+        "runtime_epoch": service.health()["runtime_epoch"],
+    })
+
+
+def _settle_attempt(service: RuntimeService, attempt: dict, *, effect=None):
+    body = {
+        "lease_id": attempt["lease_id"],
+        "fence": attempt["fence"],
+        "runtime_epoch": attempt["runtime_epoch"],
+        "outputs": [],
+    }
+    if effect is not None:
+        body["effect"] = effect
+    return service.settle_attempt(attempt["attempt_id"], body)
+
+
 def test_named_resource_reservation_blocks_and_releases_with_attempt_lease(tmp_path):
     service = RuntimeService(tmp_path / "realm")
     try:
@@ -40,21 +60,20 @@ def test_named_resource_reservation_blocks_and_releases_with_attempt_lease(tmp_p
             "definition_digest": _digest("render.gpu-v1"),
             "required_resource_keys": ["gpu"],
         })
-        service.register_worker({"worker_id": "gpu-worker", "capabilities": ["render.gpu"], "resource_keys": ["gpu"], "max_concurrency": 1})
+        service.register_executor({"executor_id": "gpu-worker", "capabilities": ["render.gpu"], "resource_keys": ["gpu"], "max_concurrency": 1, "runtime_epoch": service.health()["runtime_epoch"]})
         first = _task(service, "first")["task"]["id"]
         second = _task(service, "second")["task"]["id"]
-        claimed = _claim(service, first, {"worker_id": "gpu-worker", "lease_token": "lease-first"})
-        assert claimed["task"]["status"] == "running"
-        blocked = _claim(service, second, {"worker_id": "gpu-worker", "lease_token": "lease-second"})
-        assert blocked["task"]["status"] == "queued"
+        claimed = _claim_attempt(service, executor="gpu-worker")
+        assert claimed["task_id"] == first
+        blocked = _claim_attempt(service, executor="gpu-worker")
+        assert blocked["task"]["state"] == "queued"
         assert blocked["task"]["waiting_reason"] == "waiting_for_worker"
-        assert blocked["task"]["blocked_reason"] == "waiting_for_worker"
-        service.settle(first, {"lease_token": "lease-first", "fence": 1, "result": {"ok": True}})
+        _settle_attempt(service, claimed)
         reservation = service.store.conn.execute("SELECT released_at FROM reservations WHERE task_id=? AND resource_key='gpu'", (first,)).fetchone()
         assert reservation["released_at"] is not None
-        released = _claim(service, second, {"worker_id": "gpu-worker", "lease_token": "lease-second"})
-        assert released["task"]["status"] == "running"
-        assert released["task"]["lease_fence"] == 1
+        released = _claim_attempt(service, executor="gpu-worker")
+        assert released["task_id"] == second
+        assert service.task(second)["task"]["lease_fence"] == 1
     finally:
         service.close()
 
@@ -197,7 +216,7 @@ def test_retry_is_state_guarded_and_records_transition(tmp_path):
     service = RuntimeService(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1")})
-        service.register_worker({"worker_id": "worker", "capabilities": ["render.gpu"]})
+        service.register_executor({"executor_id": "worker", "capabilities": ["render.gpu"], "runtime_epoch": service.health()["runtime_epoch"]})
         cancelled = _task(service, "retry-cancelled")["task"]["id"]
         service.cancel(cancelled)
         retried = service.retry_task(cancelled, {"expected_version": 1})
@@ -220,24 +239,24 @@ def test_settlement_effect_rejects_undeclared_stale_and_duplicate(tmp_path):
         service.register_capability({"capability_id": "render.gpu", "definition_digest": _digest("render.gpu-v1")})
         service.register_worker({"worker_id": "worker", "capabilities": ["render.gpu"]})
         undeclared = _task(service, "effect-undeclared")["task"]["id"]
-        _claim(service, undeclared, {"worker_id": "worker", "lease_token": "u"})
+        undeclared_attempt = _claim_attempt(service)
         with pytest.raises(ValidationError):
-                service.settle(undeclared, {"lease_token": "u", "fence": 1, "result": {}, "effect": {"effect_type": "project.update", "target_id": project["id"], "expected_version": 1}})
+            _settle_attempt(service, undeclared_attempt, effect={"effect_type": "project.update", "target_id": project["id"], "expected_version": 1})
         service.cancel(undeclared)
 
         stale_effect = {"effect_type": "project.update", "target_id": project["id"], "expected_version": 2}
         stale = service.create_task({"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": stale_effect, "idempotency_key": "effect-stale"})["task"]["id"]
-        _claim(service, stale, {"worker_id": "worker", "lease_token": "s"})
+        stale_attempt = _claim_attempt(service)
         with pytest.raises(ConflictError):
-            service.settle(stale, {"lease_token": "s", "fence": 1, "result": {}, "effect": stale_effect})
+            _settle_attempt(service, stale_attempt, effect=stale_effect)
         service.cancel(stale)
 
         valid_effect = {"effect_type": "project.update", "target_id": project["id"], "expected_version": 1}
         duplicate = service.create_task({"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": valid_effect, "idempotency_key": "effect-duplicate"})["task"]["id"]
-        _claim(service, duplicate, {"worker_id": "worker", "lease_token": "d"})
-        service.settle(duplicate, {"lease_token": "d", "fence": 1, "result": {}, "effect": valid_effect})
+        duplicate_attempt = _claim_attempt(service)
+        _settle_attempt(service, duplicate_attempt, effect=valid_effect)
         with pytest.raises(LeaseError):
-            service.settle(duplicate, {"lease_token": "d", "fence": 1, "result": {}, "effect": valid_effect})
+            _settle_attempt(service, duplicate_attempt, effect=valid_effect)
     finally:
         service.close()
 

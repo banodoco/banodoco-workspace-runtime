@@ -1016,9 +1016,6 @@ class RuntimeService:
     def claim(self, task_id, body):
         return self.store.claim_task(task_id, body.get("worker_id", "worker"), body.get("lease_token", ""), runtime_epoch=body.get("runtime_epoch"))
 
-    def settle(self, task_id, body):
-        return self.store.settle_task(task_id, body.get("lease_token", ""), body.get("result", {}), effect=body.get("effect"), output_objects=body.get("output_objects"), fence=body.get("fence"))
-
     def heartbeat(self, task_id, body):
         self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="worker", identity_id=body.get("worker_id"), required=True)
         return self.store.heartbeat_task(task_id, body.get("lease_token", ""), fence=body.get("fence"), lease_seconds=body.get("lease_seconds", 30))
@@ -1141,7 +1138,7 @@ class RuntimeService:
                 self.store._validate_settlement_effect(effect)
             outputs = self._publish_outputs(body.get("outputs", []))
             result = {"outputs": outputs}
-            value = self.store.settle_task(row["task_id"], row["lease_id"], result, effect=effect, fence=body.get("fence"), attempt_id=attempt_id)
+            value = self.store._settle_attempt(row["task_id"], row["lease_id"], result, effect=effect, fence=body.get("fence"), attempt_id=attempt_id)
             return self._task_resource(value)
 
     def _publish_outputs(self, outputs):
