@@ -359,6 +359,84 @@ def test_b10_multiple_media_associations_use_primary_and_preserve_owner_rows(tmp
         runtime.close()
 
 
+def test_b10_reference_metadata_object_id_cannot_override_primary_media_association(tmp_path):
+    source = tmp_path / "legacy-clone"
+    fixture = build_synthetic_fixture(source)
+    metadata_digest = "f" * 64
+    db = sqlite3.connect(source / ".astrid" / "astrid.sqlite3")
+    db.execute("UPDATE project_references SET metadata_json=? WHERE id='ref-1'", (json.dumps({"object_id": metadata_digest}),))
+    db.commit()
+    db.close()
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        report = run_rehearsal(
+            MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+            RuntimeServiceAdapter(runtime), runtime=runtime,
+        )
+        reference = report["reconciliation"]["destination_truth"]["truth"]["timeline_references"][0]
+        assert reference["object_id"] == fixture.media_digest
+        assert reference["object_id"] != metadata_digest
+    finally:
+        runtime.close()
+
+
+def test_b10_explicit_zero_shot_duration_fails_closed_without_rewriting(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    db = sqlite3.connect(source / ".astrid" / "astrid.sqlite3")
+    db.execute("UPDATE shots SET metadata_json=? WHERE id='shot-1'", (json.dumps({"timeline_id": "tl-main", "duration_ms": 0}),))
+    db.commit()
+    db.close()
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="shot shot-1 has invalid timing"):
+            run_rehearsal(
+                MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+                RuntimeServiceAdapter(runtime), runtime=runtime,
+            )
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+        assert not (tmp_path / "destination" / "activation-manifest.json").exists()
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "column"),
+    (
+        ("generation_variants", "media_id"),
+        ("shot_items", "media_id"),
+        ("task_outputs", "media_id"),
+        ("runaway_transitions", "run_id"),
+    ),
+)
+@pytest.mark.parametrize("bad_value", [None, "missing-id", {"malformed": True}])
+def test_b10_required_owner_foreign_keys_fail_closed_before_writes(tmp_path, table, column, bad_value):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    db = sqlite3.connect(source / ".astrid" / "astrid.sqlite3")
+    db.execute("PRAGMA foreign_keys=OFF")
+    # SQLite cannot bind a mapping; the JSON object is intentionally a
+    # malformed FK value rather than a string that could accidentally match.
+    value = json.dumps(bad_value) if isinstance(bad_value, dict) else bad_value
+    db.execute(f"UPDATE {table} SET {column}=?", (value,))
+    db.commit()
+    db.close()
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match=f"({table}.*foreign key|integrity/foreign-key preflight)"):
+            run_rehearsal(
+                MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+                RuntimeServiceAdapter(runtime), runtime=runtime,
+            )
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM migration_owner_records").fetchone()[0] == 0
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0] == 0
+    finally:
+        runtime.close()
+
+
 def test_b10_reconciliation_rejects_tampered_generation_source_task_mapping(tmp_path):
     source = tmp_path / "legacy-clone"
     build_synthetic_fixture(source)

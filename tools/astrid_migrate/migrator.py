@@ -205,6 +205,81 @@ def _canonical_media_reference(rows: list[Mapping[str, Any]]) -> Mapping[str, An
     return min(candidates, key=lambda item: (item[0], _canonical(dict(item[1]))))[1]
 
 
+def _reference_object_digest(data: Mapping[str, list[dict[str, Any]]], reference: Mapping[str, Any]) -> str:
+    """Resolve a reference's native object only through its authored media link.
+
+    ``project_references.metadata_json`` is opaque owner data.  In particular,
+    an ``object_id`` there cannot replace the explicit canonical
+    ``media_references`` association: doing so can mount an object that was
+    never authored for the reference (or is not present in the destination
+    CAS).  Require the linked source media and its content hash here, before
+    any destination write.
+    """
+    reference_id = str(reference.get("id"))
+    links = [
+        row for row in data.get("media_references", [])
+        if str(row.get("reference_id")) == reference_id
+    ]
+    linked = _canonical_media_reference(links)
+    if linked is None:
+        # Older source databases may have references without a media row. In
+        # that case retain the legacy metadata value for compatibility; it is
+        # only a fallback because there is no explicit association to
+        # override. A linked media row always takes precedence below.
+        metadata = _json(reference.get("metadata_json"), {}) or {}
+        if not isinstance(metadata, Mapping):
+            raise MigrationError(f"project reference {reference_id} has invalid metadata")
+        return str(metadata.get("object_id") or metadata.get("digest") or "").removeprefix("sha256:")
+    media = next(
+        (row for row in data.get("media", []) if str(row.get("id")) == str(linked.get("media_id"))),
+        None,
+    )
+    if media is None:
+        raise MigrationError(
+            f"project reference {reference_id} canonical media association has no source media"
+        )
+    digest = str(media.get("content_hash") or "").removeprefix("sha256:")
+    if len(digest) != 64 or any(character not in "0123456789abcdefABCDEF" for character in digest):
+        raise MigrationError(
+            f"project reference {reference_id} canonical media has no valid content hash"
+        )
+    return digest
+
+
+def _source_shot_fields(source: Mapping[str, Any]) -> tuple[int, int, list[str]]:
+    """Read authored shot timing without coercing explicit zero/null values."""
+    metadata = _json(source.get("metadata_json"), {}) or {}
+    if not isinstance(metadata, Mapping):
+        raise MigrationError(f"shot {source.get('id')} has invalid metadata")
+
+    def number(name: str, default: int) -> int:
+        if name in source:
+            value = source[name]
+        elif name in metadata:
+            value = metadata[name]
+        else:
+            value = default
+        if value is None or isinstance(value, bool):
+            raise MigrationError(f"shot {source.get('id')} has invalid timing")
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise MigrationError(f"shot {source.get('id')} has invalid timing") from exc
+
+    start_ms = number("start_ms", 0)
+    # The runtime schema requires positive duration.  Keep an authored zero
+    # exact through validation and fail closed instead of rewriting it to 1.
+    duration_ms = number("duration_ms", 1)
+    if start_ms < 0 or duration_ms <= 0:
+        raise MigrationError(f"shot {source.get('id')} has invalid timing")
+    reference_ids = source.get("reference_ids")
+    if reference_ids is None:
+        reference_ids = metadata.get("reference_ids", metadata.get("references", []))
+    if not isinstance(reference_ids, list):
+        raise MigrationError(f"shot {source.get('id')} has invalid reference ordering")
+    return start_ms, duration_ms, [str(value) for value in reference_ids]
+
+
 def _source_database(root: Path) -> Path:
     candidates = [root / ".astrid" / "astrid.sqlite3", root / "astrid.sqlite3"]
     for candidate in candidates:
@@ -427,6 +502,11 @@ class Migrator:
         for row in data.get("project_references", []):
             if not row.get("id") or str(row.get("project_id")) not in project_set:
                 raise MigrationError("reference has an invalid project reference")
+            # The explicit authored media association is the only native
+            # source of reference object identity.  Validate it before the
+            # archive/import boundary; metadata_json remains opaque and must
+            # not be allowed to override it.
+            _reference_object_digest(data, row)
         task_set = {str(row.get("id")) for row in data.get("tasks", []) if row.get("id") is not None}
         for row in data.get("generations", []):
             task_id = row.get("task_id")
@@ -485,14 +565,14 @@ class Migrator:
             "media_references": (("reference_id", "project_references", False), ("media_id", "media", False), ("context_task_id", "tasks", True)),
             "media_relations": (("from_media_id", "media", False), ("to_media_id", "media", False)),
             "reference_links": (("from_reference_id", "project_references", False), ("to_reference_id", "project_references", False)),
-            "generation_variants": (("generation_id", "generations", False), ("media_id", "media", True)),
-            "shot_items": (("shot_id", "shots", False), ("media_id", "media", True)),
+            "generation_variants": (("generation_id", "generations", False), ("media_id", "media", False)),
+            "shot_items": (("shot_id", "shots", False), ("media_id", "media", False)),
             "task_dependencies": (("task_id", "tasks", False), ("depends_on_task_id", "tasks", False)),
-            "task_outputs": (("task_id", "tasks", False), ("media_id", "media", True)),
+            "task_outputs": (("task_id", "tasks", False), ("media_id", "media", False)),
             "execution_attempts": (("task_id", "tasks", False),),
             "command_receipts": (("project_id", "projects", False),),
             "evidence_items": (("run_id", "runs", False), ("task_id", "tasks", True), ("media_id", "media", True)),
-            "runaway_transitions": (("project_id", "projects", False), ("run_id", "runs", True), ("task_id", "tasks", True)),
+            "runaway_transitions": (("project_id", "projects", False), ("run_id", "runs", False), ("task_id", "tasks", True)),
         }
         for table, columns in checks.items():
             for row in data.get(table, []):
@@ -500,6 +580,10 @@ class Migrator:
                     value = row.get(column)
                     if nullable and value in (None, ""):
                         continue
+                    if value in (None, "") or isinstance(value, (dict, list)):
+                        raise MigrationError(
+                            f"{table} row {_owner_key(table, row)} requires a valid {target}.{column} foreign key"
+                        )
                     if str(value) not in ids[target]:
                         raise MigrationError(f"{table} row {_owner_key(table, row)} references missing {target}.{column}={value!r}")
 
@@ -720,17 +804,8 @@ class Migrator:
             timeline_id = str(metadata.get("timeline_id") or row.get("timeline_id") or "")
             if not timeline_id:
                 continue
-            try:
-                start_ms = int(row.get("start_ms", metadata.get("start_ms", metadata.get("start", 0))) or 0)
-                duration_ms = int(row.get("duration_ms", metadata.get("duration_ms", metadata.get("duration", 1))) or 1)
-            except (TypeError, ValueError) as exc:
-                raise MigrationError(f"shot {row.get('id')} has invalid timing") from exc
-            if start_ms < 0 or duration_ms <= 0:
-                raise MigrationError(f"shot {row.get('id')} has invalid timing")
-            reference_ids = row.get("reference_ids") or metadata.get("reference_ids") or metadata.get("references") or []
-            if not isinstance(reference_ids, list):
-                raise MigrationError(f"shot {row.get('id')} has invalid reference ordering")
-            shot = self._invoke("create_shot", timeline_id, {"shot_id": str(row["id"]), "start_ms": start_ms, "duration_ms": duration_ms, "reference_ids": [str(value) for value in reference_ids]}, idempotency_key=f"astrid-migrate-shot-{row['id']}")
+            start_ms, duration_ms, reference_ids = _source_shot_fields(row)
+            shot = self._invoke("create_shot", timeline_id, {"shot_id": str(row["id"]), "start_ms": start_ms, "duration_ms": duration_ms, "reference_ids": reference_ids}, idempotency_key=f"astrid-migrate-shot-{row['id']}")
             if self._result_id(shot, "shot_id", "id") is not None:
                 self._import_counts["shots"] = self._import_counts.get("shots", 0) + 1
             else:
@@ -738,17 +813,9 @@ class Migrator:
         for row in data.get("project_references", []):
             project_id = str(row["project_id"])
             timeline = next((x for x in data.get("timelines", []) if str(x.get("project_id")) == project_id), None)
-            metadata = _json(row.get("metadata_json"), {}) or {}
-            object_id = metadata.get("object_id") or metadata.get("digest")
-            if not object_id:
-                linked_media = _canonical_media_reference([
-                    x for x in data.get("media_references", [])
-                    if str(x.get("reference_id")) == str(row.get("id"))
-                ])
-                if linked_media:
-                    source_media = next((x for x in data.get("media", []) if str(x.get("id")) == str(linked_media.get("media_id"))), None)
-                    object_id = source_media.get("content_hash") if source_media else None
-            object_id = str(object_id or "").removeprefix("sha256:")
+            # metadata_json is opaque owner data; the explicit canonical
+            # media association is authoritative for the native object.
+            object_id = _reference_object_digest(data, row)
             if timeline and hasattr(self.client, "create_reference"):
                 reference = self._invoke("create_reference", str(timeline["id"]), {"reference_id": str(row["id"]), "object_id": object_id, "role": row.get("kind")}, idempotency_key=f"astrid-migrate-reference-{row['id']}")
                 if self._result_id(reference, "reference_id", "id") is not None:
@@ -936,18 +1003,6 @@ class Migrator:
         # Query the destination rows themselves and compare timing plus the
         # ordered reference list. A wrapper/owner ledger that says a shot is
         # present cannot make a tampered mount pass this check.
-        def _source_shot_fields(source):
-            metadata = _json(source.get("metadata_json"), {}) or {}
-            try:
-                start_ms = int(source.get("start_ms", metadata.get("start_ms", metadata.get("start", 0))) or 0)
-                duration_ms = int(source.get("duration_ms", metadata.get("duration_ms", metadata.get("duration", 1))) or 1)
-            except (TypeError, ValueError) as exc:
-                raise MigrationError(f"shot {source.get('id')} has invalid timing") from exc
-            reference_ids = source.get("reference_ids") or metadata.get("reference_ids") or metadata.get("references") or []
-            if not isinstance(reference_ids, list):
-                raise MigrationError(f"shot {source.get('id')} has invalid reference ordering")
-            return start_ms, duration_ms, [str(value) for value in reference_ids]
-
         destination_shots = {str(row.get("id", row.get("shot_id", ""))): row for row in truth.get("timeline_shots", [])}
         for source in data.get("shots", []):
             shot_id = str(source.get("id"))
@@ -973,25 +1028,16 @@ class Migrator:
             if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("timeline_references", [])):
                 errors.append({"kind": "reference", "id": source.get("id"), "reason": "missing from destination truth"})
         # Reference identity includes the object content identity, not just a
-        # reference row ID. Resolve the source object through linked media
-        # when the legacy row does not carry it directly.
+        # reference row ID. Resolve it through the explicit linked media row.
         destination_references = {str(row.get("id", row.get("reference_id", ""))): row for row in truth.get("timeline_references", [])}
-        source_media_by_id = {str(row.get("id")): row for row in data.get("media", [])}
-        source_media_references: dict[str, list[Mapping[str, Any]]] = {}
-        for row in data.get("media_references", []):
-            source_media_references.setdefault(str(row.get("reference_id")), []).append(row)
         for source in data.get("project_references", []):
             reference_id = str(source.get("id"))
             actual = destination_references.get(reference_id)
             if actual is None:
                 continue
-            metadata = _json(source.get("metadata_json"), {}) or {}
-            expected_object = metadata.get("object_id") or metadata.get("digest")
-            if not expected_object:
-                linked = _canonical_media_reference(source_media_references.get(reference_id, []))
-                media = source_media_by_id.get(str(linked.get("media_id"))) if linked else None
-                expected_object = media.get("content_hash") if media else None
-            expected_object = str(expected_object or "").removeprefix("sha256:")
+            # Reconcile against the same explicit canonical media association
+            # used for import. Opaque metadata object_id is never authoritative.
+            expected_object = _reference_object_digest(data, source)
             actual_object = str(actual.get("object_id") or actual.get("digest") or "").removeprefix("sha256:")
             if expected_object != actual_object:
                 errors.append({"kind": "reference", "id": source.get("id"), "reason": "destination reference object identity differs", "expected_object_id": expected_object, "actual_object_id": actual_object})
