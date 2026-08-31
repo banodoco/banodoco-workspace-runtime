@@ -110,6 +110,7 @@ def _migration_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--source", "--source-root", dest="source_root", required=True, type=Path)
     command.add_argument("--archive", "--archive-root", dest="archive_root", required=True, type=Path)
     command.add_argument("--destination", "--destination-root", dest="destination_root", required=True, type=Path)
+    command.add_argument("--dry-run", action="store_true", help="validate and report without importing or activating")
 
 
 def _attempt_args(command: argparse.ArgumentParser) -> None:
@@ -274,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(_client(paths).restore_backup(str(args.backup.expanduser().resolve()), str(args.destination.expanduser().resolve())), json_mode=args.json)
             return 0
         if args.command in {"migrate", "rehearse"}:
-            _emit(_migrate(args, paths, dry_run=args.command == "rehearse"), json_mode=args.json)
+            _emit(_migrate(args, paths, dry_run=args.command == "rehearse" or args.dry_run), json_mode=args.json)
             return 0
         if args.command == "checkpoint":
             client = _client(paths)
