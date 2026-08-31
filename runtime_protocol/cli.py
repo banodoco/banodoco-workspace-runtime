@@ -42,11 +42,42 @@ def _parser():
     purge = sub.add_parser("purge", help="irreversibly remove a tombstoned realm (offline only)")
     purge.add_argument("--root", required=True)
     purge.add_argument("--confirm", required=True)
+    identity = sub.add_parser("identity", help="capture or verify local release identities")
+    identity.add_argument("operation", choices=("pre-live", "candidate-core", "verify"))
+    identity.add_argument("--component", action="append", default=[])
+    identity.add_argument("--pre-live")
+    identity.add_argument("--receipt")
+    identity.add_argument("--output")
     return parser
 
 
 def main(argv=None):
     args = _parser().parse_args(argv)
+    if args.command == "identity":
+        from . import release_identity
+        try:
+            if args.operation == "verify":
+                if not args.receipt:
+                    raise release_identity.ReleaseIdentityError("identity verify requires --receipt")
+                result = {"ok": True, "identity": release_identity.load_receipt(args.receipt)["identity"]}
+            else:
+                components = {}
+                for value in args.component:
+                    if "=" not in value:
+                        raise release_identity.ReleaseIdentityError("--component must use COMPONENT_ID=CHECKOUT")
+                    component, checkout = value.split("=", 1)
+                    components[component] = checkout
+                if args.operation == "pre-live":
+                    result = release_identity.create_pre_live_identity(components, output=args.output)
+                else:
+                    if not args.pre_live:
+                        raise release_identity.ReleaseIdentityError("candidate-core requires --pre-live")
+                    result = release_identity.create_candidate_core_identity(args.pre_live, components, output=args.output)
+            print(json.dumps(result, sort_keys=True, indent=2))
+            return 0
+        except release_identity.ReleaseIdentityError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+            return 1
     if args.command == "doctor":
         root = Path(args.root)
         if not root.exists() or not (root / "realm.sqlite3").exists():
