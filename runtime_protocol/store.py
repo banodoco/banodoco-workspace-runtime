@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .errors import ConflictError, LeaseError, NotFoundError, OwnerBusyError, ValidationError
+from .errors import ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, ValidationError
 from .util import canonical_json, new_id, now
 
 try:
@@ -318,11 +318,12 @@ class RealmStore:
             changed_name = current["name"] if name is None else name
             changed_meta = current["metadata"] if metadata is None else metadata
             timestamp = now()
-            self.conn.execute("UPDATE projects SET name=?, metadata_json=?, version=version+1, updated_at=? WHERE id=?",
-                              (changed_name, canonical_json(changed_meta), timestamp, current["id"]))
-            result = self._project(current["id"])
-            if idempotency_key:
-                self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("project.update", current["id"], idempotency_key, request_hash, canonical_json(result), timestamp))
+            with self._transaction():
+                self.conn.execute("UPDATE projects SET name=?, metadata_json=?, version=version+1, updated_at=? WHERE id=?",
+                                  (changed_name, canonical_json(changed_meta), timestamp, current["id"]))
+                result = self._project(current["id"])
+                if idempotency_key:
+                    self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("project.update", current["id"], idempotency_key, request_hash, canonical_json(result), timestamp))
             return result
 
     def add_object_ref(self, project: str, digest: str, relation="managed"):
@@ -681,7 +682,7 @@ class RealmStore:
         if changed.rowcount != 1:
             raise ConflictError("stale settlement effect target version")
 
-    def settle_task(self, task_id, lease_token, result, *, effect=None, output_objects=None, fence=None):
+    def settle_task(self, task_id, lease_token, result, *, effect=None, output_objects=None, fence=None, attempt_id=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
@@ -709,6 +710,8 @@ class RealmStore:
                     self._apply_settlement_effect(effect)
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
+                if attempt_id is not None:
+                    self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
                 self._append_event(task["run_id"], task_id, "task.completed", {"result": result, "effect": effect, "objects": output_objects or []})
                 return self.get_task(task_id)
@@ -778,9 +781,9 @@ class RealmStore:
                     cancelled.append(task["id"])
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (timestamp, run_id))
                 self._append_event(run_id, None, "run.cancelled", {"task_ids": cancelled})
-            result = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
-            if idempotency_key:
-                self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.cancel", run_id, idempotency_key, request_hash, canonical_json(result), now()))
+                result = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+                if idempotency_key:
+                    self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.cancel", run_id, idempotency_key, request_hash, canonical_json(result), now()))
             return result
 
     def retry_run(self, run_id, *, selected_task_ids=None, idempotency_key=None):
@@ -789,7 +792,14 @@ class RealmStore:
             run = self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             if not run:
                 raise NotFoundError("run not found")
-            selected = None if selected_task_ids is None else sorted({str(value) for value in selected_task_ids})
+            if selected_task_ids is not None:
+                if not isinstance(selected_task_ids, list) or any(not isinstance(value, str) or not value for value in selected_task_ids):
+                    raise InvalidRequestError("selected_task_ids must be an array of non-empty strings", details={"field": "selected_task_ids"})
+                if len(selected_task_ids) != len(set(selected_task_ids)):
+                    raise InvalidRequestError("selected_task_ids must not contain duplicates", details={"field": "selected_task_ids"})
+                selected = sorted(selected_task_ids)
+            else:
+                selected = None
             request_hash = hashlib.sha256(canonical_json({"selected_task_ids": selected}).encode()).hexdigest()
             if idempotency_key:
                 prior = self.conn.execute("SELECT * FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?", ("run.retry", run_id, idempotency_key)).fetchone()
@@ -818,12 +828,12 @@ class RealmStore:
                     retried.append(task["id"])
                 self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, run_id))
                 self._append_event(run_id, None, "run.retried", {"task_ids": retried})
-            result = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
-            if idempotency_key:
-                self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.retry", run_id, idempotency_key, request_hash, canonical_json(result), now()))
+                result = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
+                if idempotency_key:
+                    self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.retry", run_id, idempotency_key, request_hash, canonical_json(result), now()))
             return result
 
-    def fail_task(self, task_id, lease_token, failure, *, fence=None):
+    def fail_task(self, task_id, lease_token, failure, *, fence=None, attempt_id=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
@@ -843,6 +853,8 @@ class RealmStore:
                 result = {"error": failure}
                 self.conn.execute("UPDATE tasks SET status='failed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='failed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
+                if attempt_id is not None:
+                    self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
                 self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
                 return self.get_task(task_id)

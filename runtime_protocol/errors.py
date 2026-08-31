@@ -50,3 +50,10 @@ class LeaseError(ConflictError):
 class ProtocolError(RuntimeErrorBase):
     code = "protocol_error"
     status = 400
+
+
+class InvalidRequestError(RuntimeErrorBase):
+    """A syntactically valid request with an invalid JSON shape."""
+
+    code = "invalid_request"
+    status = 400

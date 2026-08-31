@@ -729,6 +729,8 @@ class RuntimeService:
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
             if not task or (task["runtime_epoch"] is not None and int(task["runtime_epoch"]) != current_epoch):
                 raise LeaseError("attempt belongs to a stale runtime epoch")
+            if task["status"] != "running" or task["attempt_id"] != attempt_id or task["lease_token"] != row["lease_id"] or int(task["lease_fence"] or 0) != int(row["fence"]):
+                raise LeaseError("attempt lease is stale or already settled")
             declared = json.loads(task["expected_effect_json"]) if task["expected_effect_json"] else None
             effect = body.get("effect")
             if effect is not None and declared != effect:
@@ -739,8 +741,7 @@ class RuntimeService:
                 self.store._validate_settlement_effect(effect)
             outputs = self._publish_outputs(body.get("outputs", []))
             result = {"outputs": outputs}
-            value = self.store.settle_task(row["task_id"], row["lease_id"], result, effect=effect, fence=body.get("fence"))
-            self.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (attempt_id,))
+            value = self.store.settle_task(row["task_id"], row["lease_id"], result, effect=effect, fence=body.get("fence"), attempt_id=attempt_id)
             return self._task_resource(value)
 
     def _publish_outputs(self, outputs):
@@ -1017,8 +1018,7 @@ class RuntimeService:
         current = self.store._current_runtime_epoch()
         self._validate_attempt_lease(row, body, current)
         failure = body.get("error") or body.get("reason") or {"code": "executor_failed"}
-        value = self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"])
-        self.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (attempt_id,))
+        value = self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"], attempt_id=attempt_id)
         return self._task_resource(value)
 
     def events_page(self, aggregate_id=None, *, cursor=None, limit=50):
