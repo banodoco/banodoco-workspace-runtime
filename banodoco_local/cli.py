@@ -218,7 +218,7 @@ def _migrate(args: argparse.Namespace, paths: RuntimePaths, *, dry_run: bool) ->
     # only the generated client, never a RealmStore or direct SQLite handle.
     from tools.astrid_migrate import MigrationConfig, migrate
     client = _client(paths) if read_json(paths.discovery_path) else None
-    return migrate(MigrationConfig(args.source_root, args.archive_root, args.destination_root, dry_run=dry_run), client)
+    return migrate(MigrationConfig(args.source_root, args.archive_root, args.destination_root, dry_run=dry_run, activation_registry_root=paths.activations_dir), client)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -80,6 +80,13 @@ class MigrationConfig:
     # Trusted B10.2 ``exclude`` dispositions explicitly prevent the opaque
     # owner-data import; preserve remains the default for ordinary migration.
     include_owner_data: bool = True
+    # Neutral activation registry written only after a complete destination
+    # realm has been reconciled.  The CLI supplies the runtime support path;
+    # direct offline callers get the sibling registry for deterministic tests.
+    activation_registry_root: Path | None = None
+    runtime_version: str = "workspace.v1"
+    schema_version: str = "workspace-schema-v1"
+    importer_version: str = "t5"
 
     def __post_init__(self):
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
@@ -91,6 +98,14 @@ class MigrationConfig:
         object.__setattr__(self, "destination_root", Path(os.path.abspath(os.path.expanduser(str(self.destination_root)))))
         if self.evidence_root is not None:
             object.__setattr__(self, "evidence_root", Path(self.evidence_root).expanduser().resolve())
+        if self.activation_registry_root is None:
+            # A normal realm lives below ``runtime/realms/<realm-id>`` and
+            # its neutral activation registry is a sibling of ``realms``.
+            # Deriving this keeps the offline migrator honest even when it is
+            # invoked directly rather than through banodoco-local.
+            object.__setattr__(self, "activation_registry_root", self.destination_root.parent.parent / "activations")
+        else:
+            object.__setattr__(self, "activation_registry_root", Path(self.activation_registry_root).expanduser().resolve())
 
 
 def _json(value: Any, default: Any):
@@ -1360,8 +1375,67 @@ class Migrator:
                 blockers.append({"kind": "destination_truth", "reason": "client returned no durable identities", "entities": missing})
         return {"ok": not blockers, "expected": expected, "mapped": actual, "unresolved": unresolved, "blockers": blockers, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok", "source_facts_sha256": source_facts_sha256, "source_counts": expected, "mapped_counts": actual, "destination_truth": destination}
 
+    @staticmethod
+    def _identity(path: Path) -> dict[str, int]:
+        value = path.stat(follow_symlinks=False)
+        return {"st_dev": int(value.st_dev), "st_ino": int(value.st_ino), "st_mode": int(value.st_mode)}
+
+    @staticmethod
+    def _cas_inventory(root: Path) -> tuple[list[dict[str, Any]], str]:
+        entries = []
+        cas = root / "cas"
+        if not cas.is_dir() or cas.is_symlink():
+            return [], _sha256_bytes(_canonical([]))
+        for path in sorted(cas.rglob("*")):
+            if path.is_symlink():
+                raise MigrationError("destination CAS contains a symlink")
+            if path.is_file():
+                entries.append({"path": str(path.relative_to(root)), "size": path.stat().st_size, "sha256": _sha256_file(path)})
+        return entries, _sha256_bytes(_canonical(entries))
+
     def _activation(self, archive: Path, reconciliation: Mapping[str, Any]) -> Path:
-        payload = {"format_version": 1, "state": "activated", "source_archive": str(archive), "source_archive_sha256": _sha256_file(archive / "manifest.json"), "source_version": self.config.source_version, "destination_root": str(self.config.destination_root), "reconciliation": reconciliation, "rollback_archive": str(archive), "created_at": time.time()}
+        destination = self.config.destination_root
+        database = destination / "realm.sqlite3"
+        if not database.is_file() or database.is_symlink():
+            # Lightweight fake clients do not own a runtime realm. They still
+            # receive the historical destination manifest, but cannot create
+            # a registry record that bootstrap could safely waive against.
+            format_version = 1
+            payload = {"format_version": format_version, "state": "activated", "source_archive": str(archive), "source_archive_sha256": _sha256_file(archive / "manifest.json"), "source_version": self.config.source_version, "destination_root": str(destination), "reconciliation": reconciliation, "rollback_archive": str(archive), "created_at": time.time()}
+        else:
+            archive_manifest = archive / "manifest.json"
+            source_manifest = json.loads(archive_manifest.read_text(encoding="utf-8"))
+            objects, object_hash = self._cas_inventory(destination)
+            report_payload = dict(self._report)
+            report_path = destination / "migration-report.json"
+            report_digest = _sha256_bytes(_canonical(report_payload))
+            destination_identity = self._identity(destination)
+            database_hash = _sha256_file(database)
+            source_archive_hash = _sha256_file(archive_manifest)
+            archive_tree_hash = _files_digest(_file_map(archive / "source"))
+            realm_id = ""
+            with sqlite3.connect(database) as connection:
+                row = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()
+                if row:
+                    realm_id = str(row[0])
+            if not realm_id:
+                raise MigrationError("destination runtime realm identity is unavailable")
+            report_bytes = (json.dumps(report_payload, sort_keys=True, indent=2) + "\n").encode()
+            activation_fields = {
+                "format_version": 2, "state": "activated", "realm_id": realm_id,
+                "source_archive": str(archive.resolve()), "source_archive_sha256": source_archive_hash,
+                "source_archive_identity": self._identity(archive),
+                "source_manifest_sha256": str(source_manifest.get("source_manifest_sha256", "")),
+                "source_archive_tree_sha256": archive_tree_hash,
+                "destination_root": str(destination.resolve()), "destination_identity": destination_identity,
+                "destination_database_sha256": database_hash, "cas_inventory_sha256": object_hash,
+                "cas_inventory": objects, "migration_report": str(report_path.resolve()), "migration_report_sha256": report_digest,
+                "source_version": self.config.source_version, "runtime_version": self.config.runtime_version,
+                "schema_version": self.config.schema_version, "protocol_version": "workspace.v1",
+                "importer_version": self.config.importer_version, "reconciliation": reconciliation,
+                "rollback_archive": str(archive.resolve()), "created_at": time.time(),
+            }
+            payload = activation_fields
         target = self.config.destination_root / "activation-manifest.json"
         # Keep the destination realm authority pinned for the complete
         # activation-manifest publication.  The temporary file and rename are
@@ -1394,6 +1468,8 @@ class Migrator:
             if close_destination_fd:
                 _validate_parent(self.config.destination_root, destination_pin)
             validate_target_inode()
+            if payload.get("format_version") == 2:
+                _write_bytes_at(destination_fd, "migration-report.json", report_bytes)
             _write_bytes_at(destination_fd, target.name, (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
             validate_target_inode()
             if close_destination_fd:
@@ -1402,6 +1478,19 @@ class Migrator:
             if close_destination_fd:
                 os.close(destination_fd)
             _close_pinned(destination_pin)
+        if payload.get("format_version") == 2 and self.config.activation_registry_root is not None:
+            registry = self.config.activation_registry_root
+            registry_pin = _ensure_directory(registry)
+            registry_fd = int(registry_pin.get("_parent_fd"))
+            try:
+                record = dict(payload)
+                record["activation_manifest"] = str(target.resolve())
+                record["activation_manifest_sha256"] = _sha256_file(target)
+                record["registry_version"] = 1
+                record["registry_sha256"] = _sha256_bytes(_canonical(record))
+                _write_bytes_at(registry_fd, f"{payload['realm_id']}.json", (json.dumps(record, sort_keys=True, indent=2) + "\n").encode())
+            finally:
+                _close_pinned(registry_pin)
         return target
 
 

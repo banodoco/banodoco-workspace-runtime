@@ -634,7 +634,7 @@ class LiveMigration:
             activation = self._read_json(activation_path)
         except MigrationError:
             raise
-        if activation.get("format_version") != 1 or activation.get("state") != "activated" or _absolute_path(activation.get("destination_root", "")) != _absolute_path(self.config.destination_root):
+        if activation.get("format_version") not in {1, 2} or activation.get("state") != "activated" or _absolute_path(activation.get("destination_root", "")) != _absolute_path(self.config.destination_root):
             raise MigrationError("B12 terminal activation manifest has an invalid identity")
         source_archive = Path(str(activation.get("source_archive", "")))
         if _absolute_path(source_archive) != _absolute_path(self.config.archive_root):

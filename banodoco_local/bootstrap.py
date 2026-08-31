@@ -1,8 +1,9 @@
 """T2 neutral one-realm launch/reconnect lifecycle.
 
 The boundary protocol is intentionally tiny.  A real generated workspace
-client can implement it; tests use a fake.  No method here opens a database,
-creates a CAS object, or imports product code.
+client can implement it; tests use a fake.  Runtime ownership stays behind
+that boundary; the activation verifier only performs read-only artifact
+checks before a legacy-root collision may be waived.
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import secrets
+import stat
 import time
 from contextlib import contextmanager
 from typing import Any, Mapping, Protocol, Sequence
@@ -205,36 +208,177 @@ def _legacy_collision(paths: RuntimePaths, configured: tuple[Path, ...]) -> Path
     return None
 
 
-def _verified_activation_manifest(paths: RuntimePaths) -> bool:
-    """Return true only for a complete, authenticated migration activation.
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-    Catalog presence is deliberately irrelevant.  Every digest is required
-    so an empty/stale hand-written catalog or an incomplete activation record
-    cannot make the historical root appear neutral.
-    """
+
+def _sha256_regular(path: Path) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    digest = hashlib.sha256()
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+    finally:
+        os.close(fd)
+
+
+def _read_json_regular(path: Path) -> Any:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+        return json.loads(bytes(data).decode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _stat_digest(path: Path) -> dict[str, int]:
+    value = path.stat(follow_symlinks=False)
+    return {"st_dev": int(value.st_dev), "st_ino": int(value.st_ino), "st_mode": int(value.st_mode)}
+
+
+def _has_symlink_component(path: Path) -> bool:
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _cas_inventory(root: Path) -> list[dict[str, Any]]:
+    result = []
+    cas = root / "cas"
+    if not cas.is_dir() or cas.is_symlink():
+        raise OSError("CAS root is unavailable")
+    for path in sorted(cas.rglob("*")):
+        if path.is_symlink():
+            raise OSError("CAS contains a symlink")
+        if path.is_file():
+            result.append({"path": str(path.relative_to(root)), "size": path.stat().st_size, "sha256": _sha256_regular(path)})
+    return result
+
+
+def _cas_digest(root: Path) -> str:
+    return hashlib.sha256(_canonical_json(_cas_inventory(root))).hexdigest()
+
+
+def _source_tree_digest(root: Path) -> str:
+    if root.is_symlink() or not root.is_dir():
+        raise OSError("archive source tree is unavailable")
+    result = []
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            resolved = path.resolve(strict=False)
+            try:
+                resolved.relative_to(root.resolve())
+                inside = True
+            except ValueError:
+                inside = False
+            result.append({"path": relative, "kind": "symlink", "target": os.readlink(path), "resolved_inside_root": inside})
+        elif path.is_file():
+            result.append({"path": relative, "kind": "file", "size": path.stat().st_size, "sha256": _sha256_regular(path)})
+    return hashlib.sha256(_canonical_json(result)).hexdigest()
+
+
+def _verified_activation_manifest(paths: RuntimePaths) -> bool:
+    """Verify a complete activation registry against every referenced byte."""
+    if paths.activations_dir.is_symlink() or not paths.activations_dir.is_dir():
+        return False
     try:
         manifests = tuple(paths.activations_dir.glob("*.json"))
     except OSError:
         return False
     for path in manifests:
         try:
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink() or not path.is_file() or path.name.startswith("."):
                 continue
-            value = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(value, Mapping) or value.get("version") != 1:
+            value = _read_json_regular(path)
+            if not isinstance(value, Mapping) or value.get("registry_version") != 1 or value.get("state") != "activated":
                 continue
-            required = ("realm_id", "source_archive_hash", "destination_realm_root",
-                        "destination_database_hash", "destination_object_manifest_hash",
-                        "runtime_version", "schema_version", "protocol_version",
-                        "importer_version", "validation_report_digest")
-            if any(not isinstance(value.get(key), str) or not value[key].strip() for key in required):
+            registry_hash = value.get("registry_sha256")
+            unsigned = {key: item for key, item in value.items() if key != "registry_sha256"}
+            if not isinstance(registry_hash, str) or registry_hash != hashlib.sha256(_canonical_json(unsigned)).hexdigest():
                 continue
-            if any(len(value[key]) != 64 for key in ("source_archive_hash", "destination_database_hash", "destination_object_manifest_hash", "validation_report_digest")):
+            required = ("realm_id", "source_archive", "source_archive_sha256", "source_archive_identity", "source_manifest_sha256",
+                        "source_archive_tree_sha256", "destination_root", "destination_identity",
+                        "destination_database_sha256", "cas_inventory_sha256", "cas_inventory",
+                        "migration_report", "migration_report_sha256", "activation_manifest",
+                        "activation_manifest_sha256", "runtime_version", "schema_version",
+                        "protocol_version", "importer_version", "source_version", "reconciliation")
+            if any(not isinstance(value.get(key), (str, dict, list)) or value[key] in ("", None) for key in required):
                 continue
-            if not Path(value["destination_realm_root"]).is_absolute():
+            if value["protocol_version"] != PROTOCOL_VERSION or value["schema_version"] != SCHEMA_VERSION:
+                continue
+            hex_fields = ("source_archive_sha256", "source_manifest_sha256", "source_archive_tree_sha256",
+                          "destination_database_sha256", "cas_inventory_sha256", "migration_report_sha256",
+                          "activation_manifest_sha256")
+            if any(not isinstance(value.get(key), str) or len(value[key]) != 64 or any(c not in "0123456789abcdef" for c in value[key]) for key in hex_fields):
+                continue
+            destination = Path(str(value["destination_root"]))
+            archive = Path(str(value["source_archive"]))
+            report = Path(str(value["migration_report"]))
+            activation = Path(str(value["activation_manifest"]))
+            if any(not item.is_absolute() or _has_symlink_component(item) or item.is_symlink() for item in (destination, archive, report, activation)):
+                continue
+            if destination != Path(os.path.realpath(destination)) or not destination.is_dir():
+                continue
+            if value["activation_manifest"] != str(destination / "activation-manifest.json") or activation != destination / "activation-manifest.json":
+                continue
+            if value["realm_id"] != path.stem:
+                continue
+            if _stat_digest(destination) != value["destination_identity"] or _stat_digest(archive) != value["source_archive_identity"]:
+                continue
+            if _sha256_regular(activation) != value["activation_manifest_sha256"] or _sha256_regular(destination / "realm.sqlite3") != value["destination_database_sha256"]:
+                continue
+            if _cas_digest(destination) != value["cas_inventory_sha256"] or _cas_inventory(destination) != value["cas_inventory"]:
+                continue
+            if not archive.is_dir() or _sha256_regular(archive / "manifest.json") != value["source_archive_sha256"]:
+                continue
+            archive_manifest = _read_json_regular(archive / "manifest.json")
+            if (archive_manifest.get("source_version") != value["source_version"]
+                    or archive_manifest.get("source_manifest_sha256") != value["source_manifest_sha256"]
+                    or archive_manifest.get("archive_source_tree_sha256") != value["source_archive_tree_sha256"]
+                    or archive_manifest.get("files_sha256") != value["source_archive_tree_sha256"]
+                    or _source_tree_digest(archive / "source") != value["source_archive_tree_sha256"]):
+                continue
+            report_value = _read_json_regular(report)
+            if hashlib.sha256(_canonical_json(report_value)).hexdigest() != value["migration_report_sha256"]:
+                continue
+            activation_value = _read_json_regular(activation)
+            activation_expected = {key: item for key, item in value.items() if key not in {"registry_version", "registry_sha256", "activation_manifest", "activation_manifest_sha256"}}
+            if activation_value != activation_expected:
+                continue
+            if activation_value.get("state") != "activated" or activation_value.get("reconciliation", {}).get("ok") is not True:
+                continue
+            with sqlite3.connect((destination / "realm.sqlite3").as_uri() + "?mode=ro", uri=True) as db:
+                realm = db.execute("SELECT id FROM realm LIMIT 1").fetchone()
+            if not realm or str(realm[0]) != str(value["realm_id"]):
+                continue
+            catalog = _read_catalog(paths)
+            rows = [row for row in catalog.get("realms", []) if isinstance(row, Mapping) and str(row.get("realm_id")) == str(value["realm_id"])]
+            if catalog.get("selected_realm_id") != value["realm_id"] or len(rows) != 1:
+                continue
+            catalog_root = Path(str(rows[0].get("data_root", "")))
+            if (not catalog_root.is_absolute() or _has_symlink_component(catalog_root)
+                    or catalog_root != destination or os.path.realpath(str(catalog_root)) != str(destination)):
                 continue
             return True
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, sqlite3.Error, BootstrapError):
             continue
     return False
 
@@ -371,27 +515,6 @@ def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: 
         handshake(protocol_version=PROTOCOL_VERSION, schema_version=SCHEMA_VERSION)
 
 
-def _activation(paths: RuntimePaths, realm: Mapping[str, Any], source: SourceProfile) -> Path:
-    realm_id = str(realm["realm_id"])
-    destination = Path(str(realm["data_root"]))
-    activation = {
-        "version": 1,
-        "realm_id": realm_id,
-        "source_archive_hash": source.source_digest or source.digest,
-        "destination_realm_root": str(destination),
-        "destination_database_hash": "",
-        "destination_object_manifest_hash": "",
-        "runtime_version": source.runtime_checkout,
-        "schema_version": source.schema_version,
-        "protocol_version": source.protocol_version,
-        "importer_version": "t2",
-        "validation_report_digest": "",
-    }
-    path = paths.activations_dir / f"{realm_id}.json"
-    atomic_write_json(path, activation)
-    return path
-
-
 def bootstrap(
     paths: RuntimePaths,
     boundary: RuntimeBoundary,
@@ -517,9 +640,6 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     actor_id, token = _credential(paths)
     connection = boundary.connect(endpoint=endpoint, credential=token)
     _provision_connection(connection, actor_id, token, realm_id)
-    activation_path = _activation(paths, realm, source)
-    realm["activation_manifest"] = str(activation_path)
-    realm["activation_digest"] = hashlib.sha256(activation_path.read_bytes()).hexdigest()
     realm["source_profile"] = source.profile
     catalog["source_profiles"][source.profile] = source.as_dict()
     atomic_write_json(paths.catalog_path, catalog)

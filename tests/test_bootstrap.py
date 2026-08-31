@@ -103,7 +103,7 @@ class BootstrapTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_first_launch_writes_catalog_discovery_activation_and_scoped_credential(self):
+    def test_first_launch_writes_catalog_discovery_without_synthesizing_activation(self):
         result = bootstrap(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "started")
         self.assertEqual(len(self.boundary.starts), 1)
@@ -118,7 +118,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(credential["token"]), 64)
         mode = stat.S_IMODE((self.paths.credentials_dir / "astrid.json").stat().st_mode)
         self.assertEqual(mode, 0o600)
-        self.assertTrue(Path(catalog["realms"][0]["activation_manifest"]).exists())
+        self.assertNotIn("activation_manifest", catalog["realms"][0])
+        self.assertEqual(tuple(self.paths.activations_dir.glob("*.json")), ())
         source_manifest = self.paths.source_profiles_dir / "astrid.json"
         self.assertEqual(json.loads(source_manifest.read_text()), PROFILE.as_dict())
         self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
