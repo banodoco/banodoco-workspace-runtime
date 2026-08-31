@@ -9,6 +9,11 @@
     "project_id": { "type": "string", "minLength": 1 },
     "version": { "type": "integer", "minimum": 1 },
     "archived": { "type": "boolean" },
+    "slug": { "type": "string" },
+    "name": { "type": "string" },
+    "config_version": { "type": "integer", "minimum": 1 },
+    "config": { "type": "object" },
+    "registry": { "type": "object" },
     "shots": { "type": "array", "items": { "$ref": "#/$defs/Shot" } },
     "references": { "type": "array", "items": { "$ref": "#/$defs/Reference" } }
   },

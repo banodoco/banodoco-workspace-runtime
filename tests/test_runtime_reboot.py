@@ -60,8 +60,8 @@ def test_reboot_recovery_is_atomic_with_settlement_effects(tmp_path):
     root = tmp_path / "realm"
     first = RuntimeService(root)
     project = first.create_project({"slug": "effect", "name": "Before"})
-    effect = {"kind": "project.update", "target": project["id"], "expected_version": 1, "payload": {"name": "After"}}
-    admitted = first.create_task({"capability_id": "render.basic", "project": project["id"], "spec": {}, "expected_effect": effect, "idempotency_key": "effect-reboot"})
+    effect = {"effect_type": "project.update", "target_id": project["id"], "expected_version": 1, "payload": {"name": "After"}}
+    admitted = first.create_task({"capability_id": "render.basic", "project": project["id"], "spec": {}, "settlement_effect": effect, "idempotency_key": "effect-reboot"})
     first.register_worker({"worker_id": "worker", "capabilities": ["render.basic"]})
     attempt = first.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": first.health()["runtime_epoch"]})
     first.close()

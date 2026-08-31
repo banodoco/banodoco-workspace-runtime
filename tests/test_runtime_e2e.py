@@ -166,7 +166,7 @@ def test_restart_reconnect_and_catalog_discovery(daemon, tmp_path):
     realm_id = client.get_project(project["project_id"])["realm_id"]
     discovery = json.loads((tmp_path / "support" / "discovery.json").read_text())
     catalog = json.loads((tmp_path / "support" / "catalog.json").read_text())
-    assert discovery["realm_id"] == realm_id
+    assert discovery["active_realm"] == realm_id
     assert "database" not in json.dumps(discovery).lower()
     assert catalog["selected_realm_id"] == realm_id
     daemon.stop()
@@ -251,7 +251,7 @@ def test_astrid_scoped_actor_can_discover_capability_for_task_admission(daemon):
 def test_stale_lease_and_undeclared_effect_are_rejected(daemon):
     client = Api(daemon.endpoint, daemon.token)
     project = client.create_project("effect-target", "Effect Target")
-    effect = {"kind": "project.update", "target": project["project_id"], "expected_version": 1, "payload": {"name": "Settled Effect"}}
+    effect = {"effect_type": "project.update", "target_id": project["project_id"], "expected_version": 1, "payload": {"name": "Settled Effect"}}
     task = client.create_task("render.basic", {}, project=project["project_id"], expected_effect=effect)
     task_id = task["task_id"]
     client.register_worker("effect-worker", ["render.basic"])

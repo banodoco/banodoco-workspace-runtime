@@ -116,15 +116,13 @@ class LiveDiscovery:
         self.path = Path(path).expanduser().resolve()
 
     def publish(self, **fields):
-        # Canonical discovery is shared with banodoco-local. Legacy aliases
-        # remain readable for older neutral clients during this beta.
-        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "instance_id", "realm_id"}
+        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file"}
         atomic_json_write(self.path, {k: fields[k] for k in allowed if k in fields})
 
     def clear(self, instance_id: str | None = None):
         if not self.path.exists():
             return
-        if instance_id is None or self.read().get("instance_id") == instance_id:
+        if instance_id is None or self.read().get("runtime_instance_id") == instance_id:
             try:
                 self.path.unlink()
             except FileNotFoundError:

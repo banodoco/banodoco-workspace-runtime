@@ -140,6 +140,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "POST": return self._send(201, self.runtime.create_timeline(path[2], self._body().get("timeline_id", "")))
             if method == "GET": return self._send(200, self.runtime.list_timelines(path[2]))
+        if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timeline-documents" and method == "POST":
+            self._identity("projects:write")
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
+            return self._send(201, self.runtime.create_timeline_document(path[2], self._body(), idempotency_key=key))
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("shots", "references") and method == "POST":
             self._identity("projects:write")
             body = self._body()
@@ -398,7 +404,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] == "events" and method == "GET":
             self._identity("tasks:read")
             return self._send(200, self.runtime.events_page(path[2]))
-        if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] in ("cancel", "retry-failed", "retry") and method == "POST":
+        if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] in ("cancel", "retry") and method == "POST":
             self._identity("tasks:write")
             key = self.headers.get("Idempotency-Key")
             if not key:

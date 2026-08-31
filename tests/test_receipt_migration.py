@@ -27,7 +27,7 @@ def _make_pre016(root):
         "first_project_seq=NULL, last_project_seq=NULL, event_ids_json=NULL"
     )
     service.store.conn.execute("DELETE FROM canonical_receipt_backfills")
-    service.store.conn.execute("DELETE FROM schema_migrations WHERE version=17")
+    service.store.conn.execute("DELETE FROM schema_migrations WHERE version>=17")
     service.close()
 
 

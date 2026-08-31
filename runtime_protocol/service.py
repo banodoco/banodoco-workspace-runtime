@@ -255,6 +255,41 @@ class RuntimeService:
         self._record_timeline_revision(timeline_id, resource)
         return resource
 
+    @_durable_mutation
+    def create_timeline_document(self, project_id, body, *, idempotency_key=None):
+        """Create the timeline and composition document in one transaction."""
+        if not isinstance(body, dict):
+            raise InvalidRequestError("request body must be a JSON object")
+        project = self.store.get_project(project_id)
+        timeline_id = str(body.get("timeline_id") or "")
+        if not timeline_id:
+            raise ValidationError("timeline_id is required")
+        config, registry = body.get("config", {}), body.get("registry", {})
+        if not isinstance(config, dict) or not isinstance(registry, dict):
+            raise ValidationError("config and registry must be objects")
+        slug, name = str(body.get("slug") or timeline_id), str(body.get("name") or body.get("slug") or timeline_id)
+        content = {"slug": slug, "name": name, "config": config, "registry": registry}
+        request_hash = hashlib.sha256(canonical_json({
+            "project_id": project["id"], "timeline_id": timeline_id,
+            "slug": slug, "name": name, "config": config, "registry": registry,
+        }).encode()).hexdigest()
+        replay = self._command_replay("timeline_document.create", timeline_id, idempotency_key, request_hash, project_id=project["id"])
+        if replay is not None:
+            return replay
+        if self.store.conn.execute("SELECT 1 FROM timelines WHERE id=?", (timeline_id,)).fetchone():
+            raise ConflictError("timeline already exists", details={"timeline_id": timeline_id})
+        document_id = f"timeline:{timeline_id}"
+        if self.store.conn.execute("SELECT 1 FROM project_documents WHERE id=?", (document_id,)).fetchone():
+            raise ConflictError("timeline document already exists", details={"document_id": document_id})
+        timestamp = now()
+        self.store.conn.execute("INSERT INTO timelines(id, project_id, version, created_at, archived_at) VALUES (?, ?, 1, ?, NULL)", (timeline_id, project["id"], timestamp))
+        self.store.conn.execute("INSERT INTO project_documents(id, project_id, kind, content_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)", (document_id, project["id"], "timeline.composition", canonical_json(content), timestamp, timestamp))
+        resource = self._timeline_resource(timeline_id)
+        self._record_timeline_revision(timeline_id, resource)
+        event_id = self.store._append_timeline_event(timeline_id, "timeline.document.created", {"project_id": project["id"], "document_id": document_id, "config_version": resource["config_version"]})
+        event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
+        return self._command_record("timeline_document.create", timeline_id, idempotency_key, request_hash, resource, project_id=project["id"], event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
+
     def list_timelines(self, project_id):
         project = self.store.get_project(project_id)
         rows = self.store.conn.execute("SELECT id FROM timelines WHERE project_id=? ORDER BY created_at", (project["id"],))
@@ -288,11 +323,7 @@ class RuntimeService:
         query = "SELECT * FROM project_shots WHERE project_id=?"
         if not include_archived: query += " AND archived_at IS NULL"
         rows = self.store.conn.execute(query + " ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
-        items = [self._project_shot_resource(row) for row in rows]
-        legacy_query = "SELECT s.* FROM timeline_shots s JOIN timelines t ON t.id=s.timeline_id LEFT JOIN timeline_shot_state st ON st.id=s.id WHERE t.project_id=?"
-        if not include_archived: legacy_query += " AND st.archived_at IS NULL"
-        items.extend(self._shot_resource(row) for row in self.store.conn.execute(legacy_query + " ORDER BY s.id LIMIT ?", (project["id"], limit)).fetchall())
-        return {"items": items[:limit], "next_cursor": None}
+        return {"items": [self._project_shot_resource(row) for row in rows], "next_cursor": None}
 
     def list_project_references(self, project_id, *, include_archived=False, limit=50):
         project = self.store.get_project(project_id)
@@ -300,11 +331,7 @@ class RuntimeService:
         query = "SELECT * FROM project_references WHERE project_id=?"
         if not include_archived: query += " AND archived_at IS NULL"
         rows = self.store.conn.execute(query + " ORDER BY created_at, id LIMIT ?", (project["id"], limit)).fetchall()
-        items = [self._project_reference_resource(row) for row in rows]
-        legacy_query = "SELECT r.* FROM timeline_references r JOIN timelines t ON t.id=r.timeline_id LEFT JOIN timeline_reference_state st ON st.id=r.id WHERE t.project_id=?"
-        if not include_archived: legacy_query += " AND st.archived_at IS NULL"
-        items.extend(self._reference_resource(row) for row in self.store.conn.execute(legacy_query + " ORDER BY r.id LIMIT ?", (project["id"], limit)).fetchall())
-        return {"items": items[:limit], "next_cursor": None}
+        return {"items": [self._project_reference_resource(row) for row in rows], "next_cursor": None}
 
     @staticmethod
     def _require_object_body(body):
@@ -361,12 +388,14 @@ class RuntimeService:
             return {"data": json.loads(prior["result_json"]), "receipt": self._receipt_payload(prior, project_id=project_id)}
         return json.loads(prior["result_json"])
 
-    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None):
+    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
         if idempotency_key:
             if project_id is not None:
                 self.store._record_command_receipt(
                     kind, aggregate_id, idempotency_key, request_hash, result,
-                    project_id=project_id,
+                    project_id=project_id, event_ids=event_ids,
+                    primary_stream_id=primary_stream_id,
+                    resulting_stream_seq=resulting_stream_seq,
                 )
                 row = self.store.conn.execute(
                     "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
@@ -428,7 +457,9 @@ class RuntimeService:
             raise ValidationError("invalid reference kind")
         if not name.strip():
             raise ValidationError("name is required")
-        media_id = str(body.get("media_id") or body.get("object_id") or "").removeprefix("sha256:")
+        if "object_id" in body:
+            raise ValidationError("object_id is not supported; use media_id")
+        media_id = str(body.get("media_id") or "").removeprefix("sha256:")
         reference_id = str(body.get("reference_id") or "")
         if not media_id:
             raise ValidationError("media_id is required")
@@ -533,7 +564,10 @@ class RuntimeService:
     def reorder_shot_items(self, project_id, shot_id, body, *, idempotency_key=None):
         self._require_object_body(body)
         project = self.store.get_project(project_id)
-        self.get_project_shot(project_id, shot_id); expected = self._expected_version(body); item_ids = body.get("item_ids") or body.get("items")
+        self.get_project_shot(project_id, shot_id); expected = self._expected_version(body)
+        if "items" in body:
+            raise ValidationError("items is not supported; use item_ids")
+        item_ids = body.get("item_ids")
         if not isinstance(item_ids, list) or any(not isinstance(item_id, str) for item_id in item_ids) or len(item_ids) != len(set(item_ids)): raise ValidationError("items must be a unique complete permutation")
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
@@ -946,9 +980,11 @@ class RuntimeService:
         return {"items": [{"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]} for row in rows], "next_cursor": None}
 
     def create_task(self, body, *, enforce_readiness=False):
-        capability = body.get("capability_id") or body.get("capability")
+        if "capability" in body or "expected_effect" in body:
+            raise ValidationError("legacy task body aliases are not supported")
+        capability = body.get("capability_id")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
-        value = self.store.create_task(capability, {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect") or body.get("expected_effect"), digest, enforce_readiness=enforce_readiness)
+        value = self.store.create_task(capability, {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness)
         return value
 
     def task(self, task_id):

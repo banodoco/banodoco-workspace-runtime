@@ -212,22 +212,11 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         daemon.stop()
 
 
-def test_timeline_document_retry_repairs_partial_two_request_write(tmp_path, monkeypatch):
+def test_timeline_document_is_one_atomic_runtime_command(tmp_path, monkeypatch):
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
         project = client.create_project("Composition", idempotency_key="composition-project")
-        original = client.create_document
-        calls = 0
-
-        def fail_once(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                raise ConnectionError("response lost after composition write")
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(client, "create_document", fail_once)
         result = client.create_timeline_document(
             project.project_id,
             "composition",
@@ -237,12 +226,12 @@ def test_timeline_document_retry_repairs_partial_two_request_write(tmp_path, mon
             slug=None,
             name=None,
         )
-        assert calls == 2
         assert result["slug"] == "composition" and result["name"] == "composition"
+        assert result["receipt"]["command_kind"] == "timeline_document.create"
+        assert len(result["receipt"]["event_ids"]) == 1
         assert client.get_timeline("composition")["config"] == {"tracks": []}
 
-        # Replaying after the partial write is idempotent and does not add a
-        # second timeline or composition document.
+        # Replaying is served by the runtime ledger, not a client repair loop.
         replay = client.create_timeline_document(
             project.project_id,
             "composition",
@@ -250,10 +239,35 @@ def test_timeline_document_retry_repairs_partial_two_request_write(tmp_path, mon
             registry={"assets": {}},
             idempotency_key="composition-timeline",
         )
-        assert replay["config_version"] == result["config_version"]
+        assert replay == result
+        assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id='composition'").fetchone()[0] == 1
         assert len(client.list_timelines(project.project_id)[0]) == 1
+
+        original = daemon.service._command_record
+        monkeypatch.setattr(daemon.service, "_command_record", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("receipt write failed")))
+        with pytest.raises(ApiError):
+            client.create_timeline_document(project.project_id, "faulted", config={}, registry={}, idempotency_key="faulted")
+        assert daemon.service.store.conn.execute("SELECT 1 FROM timelines WHERE id='faulted'").fetchone() is None
+        assert daemon.service.store.conn.execute("SELECT 1 FROM project_documents WHERE id='timeline:faulted'").fetchone() is None
+        monkeypatch.setattr(daemon.service, "_command_record", original)
     finally:
         daemon.stop()
+
+
+def test_timeline_document_replay_survives_runtime_restart(tmp_path):
+    root, support = tmp_path / "realm", tmp_path / "support"
+    first = RuntimeDaemon(root, support_root=support).start()
+    client = WorkspaceClient(first.endpoint, first.token)
+    project = client.create_project("Restart", idempotency_key="restart-project")
+    result = client.create_timeline_document(project.project_id, "restart-timeline", config={"tracks": []}, registry={}, idempotency_key="restart-timeline")
+    first.stop()
+    second = RuntimeDaemon(root, support_root=support).start()
+    try:
+        replay = WorkspaceClient(second.endpoint, second.token).create_timeline_document(project.project_id, "restart-timeline", config={"tracks": []}, registry={}, idempotency_key="restart-timeline")
+        assert replay == result
+        assert second.service.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id='restart-timeline'").fetchone()[0] == 1
+    finally:
+        second.stop()
 
 
 def test_project_media_mutations_roll_back_before_idempotency_replay(tmp_path, monkeypatch):
@@ -305,14 +319,15 @@ def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path
         reference = client.create_reference("timeline", {"reference_id": "reference-mounted", "object_id": object_row.object_id, "role": "source"}, idempotency_key="reference")
         shots, _ = client.list_project_shots(project.project_id)
         references, _ = client.list_project_references(project.project_id)
-        assert any(item["shot_id"] == shot["shot_id"] for item in shots) and any(item["reference_id"] == reference["reference_id"] for item in references)
+        assert all(item["shot_id"] != shot["shot_id"] for item in shots)
+        assert all(item["reference_id"] != reference["reference_id"] for item in references)
         shot = client.update_shot("shot-mounted", expected_version=1, duration_ms=200)
         reference = client.update_reference("reference-mounted", expected_version=1, role="hero")
         shot = client.archive_shot("shot-mounted", expected_version=shot["version"], idempotency_key="archive-shot")
         reference = client.archive_reference("reference-mounted", expected_version=reference["version"], idempotency_key="archive-reference")
         assert shot["archived"] is True and reference["archived"] is True
         assert all(item["shot_id"] != "shot-mounted" for item in client.list_project_shots(project.project_id)[0])
-        assert any(item["shot_id"] == "shot-mounted" and item["archived"] is True for item in client.list_project_shots(project.project_id, include_archived=True)[0])
+        assert all(item["shot_id"] != "shot-mounted" for item in client.list_project_shots(project.project_id, include_archived=True)[0])
         shot = client.recover_shot("shot-mounted", expected_version=shot["version"], idempotency_key="recover-shot")
         reference = client.recover_reference("reference-mounted", expected_version=reference["version"], idempotency_key="recover-reference")
         assert shot["archived"] is False and reference["archived"] is False

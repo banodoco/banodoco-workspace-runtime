@@ -222,18 +222,18 @@ def test_settlement_effect_rejects_undeclared_stale_and_duplicate(tmp_path):
         undeclared = _task(service, "effect-undeclared")["task"]["id"]
         _claim(service, undeclared, {"worker_id": "worker", "lease_token": "u"})
         with pytest.raises(ValidationError):
-            service.settle(undeclared, {"lease_token": "u", "fence": 1, "result": {}, "effect": {"kind": "project.update", "target": project["id"], "expected_version": 1}})
+                service.settle(undeclared, {"lease_token": "u", "fence": 1, "result": {}, "effect": {"effect_type": "project.update", "target_id": project["id"], "expected_version": 1}})
         service.cancel(undeclared)
 
-        stale_effect = {"kind": "project.update", "target": project["id"], "expected_version": 2}
-        stale = service.create_task({"capability": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": stale_effect, "idempotency_key": "effect-stale"})["task"]["id"]
+        stale_effect = {"effect_type": "project.update", "target_id": project["id"], "expected_version": 2}
+        stale = service.create_task({"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": stale_effect, "idempotency_key": "effect-stale"})["task"]["id"]
         _claim(service, stale, {"worker_id": "worker", "lease_token": "s"})
         with pytest.raises(ConflictError):
             service.settle(stale, {"lease_token": "s", "fence": 1, "result": {}, "effect": stale_effect})
         service.cancel(stale)
 
-        valid_effect = {"kind": "project.update", "target": project["id"], "expected_version": 1}
-        duplicate = service.create_task({"capability": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": valid_effect, "idempotency_key": "effect-duplicate"})["task"]["id"]
+        valid_effect = {"effect_type": "project.update", "target_id": project["id"], "expected_version": 1}
+        duplicate = service.create_task({"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": valid_effect, "idempotency_key": "effect-duplicate"})["task"]["id"]
         _claim(service, duplicate, {"worker_id": "worker", "lease_token": "d"})
         service.settle(duplicate, {"lease_token": "d", "fence": 1, "result": {}, "effect": valid_effect})
         with pytest.raises(LeaseError):
@@ -247,7 +247,7 @@ def test_storage_admission_sets_exact_waiting_reason(tmp_path, monkeypatch):
     try:
         service.register_capability({"capability_id": "render.large", "definition_digest": _digest("render.large-v1"), "estimated_output_bytes": 1024})
         monkeypatch.setattr("runtime_protocol.store.shutil.disk_usage", lambda _path: SimpleNamespace(free=1))
-        task = service.create_task({"capability": "render.large", "capability_digest": _digest("render.large-v1"), "idempotency_key": "disk-full"})
+        task = service.create_task({"capability_id": "render.large", "capability_digest": _digest("render.large-v1"), "idempotency_key": "disk-full"})
         assert task["task"]["waiting_reason"] == "insufficient_storage"
         service.register_worker({"worker_id": "worker", "capabilities": ["render.large"]})
         claimed = _claim(service, task["task"]["id"], {"worker_id": "worker", "lease_token": "disk-lease"})

@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 LEASE_SECONDS = 30
 
 
@@ -167,6 +167,10 @@ class RealmStore:
             version = 16
         if version < 17:
             self._run_receipt_backfill_migration()
+            version = 17
+        if version < 18:
+            self._run_migration(18)
+            version = 18
 
     def _run_receipt_backfill_migration(self):
         """Backfill pre-016 rows inside one retryable migration transaction."""
@@ -628,6 +632,24 @@ class RealmStore:
         ).fetchone()
         return str(event[0])
 
+    def _append_timeline_event(self, timeline_id, kind, payload):
+        """Append a timeline event in the caller's transaction."""
+        previous = self.conn.execute(
+            "SELECT event_hash FROM timeline_events WHERE timeline_id=? ORDER BY id DESC LIMIT 1",
+            (timeline_id,),
+        ).fetchone()
+        timestamp = now()
+        previous_hash = previous[0] if previous else ""
+        event_hash = hashlib.sha256(canonical_json({
+            "timeline_id": timeline_id, "kind": kind, "payload": payload,
+            "previous_hash": previous_hash, "created_at": timestamp,
+        }).encode()).hexdigest()
+        self.conn.execute(
+            "INSERT INTO timeline_events(timeline_id, kind, payload_json, previous_hash, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (timeline_id, kind, canonical_json(payload), previous_hash, event_hash, timestamp),
+        )
+        return str(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
     def _allocate_project_seq(self, project_id):
         """Allocate the next canonical project transaction sequence."""
         self.conn.execute(
@@ -900,30 +922,27 @@ class RealmStore:
     def _validate_settlement_effect(self, effect):
         if not isinstance(effect, dict):
             raise ValidationError("settlement effect must be an object")
-        kind = effect.get("effect_type") or effect.get("kind")
-        target = effect.get("target_id") or effect.get("target")
+        kind = effect.get("effect_type")
+        target = effect.get("target_id")
         expected = effect.get("expected_version")
         try:
             expected_version = int(expected)
         except (TypeError, ValueError) as exc:
             raise ValidationError("settlement effect expected_version must be a positive integer") from exc
-        if not kind or not target or expected is None or expected_version < 1:
-            raise ValidationError("settlement effect requires kind, target, and positive expected_version")
-        # Effects targeting a known project are optimistic-concurrency checked.
-        # Unknown legacy targets remain accepted for compatibility with the
-        # result-only kernel; they cannot accidentally mutate anything here.
+        if kind != "project.update" or not target or expected is None or expected_version < 1:
+            raise ValidationError("settlement effect requires effect_type=project.update, target_id, and positive expected_version")
         try:
             current = self._project(str(target))
-        except NotFoundError:
-            current = None
+        except NotFoundError as exc:
+            raise NotFoundError("settlement effect target project not found", details={"target_id": target}) from exc
         if current is not None and int(current["version"]) != expected_version:
             raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
 
     def _apply_settlement_effect(self, effect):
-        kind = effect.get("effect_type") or effect.get("kind")
+        kind = effect.get("effect_type")
         if kind != "project.update":
-            return
-        target = effect.get("target_id") or effect.get("target")
+            raise ValidationError("unsupported settlement effect_type")
+        target = effect.get("target_id")
         current = self._project(str(target))
         payload = effect.get("payload") or {}
         if not isinstance(payload, dict):
@@ -1141,6 +1160,7 @@ class RealmStore:
             "timeline_shot_state", "timeline_reference_state", "media_relations",
             "command_idempotency", "project_sequences",
             "canonical_receipt_backfills",
+            "timeline_events",
             "runtime_lifecycle",
             "recovery_checkpoints",
             "realm_lifecycle",

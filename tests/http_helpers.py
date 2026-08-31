@@ -43,7 +43,7 @@ class Api:
         if expected_digest: headers["X-Expected-Digest"] = expected_digest
         return self.request("POST", f"/v1/projects/{project}/objects", raw=data, headers=headers)
     def read_object(self, digest, *, range_header=None): return self.request("GET", f"/v1/objects/{digest}", headers={"Range": range_header} if range_header else None)
-    def create_task(self, capability, spec, *, project=None, idempotency_key=None, expected_effect=None): return self.request("POST", "/v1/tasks", {"capability": capability, "spec": spec, "project": project, "idempotency_key": idempotency_key, "expected_effect": expected_effect})["data"]
+    def create_task(self, capability, spec, *, project=None, idempotency_key=None, expected_effect=None): return self.request("POST", "/v1/tasks", {"capability_id": capability, "spec": spec, "project": project, "idempotency_key": idempotency_key, "settlement_effect": expected_effect})["data"]
     def task(self, task_id): return self.request("GET", f"/v1/tasks/{task_id}")
     def claim(self, task_id, worker_id, lease_token): return self.request("POST", f"/v1/tasks/{task_id}/claim", {"worker_id": worker_id, "lease_token": lease_token, "runtime_epoch": self.health()["runtime_epoch"]})
     def settle(self, task_id, lease_token, result, *, effect=None, output_objects=None): return self.request("POST", f"/v1/tasks/{task_id}/settle", {"lease_token": lease_token, "result": result, "effect": effect, "output_objects": output_objects or [], "runtime_epoch": self.health()["runtime_epoch"]})

@@ -531,33 +531,17 @@ class WorkspaceClient:
         slug: str | None = None,
         name: str | None = None,
     ) -> Mapping[str, Any]:
-        """Create a timeline and persist its product document atomically enough for clients.
-
-        The neutral runtime stores timeline identity/state and arbitrary product
-        composition separately. This helper composes those existing primitives
-        without importing an Astrid-specific schema into the runtime.
-        """
+        """Create the timeline and composition document in one runtime transaction."""
         slug = slug or timeline_id
         name = name or slug
-        timeline = self.create_timeline(project_id, timeline_id, idempotency_key=idempotency_key)
-        content = {"slug": slug, "name": name, "config": dict(config), "registry": dict(registry)}
-        # A response can be lost after either request. Replaying the
-        # deterministic document write is safe because create_document is
-        # idempotent for the same document id/kind/content. A caller can also
-        # retry the same idempotency key after a persistent transport failure.
-        document = None
-        last_error: Exception | None = None
-        for _ in range(2):
-            try:
-                document = self.create_document(project_id, f"timeline:{timeline_id}", "timeline.composition", content)
-                break
-            except Exception as exc:
-                last_error = exc
-        if document is None:
-            raise RuntimeError("timeline composition document was not persisted; retry the same idempotency key") from last_error
-        result = dict(timeline)
-        result.update({"slug": slug, "name": name, "config_version": document.version, "config": dict(config), "registry": dict(registry)})
-        return result
+        payload = {"timeline_id": timeline_id, "slug": slug, "name": name, "config": dict(config), "registry": dict(registry)}
+        _, _, body = self._request("POST", f"/v1/projects/{_path_part(project_id)}/timeline-documents", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(201,))
+        value = self._json(body)
+        if isinstance(value, dict) and "data" in value and "receipt" in value:
+            result = dict(value["data"])
+            result["receipt"] = value["receipt"]
+            return result
+        return value
 
     def update_timeline_document(
         self,
@@ -752,9 +736,6 @@ class WorkspaceClient:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/objects" + query)[2])
         return [ManagedObject.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
 
-    list_objects = list_project_objects
-    list_project_media = list_project_objects
-    list_media = list_project_objects
 
     def create_media_relation(self, project_id: str, from_object_id: str, to_object_id: str, kind: str, *, metadata: Mapping[str, Any] | None = None, idempotency_key: str) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"from_object_id": from_object_id, "to_object_id": to_object_id, "kind": kind}
@@ -802,7 +783,6 @@ class WorkspaceClient:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/tasks" + query)[2])
         return [Task.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
 
-    list_tasks = list_project_tasks
 
     def claim_task(self, *, executor_id: str, capability_ids: list[str], idempotency_key: str, runtime_epoch: int) -> AttemptFence | ClaimWaiting | None:
         payload: dict[str, Any] = {"executor_id": executor_id, "capability_ids": capability_ids, "runtime_epoch": runtime_epoch}
@@ -854,7 +834,7 @@ class WorkspaceClient:
 
     def retry_run(self, run_id: str, *, idempotency_key: str, selected_task_ids: list[str] | None = None) -> Mapping[str, Any]:
         payload = {} if selected_task_ids is None else {"selected_task_ids": selected_task_ids}
-        _, _, body = self._request("POST", f"/v1/runs/{_path_part(run_id)}/retry-failed", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
+        _, _, body = self._request("POST", f"/v1/runs/{_path_part(run_id)}/retry", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return self._json(body)
 
     def list_project_runs(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
@@ -862,7 +842,6 @@ class WorkspaceClient:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/runs" + query)[2])
         return list(value.get("items", [])), value.get("next_cursor")
 
-    list_runs = list_project_runs
 
     def list_events(self, *, cursor: str | None = None, limit: int = 50, aggregate_id: str | None = None) -> tuple[list[Event], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "") + (f"&aggregate_id={_path_part(aggregate_id)}" if aggregate_id else "")

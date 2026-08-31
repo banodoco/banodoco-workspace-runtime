@@ -469,7 +469,10 @@ class RuntimeServiceAdapter:
         value = dict(body)
         project = value.get("project") or value.get("project_id")
         value["project"] = self.project_ids.get(str(project), project)
-        value["capability_digest"] = value.get("capability_digest") or "sha256:" + hashlib.sha256(str(value.get("capability_id") or value.get("capability")).encode()).hexdigest()
+        legacy_capability = value.pop("capability", None)
+        value.pop("expected_effect", None)
+        value["capability_id"] = value.get("capability_id") or legacy_capability
+        value["capability_digest"] = value.get("capability_digest") or "sha256:" + hashlib.sha256(str(value.get("capability_id")).encode()).hexdigest()
         result = self.service.create_task(value)
         source_task_id = value.get("source_task_id") or value.get("legacy_task_id")
         if source_task_id not in (None, ""):

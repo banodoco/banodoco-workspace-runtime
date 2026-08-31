@@ -152,6 +152,12 @@ paths:
       operationId: listTimelines
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Timelines, content: { application/json: { schema: { $ref: '#/components/schemas/TimelinePage' } } } } }
+  /v1/projects/{project_id}/timeline-documents:
+    post:
+      operationId: createTimelineDocument
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateTimelineDocument' } } } }
+      responses: { '201': { description: Timeline and composition document committed atomically, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/timelines/{timeline_id}:
     get:
       operationId: getTimeline
@@ -418,7 +424,7 @@ paths:
       parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/RunAction' } } } }
       responses: { '200': { description: Cancelled run, content: { application/json: { schema: { $ref: './schemas/run.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
-  /v1/runs/{run_id}/retry-failed:
+  /v1/runs/{run_id}/retry:
     post:
       operationId: retryRun
       parameters: [ { $ref: '#/components/parameters/RunId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
@@ -634,6 +640,16 @@ components:
       additionalProperties: false
       required: [timeline_id]
       properties: { timeline_id: { type: string, minLength: 1 } }
+    CreateTimelineDocument:
+      type: object
+      additionalProperties: false
+      required: [timeline_id, config, registry]
+      properties:
+        timeline_id: { type: string, minLength: 1 }
+        config: { type: object, additionalProperties: true }
+        registry: { type: object, additionalProperties: true }
+        slug: { type: string, minLength: 1 }
+        name: { type: string, minLength: 1 }
     TimelinePage:
       type: object
       additionalProperties: false
