@@ -318,7 +318,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             query = parse_qs(urlsplit(self.path).query)
             return self._send(200, self.runtime.events_page(query.get("aggregate_id", [None])[0], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if path == ["v1", "capabilities"] and method == "GET":
-            self._identity("worker:execute")
+            # Capability discovery is part of task admission, not worker
+            # control. Astrid's scoped product actor must be able to resolve
+            # a capability digest before creating a task, while registration
+            # and execution remain restricted to worker scopes.
+            self._identity("tasks:read")
             return self._send(200, self.runtime.list_capabilities())
         if path == ["v1", "capabilities"] and method == "POST":
             self._identity("worker:register")

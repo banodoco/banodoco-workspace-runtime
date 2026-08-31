@@ -489,6 +489,17 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     realm["source_profile"] = source.profile
     catalog["source_profiles"][source.profile] = source.as_dict()
     atomic_write_json(paths.catalog_path, catalog)
+    # Keep the editable source profile at the neutral support boundary after a
+    # successful launch.  ``up`` may have received a one-shot manifest from a
+    # product launcher, and later operator reconnect/restart commands must be
+    # able to resolve the same composition without requiring that temporary
+    # path or a second manual setup step.  This is composition metadata only;
+    # it is not a runtime/database authority and is written only after the
+    # daemon, credential handoff, activation, and catalog commit succeeded.
+    atomic_write_json(
+        paths.source_profiles_dir / f"{source.profile}.json",
+        source.as_dict(),
+    )
     discovery_value = {
         "version": DISCOVERY_VERSION,
         "endpoint": endpoint,

@@ -119,6 +119,9 @@ class BootstrapTests(unittest.TestCase):
         mode = stat.S_IMODE((self.paths.credentials_dir / "astrid.json").stat().st_mode)
         self.assertEqual(mode, 0o600)
         self.assertTrue(Path(catalog["realms"][0]["activation_manifest"]).exists())
+        source_manifest = self.paths.source_profiles_dir / "astrid.json"
+        self.assertEqual(json.loads(source_manifest.read_text()), PROFILE.as_dict())
+        self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
 
     def test_second_launch_reconnects_same_owner_and_actor(self):
         first = bootstrap(self.paths, self.boundary, self.config)

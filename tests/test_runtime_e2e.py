@@ -125,6 +125,27 @@ def test_non_health_routes_require_scoped_credential(daemon):
     assert error.value.code == 401
 
 
+def test_astrid_scoped_actor_can_discover_capability_for_task_admission(daemon):
+    """Product admission may read the catalog without worker authority."""
+    import secrets
+
+    token = secrets.token_hex(32)
+    daemon.credentials.provision_static(
+        "astrid",
+        token,
+        ["handshake", "projects:read", "projects:write", "tasks:read", "tasks:write"],
+    )
+    owner = Api(daemon.endpoint, daemon.token)
+    owner.request(
+        "POST",
+        "/v1/capabilities",
+        {"capability_id": "render.basic", "definition_digest": "sha256:" + "a" * 64},
+    )
+    product = Api(daemon.endpoint, token)
+    catalog = product.request("GET", "/v1/capabilities")
+    assert catalog["items"][0]["capability_id"] == "render.basic"
+
+
 def test_stale_lease_and_undeclared_effect_are_rejected(daemon):
     client = Api(daemon.endpoint, daemon.token)
     project = client.create_project("effect-target", "Effect Target")
