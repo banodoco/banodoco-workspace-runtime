@@ -224,15 +224,35 @@ def _durable_activation_trust_key(paths: RuntimePaths, *, provision: bool = Fals
     """
     path = paths.activation_trust_path
     try:
-        if path.is_symlink() or not path.is_file():
-            value = None
-        else:
-            metadata = path.stat()
-            owner_uid = getattr(os, "getuid", lambda: metadata.st_uid)()
-            if metadata.st_uid != owner_uid or stat.S_IMODE(metadata.st_mode) != 0o600:
-                return None
-            value = read_json(path)
-    except OSError:
+        # Read through a retained parent descriptor and ``openat`` with
+        # ``O_NOFOLLOW``.  The previous lexical ``is_file``/``stat`` checks
+        # followed by ``read_json(path)`` let a concurrent replacement swap
+        # the anchor for a symlink between validation and use, turning the
+        # trust source into a path-resolution race.
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(path.parent, directory_flags)
+        try:
+            file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path.name, file_flags, dir_fd=parent_fd)
+            try:
+                metadata = os.fstat(fd)
+                owner_uid = getattr(os, "getuid", lambda: metadata.st_uid)()
+                if (not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_uid != owner_uid
+                        or stat.S_IMODE(metadata.st_mode) != 0o600):
+                    return None
+                data = bytearray()
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                value = json.loads(bytes(data).decode("utf-8"))
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent_fd)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         value = None
     if isinstance(value, Mapping) and value.get("version") == 1:
         encoded = value.get("key_hex")

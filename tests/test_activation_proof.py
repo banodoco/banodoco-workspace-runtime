@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import importlib
 import shutil
 from pathlib import Path
 
 import pytest
 
+bootstrap_module = importlib.import_module("banodoco_local.bootstrap")
 from banodoco_local.bootstrap import (
     BootstrapConfig,
     LEGACY_NEXT_ACTION,
@@ -237,6 +239,29 @@ def test_activation_anchor_mode_is_part_of_the_trust_boundary(tmp_path):
         bootstrap(paths, boundary, BootstrapConfig(source_profile=PROFILE))
     assert boundary.starts == 0
     assert LEGACY_NEXT_ACTION.format(legacy_root=paths.home / ".astrid") in str(error.value)
+
+
+def test_activation_anchor_read_rejects_replacement_between_parent_and_file_open(
+    tmp_path, monkeypatch
+):
+    paths, _archive, _destination = _prepare(tmp_path)
+    anchor = paths.activation_trust_path
+    outside = tmp_path / "replacement.json"
+    outside.write_text(json.dumps({"version": 1, "key_hex": "b" * 64}))
+    original_open = bootstrap_module.os.open
+    swapped = False
+
+    def hostile_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if kwargs.get("dir_fd") is not None and path == anchor.name and not swapped:
+            swapped = True
+            anchor.unlink()
+            anchor.symlink_to(outside)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(bootstrap_module.os, "open", hostile_open)
+    assert _durable_activation_trust_key(paths) is None
+    assert swapped
 
 
 def test_verified_activation_is_required_even_for_dangling_legacy_root(tmp_path):
