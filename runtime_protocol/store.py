@@ -317,8 +317,81 @@ class RealmStore:
         matches = list(migration.parent.glob(migration.name))
         if len(matches) != 1:
             raise ValidationError(f"migration {version} is missing or ambiguous")
+        if version == 19:
+            self._run_executor_authority_migration()
+            return
         script = matches[0].read_text(encoding="utf-8")
         self.conn.executescript("BEGIN IMMEDIATE;\n" + script + f"\nINSERT INTO schema_migrations(version, applied_at) VALUES ({version}, datetime('now'));\nCOMMIT;")
+
+    def _table_columns(self, table):
+        return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+
+    def _table_exists(self, table):
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is not None
+
+    def _run_executor_authority_migration(self):
+        """Apply schema 19 across both transitional and partially-upgraded realms.
+
+        SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``.  Some
+        historical receipt fixtures (and a process interrupted after the
+        structural part of schema 19) can therefore have the new executor
+        columns while still advertising a pre-19 migration marker.  Build the
+        small set of DDL/DML steps from the live shape under one transaction so
+        startup is retryable and never leaves a second authority behind.
+        """
+        with self._transaction():
+            executor_columns = self._table_columns("executors")
+            for column, definition in (
+                ("readiness", "TEXT NOT NULL DEFAULT 'ready'"),
+                ("readiness_reason", "TEXT"),
+                ("last_seen_at", "TEXT"),
+            ):
+                if column not in executor_columns:
+                    self.conn.execute(f"ALTER TABLE executors ADD COLUMN {column} {definition}")
+
+            workers_exists = self._table_exists("workers")
+            if workers_exists:
+                self.conn.execute(
+                    """INSERT INTO executors(
+                        id, max_concurrency, resource_keys_json, capabilities_json,
+                        protocol, created_at, runtime_epoch, readiness,
+                        readiness_reason, last_seen_at
+                    )
+                    SELECT
+                        w.id, w.max_concurrency, w.resource_keys_json,
+                        w.capabilities_json, 'workspace.v1', w.created_at,
+                        w.runtime_epoch, w.readiness, w.readiness_reason,
+                        w.last_seen_at
+                    FROM workers AS w
+                    WHERE NOT EXISTS (SELECT 1 FROM executors AS e WHERE e.id = w.id)"""
+                )
+
+            for table in ("tasks", "reservations"):
+                columns = self._table_columns(table)
+                if "worker_id" in columns and "executor_id" in columns:
+                    raise ValidationError(
+                        f"schema 19 found both worker_id and executor_id in {table}"
+                    )
+                if "worker_id" in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE {table} RENAME COLUMN worker_id TO executor_id"
+                    )
+
+            self.conn.execute("DROP INDEX IF EXISTS idx_tasks_worker_status")
+            self.conn.execute("DROP INDEX IF EXISTS idx_reservations_active")
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_executor_status ON tasks(executor_id, status)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_reservations_active ON reservations(executor_id, resource_key, released_at)"
+            )
+            if workers_exists:
+                self.conn.execute("DROP TABLE workers")
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (19, datetime('now'))"
+            )
 
     def close(self):
         with self._mutex:

@@ -44,3 +44,30 @@ def test_schema18_worker_state_migrates_to_one_executor_authority(tmp_path):
         assert store.conn.execute("SELECT executor_id FROM reservations WHERE task_id='task'").fetchone()[0] == "legacy-executor"
     finally:
         store.close()
+
+
+def test_schema19_authority_migration_is_safe_to_retry_after_structural_upgrade(tmp_path):
+    root = tmp_path / "realm"
+    first = RealmStore(root)
+    try:
+        assert first.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workers'").fetchone() is None
+    finally:
+        first.close()
+
+    # Simulate a crash after the schema-19 DDL committed but before its
+    # migration marker was recorded.  Older receipt fixtures exercise this
+    # same shape by rewinding the marker while retaining the live schema.
+    conn = sqlite3.connect(root / "realm.sqlite3")
+    conn.execute("DELETE FROM schema_migrations WHERE version=19")
+    conn.commit()
+    conn.close()
+
+    retried = RealmStore(root)
+    try:
+        assert retried.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 19
+        assert retried.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workers'").fetchone() is None
+        assert "readiness" in {row[1] for row in retried.conn.execute("PRAGMA table_info(executors)")}
+        assert "executor_id" in {row[1] for row in retried.conn.execute("PRAGMA table_info(tasks)")}
+        assert "executor_id" in {row[1] for row in retried.conn.execute("PRAGMA table_info(reservations)")}
+    finally:
+        retried.close()
