@@ -170,6 +170,41 @@ def _owner_records(data: Mapping[str, list[dict[str, Any]]]) -> list[dict[str, A
     return records
 
 
+def _explicit_true(value: Any) -> bool:
+    """Interpret the legacy boolean spellings used by SQLite adapters."""
+    return value is True or value == 1 or str(value).strip().lower() in {"true", "yes", "y"}
+
+
+def _canonical_media_reference(rows: list[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    """Select one canonical media row without discarding any associations.
+
+    A reference can have several authored ``media_references`` rows.  The
+    selected row is only the object identity used by the native reference;
+    every row still goes through ``_owner_records``.  Explicit primary wins,
+    then the lowest explicit ordinal, and finally source order plus the
+    canonical row bytes provide a stable fallback for old databases.
+    """
+    candidates = [(ordinal, row) for ordinal, row in enumerate(rows) if row.get("media_id") not in (None, "")]
+    if not candidates:
+        return None
+    primaries = [(ordinal, row) for ordinal, row in candidates if _explicit_true(row.get("is_primary"))]
+    if primaries:
+        candidates = primaries
+    with_ordinals = []
+    for source_ordinal, row in candidates:
+        value = row.get("ordinal")
+        if value in (None, ""):
+            continue
+        try:
+            ordinal = int(value)
+        except (TypeError, ValueError) as exc:
+            raise MigrationError("media reference ordinal must be an integer") from exc
+        with_ordinals.append((ordinal, source_ordinal, row))
+    if with_ordinals:
+        return min(with_ordinals, key=lambda item: (item[0], item[1], _canonical(dict(item[2]))))[2]
+    return min(candidates, key=lambda item: (item[0], _canonical(dict(item[1]))))[1]
+
+
 def _source_database(root: Path) -> Path:
     candidates = [root / ".astrid" / "astrid.sqlite3", root / "astrid.sqlite3"]
     for candidate in candidates:
@@ -706,7 +741,10 @@ class Migrator:
             metadata = _json(row.get("metadata_json"), {}) or {}
             object_id = metadata.get("object_id") or metadata.get("digest")
             if not object_id:
-                linked_media = next((x for x in data.get("media_references", []) if str(x.get("reference_id")) == str(row.get("id")) and x.get("media_id") is not None), None)
+                linked_media = _canonical_media_reference([
+                    x for x in data.get("media_references", [])
+                    if str(x.get("reference_id")) == str(row.get("id"))
+                ])
                 if linked_media:
                     source_media = next((x for x in data.get("media", []) if str(x.get("id")) == str(linked_media.get("media_id"))), None)
                     object_id = source_media.get("content_hash") if source_media else None
@@ -939,7 +977,9 @@ class Migrator:
         # when the legacy row does not carry it directly.
         destination_references = {str(row.get("id", row.get("reference_id", ""))): row for row in truth.get("timeline_references", [])}
         source_media_by_id = {str(row.get("id")): row for row in data.get("media", [])}
-        source_media_reference = {str(row.get("reference_id")): row for row in data.get("media_references", [])}
+        source_media_references: dict[str, list[Mapping[str, Any]]] = {}
+        for row in data.get("media_references", []):
+            source_media_references.setdefault(str(row.get("reference_id")), []).append(row)
         for source in data.get("project_references", []):
             reference_id = str(source.get("id"))
             actual = destination_references.get(reference_id)
@@ -948,7 +988,7 @@ class Migrator:
             metadata = _json(source.get("metadata_json"), {}) or {}
             expected_object = metadata.get("object_id") or metadata.get("digest")
             if not expected_object:
-                linked = source_media_reference.get(reference_id)
+                linked = _canonical_media_reference(source_media_references.get(reference_id, []))
                 media = source_media_by_id.get(str(linked.get("media_id"))) if linked else None
                 expected_object = media.get("content_hash") if media else None
             expected_object = str(expected_object or "").removeprefix("sha256:")
@@ -991,6 +1031,13 @@ class Migrator:
             if actual_generation is None:
                 errors.append({"kind": "generation", "id": source.get("id"), "reason": "missing from destination truth"})
             else:
+                source_task_id = source.get("task_id")
+                expected_task_id = None
+                if source_task_id not in (None, ""):
+                    expected_task_id = self._result_id(self._task_ids.get(str(source_task_id)), "task_id", "id")
+                actual_task_id = actual_generation.get("source_task_id")
+                if (str(actual_task_id) if actual_task_id is not None else None) != (str(expected_task_id) if expected_task_id is not None else None):
+                    errors.append({"kind": "generation", "id": source.get("id"), "reason": "native source_task_id differs from exact source-to-destination task mapping", "source_task_id": source_task_id, "expected_destination_task_id": expected_task_id, "actual_destination_task_id": actual_task_id})
                 metadata = actual_generation.get("metadata")
                 if metadata is None:
                     metadata = _json(actual_generation.get("metadata_json"), {})
@@ -1000,6 +1047,25 @@ class Migrator:
         expected_tasks = len(data.get("tasks", []))
         if len(truth.get("tasks", [])) < expected_tasks:
             errors.append({"kind": "tasks", "reason": "destination task truth is incomplete"})
+        # Generation ``source_task_id`` is a native FK, but its meaning is a
+        # source->destination migration mapping rather than the legacy ID.
+        # Reconcile the exact mapping returned during task admission and the
+        # generation FK itself.  Metadata and the owner ledger are deliberately
+        # not used as a substitute: either one may remain unchanged while the
+        # native FK is tampered with.
+        destination_task_ids = {
+            str(row.get("id", row.get("task_id", "")))
+            for row in truth.get("tasks", [])
+        }
+        for source_task in data.get("tasks", []):
+            source_task_id = str(source_task.get("id"))
+            destination_task_id = self._result_id(self._task_ids.get(source_task_id), "task_id", "id")
+            if destination_task_id is None:
+                errors.append({"kind": "task_mapping", "source_task_id": source_task_id, "reason": "source task has no destination mapping"})
+                continue
+            destination_task_id = str(destination_task_id)
+            if destination_task_id not in destination_task_ids:
+                errors.append({"kind": "task_mapping", "source_task_id": source_task_id, "destination_task_id": destination_task_id, "reason": "mapped destination task is absent from destination truth"})
         if data.get("events") and not truth.get("events"):
             errors.append({"kind": "events", "reason": "destination event truth is empty"})
         if truth.get("events") and any(not row.get("kind") or not row.get("payload_json") for row in truth["events"]):

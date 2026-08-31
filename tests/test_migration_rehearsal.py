@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -319,6 +320,64 @@ def test_b10_generation_fields_and_project_media_relationship_are_preserved(tmp_
         relationships = report["reconciliation"]["destination_truth"]["truth"]["project_objects"]
         assert len(relationships) == 1
         assert relationships[0]["relation"] == "generic"
+    finally:
+        runtime.close()
+
+
+def test_b10_multiple_media_associations_use_primary_and_preserve_owner_rows(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    alternate = b"astrid-stage1-b10-alternate-media\n"
+    (source / "media" / "alternate.bin").write_bytes(alternate)
+    alternate_digest = hashlib.sha256(alternate).hexdigest()
+    db = sqlite3.connect(source / ".astrid" / "astrid.sqlite3")
+    db.execute("UPDATE media_references SET is_primary=0 WHERE id='media-ref-1'")
+    db.execute(
+        "INSERT INTO media VALUES ('media-2','p-demo','generic','application/octet-stream',?,?,?,?)",
+        (len(alternate), alternate_digest, "{}", "2026-01-01"),
+    )
+    db.execute("INSERT INTO media_locations VALUES ('loc-2','media-2','external_local','media/alternate.bin',NULL,'2026-01-01')")
+    db.execute("INSERT INTO media_references VALUES ('media-ref-2','ref-1','media-2','alternate','task-1',1,1,'{}','2026-01-01')")
+    db.commit()
+    db.close()
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        report = run_rehearsal(
+            MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+            RuntimeServiceAdapter(runtime), runtime=runtime,
+        )
+        reference = report["reconciliation"]["destination_truth"]["truth"]["timeline_references"][0]
+        assert reference["object_id"] == alternate_digest
+        owner_rows = [
+            json.loads(row["row_json"])
+            for row in report["reconciliation"]["destination_truth"]["truth"]["owner_data"]
+            if row["source_table"] == "media_references"
+        ]
+        assert [row["id"] for row in owner_rows] == ["media-ref-1", "media-ref-2"]
+    finally:
+        runtime.close()
+
+
+def test_b10_reconciliation_rejects_tampered_generation_source_task_mapping(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+
+    class TamperingAdapter(RuntimeServiceAdapter):
+        def destination_snapshot(self):
+            snapshot = super().destination_snapshot()
+            if snapshot["generations"]:
+                snapshot["generations"][0]["source_task_id"] = "evil-task"
+            return snapshot
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="reconciliation failed"):
+            run_rehearsal(
+                MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+                TamperingAdapter(runtime), runtime=runtime,
+            )
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 0
     finally:
         runtime.close()
 
