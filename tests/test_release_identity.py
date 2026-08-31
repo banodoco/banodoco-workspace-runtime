@@ -7,6 +7,10 @@ import pytest
 
 from runtime_protocol.release_identity import ReleaseIdentityError, build_prelive_manifest, create_candidate_core_identity, create_pre_live_identity, load_receipt
 
+def _seeds() -> dict[str, bytes]:
+    from runtime_protocol.release_identity import PRELIVE_SEEDS
+    return {seed: seed.encode() for seed in PRELIVE_SEEDS}
+
 
 def _git_repo(root: Path) -> Path:
     repo = root / "component"
@@ -23,7 +27,7 @@ def _git_repo(root: Path) -> Path:
 def test_runtime_identity_round_trip(tmp_path: Path) -> None:
     repo = _git_repo(tmp_path)
     path = tmp_path / "pre.json"
-    pre = create_pre_live_identity({"NEUTRAL-RUNTIME": repo}, output=path)
+    pre = create_pre_live_identity({"NEUTRAL-RUNTIME": repo}, output=path, seed_outputs=_seeds())
     assert load_receipt(path)["identity"] == pre["identity"]
     core = create_candidate_core_identity(path, {"NEUTRAL-RUNTIME": repo})
     assert core["candidate_core"]["pre_live_evidence_root"] == pre["identity"]
