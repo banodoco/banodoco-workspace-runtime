@@ -35,6 +35,7 @@ class RealmStore:
         self.root = Path(root).expanduser().resolve()
         if create:
             self.root.mkdir(parents=True, exist_ok=True)
+            self.root.chmod(0o700)
         self.lock_path = self.root / "owner.lock"
         self.db_path = self.root / "realm.sqlite3"
         self.cas_root = self.root / "cas" / "sha256"
@@ -63,7 +64,9 @@ class RealmStore:
 
     def _acquire_owner(self):
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path.parent.chmod(0o700)
         self._lock_file = open(self.lock_path, "a+")
+        self.lock_path.chmod(0o600)
         if fcntl is not None:
             try:
                 fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -74,9 +77,14 @@ class RealmStore:
 
     def _open(self):
         self.root.mkdir(parents=True, exist_ok=True)
+        self.root.chmod(0o700)
         self.cas_root.mkdir(parents=True, exist_ok=True)
+        self.cas_root.parent.chmod(0o700)
+        self.cas_root.chmod(0o700)
         self.staging_root.mkdir(parents=True, exist_ok=True)
+        self.staging_root.chmod(0o700)
         self.conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None, check_same_thread=False)
+        self.db_path.chmod(0o600)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
