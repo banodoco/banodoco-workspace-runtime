@@ -16,7 +16,9 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -36,6 +38,34 @@ LIVE_AUTHORIZATION_IDS = (
     "AUTH-ROLLBACK-B12",
     "AUTH-REACTIVATION-B12",
 )
+
+
+def _database_snapshot_sha256(path: Path) -> str:
+    """Hash a consistent SQLite snapshot, including committed WAL state.
+
+    Hashing only the main database file is not sufficient while the runtime is
+    in WAL mode: a committed mutation can still be present exclusively in the
+    ``-wal`` file. SQLite's backup API reads one consistent view of the
+    database plus its WAL/SHM sidecars. The destination is a private temporary
+    snapshot, so checking terminal identity never checkpoints or otherwise
+    mutates the live runtime.
+    """
+    source = sqlite3.connect(str(path), timeout=10)
+    snapshot_fd, snapshot_name = tempfile.mkstemp(prefix=".b12-db-snapshot-")
+    os.close(snapshot_fd)
+    snapshot = Path(snapshot_name)
+    snapshot.unlink(missing_ok=True)
+    try:
+        target = sqlite3.connect(str(snapshot), timeout=10)
+        try:
+            source.backup(target)
+            target.commit()
+        finally:
+            target.close()
+        return _sha256_file(snapshot)
+    finally:
+        source.close()
+        snapshot.unlink(missing_ok=True)
 
 
 def issue_live_authorizations(*, source_manifest_sha256: str | None = None, selected_realm_id: str | None = None, ttl_seconds: int = 3600) -> dict[str, dict[str, Any]]:
@@ -95,6 +125,9 @@ class LiveMigration:
 
     def _validate_authorization(self, authorization_id: str, *, source_manifest_sha256: str | None, realm_id: str) -> dict[str, Any]:
         value = self.authorizations[authorization_id]
+        expected_scope = authorization_id.removeprefix("AUTH-").lower()
+        if value.get("scope") != expected_scope:
+            raise MigrationError(f"{authorization_id} scope does not match the requested operation")
         if value.get("selected_realm_id") not in (None, realm_id):
             raise MigrationError(f"{authorization_id} selected realm does not match the active realm")
         bound_source = value.get("source_manifest_sha256")
@@ -222,7 +255,7 @@ class LiveMigration:
         final_effect = journal.effects().get("final-identity")
         if not final_effect or final_effect.get("payload", {}).get("identity") != dict(identity):
             raise MigrationError("B12 terminal journal final identity effect is missing or conflicting")
-        if identity.get("active_database_sha256") != _sha256_file(self.active_runtime.store.db_path):
+        if identity.get("active_database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path):
             raise MigrationError("B12 terminal replay conflicts with the active final identity")
         return {"packet": "B12", "journal": current, "identity": dict(identity), "idempotent": True}
 
@@ -440,7 +473,7 @@ class LiveMigration:
                     journal._inject("after_reactivation_activation")
                     journal.effect("reactivation-activation", candidate=str(reactivation_root), state="reactivated", activation=reactivated, database_sha256=reactivation_verification["database_sha256"])
                 final_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
-                identity = {"packet": "B12.4", "realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "destination_root": str(active.store.root), "runtime_epoch": active.health()["runtime_epoch"], "activation_epoch": 3, "source_backup_manifest_sha256": _sha256_file(active_backup_root / "manifest.json"), "destination_backup_manifest_sha256": _sha256_file(destination_backup_root / "manifest.json"), "active_database_sha256": _sha256_file(active.store.db_path), "active_snapshot_counts": {key: len(value) for key, value in final_snapshot.items() if isinstance(value, list)}}
+                identity = {"packet": "B12.4", "realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "destination_root": str(active.store.root), "runtime_epoch": active.health()["runtime_epoch"], "activation_epoch": 3, "source_backup_manifest_sha256": _sha256_file(active_backup_root / "manifest.json"), "destination_backup_manifest_sha256": _sha256_file(destination_backup_root / "manifest.json"), "active_database_sha256": _database_snapshot_sha256(active.store.db_path), "active_snapshot_counts": {key: len(value) for key, value in final_snapshot.items() if isinstance(value, list)}}
                 _write_json(evidence_root / "activated-destination-b12-reactivated.json", {"packet": "B12.3", "state": "reactivated", **{key: identity[key] for key in ("realm_id", "source_manifest_sha256", "activation_epoch", "runtime_epoch", "active_database_sha256")}})
                 journal.effect("final-identity", identity=identity)
                 final = journal.transition("reactivated", predecessor=rollback_entry["entries"][-1], activation=reactivated, identity=identity, runtime_epoch=active.health()["runtime_epoch"], activation_epoch=3)

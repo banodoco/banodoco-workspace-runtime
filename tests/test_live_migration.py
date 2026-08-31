@@ -7,6 +7,8 @@ import pytest
 
 from runtime_protocol.service import RuntimeService
 from tools.astrid_migrate import (
+    LIVE_AUTHORIZATION_IDS,
+    LiveMigration,
     MigrationConfig,
     MigrationError,
     Migrator,
@@ -97,6 +99,25 @@ def test_b12_requires_explicit_writer_stop_boundary(tmp_path):
         active.close()
 
 
+@pytest.mark.parametrize("authorization_id", LIVE_AUTHORIZATION_IDS)
+def test_b12_rejects_scope_mismatch_for_each_operation(tmp_path, authorization_id):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    active = RuntimeService(tmp_path / "active")
+    try:
+        authorizations = issue_live_authorizations(selected_realm_id=active.realm["id"])
+        other_id = next(item for item in LIVE_AUTHORIZATION_IDS if item != authorization_id)
+        authorizations[authorization_id] = {
+            **authorizations[authorization_id],
+            "scope": other_id.removeprefix("AUTH-").lower(),
+        }
+        migration = LiveMigration(_config(source, tmp_path), active, authorizations, writer_stop=lambda: {"stopped": True})
+        with pytest.raises(MigrationError, match="scope"):
+            migration._validate_authorization(authorization_id, source_manifest_sha256=None, realm_id=active.realm["id"])
+    finally:
+        active.close()
+
+
 @pytest.mark.parametrize(
     "crash_at",
     [
@@ -156,6 +177,25 @@ def test_b12_terminal_replay_is_bound_to_exact_request_and_final_identity(tmp_pa
         with pytest.raises(MigrationError, match="frozen source manifest"):
             run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
         assert first["identity"]["realm_id"] == active.realm["id"]
+    finally:
+        active.close()
+
+
+def test_b12_terminal_replay_rejects_wal_only_active_mutation(tmp_path):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    config = _config(source, tmp_path)
+    active = RuntimeService(tmp_path / "active")
+    try:
+        authorizations = issue_live_authorizations(selected_realm_id=active.realm["id"])
+        run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
+
+        # Leave the committed mutation in WAL; do not checkpoint it into the
+        # main database file. Terminal replay must still see this live state.
+        active.store.conn.execute("UPDATE projects SET name = ?", ("tampered-after-reactivation",))
+        active.store.conn.commit()
+        with pytest.raises(MigrationError, match="active final identity"):
+            run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
     finally:
         active.close()
 
