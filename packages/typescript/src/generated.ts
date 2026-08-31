@@ -31,7 +31,6 @@ export class ApiError extends Error { constructor(public status: number, public 
 
 export class WorkspaceClient {
   public handshakeInfo?: Handshake;
-  public lastReceipt?: Record<string, unknown> | null;
   constructor(private readonly baseUrl: string, private readonly token?: string, private readonly transport?: Transport) {}
   private async request(method: string, path: string, body?: Uint8Array, headers: HeadersLike = {}, expected = [200]): Promise<{ status: number; headers: HeadersLike; body: Uint8Array }> {
     const requestHeaders: HeadersLike = { Accept: "application/json", ...headers };
@@ -49,7 +48,7 @@ export class WorkspaceClient {
   }
   private decodeError(status: number, body: Uint8Array): ApiError { try { const v = JSON.parse(new TextDecoder().decode(body)); return new ApiError(status, v.code ?? "http_error", v.message ?? `HTTP ${status}`, v.request_id ?? "", v.details ?? {}) } catch { return new ApiError(status, "http_error", `HTTP ${status}`) } }
   private json<T>(body: Uint8Array): T { return JSON.parse(new TextDecoder().decode(body)) as T }
-  private mutation<T>(body: Uint8Array): T { const value = this.json<Record<string, unknown>>(body); if ("data" in value && "receipt" in value) { this.lastReceipt = (value.receipt ?? null) as Record<string, unknown> | null; return value.data as T } this.lastReceipt = null; return value as T }
+  private mutation<T>(body: Uint8Array): T { const value = this.json<Record<string, unknown>>(body); if ("data" in value && "receipt" in value) { const data = value.data as Record<string, unknown>; Object.defineProperty(data, "receipt", { value: value.receipt, enumerable: false }); return data as T } return value as T }
   async health(): Promise<Health> { return this.json<Health>((await this.request("GET", "/v1/health")).body) }
   async handshake(client_name: string, client_version: string, requested_scopes: string[]): Promise<Handshake> { const v = this.json<Handshake>((await this.request("POST", "/v1/handshake", new TextEncoder().encode(JSON.stringify({ protocol: PROTOCOL, client_name, client_version, requested_scopes })), { "Content-Type": "application/json" })).body); this.handshakeInfo = v; return v }
   async getRealm(): Promise<Realm> { return this.json<Realm>((await this.request("GET", "/v1/realm")).body) }
