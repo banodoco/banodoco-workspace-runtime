@@ -84,7 +84,7 @@ def build_synthetic_fixture(root: str | Path) -> SyntheticFixture:
         CREATE TABLE media_locations (id TEXT PRIMARY KEY, media_id TEXT REFERENCES media(id), realm TEXT, locator TEXT, verified_at TEXT, created_at TEXT);
         CREATE TABLE generations (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), task_id TEXT, type TEXT, name TEXT, based_on_generation_id TEXT, parent_generation_id TEXT, child_order INTEGER, params_json TEXT, starred INTEGER, deleted_at TEXT, created_at TEXT, updated_at TEXT);
         CREATE TABLE media_references (id TEXT PRIMARY KEY, reference_id TEXT REFERENCES project_references(id), media_id TEXT REFERENCES media(id), role TEXT, context_task_id TEXT REFERENCES tasks(id), ordinal INTEGER, is_primary INTEGER, metadata_json TEXT, created_at TEXT);
-        CREATE TABLE media_relations (from_media_id TEXT REFERENCES media(id), to_media_id TEXT REFERENCES media(id), kind TEXT, ordinal INTEGER, metadata_json TEXT, created_at TEXT, PRIMARY KEY(from_media_id, to_media_id, kind));
+        CREATE TABLE media_relations (from_media_id TEXT REFERENCES media(id), to_media_id TEXT REFERENCES media(id), kind TEXT, ordinal INTEGER, metadata_json TEXT, created_at TEXT, PRIMARY KEY(from_media_id, to_media_id, kind, ordinal));
         CREATE TABLE reference_links (from_reference_id TEXT REFERENCES project_references(id), to_reference_id TEXT REFERENCES project_references(id), kind TEXT, metadata_json TEXT, created_at TEXT, PRIMARY KEY(from_reference_id, to_reference_id, kind));
         CREATE TABLE generation_variants (id TEXT PRIMARY KEY, generation_id TEXT REFERENCES generations(id), media_id TEXT REFERENCES media(id), variant_type TEXT, name TEXT, params_json TEXT, is_primary INTEGER, starred INTEGER, viewed_at TEXT, created_at TEXT);
         CREATE TABLE shot_items (id TEXT PRIMARY KEY, shot_id TEXT REFERENCES shots(id), media_id TEXT REFERENCES media(id), sort_key TEXT, source_frame INTEGER, metadata_json TEXT, created_at TEXT);
@@ -107,7 +107,9 @@ def build_synthetic_fixture(root: str | Path) -> SyntheticFixture:
     db.execute("INSERT INTO project_references VALUES ('ref-1','p-demo','image','Reference','synthetic','{}','2026-01-01','2026-01-01',NULL)")
     db.execute("INSERT INTO media VALUES ('media-1','p-demo','generic','application/octet-stream',?,?,?,?)", (len(payload), digest, "{}", "2026-01-01"))
     db.execute("INSERT INTO media_locations VALUES ('loc-1','media-1','external_local','media/clip.bin',NULL,'2026-01-01')")
-    db.execute("INSERT INTO generations VALUES ('gen-1','p-demo',NULL,'image','Opening generation',NULL,NULL,0,'{}',0,NULL,'2026-01-01','2026-01-01')")
+    # Mixed fixture: this generation depends on the task imported later in
+    # source order, exercising the destination task mapping/FK boundary.
+    db.execute("INSERT INTO generations VALUES ('gen-1','p-demo','task-1','image','Opening generation',NULL,NULL,0,'{}',0,NULL,'2026-01-01','2026-01-01')")
     # Every referenced root has a stream and every stream has a valid event;
     # the fixture is intentionally useful for FK/event reconciliation rather
     # than merely having the entity rows present.
@@ -119,6 +121,8 @@ def build_synthetic_fixture(root: str | Path) -> SyntheticFixture:
     db.execute("INSERT INTO tasks VALUES ('task-1','p-demo','stream-task','run-1',0,'render.basic','{\"quality\":\"draft\"}',NULL,'{}','queued',0,'2026-01-01',1,NULL,NULL,NULL,'2026-01-01','2026-01-01',NULL)")
     db.execute("INSERT INTO media_references VALUES ('media-ref-1','ref-1','media-1','plate','task-1',0,1,'{\"frame\":1}','2026-01-01')")
     db.execute("INSERT INTO media_relations VALUES ('media-1','media-1','derived',0,'{\"stage\":\"source\"}','2026-01-01')")
+    # Same endpoints/kind with a distinct ordinal is valid authored data.
+    db.execute("INSERT INTO media_relations VALUES ('media-1','media-1','derived',1,'{\"stage\":\"variant\"}','2026-01-01')")
     db.execute("INSERT INTO reference_links VALUES ('ref-1','ref-1','related','{\"reason\":\"self\"}','2026-01-01')")
     db.execute("INSERT INTO task_dependencies VALUES ('task-1','task-1','after',0)")
     db.execute("INSERT INTO generation_variants VALUES ('variant-1','gen-1','media-1','preview','Opening preview','{\"seed\":7}',1,0,NULL,'2026-01-01')")
@@ -142,6 +146,7 @@ class RuntimeServiceAdapter:
     def __init__(self, service):
         self.service = service
         self.project_ids: dict[str, str] = {}
+        self.task_ids: dict[str, str] = {}
 
     def create_project(self, name, *, slug=None, metadata=None, idempotency_key=None, legacy_id=None):
         result = self.service.create_project({"name": name, "slug": slug, "metadata": metadata or {}}, idempotency_key=idempotency_key)
@@ -214,11 +219,19 @@ class RuntimeServiceAdapter:
 
     def create_generation(self, generation, *, idempotency_key=None):
         project_id = self.project_ids.get(str(generation["project_id"]), generation["project_id"])
+        # Migrator payloads carry the already-resolved native task ID in
+        # source_task_id.  The legacy task_id fallback is only for direct
+        # adapter callers and is resolved through this adapter's map.
+        source_task_id = generation.get("source_task_id")
+        if source_task_id in (None, "") and generation.get("task_id") not in (None, ""):
+            source_task_id = self.task_ids.get(str(generation["task_id"]))
+            if source_task_id is None:
+                raise MigrationError(f"generation {generation.get('id')} task mapping unavailable")
         try:
             return self.service.create_generation(project_id, {
                 "generation_id": generation["id"],
                 "type": generation.get("type", "generation"),
-                "source_task_id": generation.get("task_id"),
+                "source_task_id": source_task_id,
                 "status": "deleted" if generation.get("deleted_at") else "created",
                 "metadata": generation.get("metadata") or {},
             })
@@ -237,7 +250,14 @@ class RuntimeServiceAdapter:
         project = value.get("project") or value.get("project_id")
         value["project"] = self.project_ids.get(str(project), project)
         value["capability_digest"] = value.get("capability_digest") or "sha256:" + hashlib.sha256(str(value.get("capability_id") or value.get("capability")).encode()).hexdigest()
-        return self.service.create_task(value)
+        result = self.service.create_task(value)
+        source_task_id = value.get("source_task_id") or value.get("legacy_task_id")
+        if source_task_id not in (None, ""):
+            task = result.get("task") if isinstance(result, Mapping) else getattr(result, "task", None)
+            task_id = task.get("id") if isinstance(task, Mapping) else getattr(task, "id", None)
+            if task_id:
+                self.task_ids[str(source_task_id)] = str(task_id)
+        return result
 
     def import_owner_data(self, records, *, idempotency_key=None):
         """Persist complete B10.2 source rows in the neutral runtime ledger."""
@@ -409,9 +429,12 @@ class RuntimeServiceAdapter:
         keep["migration_event_streams"] = {str(row.get("source_stream_id")) for row in baseline.get("event_stream_mappings", [])}
         keep["migration_events"] = {str(row.get("source_event_id")) for row in baseline.get("event_mappings", [])}
         keep_project_objects = {(str(row.get("project_id")), str(row.get("digest"))) for row in baseline.get("project_objects", [])}
-        keep_media_relations = {(str(row.get("project_id")), str(row.get("from_digest")), str(row.get("to_digest")), str(row.get("kind"))) for row in baseline.get("media_relations", [])}
+        keep_media_relations = {(str(row.get("project_id")), str(row.get("from_digest")), str(row.get("to_digest")), str(row.get("kind")), str(row.get("ordinal", 0))) for row in baseline.get("media_relations", [])}
         with self.service.store._transaction():
-            for table, key in (("migration_events", "source_event_id"), ("migration_event_streams", "source_stream_id"), ("events", "id"), ("recovery_checkpoints", "id"), ("reservations", "task_id"), ("attempts", "id"), ("generation_variants", "id"), ("timeline_shot_state", "id"), ("timeline_reference_state", "id"), ("timeline_revisions", "timeline_id"), ("timeline_shots", "id"), ("timeline_references", "id"), ("project_documents", "id"), ("media_relations", "project_id"), ("project_objects", "project_id"), ("tasks", "id"), ("generations", "id"), ("timelines", "id"), ("runs", "id"), ("projects", "id"), ("objects", "digest")):
+            # Delete in FK dependency order.  In particular generations now
+            # legitimately reference imported tasks, so tasks/runs cannot be
+            # removed before generations and their dependent rows.
+            for table, key in (("migration_events", "source_event_id"), ("migration_event_streams", "source_stream_id"), ("recovery_checkpoints", "id"), ("reservations", "task_id"), ("attempts", "id"), ("events", "id"), ("generation_variants", "id"), ("timeline_shot_state", "id"), ("timeline_reference_state", "id"), ("timeline_revisions", "timeline_id"), ("timeline_shots", "id"), ("timeline_references", "id"), ("project_documents", "id"), ("media_relations", "project_id"), ("project_objects", "project_id"), ("generations", "id"), ("tasks", "id"), ("timelines", "id"), ("runs", "id"), ("projects", "id"), ("objects", "digest")):
                 if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                     continue
                 if table == "project_objects":
@@ -420,9 +443,9 @@ class RuntimeServiceAdapter:
                             conn.execute("DELETE FROM project_objects WHERE project_id=? AND digest=?", (row[0], row[1]))
                     continue
                 if table == "media_relations":
-                    for row in conn.execute("SELECT project_id, from_digest, to_digest, kind FROM media_relations").fetchall():
+                    for row in conn.execute("SELECT project_id, from_digest, to_digest, kind, ordinal FROM media_relations").fetchall():
                         if tuple(map(str, row)) not in keep_media_relations:
-                            conn.execute("DELETE FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=?", tuple(row))
+                            conn.execute("DELETE FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=? AND ordinal=?", tuple(row))
                     continue
                 baseline_key = keep.get("documents", set()) if table == "project_documents" else keep.get(table, set())
                 rows = conn.execute(f'SELECT "{key}" FROM "{table}"').fetchall()

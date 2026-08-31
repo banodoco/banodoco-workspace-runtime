@@ -77,7 +77,7 @@ def test_b10_owner_data_preserves_every_row_identity_order_and_digest(tmp_path):
             RuntimeServiceAdapter(runtime), runtime=runtime,
         )
         rows = report["reconciliation"]["destination_truth"]["truth"]["owner_data"]
-        assert len(rows) == 11
+        assert len(rows) == 12
         assert {row["source_table"] for row in rows} == {
             "media_references", "media_relations", "reference_links", "generation_variants",
             "shot_items", "task_dependencies", "task_outputs", "execution_attempts",
@@ -85,6 +85,10 @@ def test_b10_owner_data_preserves_every_row_identity_order_and_digest(tmp_path):
         }
         assert all(len(row["row_sha256"]) == 64 for row in rows)
         assert rows == sorted(rows, key=lambda row: (row["source_table"], row["source_ordinal"], row["source_key"]))
+        relation_keys = [json.loads(row["row_json"]) for row in rows if row["source_table"] == "media_relations"]
+        assert [(row["from_media_id"], row["to_media_id"], row["kind"], row["ordinal"]) for row in relation_keys] == [
+            ("media-1", "media-1", "derived", 0), ("media-1", "media-1", "derived", 1),
+        ]
     finally:
         runtime.close()
 
@@ -308,10 +312,53 @@ def test_b10_generation_fields_and_project_media_relationship_are_preserved(tmp_
     try:
         report = run_rehearsal(MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0), RuntimeServiceAdapter(runtime), runtime=runtime)
         generation = next(row for row in report["reconciliation"]["destination_truth"]["truth"]["generations"] if row["id"] == "gen-1")
+        task = report["reconciliation"]["destination_truth"]["truth"]["tasks"][0]
+        assert generation["source_task_id"] == task["id"]
+        assert generation["source_task_id"] != "task-1"
         assert json.loads(generation["metadata_json"])["legacy_name"] == "Opening generation"
         relationships = report["reconciliation"]["destination_truth"]["truth"]["project_objects"]
         assert len(relationships) == 1
         assert relationships[0]["relation"] == "generic"
+    finally:
+        runtime.close()
+
+
+def test_b10_reconciliation_rejects_tampered_shot_mount(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+
+    class TamperingAdapter(RuntimeServiceAdapter):
+        def destination_snapshot(self):
+            snapshot = super().destination_snapshot()
+            if snapshot["timeline_shots"]:
+                snapshot["timeline_shots"][0]["duration_ms"] += 1
+            return snapshot
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="reconciliation failed"):
+            run_rehearsal(MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0), TamperingAdapter(runtime), runtime=runtime)
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM timeline_shots").fetchone()[0] == 0
+    finally:
+        runtime.close()
+
+
+def test_b10_reconciliation_rejects_tampered_reference_object_identity(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+
+    class TamperingAdapter(RuntimeServiceAdapter):
+        def destination_snapshot(self):
+            snapshot = super().destination_snapshot()
+            if snapshot["timeline_references"]:
+                snapshot["timeline_references"][0]["object_id"] = "0" * 64
+            return snapshot
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="reconciliation failed"):
+            run_rehearsal(MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0), TamperingAdapter(runtime), runtime=runtime)
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM timeline_references").fetchone()[0] == 0
     finally:
         runtime.close()
 

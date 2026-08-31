@@ -30,7 +30,11 @@ OWNER_DATA_TABLES = (
     "runaway_transitions",
 )
 OWNER_PRIMARY_KEYS = {
-    "media_references": ("id",), "media_relations": ("from_media_id", "to_media_id", "kind"),
+    # ``ordinal`` is part of the source contract: the same media pair may
+    # legitimately occur more than once (for example, two authored lineage
+    # edges with different positions).  Do not collapse those rows into one
+    # owner-data record.
+    "media_references": ("id",), "media_relations": ("from_media_id", "to_media_id", "kind", "ordinal"),
     "reference_links": ("from_reference_id", "to_reference_id", "kind"),
     "generation_variants": ("id",), "shot_items": ("id",),
     "task_dependencies": ("task_id", "depends_on_task_id", "kind"),
@@ -388,6 +392,11 @@ class Migrator:
         for row in data.get("project_references", []):
             if not row.get("id") or str(row.get("project_id")) not in project_set:
                 raise MigrationError("reference has an invalid project reference")
+        task_set = {str(row.get("id")) for row in data.get("tasks", []) if row.get("id") is not None}
+        for row in data.get("generations", []):
+            task_id = row.get("task_id")
+            if task_id not in (None, "") and str(task_id) not in task_set:
+                raise MigrationError(f"generation {row.get('id')} references missing task {task_id!r}")
         media_set = {str(row.get("id")) for row in data.get("media", [])}
         stream_ids = [str(row.get("id", row.get("stream_id", ""))) for row in data.get("event_streams", [])]
         if any(not stream_id for stream_id in stream_ids) or len(stream_ids) != len(set(stream_ids)):
@@ -716,12 +725,44 @@ class Migrator:
                     self._report.setdefault("unresolved", []).append({"kind": "reference", "id": row.get("id"), "reason": "client returned no durable identity"})
             else:
                 self._report.setdefault("unresolved", []).append({"kind": "reference", "id": row.get("id"), "reason": "client_missing_reference_operation"})
+        # Tasks must precede generations because the neutral generations table
+        # has a real FK to tasks.  Keep the source->destination task mapping
+        # explicit so a source task ID is never accidentally sent as a native
+        # destination ID.
+        for row in data.get("tasks", []):
+            project = self._project_ids.get(str(row.get("project_id")))
+            project_id = self._result_id(project, "project_id", "id") if project is not None else None
+            capability = str(row.get("capability") or "migration.legacy")
+            spec = _json(row.get("spec_json"), {})
+            key = f"astrid-migrate-task-{row['id']}"
+            if hasattr(self.client, "create_task"):
+                task = self._invoke("create_task", {"capability_id": capability, "capability": capability, "project": project_id, "project_id": project_id, "spec": spec, "idempotency_key": key, "legacy_task_id": str(row["id"])})
+            elif hasattr(self.client, "admit_task"):
+                digest = "sha256:" + hashlib.sha256(capability.encode()).hexdigest()
+                task = self.client.admit_task(capability_id=capability, capability_digest=digest, input_object_ids=[], idempotency_key=key, project_id=project_id, spec=spec)
+            else:
+                self._report.setdefault("unresolved", []).append({"kind": "task", "id": row.get("id"), "reason": "client_missing_task_operation"})
+                continue
+            self._task_ids[str(row["id"])] = task
+            task_id = self._result_id(task, "task_id", "id")
+            run_id = self._result_id(task, "run_id")
+            if run_id is not None:
+                self._run_ids[str(row.get("run_id") or run_id)] = run_id
         for row in data.get("generations", []):
             if hasattr(self.client, "create_generation"):
                 # The neutral generation schema intentionally keeps the
                 # legacy-only fields in metadata.  Preserve every authored
                 # value rather than reducing a generation to type/id alone.
                 payload = dict(row)
+                source_task_id = row.get("task_id")
+                if source_task_id not in (None, ""):
+                    mapped_task = self._task_ids.get(str(source_task_id))
+                    destination_task_id = self._result_id(mapped_task, "task_id", "id") if mapped_task is not None else None
+                    if destination_task_id is None:
+                        raise MigrationError(f"generation {row.get('id')} task mapping unavailable for source task {source_task_id!r}")
+                    payload["source_task_id"] = destination_task_id
+                else:
+                    payload["source_task_id"] = None
                 payload["metadata"] = {
                     **(_json(row.get("metadata_json"), {}) or {}),
                     "legacy_name": row.get("name"),
@@ -740,25 +781,6 @@ class Migrator:
                     self._report.setdefault("unresolved", []).append({"kind": "generation", "id": row.get("id"), "reason": "client returned no durable identity"})
             else:
                 self._report.setdefault("unresolved", []).append({"kind": "generation", "id": row.get("id"), "reason": "client_missing_create_generation"})
-        for row in data.get("tasks", []):
-            project = self._project_ids.get(str(row.get("project_id")))
-            project_id = self._result_id(project, "project_id", "id") if project is not None else None
-            capability = str(row.get("capability") or "migration.legacy")
-            spec = _json(row.get("spec_json"), {})
-            key = f"astrid-migrate-task-{row['id']}"
-            if hasattr(self.client, "create_task"):
-                task = self._invoke("create_task", {"capability_id": capability, "capability": capability, "project": project_id, "project_id": project_id, "spec": spec, "idempotency_key": key})
-            elif hasattr(self.client, "admit_task"):
-                digest = "sha256:" + hashlib.sha256(capability.encode()).hexdigest()
-                task = self.client.admit_task(capability_id=capability, capability_digest=digest, input_object_ids=[], idempotency_key=key, project_id=project_id, spec=spec)
-            else:
-                self._report.setdefault("unresolved", []).append({"kind": "task", "id": row.get("id"), "reason": "client_missing_task_operation"})
-                continue
-            self._task_ids[str(row["id"])] = task
-            task_id = self._result_id(task, "task_id", "id")
-            run_id = self._result_id(task, "run_id")
-            if run_id is not None:
-                self._run_ids[str(row.get("run_id") or run_id)] = run_id
         owner_records = _owner_records(data)
         if owner_records:
             if not hasattr(self.client, "import_owner_data"):
@@ -872,9 +894,67 @@ class Migrator:
         for source in data.get("shots", []):
             if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("timeline_shots", [])):
                 errors.append({"kind": "shot", "id": source.get("id"), "reason": "missing from destination truth"})
+        # Timeline mounts are user-authored content, not merely entity IDs.
+        # Query the destination rows themselves and compare timing plus the
+        # ordered reference list. A wrapper/owner ledger that says a shot is
+        # present cannot make a tampered mount pass this check.
+        def _source_shot_fields(source):
+            metadata = _json(source.get("metadata_json"), {}) or {}
+            try:
+                start_ms = int(source.get("start_ms", metadata.get("start_ms", metadata.get("start", 0))) or 0)
+                duration_ms = int(source.get("duration_ms", metadata.get("duration_ms", metadata.get("duration", 1))) or 1)
+            except (TypeError, ValueError) as exc:
+                raise MigrationError(f"shot {source.get('id')} has invalid timing") from exc
+            reference_ids = source.get("reference_ids") or metadata.get("reference_ids") or metadata.get("references") or []
+            if not isinstance(reference_ids, list):
+                raise MigrationError(f"shot {source.get('id')} has invalid reference ordering")
+            return start_ms, duration_ms, [str(value) for value in reference_ids]
+
+        destination_shots = {str(row.get("id", row.get("shot_id", ""))): row for row in truth.get("timeline_shots", [])}
+        for source in data.get("shots", []):
+            shot_id = str(source.get("id"))
+            actual = destination_shots.get(shot_id)
+            if actual is None:
+                continue
+            expected_start, expected_duration, expected_references = _source_shot_fields(source)
+            try:
+                actual_start = int(actual.get("start_ms"))
+                actual_duration = int(actual.get("duration_ms"))
+            except (TypeError, ValueError):
+                actual_start, actual_duration = None, None
+            actual_references = actual.get("reference_ids")
+            if actual_references is None:
+                actual_references = _json(actual.get("reference_ids_json"), [])
+            if not isinstance(actual_references, list):
+                actual_references = None
+            else:
+                actual_references = [str(value) for value in actual_references]
+            if (actual_start, actual_duration, actual_references) != (expected_start, expected_duration, expected_references):
+                errors.append({"kind": "shot", "id": source.get("id"), "reason": "destination shot timing, reference IDs, or reference order differs", "expected": {"start_ms": expected_start, "duration_ms": expected_duration, "reference_ids": expected_references}, "actual": {"start_ms": actual_start, "duration_ms": actual_duration, "reference_ids": actual_references}})
         for source in data.get("project_references", []):
             if not any(str(row.get("id")) == str(source.get("id")) for row in truth.get("timeline_references", [])):
                 errors.append({"kind": "reference", "id": source.get("id"), "reason": "missing from destination truth"})
+        # Reference identity includes the object content identity, not just a
+        # reference row ID. Resolve the source object through linked media
+        # when the legacy row does not carry it directly.
+        destination_references = {str(row.get("id", row.get("reference_id", ""))): row for row in truth.get("timeline_references", [])}
+        source_media_by_id = {str(row.get("id")): row for row in data.get("media", [])}
+        source_media_reference = {str(row.get("reference_id")): row for row in data.get("media_references", [])}
+        for source in data.get("project_references", []):
+            reference_id = str(source.get("id"))
+            actual = destination_references.get(reference_id)
+            if actual is None:
+                continue
+            metadata = _json(source.get("metadata_json"), {}) or {}
+            expected_object = metadata.get("object_id") or metadata.get("digest")
+            if not expected_object:
+                linked = source_media_reference.get(reference_id)
+                media = source_media_by_id.get(str(linked.get("media_id"))) if linked else None
+                expected_object = media.get("content_hash") if media else None
+            expected_object = str(expected_object or "").removeprefix("sha256:")
+            actual_object = str(actual.get("object_id") or actual.get("digest") or "").removeprefix("sha256:")
+            if expected_object != actual_object:
+                errors.append({"kind": "reference", "id": source.get("id"), "reason": "destination reference object identity differs", "expected_object_id": expected_object, "actual_object_id": actual_object})
         actual_media = {str(row.get("digest") or row.get("content_hash")) .removeprefix("sha256:") for row in truth.get("objects", [])}
         cas_objects = {str(row.get("digest")) .removeprefix("sha256:"): row for row in truth.get("cas_objects", []) if isinstance(row, Mapping)}
         for source in data.get("media", []):

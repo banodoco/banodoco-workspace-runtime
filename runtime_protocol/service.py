@@ -541,18 +541,23 @@ class RuntimeService:
             if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone(): raise NotFoundError("object is not in project")
         metadata = body.get("metadata", {})
         if not isinstance(metadata, dict): raise ValidationError("media relation metadata must be an object")
+        try:
+            ordinal = int(body.get("ordinal", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("media relation ordinal must be an integer") from exc
+        if ordinal < 0: raise ValidationError("media relation ordinal must be non-negative")
         with self.store._mutex:
             try:
-                self.store.conn.execute("INSERT INTO media_relations VALUES (?, ?, ?, ?, ?, ?)", (project_id, source, target, kind, canonical_json(metadata), now()))
+                self.store.conn.execute("INSERT INTO media_relations VALUES (?, ?, ?, ?, ?, ?, ?)", (project_id, source, target, kind, ordinal, canonical_json(metadata), now()))
             except sqlite3.IntegrityError as exc:
                 raise ConflictError("media relation already exists") from exc
-        return {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "metadata": metadata, "created_at": self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=?", (project_id, source, target, kind)).fetchone()[0]}
+        return {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "ordinal": ordinal, "metadata": metadata, "created_at": self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=? AND ordinal=?", (project_id, source, target, kind, ordinal)).fetchone()[0]}
 
     def list_media_relations(self, project, *, limit=50):
         project_id = self.store.get_project(project)["id"]
         limit = max(1, min(int(limit), 200))
-        rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY created_at, from_digest, to_digest, kind LIMIT ?", (project_id, limit)).fetchall()
-        return {"items": [{"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]} for row in rows], "next_cursor": None}
+        rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY created_at, from_digest, to_digest, kind, ordinal LIMIT ?", (project_id, limit)).fetchall()
+        return {"items": [{"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]} for row in rows], "next_cursor": None}
 
     def create_task(self, body):
         capability = body.get("capability_id") or body.get("capability")
