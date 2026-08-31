@@ -22,8 +22,7 @@ try:
 except ImportError:  # pragma: no cover - the supported POSIX runtimes use fcntl
     fcntl = None
 
-from runtime_protocol.errors import AuthorizationError, ConflictError, ValidationError
-from runtime_protocol.util import atomic_json_write, canonical_json, now
+from .boundary import AuthorizationError, ConflictError, ValidationError, atomic_json_write, canonical_json, now
 
 from .migrator import MigrationConfig, MigrationError, Migrator
 

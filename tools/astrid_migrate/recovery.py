@@ -22,11 +22,7 @@ import sqlite3
 import time
 from typing import Any, Callable, Mapping
 
-from runtime_protocol.backup import restore_backup, verify_backup, verify_restore_candidate, _json_at, _open_relative, _sha256_at, _connection_from_fd
-from runtime_protocol.service import RuntimeService
-from runtime_protocol.store import RealmStore
-from runtime_protocol.util import canonical_json, new_id
-from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_parent as _validate_parent, pin_directory as _pin_directory
+from .boundary import restore_backup, verify_backup, verify_restore_candidate, _open_relative, _sha256_at, _connection_from_fd, canonical_json, new_id, atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_parent as _validate_parent, pin_directory as _pin_directory
 
 from .migrator import MigrationError, _sha256_file
 from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path
@@ -411,7 +407,7 @@ class RecoveryJournal:
 class B13Recovery:
     """Run the product-level B13.2 recovery journey against one selected realm."""
 
-    active_runtime: RuntimeService
+    active_runtime: Any
     recovery_base_backup: Path
     rollback_archive: Path
     evidence_root: Path
@@ -784,7 +780,7 @@ class B13Recovery:
         if _tree_digest(target) != payload.get("tombstoned_tree_sha256") or _sha256_file(target / "realm.sqlite3") != payload.get("tombstoned_database_sha256"):
             raise MigrationError("B13.2 purge target bytes changed while interrupted")
         # The authenticated post-tombstone database/tree digests above already
-        # cover the realm and lifecycle rows. Do not reopen RealmStore (or even
+        # cover the realm and lifecycle rows. Do not reopen the runtime store (or even
         # a normal read-only SQLite connection) here: SQLite may create a
         # ``-shm`` sidecar on open, changing the exact tree receipt we are
         # validating immediately before deletion.
@@ -819,7 +815,7 @@ class B13Recovery:
             reservation = getattr(self, "_capacity_reservation", None)
             if reservation is not None:
                 reservation.recheck()
-            target_store = RealmStore(target, acquire_owner=True)
+            target_store = type(self.active_runtime.store)(target, acquire_owner=True)
             try:
                 lifecycle = target_store.realm_lifecycle()
                 if target_store.realm["id"] != realm_id or lifecycle["state"] != "active":
@@ -898,7 +894,7 @@ class B13Recovery:
         return value
 
     @staticmethod
-    def _runtime_session(runtime: RuntimeService) -> str:
+    def _runtime_session(runtime: Any) -> str:
         value = getattr(runtime, "runtime_session_id", None)
         if not isinstance(value, str) or not value:
             raise MigrationError("B13.2 runtime has no boot session identity")
@@ -1395,7 +1391,7 @@ class B13Recovery:
         raise MigrationError(f"B13.2 recovery stopped in unexpected state {journal.read()['state']!r}")
 
 
-def run_b13_recovery(active_runtime: RuntimeService, *, recovery_base_backup: str | Path, rollback_archive: str | Path, evidence_root: str | Path, disposable_root: str | Path, authorizations: Mapping[str, Mapping[str, Any]], crash_at: str | None = None, fault_injector: Callable[[str], None] | None = None, reboot_executor: Callable[..., Any] | None = None, boot_identity_provider: Callable[[], str] | None = None, source_root: str | Path | None = None) -> dict[str, Any]:
+def run_b13_recovery(active_runtime: Any, *, recovery_base_backup: str | Path, rollback_archive: str | Path, evidence_root: str | Path, disposable_root: str | Path, authorizations: Mapping[str, Mapping[str, Any]], crash_at: str | None = None, fault_injector: Callable[[str], None] | None = None, reboot_executor: Callable[..., Any] | None = None, boot_identity_provider: Callable[[], str] | None = None, source_root: str | Path | None = None) -> dict[str, Any]:
     return B13Recovery(active_runtime, Path(recovery_base_backup), Path(rollback_archive), Path(evidence_root), Path(disposable_root), authorizations, crash_at=crash_at, fault_injector=fault_injector, reboot_executor=reboot_executor, boot_identity_provider=boot_identity_provider, source_root=Path(source_root) if source_root is not None else None).run()
 
 

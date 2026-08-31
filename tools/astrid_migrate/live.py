@@ -21,11 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from runtime_protocol.backup import restore_backup, verify_backup, verify_restore_candidate
-from runtime_protocol.dirfd import capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, ensure_parent_at as _ensure_parent_at, pin_directory as _pin_directory, copy_file_at as _copy_file_at, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_created_parent as _validate_created_parent, validate_parent as _validate_parent
-from runtime_protocol.service import RuntimeService
-from runtime_protocol.store import RealmStore
-from runtime_protocol.util import canonical_json
+from .boundary import restore_backup, verify_backup, verify_restore_candidate, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, ensure_parent_at as _ensure_parent_at, pin_directory as _pin_directory, copy_file_at as _copy_file_at, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_created_parent as _validate_created_parent, validate_parent as _validate_parent, canonical_json, RealmCatalog
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _sha256_file, _tree_size
 from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path, close_activation_path
@@ -187,7 +183,7 @@ class LiveMigration:
     """Execute B12 against a selected runtime and an immutable source root."""
 
     config: MigrationConfig
-    active_runtime: RuntimeService
+    active_runtime: Any
     authorizations: Mapping[str, Mapping[str, Any]]
     writer_stop: Callable[[], Any]
     fault_injector: Callable[[str], None] | None = None
@@ -455,7 +451,7 @@ class LiveMigration:
             raise MigrationError("B12 terminal capacity reservation was not durably released")
         return {"packet": "B12", "journal": current, "identity": dict(identity), "idempotent": True}
 
-    def _backup_or_reuse(self, runtime: RuntimeService, destination: Path, *, binding: Mapping[str, Any], journal: MigrationJournal, effect_name: str, seam: str) -> dict[str, Any]:
+    def _backup_or_reuse(self, runtime: Any, destination: Path, *, binding: Mapping[str, Any], journal: MigrationJournal, effect_name: str, seam: str) -> dict[str, Any]:
         if _has_symlink_component(destination):
             raise MigrationError(f"B12 {effect_name} path contains a symlink component")
         existing = self._existing_effect(journal, effect_name)
@@ -601,7 +597,7 @@ class LiveMigration:
         expected = {str(item["digest"]): str(item["sha256"]) for item in verified["cas_manifest"].get("objects", [])}
         if self._cas_content_map(root) != expected:
             raise MigrationError("B12 destination CAS changed after reconciliation")
-        store = RealmStore(root, acquire_owner=False)
+        store = type(self.active_runtime.store)(root, acquire_owner=False)
         try:
             if store.realm["id"] != realm_id or not store.doctor()["ok"]:
                 raise MigrationError("B12 destination failed its final doctor check")
@@ -628,7 +624,7 @@ class LiveMigration:
         except Exception:
             return False
 
-    def _runtime_artifact_identity(self, runtime: RuntimeService, *, source_manifest_sha256: str, expected_activation_manifest_sha256: str | None = None) -> dict[str, Any]:
+    def _runtime_artifact_identity(self, runtime: Any, *, source_manifest_sha256: str, expected_activation_manifest_sha256: str | None = None) -> dict[str, Any]:
         """Verify the control-plane artifacts that a terminal replay relies on."""
         root = _absolute_path(runtime.store.root)
         activation_path = root / "activation-manifest.json"
@@ -682,7 +678,7 @@ class LiveMigration:
             catalog_identity = {"status": "ready", "sha256": _sha256_file(catalog_path), "selected_realm_id": runtime.realm["id"], "data_root": str(root)}
         return {"activation_manifest_sha256": activation_sha256, "activation_state": activation.get("state"), "catalog": catalog_identity}
 
-    def _revalidate_destination(self, config: MigrationConfig, inventory: Mapping[str, Any], destination: RuntimeService, *, source_manifest_sha256: str) -> dict[str, Any]:
+    def _revalidate_destination(self, config: MigrationConfig, inventory: Mapping[str, Any], destination: Any, *, source_manifest_sha256: str) -> dict[str, Any]:
         """Read and reconcile destination truth immediately before activation."""
         current_inventory = Migrator(config, None).inventory()
         if current_inventory.get("source_manifest_sha256") != source_manifest_sha256:
@@ -707,7 +703,7 @@ class LiveMigration:
             raise MigrationError("B12.2 destination failed its final integrity or realm check")
         return dict(reconciliation)
 
-    def _destination_truth(self, destination: RuntimeService) -> dict[str, Any]:
+    def _destination_truth(self, destination: Any) -> dict[str, Any]:
         """Capture the durable destination identity at a write boundary."""
         snapshot = RuntimeServiceAdapter(destination).destination_snapshot()
         return {
@@ -717,7 +713,7 @@ class LiveMigration:
             "realm_id": str(destination.realm["id"]),
         }
 
-    def _assert_active_baseline(self, journal: MigrationJournal, active: RuntimeService) -> None:
+    def _assert_active_baseline(self, journal: MigrationJournal, active: Any) -> None:
         effect = journal.effects().get("active-baseline")
         if not effect:
             raise MigrationError("B12 active baseline is missing before activation")
@@ -726,7 +722,7 @@ class LiveMigration:
         if payload.get("semantic_snapshot_sha256") != _canonical_digest(_semantic_snapshot(snapshot)):
             raise MigrationError("B12 active runtime changed after the writer-stop boundary")
 
-    def _assert_destination_baseline(self, destination: RuntimeService, payload: Mapping[str, Any]) -> None:
+    def _assert_destination_baseline(self, destination: Any, payload: Mapping[str, Any]) -> None:
         current = self._destination_truth(destination)
         if any(payload.get(key) != current.get(key) for key in ("semantic_snapshot_sha256", "cas_manifest_sha256", "database_semantic_sha256", "realm_id")):
             raise MigrationError("B12 destination changed after its final reconciliation")
@@ -873,7 +869,7 @@ class LiveMigration:
                     raise MigrationError("B12 destination must not contain a symlink component")
                 reservation.recheck()
                 # Create/open the destination root relative to its retained
-                # parent, and keep cwd pinned while RealmStore performs its
+                # parent, and keep cwd pinned while the runtime performs its
                 # startup migrations and control writes.
                 destination_pin = _capture_parent(self.config.destination_root, require_fresh_target=not os.path.lexists(str(self.config.destination_root)))
                 destination_parent_fd = -1
@@ -889,7 +885,7 @@ class LiveMigration:
                             raise MigrationError("B12 destination appeared before runtime initialization")
                     _validate_created_parent(self.config.destination_root, destination_pin, destination_parent_fd)
                     # Retain the newly created/existing root itself before
-                    # invoking RealmStore. Opening it with O_NOFOLLOW closes
+                    # invoking the runtime. Opening it with O_NOFOLLOW closes
                     # the final name-to-inode gap after the mkdir seam; cwd is
                     # then pinned to this descriptor for all startup writes.
                     destination_root_fd = os.open(destination_name, _DIR_FLAGS, dir_fd=destination_parent_fd)
@@ -900,7 +896,7 @@ class LiveMigration:
                     cwd_fd = os.open(".", _DIR_FLAGS)
                     try:
                         os.fchdir(destination_root_fd)
-                        destination = RuntimeService(Path("."), display_name=active.realm["display_name"], realm_id=realm_id)
+                        destination = type(active)(Path("."), display_name=active.realm["display_name"], realm_id=realm_id)
                     finally:
                         os.fchdir(cwd_fd)
                         os.close(cwd_fd)
@@ -1094,7 +1090,7 @@ class LiveMigration:
             raise MigrationError("B12 live migration did not reach a resumable terminal state")
 
 
-def run_live_migration(config: MigrationConfig, active_runtime: RuntimeService, authorizations: Mapping[str, Mapping[str, Any]], *, writer_stop: Callable[[], Any], fault_injector: Callable[[str], None] | None = None, crash_at: str | None = None) -> dict[str, Any]:
+def run_live_migration(config: MigrationConfig, active_runtime: Any, authorizations: Mapping[str, Mapping[str, Any]], *, writer_stop: Callable[[], Any], fault_injector: Callable[[str], None] | None = None, crash_at: str | None = None) -> dict[str, Any]:
     """Run the serialized B12 flow against a selected disposable runtime."""
     return LiveMigration(config, active_runtime, authorizations, writer_stop, fault_injector=fault_injector, crash_at=crash_at).run()
 

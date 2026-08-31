@@ -28,10 +28,7 @@ from .capacity import (
     revalidate_activation_parent,
     revalidate_activation_path,
 )
-from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, validate_parent as _validate_parent
-from runtime_protocol.backup import _open_relative, _connection_from_fd, _sha256_at
-from runtime_protocol.dirfd import pin_directory as _pin_directory
-from runtime_protocol.util import now
+from .boundary import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, validate_parent as _validate_parent, _open_relative, _connection_from_fd, _sha256_at, pin_directory as _pin_directory, RealmCatalog, now
 
 
 def _write_json(path: Path, value: Mapping[str, Any], *, identity: Mapping[str, Any] | None = None) -> None:
@@ -730,7 +727,7 @@ class RuntimeServiceAdapter:
                 raise MigrationError(f"candidate realm cannot be opened safely: {candidate}") from exc
             if not _exists_at(candidate_fd, "realm.sqlite3") or not _exists_at(candidate_fd, "cas"):
                 raise MigrationError("candidate is not a complete inactive realm")
-            from runtime_protocol.backup import verify_restore_candidate
+            from .boundary import verify_restore_candidate
             # Candidate restore directories carry a handoff, while backups carry
             # a manifest.  Both must be checked before touching the authority.
             if not _exists_at(candidate_fd, "activation-handoff.json"):
@@ -780,14 +777,13 @@ class RuntimeServiceAdapter:
             temporary_fd = -1
 
             # Open the new runtime while its root is still named by the
-            # descriptor-pinned parent. RuntimeService/RealmStore performs
+            # descriptor-pinned parent. The runtime performs
             # startup writes; fchdir makes their relative path resolve to the
             # pinned directory rather than an attacker-swapped absolute path.
-            from runtime_protocol.service import RuntimeService
             cwd_fd = os.open(".", _DIR_FLAGS)
             try:
                 os.fchdir(parent_fd)
-                reopened = RuntimeService(temporary_name, display_name=display_name, realm_id=realm_id, support_root=support_root)
+                reopened = type(old_service)(temporary_name, display_name=display_name, realm_id=realm_id, support_root=support_root)
             finally:
                 try:
                     os.fchdir(cwd_fd)
@@ -810,7 +806,6 @@ class RuntimeServiceAdapter:
             # the parent boundary before any path-based reopen or retargeting.
             revalidate_activation_parent(target, target_identity)
             if support_root is not None:
-                from runtime_protocol.catalog import RealmCatalog
                 catalog_path = Path(support_root) / "catalog.json"
                 catalog_identity = _capture_parent(catalog_path)
                 try:
@@ -1274,7 +1269,7 @@ class Rehearsal:
         expected = self._destination_binding()
         if destination.exists():
             try:
-                from runtime_protocol.backup import verify_backup
+                from .boundary import verify_backup
                 result = verify_backup(destination)
                 actual = result["manifest"].get("destination_binding")
                 if actual != expected:
@@ -1313,11 +1308,11 @@ class Rehearsal:
                 value = _read_json_pinned(handoff)
             except (FileNotFoundError, OSError, json.JSONDecodeError, MigrationError) as exc:
                 raise MigrationError(f"existing restore destination is not resumable: {destination}") from exc
-            from runtime_protocol.backup import verify_backup
+            from .boundary import verify_backup
             source_manifest = verify_backup(backup)["manifest"]
             if value.get("source_manifest_sha256") != _hash_file_pinned(backup / "manifest.json"):
                 raise MigrationError(f"existing restore destination came from a different backup: {destination}")
-            from runtime_protocol.backup import verify_restore_candidate
+            from .boundary import verify_restore_candidate
             try:
                 candidate_verification = verify_restore_candidate(destination)
             except Exception as exc:

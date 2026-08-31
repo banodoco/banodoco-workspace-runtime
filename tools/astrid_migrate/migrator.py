@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Mapping
 
-from runtime_protocol.dirfd import (
+from .boundary import (
     capture_parent as _capture_parent,
     close_pinned as _close_pinned,
     copy_tree_at as _copy_tree_at,

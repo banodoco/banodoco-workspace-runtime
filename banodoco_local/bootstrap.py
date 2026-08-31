@@ -196,13 +196,47 @@ def _default_legacy_roots(paths: RuntimePaths) -> tuple[Path, ...]:
 def _legacy_collision(paths: RuntimePaths, configured: tuple[Path, ...]) -> Path | None:
     for root in (*configured, *_default_legacy_roots(paths)):
         root = Path(root).expanduser()
-        if root.exists() and (root.is_dir() or root.is_file()):
-            # A neutral activation manifest in this support tree means this is
-            # already managed; it is not evidence of a legacy collision.
-            if root == paths.home / ".astrid" and paths.catalog_path.exists():
+        # lexists is intentional: a dangling legacy symlink is still a
+        # collision and must not be bypassed by a stale/empty catalog.
+        if os.path.lexists(str(root)) and (root.is_dir() or root.is_file() or root.is_symlink()):
+            if root == paths.home / ".astrid" and _verified_activation_manifest(paths):
                 continue
             return root
     return None
+
+
+def _verified_activation_manifest(paths: RuntimePaths) -> bool:
+    """Return true only for a complete, authenticated migration activation.
+
+    Catalog presence is deliberately irrelevant.  Every digest is required
+    so an empty/stale hand-written catalog or an incomplete activation record
+    cannot make the historical root appear neutral.
+    """
+    try:
+        manifests = tuple(paths.activations_dir.glob("*.json"))
+    except OSError:
+        return False
+    for path in manifests:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, Mapping) or value.get("version") != 1:
+                continue
+            required = ("realm_id", "source_archive_hash", "destination_realm_root",
+                        "destination_database_hash", "destination_object_manifest_hash",
+                        "runtime_version", "schema_version", "protocol_version",
+                        "importer_version", "validation_report_digest")
+            if any(not isinstance(value.get(key), str) or not value[key].strip() for key in required):
+                continue
+            if any(len(value[key]) != 64 for key in ("source_archive_hash", "destination_database_hash", "destination_object_manifest_hash", "validation_report_digest")):
+                continue
+            if not Path(value["destination_realm_root"]).is_absolute():
+                continue
+            return True
+        except (OSError, ValueError, TypeError):
+            continue
+    return False
 
 
 def _new_realm_id() -> str:

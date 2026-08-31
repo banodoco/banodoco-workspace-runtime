@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
 from .errors import RuntimeErrorBase, AuthorizationError, NotFoundError, ProtocolError, InvalidRequestError
+from migration_boundary import BoundaryError
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -64,7 +65,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
 
     def _error(self, exc):
-        if isinstance(exc, RuntimeErrorBase):
+        if isinstance(exc, (RuntimeErrorBase, BoundaryError)):
             self._send(exc.status, error=exc.as_dict())
         else:
             self._send(500, error={"code": "internal_error", "message": "internal runtime error"})
