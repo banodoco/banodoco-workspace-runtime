@@ -185,7 +185,7 @@ paths:
       responses: { '200': { description: Shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } } }
     patch:
       operationId: updateShot
-      parameters: [ { $ref: '#/components/parameters/ShotId' } ]
+      parameters: [ { $ref: '#/components/parameters/ShotId' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string } } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateShot' } } } }
       responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/Shot' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/shots/{shot_id}/archive:
@@ -207,15 +207,105 @@ paths:
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } }
       responses: { '201': { description: Reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } } }
   /v1/projects/{project_id}/shots:
+    post:
+      operationId: createProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotCreate' } } } }
+      responses: { '201': { description: Project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
     get:
       operationId: listProjectShots
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: include_archived, in: query, required: false, schema: { type: boolean, default: false } } ]
-      responses: { '200': { description: Project shots, content: { application/json: { schema: { $ref: '#/components/schemas/ShotPage' } } } } }
+      responses: { '200': { description: Project shots, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotPage' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}:
+    get:
+      operationId: getProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' } ]
+      responses: { '200': { description: Project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+    patch:
+      operationId: updateProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotUpdate' } } } }
+      responses: { '200': { description: Updated project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/archive:
+    post:
+      operationId: archiveProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/recover:
+    post:
+      operationId: recoverProjectShot
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Recovered project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/items:
+    post:
+      operationId: addShotItem
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotItemCreate' } } } }
+      responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/items/{item_id}:
+    delete:
+      operationId: removeShotItem
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { name: item_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/reorder:
+    post:
+      operationId: reorderShotItems
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotReorder' } } } }
+      responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
   /v1/projects/{project_id}/references:
+    post:
+      operationId: createProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferenceCreate' } } } }
+      responses: { '201': { description: Project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
     get:
       operationId: listProjectReferences
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: include_archived, in: query, required: false, schema: { type: boolean, default: false } } ]
-      responses: { '200': { description: Project references, content: { application/json: { schema: { $ref: '#/components/schemas/ReferencePage' } } } } }
+      responses: { '200': { description: Project references, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferencePage' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}:
+    get:
+      operationId: getProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' } ]
+      responses: { '200': { description: Project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+    patch:
+      operationId: updateProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferenceUpdate' } } } }
+      responses: { '200': { description: Updated project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/archive:
+    post:
+      operationId: archiveProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Archived project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/recover:
+    post:
+      operationId: recoverProjectReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
+      responses: { '200': { description: Recovered project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/associations:
+    post:
+      operationId: associateReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceAssociation' } } } }
+      responses: { '200': { description: Updated reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+  /v1/projects/{project_id}/references/{reference_id}/primary:
+    post:
+      operationId: setPrimaryReference
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SetPrimaryReference' } } } }
+      responses: { '200': { description: Updated reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+  /v1/projects/{project_id}/reference-links:
+    post:
+      operationId: linkReferences
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceLink' } } } }
+      responses: { '200': { description: Reference link, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceLink' } } } } }
   /v1/references/{reference_id}:
     get:
       operationId: getReference
@@ -223,7 +313,7 @@ paths:
       responses: { '200': { description: Reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } } }
     patch:
       operationId: updateReference
-      parameters: [ { $ref: '#/components/parameters/ReferenceId' } ]
+      parameters: [ { $ref: '#/components/parameters/ReferenceId' }, { name: Idempotency-Key, in: header, required: false, schema: { type: string } } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateReference' } } } }
       responses: { '200': { description: Updated reference, content: { application/json: { schema: { $ref: '#/components/schemas/Reference' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/references/{reference_id}/archive:
@@ -691,6 +781,74 @@ components:
       additionalProperties: false
       required: [confirmation]
       properties: { confirmation: { type: string, minLength: 1 } }
+    ShotItem:
+      type: object
+      additionalProperties: false
+      required: [item_id, media_id, sort_key]
+      properties: { item_id: { type: string }, media_id: { type: string }, sort_key: { type: string }, source_frame: { type: [integer, 'null'] }, metadata: { type: object } }
+    ProjectShot:
+      type: object
+      additionalProperties: false
+      required: [shot_id, project_id, name, metadata, version, items, archived]
+      properties: { shot_id: { type: string }, project_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object }, version: { type: integer, minimum: 1 }, items: { type: array, items: { $ref: '#/components/schemas/ShotItem' } }, archived: { type: boolean }, created_at: { type: string }, updated_at: { type: string } }
+    ProjectShotCreate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties: { shot_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object } }
+    ProjectShotUpdate:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, name: { type: string }, metadata: { type: object } }
+    ShotItemCreate:
+      type: object
+      additionalProperties: false
+      required: [media_id]
+      properties: { item_id: { type: string }, media_id: { type: string }, position: { type: integer, minimum: 0 }, source_frame: { type: integer, minimum: 0 }, metadata: { type: object } }
+    ShotReorder:
+      type: object
+      additionalProperties: false
+      required: [expected_version, item_ids]
+      properties: { expected_version: { type: integer, minimum: 1 }, item_ids: { type: array, items: { type: string }, uniqueItems: true } }
+    ProjectShotPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/ProjectShot' } }, next_cursor: { type: [string, 'null'] } }
+    ReferenceAssociation:
+      type: object
+      additionalProperties: false
+      required: [media_id, role]
+      properties: { association_id: { type: string }, media_id: { type: string }, role: { type: string }, metadata: { type: object } }
+    ProjectReference:
+      type: object
+      additionalProperties: false
+      required: [reference_id, project_id, kind, name, description, metadata, version, media_references, links, archived]
+      properties: { reference_id: { type: string }, project_id: { type: string }, kind: { type: string }, name: { type: string }, description: { type: string }, metadata: { type: object }, version: { type: integer, minimum: 1 }, media_references: { type: array, items: { $ref: '#/components/schemas/ReferenceAssociation' } }, links: { type: array, items: { $ref: '#/components/schemas/ReferenceLink' } }, archived: { type: boolean }, created_at: { type: string }, updated_at: { type: string } }
+    ProjectReferenceCreate:
+      type: object
+      additionalProperties: false
+      required: [kind, name, media_id]
+      properties: { reference_id: { type: string }, kind: { type: string }, name: { type: string }, media_id: { type: string }, description: { type: string }, metadata: { type: object } }
+    ProjectReferenceUpdate:
+      type: object
+      additionalProperties: false
+      required: [expected_version]
+      properties: { expected_version: { type: integer, minimum: 1 }, name: { type: string }, description: { type: string }, metadata: { type: object } }
+    ProjectReferencePage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/ProjectReference' } }, next_cursor: { type: [string, 'null'] } }
+    SetPrimaryReference:
+      type: object
+      additionalProperties: false
+      required: [association_id, expected_version]
+      properties: { association_id: { type: string }, expected_version: { type: integer, minimum: 1 } }
+    ReferenceLink:
+      type: object
+      additionalProperties: false
+      required: [from_reference_id, to_reference_id, kind]
+      properties: { from_reference_id: { type: string }, to_reference_id: { type: string }, kind: { type: string }, metadata: { type: object } }
   responses:
     Conflict:
       description: Conflict or idempotency mismatch

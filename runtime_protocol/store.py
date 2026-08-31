@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 LEASE_SECONDS = 30
 
 
@@ -146,6 +146,9 @@ class RealmStore:
             version = 12
         if version < 13:
             self._run_migration(13)
+            version = 13
+        if version < 14:
+            self._run_migration(14)
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.

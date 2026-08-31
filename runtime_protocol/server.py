@@ -146,17 +146,23 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_shot(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "PATCH":
-            self._identity("projects:write"); return self._send(200, self.runtime.update_shot(path[2], self._body()))
+            self._identity("projects:write"); return self._send(200, self.runtime.update_shot(path[2], self._body(), idempotency_key=self.headers.get("Idempotency-Key")))
         if len(path) == 4 and path[:2] == ["v1", "shots"] and path[3] in ("archive", "recover") and method == "POST":
             self._identity("projects:write")
-            return self._send(200, self.runtime.archive_shot(path[2], self._body()) if path[3] == "archive" else self.runtime.recover_shot(path[2], self._body()))
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
+            return self._send(200, self.runtime.archive_shot(path[2], self._body(), idempotency_key=key) if path[3] == "archive" else self.runtime.recover_shot(path[2], self._body(), idempotency_key=key))
         if len(path) == 3 and path[:2] == ["v1", "references"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_reference(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "references"] and method == "PATCH":
-            self._identity("projects:write"); return self._send(200, self.runtime.update_reference(path[2], self._body()))
+            self._identity("projects:write"); return self._send(200, self.runtime.update_reference(path[2], self._body(), idempotency_key=self.headers.get("Idempotency-Key")))
         if len(path) == 4 and path[:2] == ["v1", "references"] and path[3] in ("archive", "recover") and method == "POST":
             self._identity("projects:write")
-            return self._send(200, self.runtime.archive_reference(path[2], self._body()) if path[3] == "archive" else self.runtime.recover_reference(path[2], self._body()))
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
+            return self._send(200, self.runtime.archive_reference(path[2], self._body(), idempotency_key=key) if path[3] == "archive" else self.runtime.recover_reference(path[2], self._body(), idempotency_key=key))
         if path == ["v1", "projects"]:
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
@@ -215,6 +221,48 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 include_archived = query.get("include_archived", ["false"])[0].lower() == "true"
                 value = self.runtime.list_project_shots(selector, include_archived=include_archived, limit=query.get("limit", [50])[0]) if path[3] == "shots" else self.runtime.list_project_references(selector, include_archived=include_archived, limit=query.get("limit", [50])[0])
                 return self._send(200, value)
+            if len(path) >= 5 and path[3] in ("shots", "references"):
+                kind, resource_id = path[3], path[4]
+                self._identity("projects:read" if method == "GET" else "projects:write")
+                key = self.headers.get("Idempotency-Key")
+                if method in ("PATCH", "POST") and path[5:] in ([], ["archive"], ["recover"]):
+                    body = self._body()
+                    if path[5:] == ["archive"] or path[5:] == ["recover"]:
+                        if not key: raise ProtocolError("Idempotency-Key header is required")
+                        value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"]) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"])
+                    else:
+                        value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key)
+                    return self._send(200, value)
+                if method == "GET" and not path[5:]:
+                    return self._send(200, self.runtime.get_project_shot(selector, resource_id) if kind == "shots" else self.runtime.get_project_reference(selector, resource_id))
+                if kind == "shots" and path[5:] == ["items"] and method == "POST":
+                    if not key: raise ProtocolError("Idempotency-Key header is required")
+                    return self._send(200, self.runtime.add_shot_item(selector, resource_id, self._body(), idempotency_key=key))
+                if kind == "shots" and len(path) == 7 and path[5] == "items" and method == "DELETE":
+                    if not key: raise ProtocolError("Idempotency-Key header is required")
+                    return self._send(200, self.runtime.remove_shot_item(selector, resource_id, path[6], self._body(), idempotency_key=key))
+                if kind == "shots" and path[5:] == ["reorder"] and method == "POST":
+                    if not key: raise ProtocolError("Idempotency-Key header is required")
+                    return self._send(200, self.runtime.reorder_shot_items(selector, resource_id, self._body(), idempotency_key=key))
+                if kind == "references" and path[5:] == ["associations"] and method == "POST":
+                    if not key: raise ProtocolError("Idempotency-Key header is required")
+                    return self._send(200, self.runtime.associate_reference(selector, resource_id, self._body(), idempotency_key=key))
+                if kind == "references" and path[5:] == ["primary"] and method == "POST":
+                    if not key: raise ProtocolError("Idempotency-Key header is required")
+                    body = self._body(); return self._send(200, self.runtime.set_primary_reference(selector, resource_id, body.get("association_id"), body, idempotency_key=key))
+            if len(path) == 4 and path[3] in ("shots", "references") and method == "POST":
+                self._identity("projects:write")
+                key = self.headers.get("Idempotency-Key")
+                if not key:
+                    raise ProtocolError("Idempotency-Key header is required")
+                body = self._body()
+                value = self.runtime.create_project_shot(selector, body, idempotency_key=key) if path[3] == "shots" else self.runtime.create_project_reference(selector, body, idempotency_key=key)
+                return self._send(201, value)
+            if len(path) == 4 and path[3] == "reference-links" and method == "POST":
+                self._identity("projects:write")
+                key = self.headers.get("Idempotency-Key")
+                if not key: raise ProtocolError("Idempotency-Key header is required")
+                return self._send(200, self.runtime.link_references(selector, self._body(), idempotency_key=key))
             if len(path) == 4 and path[3] == "media-relations":
                 self._identity("objects:read" if method == "GET" else "objects:write")
                 if method == "GET":
@@ -373,3 +421,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self.do_PATCH()
+
+    def do_DELETE(self):
+        try:
+            self._route()
+        except Exception as exc:
+            self._error(exc)

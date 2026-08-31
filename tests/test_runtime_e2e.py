@@ -103,6 +103,63 @@ def test_project_patch_and_run_cancel_retry_are_durable_and_idempotent(daemon, t
         restarted.stop()
 
 
+def test_project_shot_reference_crud_isolated_idempotent_and_restart_durable(daemon, tmp_path):
+    client = WorkspaceClient(daemon.endpoint, daemon.token)
+    first = client.create_project("shots-a", idempotency_key="shots-project-a")
+    second = client.create_project("shots-b", idempotency_key="shots-project-b")
+    media = client.ingest_project_object(first.project_id, b"reference-media", media_type="application/octet-stream", idempotency_key="shots-media")
+    shot_body = {"shot_id": "project-shot", "name": "Project Shot", "metadata": {"scene": 1}}
+    reference_body = {"reference_id": "project-reference", "kind": "character", "name": "Aria", "media_id": media.object_id}
+    shot = client.create_project_shot(first.project_id, shot_body, idempotency_key="project-shot-create")
+    reference = client.create_project_reference(first.project_id, reference_body, idempotency_key="project-reference-create")
+    assert shot["project_id"] == first.project_id and reference["project_id"] == first.project_id
+    assert client.create_project_shot(first.project_id, shot_body, idempotency_key="project-shot-create") == shot
+    assert client.create_project_reference(first.project_id, reference_body, idempotency_key="project-reference-create") == reference
+    with pytest.raises(ApiError) as mismatch:
+        client.create_project_shot(first.project_id, {**shot_body, "name": "Changed"}, idempotency_key="project-shot-create")
+    assert mismatch.value.status == 409
+    assert client.list_project_shots(first.project_id)[0][0]["shot_id"] == "project-shot"
+    assert client.list_project_shots(second.project_id)[0] == []
+    assert client.list_project_references(second.project_id)[0] == []
+
+    updated = client.update_project_shot(first.project_id, "project-shot", expected_version=1, name="Updated Shot", idempotency_key="project-shot-update")
+    assert updated["version"] == 2 and updated["name"] == "Updated Shot"
+    assert client.update_project_shot(first.project_id, "project-shot", expected_version=1, name="Updated Shot", idempotency_key="project-shot-update") == updated
+    with pytest.raises(ApiError) as stale:
+        client.update_project_shot(first.project_id, "project-shot", expected_version=1, name="stale", idempotency_key="project-shot-stale")
+    assert stale.value.status == 409
+    archived = client.archive_project_shot(first.project_id, "project-shot", expected_version=updated["version"], idempotency_key="project-shot-archive")
+    assert archived["archived"] is True
+    assert client.list_project_shots(first.project_id)[0] == []
+    recovered = client.recover_project_shot(first.project_id, "project-shot", expected_version=archived["version"], idempotency_key="project-shot-recover")
+    assert recovered["archived"] is False
+    ref_updated = client.update_project_reference(first.project_id, "project-reference", expected_version=1, name="Aria Prime", idempotency_key="project-reference-update")
+    ref_archived = client.archive_project_reference(first.project_id, "project-reference", expected_version=ref_updated["version"], idempotency_key="project-reference-archive")
+    ref_recovered = client.recover_project_reference(first.project_id, "project-reference", expected_version=ref_archived["version"], idempotency_key="project-reference-recover")
+    assert ref_recovered["name"] == "Aria Prime" and ref_recovered["archived"] is False
+    second_media = client.ingest_project_object(first.project_id, b"second-media", media_type="application/octet-stream", idempotency_key="shots-media-2")
+    with_item = client.add_shot_item(first.project_id, "project-shot", {"item_id": "item-a", "media_id": media.object_id, "position": 0}, idempotency_key="shot-item-a")
+    with_two = client.add_shot_item(first.project_id, "project-shot", {"item_id": "item-b", "media_id": second_media.object_id, "position": 1}, idempotency_key="shot-item-b")
+    reordered = client.reorder_shot_items(first.project_id, "project-shot", ["item-b", "item-a"], expected_version=with_two["version"], idempotency_key="shot-reorder")
+    removed = client.remove_shot_item(first.project_id, "project-shot", "item-a", expected_version=reordered["version"], idempotency_key="shot-item-remove")
+    assert [item["item_id"] for item in removed["items"]] == ["item-b"]
+    associated = client.associate_reference(first.project_id, "project-reference", {"association_id": "assoc-b", "media_id": second_media.object_id, "role": "depicts"}, idempotency_key="reference-associate")
+    primary = client.set_primary_reference(first.project_id, "project-reference", "assoc-b", expected_version=associated["version"], idempotency_key="reference-primary")
+    linked_ref = client.create_project_reference(first.project_id, {"reference_id": "project-reference-2", "kind": "object", "name": "Prop", "media_id": media.object_id}, idempotency_key="reference-2")
+    link = client.link_references(first.project_id, {"from_reference_id": "project-reference", "to_reference_id": linked_ref["reference_id"], "kind": "associated_with"}, idempotency_key="reference-link")
+    assert primary["media_references"][-1]["is_primary"] is True and link["kind"] == "associated_with"
+
+    daemon.stop()
+    restarted = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        replay = WorkspaceClient(restarted.endpoint, restarted.token)
+        assert replay.create_project_shot(first.project_id, shot_body, idempotency_key="project-shot-create") == shot
+        assert replay.get_project_shot(first.project_id, "project-shot")["name"] == "Updated Shot"
+        assert replay.get_project_reference(first.project_id, "project-reference")["archived"] is False
+    finally:
+        restarted.stop()
+
+
 def test_restart_reconnect_and_catalog_discovery(daemon, tmp_path):
     client = Api(daemon.endpoint, daemon.token)
     project = client.create_project("persist", "Persistent")

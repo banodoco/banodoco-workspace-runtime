@@ -598,12 +598,41 @@ class WorkspaceClient:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/shots" + query)[2])
         return list(value.get("items", [])), value.get("next_cursor")
 
-    def update_shot(self, shot_id: str, *, expected_version: int, start_ms: int | None = None, duration_ms: int | None = None, reference_ids: list[str] | None = None) -> Mapping[str, Any]:
+    def create_project_shot(self, project_id: str, shot: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots", body=json.dumps(dict(shot), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
+
+    def get_project_shot(self, project_id: str, shot_id: str) -> Mapping[str, Any]:
+        return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}")[2])
+
+    def update_project_shot(self, project_id: str, shot_id: str, *, expected_version: int, name: str | None = None, metadata: Mapping[str, Any] | None = None, idempotency_key: str) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"expected_version": expected_version}
+        if name is not None: payload["name"] = name
+        if metadata is not None: payload["metadata"] = metadata
+        return self._json(self._request("PATCH", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def archive_project_shot(self, project_id: str, shot_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def recover_project_shot(self, project_id: str, shot_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def add_shot_item(self, project_id: str, shot_id: str, item: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items", body=json.dumps(dict(item), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def remove_shot_item(self, project_id: str, shot_id: str, item_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("DELETE", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items/{_path_part(item_id)}", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def reorder_shot_items(self, project_id: str, shot_id: str, item_ids: list[str], *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/reorder", body=json.dumps({"expected_version": expected_version, "item_ids": item_ids}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def update_shot(self, shot_id: str, *, expected_version: int, start_ms: int | None = None, duration_ms: int | None = None, reference_ids: list[str] | None = None, idempotency_key: str | None = None) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"expected_version": expected_version}
         if start_ms is not None: payload["start_ms"] = start_ms
         if duration_ms is not None: payload["duration_ms"] = duration_ms
         if reference_ids is not None: payload["reference_ids"] = reference_ids
-        return self._json(self._request("PATCH", f"/v1/shots/{_path_part(shot_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+        headers = {"Content-Type": "application/json"}
+        if idempotency_key: headers["Idempotency-Key"] = idempotency_key
+        return self._json(self._request("PATCH", f"/v1/shots/{_path_part(shot_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers=headers)[2])
 
     def archive_shot(self, shot_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
         return self._json(self._request("POST", f"/v1/shots/{_path_part(shot_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
@@ -622,11 +651,41 @@ class WorkspaceClient:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/references" + query)[2])
         return list(value.get("items", [])), value.get("next_cursor")
 
-    def update_reference(self, reference_id: str, *, expected_version: int, object_id: str | None = None, role: str | None = None) -> Mapping[str, Any]:
+    def create_project_reference(self, project_id: str, reference: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references", body=json.dumps(dict(reference), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
+
+    def get_project_reference(self, project_id: str, reference_id: str) -> Mapping[str, Any]:
+        return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}")[2])
+
+    def update_project_reference(self, project_id: str, reference_id: str, *, expected_version: int, name: str | None = None, description: str | None = None, metadata: Mapping[str, Any] | None = None, idempotency_key: str) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"expected_version": expected_version}
+        if name is not None: payload["name"] = name
+        if description is not None: payload["description"] = description
+        if metadata is not None: payload["metadata"] = metadata
+        return self._json(self._request("PATCH", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def archive_project_reference(self, project_id: str, reference_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def recover_project_reference(self, project_id: str, reference_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def associate_reference(self, project_id: str, reference_id: str, association: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/associations", body=json.dumps(dict(association), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def set_primary_reference(self, project_id: str, reference_id: str, association_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/primary", body=json.dumps({"association_id": association_id, "expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def link_references(self, project_id: str, link: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
+        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/reference-links", body=json.dumps(dict(link), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def update_reference(self, reference_id: str, *, expected_version: int, object_id: str | None = None, role: str | None = None, idempotency_key: str | None = None) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"expected_version": expected_version}
         if object_id is not None: payload["object_id"] = object_id
         if role is not None: payload["role"] = role
-        return self._json(self._request("PATCH", f"/v1/references/{_path_part(reference_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+        headers = {"Content-Type": "application/json"}
+        if idempotency_key: headers["Idempotency-Key"] = idempotency_key
+        return self._json(self._request("PATCH", f"/v1/references/{_path_part(reference_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers=headers)[2])
 
     def archive_reference(self, reference_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
         return self._json(self._request("POST", f"/v1/references/{_path_part(reference_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])

@@ -6,6 +6,7 @@ import pytest
 
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.service import RuntimeService
 
 
 def _digest(value: str) -> str:
@@ -108,6 +109,29 @@ def test_timeline_document_retry_repairs_partial_two_request_write(tmp_path, mon
         assert len(client.list_timelines(project.project_id)[0]) == 1
     finally:
         daemon.stop()
+
+
+def test_project_media_mutations_roll_back_before_idempotency_replay(tmp_path, monkeypatch):
+    service = RuntimeService(tmp_path / "realm")
+    project = service.create_project({"slug": "atomic", "name": "Atomic"})
+    service.store.record_object("a" * 64, 1, "application/octet-stream")
+    service.store.add_object_ref(project["id"], "a" * 64)
+    original = service._command_record
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("response serialization failed")
+
+    monkeypatch.setattr(service, "_command_record", fail)
+    with pytest.raises(RuntimeError):
+        service.create_project_shot(project["id"], {"shot_id": "atomic-shot", "name": "Shot"}, idempotency_key="atomic-shot")
+    with pytest.raises(RuntimeError):
+        service.create_project_reference(project["id"], {"reference_id": "atomic-ref", "kind": "character", "name": "Ref", "media_id": "sha256:" + "a" * 64}, idempotency_key="atomic-ref")
+    assert service.store.conn.execute("SELECT 1 FROM project_shots WHERE id='atomic-shot'").fetchone() is None
+    assert service.store.conn.execute("SELECT 1 FROM project_references WHERE id='atomic-ref'").fetchone() is None
+    monkeypatch.setattr(service, "_command_record", original)
+    shot = service.create_project_shot(project["id"], {"shot_id": "atomic-shot", "name": "Shot"}, idempotency_key="atomic-shot")
+    assert service.create_project_shot(project["id"], {"shot_id": "atomic-shot", "name": "Shot"}, idempotency_key="atomic-shot") == shot
+    service.close()
 
 
 def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path):
