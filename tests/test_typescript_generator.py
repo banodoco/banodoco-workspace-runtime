@@ -55,3 +55,50 @@ def test_typescript_generator_check_rejects_client_and_manifest_mutation(tmp_pat
     mutated_component.write_text(json.dumps(changed, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
     changed_check = ["node", str(script), "--contract", str(contract), "--schema-manifest", str(schema), "--component-manifest", str(mutated_component), "--check", "--source-root", str(source)]
     assert subprocess.run(changed_check, capture_output=True, text=True).returncode != 0
+
+
+def test_typescript_generator_check_rejects_source_symlink_escapes(tmp_path: Path) -> None:
+    root = Path(__file__).parents[1]
+    script = root / "tools" / "generate_typescript_conformance.mjs"
+    contract = root / "contract" / "openapi" / "workspace-v1.yaml"
+    schema = root / "contract" / "manifest.json"
+    original = json.loads((root / "contract" / "component-manifest.json").read_text())
+
+    for field, output_name in (("source", "generated.ts"), ("metadata_source", "contract-metadata.ts")):
+        for kind in ("intermediate", "leaf"):
+            changed = json.loads(json.dumps(original))
+            source = tmp_path / f"{field}-{kind}-source"
+            outside = tmp_path / f"{field}-{kind}-outside"
+            source.mkdir()
+            outside.mkdir()
+            for client in changed["clients"]:
+                if client["generator"] == "GENERATOR-TYPESCRIPT-CONFORMANCE":
+                    client[field] = f"linked/{output_name}"
+            component = tmp_path / f"component-{field}-{kind}.json"
+            component.write_text(json.dumps(changed, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+
+            expected = tmp_path / f"expected-{field}-{kind}"
+            generate = [
+                "node", str(script), "--contract", str(contract), "--schema-manifest", str(schema),
+                "--component-manifest", str(component), "--output-root", str(expected),
+            ]
+            subprocess.run(generate, check=True, capture_output=True, text=True)
+
+            normal = source / "clients" / "typescript"
+            normal.mkdir(parents=True)
+            other_name = "contract-metadata.ts" if output_name == "generated.ts" else "generated.ts"
+            shutil.copyfile(expected / other_name, normal / other_name)
+            if kind == "intermediate":
+                shutil.copyfile(expected / output_name, outside / output_name)
+                (source / "linked").symlink_to(outside, target_is_directory=True)
+            else:
+                shutil.copyfile(expected / output_name, outside / output_name)
+                (source / "linked").symlink_to(outside / output_name)
+
+            check = [
+                "node", str(script), "--contract", str(contract), "--schema-manifest", str(schema),
+                "--component-manifest", str(component), "--check", "--source-root", str(source),
+            ]
+            result = subprocess.run(check, capture_output=True, text=True)
+            assert result.returncode != 0
+            assert "symlink" in result.stderr

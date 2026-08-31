@@ -7,7 +7,7 @@
  * and carries the canonical wire fixtures.  ``--check`` is deliberately
  * read-only and fails closed on any checked-in source or manifest drift.
  */
-import { readFileSync, mkdirSync, writeFileSync, lstatSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, lstatSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { createHash } from "node:crypto";
@@ -91,6 +91,41 @@ function safeRelative(value, label) {
     throw new Error(`${label} must be a contained relative path`);
   }
   return value;
+}
+
+function containedSourcePath(sourceRoot, value, label) {
+  const relative = safeRelative(value, label);
+  const root = resolve(sourceRoot);
+  const candidate = resolve(root, relative);
+  let current = root;
+  for (const part of relative.split("/")) {
+    if (!part || part === ".") continue;
+    current = join(current, part);
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Error(`${label} must not traverse a symlink`);
+    } catch (error) {
+      if (error instanceof Error && error.message === `${label} must not traverse a symlink`) throw error;
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") break;
+      throw error;
+    }
+  }
+  try {
+    const resolvedCandidate = realpathSync(candidate);
+    if (resolvedCandidate !== root && !resolvedCandidate.startsWith(`${root}/`)) {
+      throw new Error(`${label} must be contained by source root`);
+    }
+  } catch (error) {
+    if (error instanceof Error && (error.message === `${label} must be contained by source root` || error.message === `${label} must not traverse a symlink`)) throw error;
+    if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") throw error;
+  }
+  return candidate;
+}
+
+function validateClientSources(sourceRoot, client) {
+  return {
+    source: containedSourcePath(sourceRoot, client.source, "client source"),
+    metadata_source: containedSourcePath(sourceRoot, client.metadata_source, "metadata source"),
+  };
 }
 
 function validateManifest(manifest, schema) {
@@ -207,17 +242,16 @@ function writeFiles(root, files) {
   }
 }
 
-function checkFiles(sourceRoot, files, client, fixtureRoot) {
+function checkFiles(sourceRoot, files, client, fixtureRoot, sourcePaths) {
   const checks = {
-    [safeRelative(client.source, "client source")]: files[safeRelative(client.output, "client output")],
-    [safeRelative(client.metadata_source, "metadata source")]: files[safeRelative(client.metadata_output, "metadata output")],
+    [sourcePaths.source]: files[safeRelative(client.output, "client output")],
+    [sourcePaths.metadata_source]: files[safeRelative(client.metadata_output, "metadata output")],
   };
   if (fixtureRoot) {
     for (const [relative, data] of Object.entries(files)) if (relative.startsWith("fixture-")) checks[resolve(fixtureRoot, relative.slice("fixture-".length))] = data;
   }
   const failures = [];
-  for (const [relative, expected] of Object.entries(checks)) {
-    const target = resolve(sourceRoot, relative);
+  for (const [target, expected] of Object.entries(checks)) {
     try {
       const actual = regular(target, "generated artifact").bytes;
       if (!actual.equals(expected)) failures.push(target);
@@ -234,10 +268,11 @@ function main() {
   const schemaInput = jsonInput(argument("--schema-manifest"), "--schema-manifest", false);
   const componentInput = jsonInput(componentPath(schemaInput.path, argument("--component-manifest", false)), "--component-manifest");
   const client = validateManifest(componentInput.value, schemaInput.value);
-  const files = renderFiles(componentInput.value, componentInput.bytes, contractInput.bytes, schemaInput.bytes);
   const sourceRoot = resolve(argument("--source-root", false) ?? ROOT);
+  const sourcePaths = validateClientSources(sourceRoot, client);
+  const files = renderFiles(componentInput.value, componentInput.bytes, contractInput.bytes, schemaInput.bytes);
   const fixtureRoot = argument("--fixture-root", false);
-  if (process.argv.includes("--check")) return checkFiles(sourceRoot, files, client, fixtureRoot ? resolve(fixtureRoot) : undefined);
+  if (process.argv.includes("--check")) return checkFiles(sourceRoot, files, client, fixtureRoot ? resolve(fixtureRoot) : undefined, sourcePaths);
   const outputRoot = argument("--output-root");
   writeFiles(resolve(outputRoot), files);
   for (const relative of Object.keys(files).sort()) console.log(relative);
