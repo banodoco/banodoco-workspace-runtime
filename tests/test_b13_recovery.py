@@ -110,3 +110,103 @@ def test_b13_rejects_conflicting_authorization_and_missing_rollback_archive(tmp_
             ).run()
     finally:
         active.close()
+
+
+def test_b13_authorizations_are_operation_scoped_and_realm_bound(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    try:
+        for authorization_id in auth:
+            mismatched = {key: dict(value) for key, value in auth.items()}
+            mismatched[authorization_id]["scope"] = "wrong-operation"
+            with pytest.raises(MigrationError, match="scope"):
+                B13Recovery(
+                    active,
+                    tmp_path / f"base-{authorization_id}",
+                    rollback_archive,
+                    tmp_path / f"evidence-{authorization_id}",
+                    tmp_path / f"disposable-{authorization_id}",
+                    mismatched,
+                )
+        with pytest.raises(ValueError, match="concrete selected realm"):
+            issue_b13_authorizations()
+        wrong_realm = issue_b13_authorizations(selected_realm_id="different-realm")
+        with pytest.raises(MigrationError, match="different selected realm"):
+            B13Recovery(
+                active,
+                tmp_path / "wrong-base",
+                rollback_archive,
+                tmp_path / "wrong-evidence",
+                tmp_path / "wrong-disposable",
+                wrong_realm,
+            ).run()
+    finally:
+        active.close()
+
+
+def test_b13_rejects_disposable_symlink_without_deleting_resolved_target(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    disposable = tmp_path / "disposable"
+    disposable.symlink_to(outside, target_is_directory=True)
+    try:
+        with pytest.raises(MigrationError, match="fresh ordinary path"):
+            run_b13_recovery(
+                active,
+                recovery_base_backup=tmp_path / "recovery-base",
+                rollback_archive=rollback_archive,
+                evidence_root=tmp_path / "evidence",
+                disposable_root=disposable,
+                authorizations=auth,
+            )
+        assert disposable.is_symlink()
+        assert outside.exists()
+    finally:
+        active.close()
+
+
+def test_b13_terminal_replay_binds_live_wal_identity(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    kwargs = dict(
+        recovery_base_backup=tmp_path / "recovery-base",
+        rollback_archive=rollback_archive,
+        evidence_root=tmp_path / "evidence",
+        disposable_root=tmp_path / "disposable",
+        authorizations=auth,
+    )
+    try:
+        report = run_b13_recovery(active, **kwargs)
+        report["active_runtime"].store.conn.execute("UPDATE runtime_lifecycle SET boot_id='tampered' WHERE id=1")
+        report["active_runtime"].store.conn.commit()
+        with pytest.raises(MigrationError, match="live database identity"):
+            run_b13_recovery(report["active_runtime"], **kwargs)
+    finally:
+        try:
+            report["active_runtime"].close()
+        except (UnboundLocalError, KeyError):
+            active.close()
+
+
+@pytest.mark.parametrize("conflict", ["disposable_root", "authorization_nonce"])
+def test_b13_terminal_replay_rejects_complete_request_conflicts(tmp_path, conflict):
+    active, rollback_archive, auth = _setup(tmp_path)
+    kwargs = dict(
+        recovery_base_backup=tmp_path / "recovery-base",
+        rollback_archive=rollback_archive,
+        evidence_root=tmp_path / "evidence",
+        disposable_root=tmp_path / "disposable",
+        authorizations=auth,
+    )
+    try:
+        report = run_b13_recovery(active, **kwargs)
+        if conflict == "disposable_root":
+            kwargs["disposable_root"] = tmp_path / "other-disposable"
+        else:
+            kwargs["authorizations"]["AUTH-REBOOT-R2"]["nonce"] = "changed-nonce"
+        with pytest.raises(MigrationError, match="request binding"):
+            run_b13_recovery(report["active_runtime"], **kwargs)
+    finally:
+        try:
+            report["active_runtime"].close()
+        except (UnboundLocalError, KeyError):
+            active.close()

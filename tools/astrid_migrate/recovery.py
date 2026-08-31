@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import sqlite3
+import tempfile
 import time
 from typing import Any, Callable, Mapping
 
@@ -37,14 +39,53 @@ B13_AUTHORIZATION_IDS = (
 )
 
 
+def _absolute_path(value: str | Path) -> Path:
+    """Make a lexical absolute path without following symlinks."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
+
+
+def _has_symlink_component(path: Path) -> bool:
+    """Return whether any existing component of ``path`` is a symlink."""
+    path = _absolute_path(path)
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _database_snapshot_sha256(path: Path) -> str:
+    """Hash a consistent SQLite view, including committed WAL frames."""
+    source = sqlite3.connect(str(path), timeout=10)
+    snapshot_fd, snapshot_name = tempfile.mkstemp(prefix=".b13-db-snapshot-", dir=str(path.parent))
+    os.close(snapshot_fd)
+    snapshot = Path(snapshot_name)
+    snapshot.unlink(missing_ok=True)
+    try:
+        target = sqlite3.connect(str(snapshot), timeout=10)
+        try:
+            source.backup(target)
+            target.commit()
+        finally:
+            target.close()
+        return _sha256_file(snapshot)
+    finally:
+        source.close()
+        snapshot.unlink(missing_ok=True)
+
+
 def issue_b13_authorizations(*, selected_realm_id: str | None = None, ttl_seconds: int = 3600) -> dict[str, dict[str, Any]]:
     """Issue distinct, short-lived operator inputs for the B13 commands."""
     if ttl_seconds <= 0:
         raise ValueError("authorization TTL must be positive")
+    if not isinstance(selected_realm_id, str) or not selected_realm_id.strip():
+        raise ValueError("B13 authorizations require a concrete selected realm")
     expires_at = time.time() + ttl_seconds
     return {
         authorization_id: {
             "authorization_id": authorization_id,
+            "scope": authorization_id.removeprefix("AUTH-").lower(),
             "nonce": secrets.token_urlsafe(32),
             "selected_realm_id": selected_realm_id,
             "expires_at": expires_at,
@@ -191,10 +232,19 @@ class B13Recovery:
         nonces = [str(self.authorizations[item].get("nonce") or "") for item in B13_AUTHORIZATION_IDS]
         if any(not nonce for nonce in nonces) or len(set(nonces)) != len(nonces):
             raise MigrationError("B13.2 authorizations must have distinct nonces")
-        self.recovery_base_backup = Path(self.recovery_base_backup).expanduser().resolve()
-        self.rollback_archive = Path(self.rollback_archive).expanduser().resolve()
-        self.evidence_root = Path(self.evidence_root).expanduser().resolve()
-        self.disposable_root = Path(self.disposable_root).expanduser().resolve()
+        for authorization_id in B13_AUTHORIZATION_IDS:
+            value = self.authorizations[authorization_id]
+            expected_scope = authorization_id.removeprefix("AUTH-").lower()
+            if value.get("scope") != expected_scope:
+                raise MigrationError(f"{authorization_id} scope does not match the requested operation")
+            selected_realm_id = value.get("selected_realm_id")
+            if not isinstance(selected_realm_id, str) or not selected_realm_id.strip():
+                raise MigrationError(f"{authorization_id} requires a concrete selected realm")
+        # Preserve lexical paths until safety checks have rejected symlinks.
+        self.recovery_base_backup = _absolute_path(self.recovery_base_backup)
+        self.rollback_archive = _absolute_path(self.rollback_archive)
+        self.evidence_root = _absolute_path(self.evidence_root)
+        self.disposable_root = _absolute_path(self.disposable_root)
 
     @staticmethod
     def _nonce_digest(value: Mapping[str, Any]) -> str:
@@ -204,7 +254,10 @@ class B13Recovery:
         value = self.authorizations[authorization_id]
         if value.get("authorization_id") != authorization_id:
             raise MigrationError(f"invalid B13.2 authorization instance {authorization_id}")
-        if value.get("selected_realm_id") not in (None, realm_id):
+        expected_scope = authorization_id.removeprefix("AUTH-").lower()
+        if value.get("scope") != expected_scope:
+            raise MigrationError(f"{authorization_id} scope does not match the requested operation")
+        if value.get("selected_realm_id") != realm_id:
             raise MigrationError(f"{authorization_id} is bound to a different selected realm")
         try:
             if float(value.get("expires_at", 0)) <= time.time():
@@ -265,11 +318,15 @@ class B13Recovery:
 
     def _safe_disposable_target(self, realm_id: str) -> dict[str, Any]:
         target = self.disposable_root
-        forbidden = {self.active_runtime.store.root.resolve(), self.recovery_base_backup, self.rollback_archive}
-        if target in forbidden or os.path.lexists(str(target)) and target.is_symlink():
+        # Check the lexical path before resolving it: resolving a pre-existing
+        # symlink would turn an unsafe delete into an apparently safe target.
+        if _has_symlink_component(target):
             raise MigrationError("B13.2 purge target is not a fresh ordinary path")
-        if target.exists():
+        if os.path.lexists(str(target)):
             raise MigrationError("B13.2 purge target must not pre-exist")
+        forbidden = {self.active_runtime.store.root.resolve(), self.recovery_base_backup.resolve(), self.rollback_archive.resolve()}
+        if target.resolve() in forbidden:
+            raise MigrationError("B13.2 purge target is not separate from an authoritative root")
         catalog = self.active_runtime.support_root / "catalog.json" if self.active_runtime.support_root else None
         selected = bool(catalog and catalog.is_file() and str(target) in catalog.read_text(encoding="utf-8"))
         return {"realm_class": "disposable", "selected": selected, "live": False, "migration_source": False, "migration_destination": False, "backup": False, "rollback_archive": False, "realm_id": realm_id, "root": str(target)}
@@ -286,9 +343,11 @@ class B13Recovery:
         self._validate_auth("AUTH-PURGE-B13", realm_id)
         self._consume_auth(journal, "AUTH-PURGE-B13", realm_id)
         if not journal.effects().get("purge-started"):
-            if not target.exists():
+            if _has_symlink_component(target):
+                raise MigrationError("B13.2 unsafe purge target")
+            if not os.path.lexists(str(target)) or not target.exists():
                 raise MigrationError("B13.2 disposable purge target is missing before purge")
-            if target.is_symlink() or target.resolve() in {self.active_runtime.store.root.resolve(), self.recovery_base_backup, self.rollback_archive}:
+            if target.resolve() in {self.active_runtime.store.root.resolve(), self.recovery_base_backup.resolve(), self.rollback_archive.resolve()}:
                 raise MigrationError("B13.2 unsafe purge target")
             target_store = RealmStore(target, acquire_owner=True)
             try:
@@ -383,8 +442,11 @@ class B13Recovery:
     def _terminal_replay(self, journal: RecoveryJournal, realm_id: str) -> dict[str, Any]:
         current = journal.read()
         binding = current.get("binding") or {}
-        if binding.get("realm_id") != realm_id or binding.get("active_root") != str(self.active_runtime.store.root.resolve()):
-            raise MigrationError("B13.2 terminal replay conflicts with active realm binding")
+        for authorization_id in B13_AUTHORIZATION_IDS:
+            self._validate_auth(authorization_id, realm_id)
+        expected_binding = self._request_binding(realm_id)
+        if binding != expected_binding:
+            raise MigrationError("B13.2 terminal replay conflicts with the durable request binding")
         identity = current["entries"][-1].get("identity") if current["entries"] else None
         if not isinstance(identity, Mapping):
             raise MigrationError("B13.2 terminal journal has no final identity")
@@ -395,16 +457,40 @@ class B13Recovery:
         snapshot = RuntimeServiceAdapter(self.active_runtime).destination_snapshot()
         if identity.get("semantic_snapshot_sha256") != _canonical_digest(_semantic_snapshot(snapshot)):
             raise MigrationError("B13.2 terminal replay conflicts with active final identity")
+        if identity.get("database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path):
+            raise MigrationError("B13.2 terminal replay conflicts with active live database identity")
         return {"packet": "B13.2", "journal": current, "identity": dict(identity), "idempotent": True, "active_runtime": self.active_runtime}
 
+    def _request_binding(self, realm_id: str) -> dict[str, Any]:
+        return {
+            "realm_id": realm_id,
+            "active_root": str(self.active_runtime.store.root.resolve()),
+            "recovery_base_backup": str(self.recovery_base_backup),
+            "rollback_archive": str(self.rollback_archive),
+            "evidence_root": str(self.evidence_root),
+            "disposable_root": str(self.disposable_root),
+            "authorization_nonce_sha256": {item: self._nonce_digest(self.authorizations[item]) for item in B13_AUTHORIZATION_IDS},
+            "authorization_binding": {
+                item: {
+                    "authorization_id": self.authorizations[item].get("authorization_id"),
+                    "scope": self.authorizations[item].get("scope"),
+                    "selected_realm_id": self.authorizations[item].get("selected_realm_id"),
+                    "nonce_sha256": self._nonce_digest(self.authorizations[item]),
+                }
+                for item in B13_AUTHORIZATION_IDS
+            },
+        }
+
     def run(self) -> dict[str, Any]:
+        realm_id = str(self.active_runtime.realm["id"])
+        for authorization_id in B13_AUTHORIZATION_IDS:
+            self._validate_auth(authorization_id, realm_id)
         self.evidence_root.mkdir(parents=True, exist_ok=True)
         journal = RecoveryJournal(self.evidence_root / "migration-journal-b13.json", crash_at=self.crash_at, fault_injector=self.fault_injector)
-        realm_id = str(self.active_runtime.realm["id"])
         current = journal.read()
         if current["state"] == "reactivated":
             return self._terminal_replay(journal, realm_id)
-        binding = {"realm_id": realm_id, "active_root": str(self.active_runtime.store.root.resolve()), "recovery_base_backup": str(self.recovery_base_backup), "rollback_archive": str(self.rollback_archive), "disposable_root": str(self.disposable_root), "authorization_nonce_sha256": {item: self._nonce_digest(self.authorizations[item]) for item in B13_AUTHORIZATION_IDS}}
+        binding = self._request_binding(realm_id)
         journal.bind(**binding)
         current = journal.read()
 
@@ -473,7 +559,7 @@ class B13Recovery:
                 rollback = self._activate(candidate, "rolled_back", realm_id=realm_id, journal=journal, seam="final_rollback_activation")
                 journal.effect("final-rollback-activation", activation=rollback, destination=str(candidate), runtime_epoch=int(self.active_runtime.health()["runtime_epoch"]))
             rollback_snapshot = RuntimeServiceAdapter(self.active_runtime).destination_snapshot()
-            rollback_identity = {"realm_id": realm_id, "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(rollback_snapshot)), "database_sha256": _sha256_file(self.active_runtime.store.db_path)}
+            rollback_identity = {"realm_id": realm_id, "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(rollback_snapshot)), "database_sha256": _database_snapshot_sha256(self.active_runtime.store.db_path)}
             self._write("activated-destination-b13-rollback.json", {"packet": "B13.2", "state": "rolled_back", **rollback_identity})
             journal.transition("rolled_back", activation=rollback, identity=rollback_identity)
             current = journal.read()
@@ -495,7 +581,7 @@ class B13Recovery:
                 journal.effect("final-reactivation-activation", activation=reactivated, destination=str(candidate), runtime_epoch=int(self.active_runtime.health()["runtime_epoch"]))
             final_snapshot = RuntimeServiceAdapter(self.active_runtime).destination_snapshot()
             checkpoint = journal.effects()["checkpoint"]["payload"]
-            identity = {"packet": "B13.2", "state": "reactivated", "realm_id": realm_id, "root": str(self.active_runtime.store.root.resolve()), "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(final_snapshot)), "database_sha256": _sha256_file(self.active_runtime.store.db_path), "recovery_base_manifest_sha256": checkpoint["recovery_base_manifest_sha256"], "rollback_archive_manifest_sha256": checkpoint["rollback_archive_manifest_sha256"], "purged_disposable_root": str(self.disposable_root), "integrity_ok": bool(self.active_runtime.doctor()["ok"])}
+            identity = {"packet": "B13.2", "state": "reactivated", "realm_id": realm_id, "root": str(self.active_runtime.store.root.resolve()), "runtime_epoch": int(self.active_runtime.health()["runtime_epoch"]), "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(final_snapshot)), "database_sha256": _database_snapshot_sha256(self.active_runtime.store.db_path), "recovery_base_manifest_sha256": checkpoint["recovery_base_manifest_sha256"], "rollback_archive_manifest_sha256": checkpoint["rollback_archive_manifest_sha256"], "purged_disposable_root": str(self.disposable_root), "integrity_ok": bool(self.active_runtime.doctor()["ok"])}
             if not identity["integrity_ok"] or identity["semantic_snapshot_sha256"] != checkpoint["semantic_snapshot_sha256"]:
                 raise MigrationError("B13.2 final reactivation does not match the pre-R2 active identity")
             self._write("activated-destination-b13.json", identity)
