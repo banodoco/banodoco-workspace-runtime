@@ -28,6 +28,11 @@ from runtime_protocol.util import atomic_json_write, canonical_json, now
 from .migrator import MigrationConfig, MigrationError, Migrator
 
 SCHEMA_VERSION = "trusted-disposition-v1"
+DEFAULT_FACT_SCOPE = ("media", "owner-data")
+DEFAULT_FIELD_SCOPE = ("all",)
+DEFAULT_SOURCE_PAIR_SCOPE = ("legacy-clone -> neutral-runtime",)
+EPOCH_KEYS = frozenset(("source_epoch", "migration_epoch"))
+DECISIONS = frozenset(("preserve", "exclude"))
 FIELDS = (
     "schema_version", "disposition_id", "owner_identity", "source_owner_binding",
     "trust_root_or_verifier_sha256", "attestation_method", "source_manifest_sha256",
@@ -62,6 +67,18 @@ def _timestamp(value: Any, label: str, *, allow_none: bool = False) -> None:
         raise ValidationError(f"{label} must include a timezone")
 
 
+def _scope(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value) or value != sorted(set(value)):
+        raise ValidationError(f"trusted disposition {label} must be a sorted unique string list")
+    return value
+
+
+def _epochs(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != EPOCH_KEYS or any(not isinstance(item, str) or not item for item in value.values()):
+        raise ValidationError("trusted disposition epochs must contain exactly source_epoch and migration_epoch strings")
+    return dict(value)
+
+
 def issue_trusted_disposition(
     *, owner_identity: str, source_manifest_sha256: str,
     fact_scope: Sequence[str], field_scope: Sequence[str], source_pair_scope: Sequence[str],
@@ -81,8 +98,9 @@ def issue_trusted_disposition(
     for value, label in ((source_manifest_sha256, "source manifest"), (basis_artifact_sha256, "basis artifact")):
         if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
             raise ValidationError(f"{label} digest must be a SHA-256 hex digest")
-    if not decision or not isinstance(decision, str):
-        raise ValidationError("trusted disposition decision is required")
+    if decision not in DECISIONS:
+        raise ValidationError("trusted disposition decision must be preserve or exclude")
+    validated_epochs = _epochs(epochs)
     disposition = {
         "schema_version": SCHEMA_VERSION,
         "disposition_id": disposition_id or f"DISPOSITION-B10:{secrets.token_hex(12)}",
@@ -100,7 +118,7 @@ def issue_trusted_disposition(
         "expires_at": expires_at,
         "nonce": nonce or secrets.token_urlsafe(32),
         "revoked_at": "NONE",
-        "epochs": dict(epochs),
+        "epochs": validated_epochs,
         "signature_or_attestation_sha256": "",
     }
     disposition["signature_or_attestation_sha256"] = _signature(disposition, signing_key)
@@ -110,9 +128,9 @@ def issue_trusted_disposition(
 def verify_trusted_disposition(
     disposition: Mapping[str, Any], *, verification_key: bytes,
     expected_owner_identity: str, expected_source_manifest_sha256: str,
-    expected_fact_scope: Sequence[str] | None = None,
-    expected_field_scope: Sequence[str] | None = None,
-    expected_source_pair_scope: Sequence[str] | None = None,
+    expected_fact_scope: Sequence[str] = DEFAULT_FACT_SCOPE,
+    expected_field_scope: Sequence[str] = DEFAULT_FIELD_SCOPE,
+    expected_source_pair_scope: Sequence[str] = DEFAULT_SOURCE_PAIR_SCOPE,
     now_value: datetime | None = None,
 ) -> dict[str, Any]:
     """Verify schema, source/owner/scope binding, freshness, and HMAC."""
@@ -153,11 +171,12 @@ def verify_trusted_disposition(
     if value["expires_at"] != "NONE" and datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00")) <= clock:
         raise AuthorizationError("trusted disposition has expired")
     for key in ("fact_scope", "field_scope", "source_pair_scope"):
-        scope = value[key]
-        if not isinstance(scope, list) or any(not isinstance(item, str) or not item for item in scope) or scope != sorted(set(scope)):
-            raise ValidationError(f"trusted disposition {key} must be a sorted unique string list")
+        _scope(value[key], key)
+    if value["decision"] not in DECISIONS:
+        raise ValidationError("trusted disposition decision must be preserve or exclude")
+    _epochs(value["epochs"])
     for key, expected in (("fact_scope", expected_fact_scope), ("field_scope", expected_field_scope), ("source_pair_scope", expected_source_pair_scope)):
-        if expected is not None and value[key] != sorted(set(str(item) for item in expected)):
+        if value[key] != sorted(set(str(item) for item in expected)):
             raise ConflictError(f"trusted disposition {key} does not match requested scope")
     return value
 
@@ -214,12 +233,15 @@ class DispositionNonceLedger:
 def resolve_trusted_dispositions(
     dispositions: Sequence[Mapping[str, Any]], *, verification_key: bytes,
     expected_owner_identity: str, expected_source_manifest_sha256: str,
+    expected_fact_scope: Sequence[str] = DEFAULT_FACT_SCOPE,
+    expected_field_scope: Sequence[str] = DEFAULT_FIELD_SCOPE,
+    expected_source_pair_scope: Sequence[str] = DEFAULT_SOURCE_PAIR_SCOPE,
     nonce_ledger: DispositionNonceLedger | None = None,
 ) -> dict[str, Any]:
     """Verify and resolve a set; contradictory decisions stop migration."""
     if not dispositions:
         raise ValidationError("at least one trusted disposition is required")
-    verified = [verify_trusted_disposition(item, verification_key=verification_key, expected_owner_identity=expected_owner_identity, expected_source_manifest_sha256=expected_source_manifest_sha256) for item in dispositions]
+    verified = [verify_trusted_disposition(item, verification_key=verification_key, expected_owner_identity=expected_owner_identity, expected_source_manifest_sha256=expected_source_manifest_sha256, expected_fact_scope=expected_fact_scope, expected_field_scope=expected_field_scope, expected_source_pair_scope=expected_source_pair_scope) for item in dispositions]
     keys = {(tuple(item["fact_scope"]), tuple(item["field_scope"]), tuple(item["source_pair_scope"])) for item in verified}
     decisions = {item["decision"] for item in verified}
     if len(keys) != 1 or len(decisions) != 1:
@@ -240,6 +262,7 @@ def migrate_with_trusted_disposition(config: MigrationConfig, client: Any, *, di
     """Authorize a migration from a frozen inventory, then run the driver."""
     inventory = Migrator(config, client).inventory()
     resolved = resolve_trusted_dispositions(dispositions, verification_key=verification_key, expected_owner_identity=source_owner_id, expected_source_manifest_sha256=inventory["source_manifest_sha256"], nonce_ledger=nonce_ledger)
-    report = Migrator(config.__class__(**{**config.__dict__, "expected_source_manifest_sha256": inventory["source_manifest_sha256"], "expected_source_facts_sha256": inventory["source_facts_sha256"]}), client).migrate()
+    migration_config = config.__class__(**{**config.__dict__, "expected_source_manifest_sha256": inventory["source_manifest_sha256"], "expected_source_facts_sha256": inventory["source_facts_sha256"], "include_owner_data": resolved["decision"] == "preserve"})
+    report = Migrator(migration_config, client).migrate()
     report["trusted_disposition"] = resolved
     return report

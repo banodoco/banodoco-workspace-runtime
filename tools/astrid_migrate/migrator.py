@@ -63,6 +63,9 @@ class MigrationConfig:
     # becomes the new baseline and can go unnoticed.
     expected_source_manifest_sha256: str | None = None
     expected_source_facts_sha256: str | None = None
+    # Trusted B10.2 ``exclude`` dispositions explicitly prevent the opaque
+    # owner-data import; preserve remains the default for ordinary migration.
+    include_owner_data: bool = True
 
     def __post_init__(self):
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
@@ -699,7 +702,7 @@ class Migrator:
 
     def _mapping_preview(self, data):
         result = {"projects": len(data.get("projects", [])), "timelines": len(data.get("timelines", [])), "shots": len(data.get("shots", [])), "references": len(data.get("project_references", [])), "generations": len(data.get("generations", [])), "media": len(data.get("media", [])), "runs": len(data.get("runs", [])), "tasks": len(data.get("tasks", []))}
-        owner_count = len(_owner_records(data))
+        owner_count = len(_owner_records(data)) if getattr(self.config, "include_owner_data", True) else 0
         if owner_count:
             result["owner_data"] = owner_count
         return result
@@ -890,7 +893,7 @@ class Migrator:
                     self._report.setdefault("unresolved", []).append({"kind": "generation", "id": row.get("id"), "reason": "client returned no durable identity"})
             else:
                 self._report.setdefault("unresolved", []).append({"kind": "generation", "id": row.get("id"), "reason": "client_missing_create_generation"})
-        owner_records = _owner_records(data)
+        owner_records = _owner_records(data) if getattr(self.config, "include_owner_data", True) else []
         if owner_records:
             if not hasattr(self.client, "import_owner_data"):
                 self._report.setdefault("unresolved", []).append({"kind": "owner_data", "rows": len(owner_records), "reason": "client_missing_owner_data_operation"})
@@ -927,7 +930,7 @@ class Migrator:
         if not isinstance(truth, Mapping):
             return {"ok": False, "errors": [{"kind": "destination_verification", "reason": "destination snapshot must be a mapping"}]}
         required_sections = ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "event_streams", "media_locations", "project_objects", "foreign_key_errors")
-        if _owner_records(data):
+        if getattr(self.config, "include_owner_data", True) and _owner_records(data):
             required_sections += ("owner_data",)
         missing_sections = [section for section in required_sections if section not in truth]
         if self.config.require_destination_verification and missing_sections:
@@ -1296,7 +1299,7 @@ class Migrator:
     def _reconcile(self, data, *, preview: bool) -> dict[str, Any]:
         expected = self._mapping_preview(data)
         actual = {"projects": len(self._project_ids), "timelines": len(self._timeline_ids), "shots": self._import_counts.get("shots", 0), "references": len(self._reference_ids), "generations": self._import_counts.get("generations", 0), "media": len(self._media_ids), "runs": len(self._run_ids), "tasks": len(self._task_ids), "documents": len(self._document_ids)} if not preview else {}
-        if not preview and _owner_records(data):
+        if not preview and getattr(self.config, "include_owner_data", True) and _owner_records(data):
             actual["owner_data"] = self._import_counts.get("owner_data", 0)
         unresolved = self._report.get("unresolved", [])
         blockers = list(self._report.get("inventory", {}).get("blockers", [])) + unresolved

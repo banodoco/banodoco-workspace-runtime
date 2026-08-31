@@ -105,6 +105,25 @@ def test_conflicting_decisions_stop_without_resolution(tmp_path):
         resolve_trusted_dispositions([first, second], verification_key=key, expected_owner_identity="owner-1", expected_source_manifest_sha256=inventory["source_manifest_sha256"])
 
 
+def test_disposition_must_match_current_migration_scope_and_semantics(tmp_path):
+    _, inventory, key, value = _disposition(tmp_path)
+    with pytest.raises(ConflictError, match="fact_scope"):
+        resolve_trusted_dispositions(
+            [value], verification_key=key, expected_owner_identity="owner-1",
+            expected_source_manifest_sha256=inventory["source_manifest_sha256"],
+            expected_fact_scope=["unrelated-fact"],
+        )
+    for field, replacement in (("decision", "ignore"), ("epochs", {"source_epoch": "s", "migration_epoch": "m", "unexpected": "x"})):
+        forged = dict(value)
+        forged[field] = replacement
+        forged["signature_or_attestation_sha256"] = _signature(forged, key)
+        with pytest.raises(ValidationError):
+            verify_trusted_disposition(
+                forged, verification_key=key, expected_owner_identity="owner-1",
+                expected_source_manifest_sha256=inventory["source_manifest_sha256"],
+            )
+
+
 def test_authorized_migration_consumes_disposition_and_binds_frozen_source(tmp_path):
     config, inventory, key, value = _disposition(tmp_path)
     runtime = RuntimeService(config.destination_root)
@@ -115,6 +134,21 @@ def test_authorized_migration_consumes_disposition_and_binds_frozen_source(tmp_p
     assert report["trusted_disposition"]["decision"] == "preserve"
     assert report["trusted_disposition"]["trusted_disposition_sha256"]
     assert report["source_freeze"]
+
+
+def test_exclude_disposition_does_not_import_owner_rows(tmp_path):
+    config, _, key, value = _disposition(tmp_path, decision="exclude")
+    runtime = RuntimeService(config.destination_root)
+    try:
+        report = migrate_with_trusted_disposition(
+            config, RuntimeServiceAdapter(runtime), dispositions=[value],
+            verification_key=key, source_owner_id="owner-1",
+            nonce_ledger=DispositionNonceLedger(tmp_path / "nonce-ledger.json"),
+        )
+        assert report["trusted_disposition"]["decision"] == "exclude"
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM migration_owner_records").fetchone()[0] == 0
+    finally:
+        runtime.close()
 
 
 def _consume_nonce_worker(path, disposition, barrier, result_queue):
