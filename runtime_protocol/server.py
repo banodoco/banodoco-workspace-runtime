@@ -155,7 +155,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("shots", "references") and method == "POST":
             self._identity("projects:write")
             body = self._body()
-            return self._send(201, self.runtime.create_shot(path[2], body) if path[3] == "shots" else self.runtime.create_reference(path[2], body))
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
+            return self._send(201, self.runtime.create_shot(path[2], body, idempotency_key=key) if path[3] == "shots" else self.runtime.create_reference(path[2], body, idempotency_key=key))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime._timeline_resource(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
@@ -431,7 +434,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(201, self.runtime.register_capability(self._body()))
         if path == ["v1", "executors"] and method == "POST":
             self._identity("worker:register")
-            return self._send(201, self.runtime.register_executor(self._body()))
+            key = self.headers.get("Idempotency-Key")
+            if not key:
+                raise ProtocolError("Idempotency-Key header is required")
+            return self._send(201, self.runtime.register_executor(self._body(), idempotency_key=key))
         if len(path) == 3 and path[:2] == ["v1", "runs"] and method == "GET":
             self._identity("tasks:read")
             return self._send(200, self.runtime.run(path[2]))

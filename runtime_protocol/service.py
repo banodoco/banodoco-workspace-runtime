@@ -732,23 +732,65 @@ class RuntimeService:
                 self._record_timeline_revision(timeline_id, resource)
             return resource
 
-    def create_shot(self, timeline_id, body):
-        if int(body.get("duration_ms", 0)) < 1 or int(body.get("start_ms", 0)) < 0: raise ValidationError("invalid shot timing")
+    @_durable_mutation
+    def create_shot(self, timeline_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
+        if not isinstance(body.get("shot_id"), str) or not body["shot_id"]:
+            raise ValidationError("shot_id is required")
+        if int(body.get("duration_ms", 0)) < 1 or int(body.get("start_ms", 0)) < 0:
+            raise ValidationError("invalid shot timing")
+        references = body.get("reference_ids", [])
+        if not isinstance(references, list) or any(not isinstance(value, str) or not value for value in references):
+            raise ValidationError("reference_ids must be a list of non-empty strings")
         self._timeline_resource(timeline_id)
-        self.store.conn.execute("INSERT OR REPLACE INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (body["shot_id"], timeline_id, int(body["start_ms"]), int(body["duration_ms"]), canonical_json(body.get("reference_ids", []))))
-        self.store.conn.execute("INSERT OR IGNORE INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (body["shot_id"],))
-        return self._shot_resource(self.store.conn.execute("SELECT * FROM timeline_shots WHERE id=?", (body["shot_id"],)).fetchone())
+        request_hash = hashlib.sha256(canonical_json({"timeline_id": timeline_id, "shot": body}).encode()).hexdigest()
+        # The key is scoped to the create-shot operation, while the request
+        # hash binds both the timeline path and complete body.  This makes a
+        # key reused for a different timeline or shot a deterministic
+        # conflict rather than an unrelated successful mutation.
+        aggregate_id = "timeline.shots"
+        replay = self._command_replay("timeline.shot.create", aggregate_id, idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        try:
+            self.store.conn.execute(
+                "INSERT INTO timeline_shots(id, timeline_id, start_ms, duration_ms, reference_ids_json) VALUES (?, ?, ?, ?, ?)",
+                (body["shot_id"], timeline_id, int(body["start_ms"]), int(body["duration_ms"]), canonical_json(references)),
+            )
+            self.store.conn.execute("INSERT INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (body["shot_id"],))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("shot already exists", details={"shot_id": body["shot_id"]}) from exc
+        result = self._shot_resource(self.store.conn.execute("SELECT * FROM timeline_shots WHERE id=?", (body["shot_id"],)).fetchone())
+        return self._command_record("timeline.shot.create", aggregate_id, idempotency_key, request_hash, result)
 
     def get_shot(self, shot_id):
         row = self.store.conn.execute("SELECT * FROM timeline_shots WHERE id=?", (shot_id,)).fetchone()
         if not row: raise NotFoundError("shot not found")
         return self._shot_resource(row)
 
-    def create_reference(self, timeline_id, body):
+    @_durable_mutation
+    def create_reference(self, timeline_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
+        if not isinstance(body.get("reference_id"), str) or not body["reference_id"]:
+            raise ValidationError("reference_id is required")
+        if not isinstance(body.get("object_id"), str) or not body["object_id"]:
+            raise ValidationError("object_id is required")
         self._timeline_resource(timeline_id)
-        self.store.conn.execute("INSERT OR REPLACE INTO timeline_references VALUES (?, ?, ?, ?)", (body["reference_id"], timeline_id, body["object_id"], body.get("role")))
-        self.store.conn.execute("INSERT OR IGNORE INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (body["reference_id"],))
-        return self._reference_resource(self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (body["reference_id"],)).fetchone())
+        request_hash = hashlib.sha256(canonical_json({"timeline_id": timeline_id, "reference": body}).encode()).hexdigest()
+        aggregate_id = "timeline.references"
+        replay = self._command_replay("timeline.reference.create", aggregate_id, idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        try:
+            self.store.conn.execute(
+                "INSERT INTO timeline_references(id, timeline_id, object_id, role) VALUES (?, ?, ?, ?)",
+                (body["reference_id"], timeline_id, body["object_id"], body.get("role")),
+            )
+            self.store.conn.execute("INSERT INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (body["reference_id"],))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("reference already exists", details={"reference_id": body["reference_id"]}) from exc
+        result = self._reference_resource(self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (body["reference_id"],)).fetchone())
+        return self._command_record("timeline.reference.create", aggregate_id, idempotency_key, request_hash, result)
 
     def _document_resource(self, row):
         value = dict(row)
@@ -1102,17 +1144,30 @@ class RuntimeService:
     def worker_heartbeat(self, worker_id, body):
         return self.store.heartbeat_worker(worker_id, ready=body.get("ready"), reason=body.get("reason"), runtime_epoch=body.get("runtime_epoch"))
 
-    def register_executor(self, body):
+    @_durable_mutation
+    def register_executor(self, body, *, idempotency_key=None):
+        self._require_object_body(body)
         if not body.get("executor_id"):
             raise ValidationError("executor_id is required")
         max_concurrency = int(body.get("max_concurrency", 1))
         if max_concurrency < 1:
             raise ValidationError("max_concurrency must be positive")
         capabilities = body.get("capabilities", [])
+        request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
+        # Executor registration is an endpoint-scoped command.  The request
+        # hash includes executor identity and all registration fields, so a
+        # reused key can only replay the exact durable result.
+        aggregate_id = "executors"
+        replay = self._command_replay("executor.register", aggregate_id, idempotency_key, request_hash)
+        if replay is not None:
+            return replay
+        if self.store.conn.execute("SELECT 1 FROM executors WHERE id=?", (body["executor_id"],)).fetchone():
+            raise ConflictError("executor already exists", details={"executor_id": body["executor_id"]})
         epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"))
         self.store.register_worker(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch)
-        self.store.conn.execute("INSERT OR REPLACE INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)", (body["executor_id"], max_concurrency, canonical_json(body.get("resource_keys", [])), canonical_json(capabilities), body.get("protocol", "workspace.v1"), now(), epoch))
-        return {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
+        self.store.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?)", (body["executor_id"], max_concurrency, canonical_json(body.get("resource_keys", [])), canonical_json(capabilities), body.get("protocol", "workspace.v1"), now(), epoch))
+        result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
+        return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result)
 
     @_durable_mutation
     def claim_next(self, body, *, idempotency_key=None):

@@ -434,10 +434,12 @@ class RuntimeServiceAdapter:
         return result.get("data", result) if isinstance(result, dict) else result
 
     def create_shot(self, timeline_id, shot, *, idempotency_key=None):
-        return self.service.create_shot(timeline_id, shot)
+        result = self.service.create_shot(timeline_id, shot, idempotency_key=idempotency_key)
+        return result.get("data", result) if isinstance(result, dict) else result
 
     def create_reference(self, timeline_id, reference, *, idempotency_key=None):
-        return self.service.create_reference(timeline_id, reference)
+        result = self.service.create_reference(timeline_id, reference, idempotency_key=idempotency_key)
+        return result.get("data", result) if isinstance(result, dict) else result
 
     def create_generation(self, generation, *, idempotency_key=None):
         project_id = self.project_ids.get(str(generation["project_id"]), generation["project_id"])
@@ -1119,6 +1121,8 @@ class Rehearsal:
                 require_destination_verification=True,
                 expected_source_manifest_sha256=self.config.expected_source_manifest_sha256,
                 expected_source_facts_sha256=self.config.expected_source_facts_sha256,
+                activation_registry_root=self.config.activation_registry_root,
+                activation_trust_key=self.config.activation_trust_key,
             )
         migrator = Migrator(rehearsal_config, self.client)
         inventory = migrator.inventory()
@@ -1135,6 +1139,8 @@ class Rehearsal:
             require_destination_verification=True,
             expected_source_manifest_sha256=freeze["source_manifest_sha256"],
             expected_source_facts_sha256=freeze["source_facts_sha256"],
+            activation_registry_root=self.config.activation_registry_root,
+            activation_trust_key=self.config.activation_trust_key,
         )
         migrator = Migrator(rehearsal_config, self.client)
         preceding = _tree_size(self.config.source_root)
