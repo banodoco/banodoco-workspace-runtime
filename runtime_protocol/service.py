@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .errors import ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
+from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
@@ -51,17 +52,17 @@ class RuntimeService:
     def close(self):
         self.store.close()
 
-    def backup(self, destination, *, binding=None):
+    def backup(self, destination, *, binding=None, destination_identity=None):
         key_path = (self.support_root / "backup-auth.key") if self.support_root else (self.store.root / ".operator-backup-key")
-        return create_backup(self.store, destination, binding=binding, key_path=key_path)
+        return create_backup(self.store, destination, binding=binding, key_path=key_path, destination_identity=destination_identity)
 
-    def restore(self, backup_dir, destination):
+    def restore(self, backup_dir, destination, *, destination_identity=None, source_identity=None):
         key_path = (self.support_root / "backup-auth.key") if self.support_root else (self.store.root / ".operator-backup-key")
         # A backup may have been created by a prior active root whose path is
         # now inactive. Let restore fall back to the manifest path in that
         # case; when this service owns a stable support key, bind verification
         # to it explicitly and retain the same HMAC key for the handoff.
-        return restore_backup(backup_dir, destination, key_path=key_path if key_path.is_file() else None)
+        return restore_backup(backup_dir, destination, key_path=key_path if key_path.is_file() else None, destination_identity=destination_identity, source_identity=source_identity)
 
     def export_structured(self, destination=None):
         value = structured_export(self.store)
@@ -1238,21 +1239,22 @@ class RuntimeService:
                 return {"checkpoint_id": existing["id"], "attempt_id": existing["attempt_id"], "task_id": existing["task_id"], "runtime_epoch": existing["runtime_epoch"], "nonce": nonce, "digest": "sha256:" + existing["checkpoint_digest"], "size": existing["checkpoint_size"], "state": existing["state"], "path": existing["checkpoint_path"]}
             checkpoint_id = new_id()
             path = self.store.root / "checkpoints" / f"{checkpoint_id}.json"
-            atomic_json_write(path, payload)
-            durable_bytes = path.read_bytes()
+            root_identity, root_fd, _ = _pin_directory(self.store.root)
+            checkpoints_fd = -1
+            try:
+                checkpoints_fd = _mkdir_chain_at(root_fd, "checkpoints")
+                _write_bytes_at(checkpoints_fd, f"{checkpoint_id}.json", durable_bytes)
+                os.fsync(checkpoints_fd)
+            finally:
+                if checkpoints_fd >= 0:
+                    os.close(checkpoints_fd)
+                os.close(root_fd)
+                _close_pinned(root_identity)
             if durable_bytes != durable_json_bytes(payload):
                 raise ConflictError("checkpoint serializer changed while writing")
             digest = sha256_bytes(durable_bytes)
             # atomic_json_write fsyncs the file; fsync the containing directory
             # as well so the rename survives a sudden power loss.
-            try:
-                directory_fd = os.open(path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            except OSError as exc:
-                raise ConflictError("checkpoint directory could not be made durable") from exc
             timestamp = now()
             with self.store._transaction():
                 self.store.conn.execute("INSERT INTO recovery_checkpoints(id, attempt_id, task_id, executor_id, runtime_epoch, lease_id, fence, nonce, checkpoint_path, checkpoint_digest, checkpoint_size, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'durable', ?, ?)", (checkpoint_id, attempt_id, row["task_id"], row["executor_id"], current, row["lease_id"], row["fence"], nonce, str(path), digest, len(durable_bytes), timestamp, timestamp))

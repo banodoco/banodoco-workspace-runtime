@@ -13,14 +13,29 @@ import hashlib
 import hmac
 import json
 import os
-import shutil
 import sqlite3
-import tempfile
 from pathlib import Path
 import stat
+from typing import Any, Mapping
 
 from .errors import ConflictError, NotFoundError, ValidationError
-from .util import atomic_json_write, canonical_json, now
+from .util import canonical_json, now
+from .dirfd import (
+    absolute_path,
+    capture_parent,
+    close_pinned,
+    copy_file_at,
+    copy_tree_at,
+    ensure_parent_at,
+    mkdir_chain_at,
+    mkdir_temp_at,
+    open_directory_chain,
+    pin_directory,
+    remove_tree_at,
+    validate_created_parent,
+    validate_parent,
+    write_bytes_at,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -29,6 +44,86 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _open_relative(root_fd: int, relative: str | Path, *, directory: bool = False) -> int:
+    """Open a relative file/dir without resolving a path from the process cwd."""
+    relative = Path(relative)
+    if relative.is_absolute() or not relative.parts or any(part in ("", ".", "..") for part in relative.parts):
+        raise ValidationError("invalid descriptor-relative path")
+    parts = list(relative.parts)
+    current = root_fd
+    opened: list[int] = []
+    try:
+        for index, part in enumerate(parts):
+            final = index == len(parts) - 1
+            flags = (os.O_RDONLY | (getattr(os, "O_DIRECTORY", 0) if (directory or not final) else 0) | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(part, flags, dir_fd=current)
+            if current != root_fd:
+                opened.append(current)
+            current = fd
+        for fd in opened:
+            os.close(fd)
+        return current
+    except Exception:
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if current != root_fd:
+            try:
+                os.close(current)
+            except OSError:
+                pass
+        raise
+
+
+def _sha256_at(root_fd: int, relative: str | Path) -> tuple[str, int]:
+    fd = _open_relative(root_fd, relative)
+    try:
+        value = os.fstat(fd)
+        if not stat.S_ISREG(value.st_mode):
+            raise ConflictError(f"backup entry is not a regular file: {relative}")
+        os.lseek(fd, 0, os.SEEK_SET)
+        return _sha256_fd(fd), int(value.st_size)
+    finally:
+        os.close(fd)
+
+
+def _json_at(root_fd: int, name: str) -> dict:
+    fd = _open_relative(root_fd, name)
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        data = b""
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            data += chunk
+        value = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise ConflictError(f"backup artifact is invalid: {name}") from exc
+    finally:
+        os.close(fd)
+    if not isinstance(value, dict):
+        raise ConflictError(f"backup artifact must be an object: {name}")
+    return value
+
+
+def _file_record_at(root_fd: int, name: str) -> dict:
+    digest, size = _sha256_at(root_fd, name)
+    return {"sha256": digest, "size": size}
 
 
 def _authenticated_digest(payload: dict) -> str:
@@ -46,7 +141,7 @@ def _key_id(key: bytes) -> str:
 
 def _provision_key(path: Path, *, rotate: bool = False) -> bytes:
     """Provision a private operator key outside the backup directory."""
-    path = path.expanduser().resolve()
+    path = absolute_path(path)
     if path.exists() and not rotate:
         if path.is_symlink() or not path.is_file():
             raise ConflictError("backup authentication key is not a regular file")
@@ -54,21 +149,19 @@ def _provision_key(path: Path, *, rotate: bool = False) -> bytes:
         if len(key) < 32:
             raise ConflictError("backup authentication key is too short")
         return key
-    path.parent.mkdir(parents=True, exist_ok=True)
     key = os.urandom(32)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    identity = capture_parent(path)
     try:
-        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(key)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
+        parent_fd, name = ensure_parent_at(path, identity)
         try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+            validate_parent(path, identity, allow_parent_appeared=True)
+            write_bytes_at(parent_fd, name, key, mode=stat.S_IRUSR | stat.S_IWUSR)
+            os.fsync(parent_fd)
+        finally:
+            if parent_fd != identity.get("_parent_fd"):
+                os.close(parent_fd)
+    finally:
+        close_pinned(identity)
     return key
 
 
@@ -109,10 +202,6 @@ def _manifest_mac(manifest: dict, key: bytes) -> str:
     return hmac.new(key, canonical_json(_auth_payload(manifest)).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _file_record(path: Path) -> dict:
-    return {"sha256": _sha256(path), "size": path.stat().st_size}
-
-
 def _manifest_digest_payload(manifest: dict) -> dict:
     return {key: value for key, value in manifest.items() if key not in {"manifest_sha256", "manifest_hmac"}}
 
@@ -127,17 +216,23 @@ def _object_path(cas_root: Path, digest: str) -> Path:
     return cas_root / digest[:2] / digest[2:]
 
 
-def cas_manifest(store, *, cas_root: Path | None = None) -> dict:
+def cas_manifest(store, *, cas_root: Path | None = None, cas_root_fd: int | None = None) -> dict:
     root = Path(cas_root or store.cas_root)
     rows = store.conn.execute("SELECT digest, size, media_type, original_name, created_at FROM objects ORDER BY digest").fetchall()
     objects = []
     for row in rows:
         digest = row["digest"]
         path = _object_path(root, digest)
-        if not path.is_file():
-            raise NotFoundError("CAS object is missing", details={"digest": digest})
-        actual_size = path.stat().st_size
-        actual_hash = _sha256(path)
+        if cas_root_fd is not None:
+            try:
+                actual_hash, actual_size = _sha256_at(cas_root_fd, f"{digest[:2]}/{digest[2:]}")
+            except OSError as exc:
+                raise NotFoundError("CAS object is missing", details={"digest": digest}) from exc
+        else:
+            if not path.is_file():
+                raise NotFoundError("CAS object is missing", details={"digest": digest})
+            actual_size = path.stat().st_size
+            actual_hash = _sha256(path)
         if actual_hash != digest or actual_size != int(row["size"]):
             raise ConflictError("CAS object failed backup verification", details={"digest": digest, "actual_digest": actual_hash, "actual_size": actual_size})
         objects.append({"digest": digest, "size": actual_size, "sha256": actual_hash, "media_type": row["media_type"], "original_name": row["original_name"], "created_at": row["created_at"]})
@@ -158,12 +253,34 @@ def _verify_cas_manifest(root: Path, manifest: dict) -> None:
             raise ConflictError("backup CAS object failed verification", details={"digest": obj.get("digest")})
 
 
-def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False, key: bytes | None = None, key_path: str | Path | None = None) -> dict:
-    root = Path(backup_dir).expanduser().resolve()
+def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None) -> dict:
+    """Verify a backup while retaining its lexical parent for the whole read."""
+    root = absolute_path(backup_dir)
+    own_identity = directory_identity is None
+    identity = directory_identity or capture_parent(root)
+    try:
+        return _verify_backup_pinned(root, allow_legacy=allow_legacy, key=key, key_path=key_path, directory_identity=identity)
+    finally:
+        if own_identity:
+            close_pinned(identity)
+
+
+def _verify_backup_pinned(backup_dir: str | Path, *, allow_legacy: bool = False, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any]) -> dict:
+    root = absolute_path(backup_dir)
+    own_identity = False
+    directory_identity = directory_identity
+    try:
+        validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
+    except Exception:
+        if own_identity:
+            close_pinned(directory_identity)
+        raise
     manifest_path = root / "manifest.json"
     cas_manifest_path = root / "cas-manifest.json"
     database_path = root / "realm.sqlite3"
     if not manifest_path.is_file() or not cas_manifest_path.is_file() or not database_path.is_file():
+        if own_identity:
+            close_pinned(directory_identity)
         raise NotFoundError("backup is incomplete", details={"backup": str(root)})
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -220,101 +337,168 @@ def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False, key: by
             raise ConflictError("backup realm identity mismatch")
     finally:
         connection.close()
+    validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
     # Never expose the operator key through an API response: this result is
     # serialized by the HTTP server for backup callers.
     return {"manifest": manifest, "cas_manifest": cas}
 
 
-def verify_restore_candidate(candidate_dir: str | Path) -> dict:
+def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: Mapping[str, Any] | None = None) -> dict:
     """Verify a restored realm against its immutable backup handoff.
 
     This must run immediately before every activation and reuse.  In
     particular, a database edit (including an extra project) changes the
     candidate digest and is rejected before the active realm is touched.
     """
-    root = Path(candidate_dir).expanduser().resolve()
-    handoff_path = root / "activation-handoff.json"
-    database = root / "realm.sqlite3"
-    cas_root = root / "cas" / "sha256"
-    if not handoff_path.is_file() or not database.is_file() or not cas_root.is_dir():
-        raise ConflictError("restore candidate is incomplete")
+    root = absolute_path(candidate_dir)
+    own_identity = directory_identity is None
+    directory_identity = directory_identity or capture_parent(root)
+    candidate_fd = -1
+    cwd_fd = -1
+    restored = None
     try:
-        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConflictError("restore candidate handoff is invalid") from exc
-    source_backup = Path(str(handoff.get("source_backup", ""))).expanduser().resolve()
-    verified = verify_backup(source_backup)
-    source_manifest = verified["manifest"]
-    if handoff.get("format_version") != 2:
-        raise ConflictError("legacy restore handoff requires explicit migration")
-    handoff_digest = handoff.get("handoff_sha256")
-    handoff_mac = handoff.get("handoff_hmac")
-    auth_key = _resolve_key(source_manifest)
-    if not isinstance(handoff_digest, str) or not hmac.compare_digest(handoff_digest, _authenticated_digest(_handoff_digest_payload(handoff))):
-        raise ConflictError("restore handoff authentication failed")
-    if not isinstance(handoff_mac, str) or not auth_key or not hmac.compare_digest(handoff_mac, hmac.new(auth_key, canonical_json(_auth_payload(handoff)).encode("utf-8"), hashlib.sha256).hexdigest()):
-        raise ConflictError("restore handoff authentication failed")
-    if handoff.get("source_manifest_sha256") != _sha256(source_backup / "manifest.json"):
-        raise ConflictError("restore handoff source manifest mismatch")
-    if handoff.get("realm_id") != source_manifest.get("realm_id"):
-        raise ConflictError("restore candidate realm does not match its backup")
-    candidate_db_hash = _sha256(database)
-    if handoff.get("candidate_database_sha256") != candidate_db_hash or candidate_db_hash != source_manifest.get("database_sha256"):
-        raise ConflictError("restore candidate SQLite bytes differ from its verified backup")
-    expected_objects = {str(item["digest"]): item for item in verified["cas_manifest"].get("objects", [])}
-    actual_objects = {}
-    for path in cas_root.rglob("*"):
-        if path.is_file() and not path.is_symlink():
-            digest = path.parent.name + path.name
-            actual_objects[digest] = path
-    if set(actual_objects) != set(expected_objects):
-        raise ConflictError("restore candidate CAS object set differs from its verified backup")
-    for digest, item in expected_objects.items():
-        path = actual_objects[digest]
-        if path.stat().st_size != int(item["size"]) or _sha256(path) != item["sha256"]:
-            raise ConflictError("restore candidate CAS bytes differ from its verified backup", details={"digest": digest})
-    from .store import RealmStore
-    restored = RealmStore(root, acquire_owner=False)
-    try:
+        validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
+        parent_fd = int(directory_identity.get("_parent_fd"))
+        parent_path = Path(str(directory_identity["parent"]))
+        if root.parent == parent_path:
+            candidate_fd = os.open(root.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+        else:
+            relative = root.relative_to(parent_path)
+            candidate_fd = os.open(str(relative), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+        if not stat.S_ISDIR(os.fstat(candidate_fd).st_mode):
+            raise ConflictError("restore candidate is not an ordinary directory")
+        try:
+            handoff = _json_at(candidate_fd, "activation-handoff.json")
+            candidate_db_hash, _ = _sha256_at(candidate_fd, "realm.sqlite3")
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            raise ConflictError("restore candidate is incomplete or invalid") from exc
+        source_backup = Path(str(handoff.get("source_backup", ""))).expanduser().resolve()
+        verified = verify_backup(source_backup)
+        source_manifest = verified["manifest"]
+        if handoff.get("format_version") != 2:
+            raise ConflictError("legacy restore handoff requires explicit migration")
+        handoff_digest = handoff.get("handoff_sha256")
+        handoff_mac = handoff.get("handoff_hmac")
+        auth_key = _resolve_key(source_manifest)
+        if not isinstance(handoff_digest, str) or not hmac.compare_digest(handoff_digest, _authenticated_digest(_handoff_digest_payload(handoff))):
+            raise ConflictError("restore handoff authentication failed")
+        if not isinstance(handoff_mac, str) or not auth_key or not hmac.compare_digest(handoff_mac, hmac.new(auth_key, canonical_json(_auth_payload(handoff)).encode("utf-8"), hashlib.sha256).hexdigest()):
+            raise ConflictError("restore handoff authentication failed")
+        if handoff.get("source_manifest_sha256") != _sha256(source_backup / "manifest.json"):
+            raise ConflictError("restore handoff source manifest mismatch")
+        if handoff.get("realm_id") != source_manifest.get("realm_id"):
+            raise ConflictError("restore candidate realm does not match its backup")
+        if handoff.get("candidate_database_sha256") != candidate_db_hash or candidate_db_hash != source_manifest.get("database_sha256"):
+            raise ConflictError("restore candidate SQLite bytes differ from its verified backup")
+        expected_objects = {str(item["digest"]): item for item in verified["cas_manifest"].get("objects", [])}
+        actual_objects = {}
+        cas_fd = os.open("cas", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=candidate_fd)
+        sha_fd = os.open("sha256", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=cas_fd)
+        try:
+            for entry in os.scandir(sha_fd):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                prefix = entry.name
+                prefix_fd = os.open(prefix, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=sha_fd)
+                try:
+                    for obj in os.scandir(prefix_fd):
+                        if obj.is_file(follow_symlinks=False):
+                            actual_objects[prefix + obj.name] = (prefix, obj.name)
+                finally:
+                    os.close(prefix_fd)
+        finally:
+            os.close(sha_fd)
+            os.close(cas_fd)
+        if set(actual_objects) != set(expected_objects):
+            raise ConflictError("restore candidate CAS object set differs from its verified backup")
+        cas_fd = os.open("cas", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=candidate_fd)
+        sha_fd = os.open("sha256", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=cas_fd)
+        try:
+            for digest, item in expected_objects.items():
+                prefix, name = actual_objects[digest]
+                obj_fd = os.open(prefix, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=sha_fd)
+                try:
+                    actual_hash, actual_size = _sha256_at(obj_fd, name)
+                finally:
+                    os.close(obj_fd)
+                if actual_size != int(item["size"]) or actual_hash != item["sha256"]:
+                    raise ConflictError("restore candidate CAS bytes differ from its verified backup", details={"digest": digest})
+        finally:
+            os.close(sha_fd)
+            os.close(cas_fd)
+        from .store import RealmStore
+        # RealmStore performs startup durability operations even for doctor.
+        # Make its relative root resolve from the retained candidate inode.
+        cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fchdir(candidate_fd)
+        restored = RealmStore(Path("."), acquire_owner=False)
         report = restored.doctor()
         if not report["ok"]:
             raise ConflictError("restore candidate failed integrity checks", details=report)
         realm = restored.realm
+        if realm["id"] != source_manifest.get("realm_id"):
+            raise ConflictError("restore candidate realm identity mismatch")
+        validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
+        return {"handoff": handoff, "manifest": source_manifest, "doctor": report, "database_sha256": candidate_db_hash, "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
     finally:
-        restored.close()
-    if realm["id"] != source_manifest.get("realm_id"):
-        raise ConflictError("restore candidate realm identity mismatch")
-    return {"handoff": handoff, "manifest": source_manifest, "doctor": report, "database_sha256": candidate_db_hash, "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
-
-
-def create_backup(store, destination: str | Path, *, binding: dict | None = None, key: bytes | None = None, key_path: str | Path | None = None) -> dict:
-    destination = Path(destination).expanduser().resolve()
-    if destination.exists():
-        raise ConflictError("backup destination already exists", details={"destination": str(destination)})
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
-    try:
-        (temporary / "cas" / "sha256").mkdir(parents=True)
-        with store._mutex:
-            cas = cas_manifest(store)
-            target_db = temporary / "realm.sqlite3"
-            source = sqlite3.connect(store.db_path)
-            target = sqlite3.connect(target_db)
+        if restored is not None:
+            restored.close()
+        if cwd_fd >= 0:
             try:
-                source.backup(target)
+                os.fchdir(cwd_fd)
+            finally:
+                os.close(cwd_fd)
+        if candidate_fd >= 0:
+            os.close(candidate_fd)
+        if own_identity:
+            close_pinned(directory_identity)
+
+
+def create_backup(store, destination: str | Path, *, binding: dict | None = None, key: bytes | None = None, key_path: str | Path | None = None, destination_identity: Mapping[str, Any] | None = None) -> dict:
+    destination = absolute_path(destination)
+    if os.path.lexists(str(destination)):
+        raise ConflictError("backup destination already exists", details={"destination": str(destination)})
+    own_destination_identity = destination_identity is None
+    destination_identity = destination_identity or capture_parent(destination, require_fresh_target=True)
+    parent_fd = -1
+    destination_name = None
+    temporary_name = None
+    temporary_fd = -1
+    source_cas_fd = -1
+    try:
+        parent_fd, destination_name = ensure_parent_at(destination, destination_identity)
+        temporary_name, temporary_fd = mkdir_temp_at(parent_fd, f".{destination.name}.")
+        source_cas_fd = open_directory_chain(store.cas_root)
+        cas_root_fd = mkdir_chain_at(temporary_fd, "cas/sha256")
+        os.close(cas_root_fd)
+        with store._mutex:
+            # The live connection is already pinned to the selected realm.  Do
+            # not reopen ``store.db_path`` by name after parent validation.
+            cas = cas_manifest(store, cas_root=store.cas_root, cas_root_fd=source_cas_fd)
+            cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fchdir(parent_fd)
+                target_db = Path(temporary_name) / "realm.sqlite3"
+                target = sqlite3.connect(str(target_db))
+            finally:
+                os.fchdir(cwd_fd)
+                os.close(cwd_fd)
+            try:
+                store.conn.backup(target)
                 target.commit()
             finally:
                 target.close()
-                source.close()
             for obj in cas["objects"]:
-                source_path = _object_path(store.cas_root, obj["digest"])
-                target_path = _object_path(temporary / "cas" / "sha256", obj["digest"])
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source_path, target_path)
-            atomic_json_write(temporary / "cas-manifest.json", cas)
+                obj_dir = mkdir_chain_at(temporary_fd, f"cas/sha256/{obj['digest'][:2]}")
+                try:
+                    copy_file_at(source_cas_fd, f"{obj['digest'][:2]}/{obj['digest'][2:]}", obj_dir, obj["digest"][2:])
+                    os.fsync(obj_dir)
+                finally:
+                    os.close(obj_dir)
+            write_bytes_at(temporary_fd, "cas-manifest.json", (canonical_json(cas) + "\n").encode())
             realm = store.realm
             schema_version = store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
-            auth_path = Path(key_path or (store.root / ".operator-backup-key")).expanduser().resolve()
+            auth_path = absolute_path(key_path or (store.root / ".operator-backup-key"))
             auth_key = bytes(key) if key is not None else _provision_key(auth_path)
             if len(auth_key) < 32:
                 raise ConflictError("backup authentication key is too short")
@@ -323,13 +507,13 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                 "created_at": now(),
                 "realm": {"id": realm["id"], "display_name": realm["display_name"]},
                 "schema": {"version": schema_version},
-                "files": {"realm.sqlite3": _file_record(target_db), "cas-manifest.json": _file_record(temporary / "cas-manifest.json")},
+                "files": {"realm.sqlite3": _file_record_at(temporary_fd, "realm.sqlite3"), "cas-manifest.json": _file_record_at(temporary_fd, "cas-manifest.json")},
                 # Stable aliases make the transition readable to existing
                 # operators while the authenticated envelope is authoritative.
                 "schema_version": schema_version,
                 "realm_id": realm["id"],
                 "display_name": realm["display_name"],
-                "database_sha256": _sha256(target_db),
+                "database_sha256": _file_record_at(temporary_fd, "realm.sqlite3")["sha256"],
                 "cas_manifest_sha256": cas["manifest_sha256"],
                 "authentication": {"algorithm": "hmac-sha256", "key_id": _key_id(auth_key), "key_path": str(auth_path)},
             }
@@ -337,12 +521,42 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                 manifest["destination_binding"] = dict(binding)
             manifest["manifest_sha256"] = _authenticated_digest(manifest)
             manifest["manifest_hmac"] = _manifest_mac(manifest, auth_key)
-            atomic_json_write(temporary / "manifest.json", manifest)
-        temporary.rename(destination)
-        return verify_backup(destination, key=auth_key)
+            write_bytes_at(temporary_fd, "manifest.json", (canonical_json(manifest) + "\n").encode())
+            os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        validate_created_parent(destination, destination_identity, parent_fd)
+        # A fresh destination must still be absent relative to the retained
+        # parent.  The final rename is the only publication syscall.
+        try:
+            os.stat(destination_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ConflictError("backup destination appeared before publication")
+        os.rename(temporary_name, destination_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        validate_created_parent(destination, destination_identity, parent_fd)
+        return verify_backup(destination, key=auth_key, directory_identity=destination_identity)
     except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
+        if temporary_fd >= 0:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        if temporary_name is not None and parent_fd >= 0:
+            try:
+                remove_tree_at(parent_fd, temporary_name)
+            except OSError:
+                pass
         raise
+    finally:
+        if source_cas_fd >= 0:
+            os.close(source_cas_fd)
+        if parent_fd >= 0 and parent_fd != destination_identity.get("_parent_fd"):
+            os.close(parent_fd)
+        if own_destination_identity:
+            close_pinned(destination_identity)
 
 
 def restore_backup(
@@ -351,6 +565,8 @@ def restore_backup(
     *,
     key: bytes | None = None,
     key_path: str | Path | None = None,
+    destination_identity: Mapping[str, Any] | None = None,
+    source_identity: Mapping[str, Any] | None = None,
 ) -> dict:
     """Restore an authenticated backup into a new inactive realm.
 
@@ -359,18 +575,52 @@ def restore_backup(
     manifest's recorded key path is used. Every path still goes through the
     manifest key-id and HMAC checks in :func:`verify_backup`.
     """
-    source = Path(backup_dir).expanduser().resolve()
-    destination = Path(destination).expanduser().resolve()
-    if destination.exists():
+    source = absolute_path(backup_dir)
+    destination = absolute_path(destination)
+    if os.path.lexists(str(destination)):
         raise ConflictError("restore destination must be a new inactive realm", details={"destination": str(destination)})
-    verified = verify_backup(source, key=key, key_path=key_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
+    own_source_identity = source_identity is None
+    own_destination_identity = destination_identity is None
+    source_fd = -1
+    parent_fd = -1
+    destination_name = None
+    temporary_name = None
+    temporary_fd = -1
     try:
-        shutil.copy2(source / "realm.sqlite3", temporary / "realm.sqlite3")
-        shutil.copytree(source / "cas", temporary / "cas")
+        if source_identity is None:
+            source_identity, source_fd, _ = pin_directory(source)
+        else:
+            source_fd = int(source_identity.get("_target_fd", -1))
+            if source_fd < 0:
+                # A caller may provide the retained source parent but not the root
+                # fd; open the root once, with O_NOFOLLOW, before material reads.
+                source_fd = os.open(source.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=int(source_identity["_parent_fd"]))
+        verified = verify_backup(source, key=key, key_path=key_path, directory_identity=source_identity)
+        destination_identity = destination_identity or capture_parent(destination, require_fresh_target=True)
+        parent_fd, destination_name = ensure_parent_at(destination, destination_identity)
+    except Exception:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if own_source_identity:
+            close_pinned(source_identity)
+        if own_destination_identity and destination_identity is not None:
+            close_pinned(destination_identity)
+        raise
+    try:
+        temporary_name, temporary_fd = mkdir_temp_at(parent_fd, f".{destination.name}.")
+        copy_file_at(source_fd, "realm.sqlite3", temporary_fd, "realm.sqlite3")
+        copy_tree_at(source_fd, "cas", temporary_fd, "cas")
         from .store import RealmStore
-        restored = RealmStore(temporary, acquire_owner=False)
+        # RealmStore performs startup migrations/control writes. Keep cwd on
+        # the pinned destination parent while opening its relative temporary
+        # root so a parent swap cannot redirect those writes.
+        cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fchdir(parent_fd)
+            restored = RealmStore(Path(temporary_name), acquire_owner=False)
+        finally:
+            os.fchdir(cwd_fd)
+            os.close(cwd_fd)
         try:
             report = restored.doctor()
             if not report["ok"]:
@@ -378,16 +628,46 @@ def restore_backup(
             realm = restored.realm
         finally:
             restored.close()
-        handoff = {"format_version": 2, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _sha256(temporary / "realm.sqlite3"), "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
+        source_manifest_sha256, _ = _sha256_at(source_fd, "manifest.json")
+        handoff = {"format_version": 2, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": source_manifest_sha256, "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _file_record_at(temporary_fd, "realm.sqlite3")["sha256"], "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
         handoff["handoff_sha256"] = _authenticated_digest(handoff)
         auth_key = _resolve_key(verified["manifest"], key=key, key_path=key_path)
         handoff["handoff_hmac"] = hmac.new(auth_key, canonical_json(_auth_payload(handoff)).encode("utf-8"), hashlib.sha256).hexdigest()
-        atomic_json_write(temporary / "activation-handoff.json", handoff)
-        temporary.rename(destination)
+        write_bytes_at(temporary_fd, "activation-handoff.json", (canonical_json(handoff) + "\n").encode())
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        validate_created_parent(destination, destination_identity, parent_fd)
+        try:
+            os.stat(destination_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ConflictError("restore destination appeared before publication")
+        os.rename(temporary_name, destination_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        validate_created_parent(destination, destination_identity, parent_fd)
         return {"destination": str(destination), "realm_id": realm["id"], "activation_handoff": str(destination / "activation-handoff.json"), "source_manifest_sha256": handoff["source_manifest_sha256"], "verification": verified["manifest"]}
     except Exception:
-        shutil.rmtree(temporary, ignore_errors=True)
+        if temporary_fd >= 0:
+            try:
+                os.close(temporary_fd)
+            except OSError:
+                pass
+        if temporary_name is not None:
+            try:
+                remove_tree_at(parent_fd, temporary_name)
+            except OSError:
+                pass
         raise
+    finally:
+        os.close(source_fd)
+        if own_source_identity:
+            close_pinned(source_identity)
+        if parent_fd >= 0 and parent_fd != destination_identity.get("_parent_fd"):
+            os.close(parent_fd)
+        if own_destination_identity:
+            close_pinned(destination_identity)
 
 
 def structured_export(store) -> dict:

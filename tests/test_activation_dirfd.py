@@ -29,7 +29,10 @@ def test_activation_anchors_last_rename_to_validated_parent(tmp_path: Path, monk
 
     def hostile_rename(source, destination, **kwargs):
         nonlocal swapped
-        if source == "active" and not swapped:
+        # Trigger at the actual publication rename, after the replacement
+        # runtime has been fully prepared.  The old service must remain usable
+        # while the failed publication is rolled back.
+        if destination == "active" and str(source).startswith(".active.activate-") and not swapped:
             swapped = True
             authority.rename(tmp_path / "authority-real")
             authority.symlink_to(outside, target_is_directory=True)
@@ -40,6 +43,7 @@ def test_activation_anchors_last_rename_to_validated_parent(tmp_path: Path, monk
         with pytest.raises(MigrationError, match="parent|publication|identity"):
             RuntimeServiceAdapter(active).activate_destination(candidate, state=state, target_identity=identity)
         assert swapped
+        assert active.health()["status"] == "ok"
         assert not any(outside.iterdir())
         assert (tmp_path / "authority-real" / "active").is_dir()
     finally:

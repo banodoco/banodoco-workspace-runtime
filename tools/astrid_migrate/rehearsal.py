@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import stat
 import tempfile
@@ -29,27 +28,19 @@ from .capacity import (
     revalidate_activation_parent,
     revalidate_activation_path,
 )
+from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory
 from runtime_protocol.util import now
 
 
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
-    with temporary.open("wb") as stream:
-        stream.write(_canonical(value) + b"\n")
-        stream.flush()
-        import os
-        os.fsync(stream.fileno())
-    temporary.replace(path)
+def _write_json(path: Path, value: Mapping[str, Any], *, identity: Mapping[str, Any] | None = None) -> None:
+    """Publish evidence/journal bytes through a retained parent descriptor."""
+    own = identity is None
+    pinned = identity or _capture_parent(path)
     try:
-        directory = path.parent.open("rb")
-        try:
-            import os
-            os.fsync(directory.fileno())
-        finally:
-            directory.close()
-    except OSError:
-        pass
+        _atomic_json_write(path, _canonical(value) + b"\n", identity=pinned)
+    finally:
+        if own:
+            _close_pinned(pinned)
 
 
 def _tree_digest(root: Path) -> str:
@@ -197,6 +188,15 @@ def _assert_pinned_candidate(candidate: Path, parent_fd: int, root_fd: int, pare
     current_root = os.fstat(root_fd)
     if (current_parent.st_dev, current_parent.st_ino, current_parent.st_mode) != (parent_stat.st_dev, parent_stat.st_ino, parent_stat.st_mode):
         raise MigrationError(f"candidate parent identity changed: {candidate.parent}")
+    # The retained fd protects source reads, but the lexical name is also part
+    # of the request identity. Reject an ordinary directory replacement, not
+    # just a symlink replacement.
+    try:
+        named_parent = os.stat(candidate.parent, follow_symlinks=False)
+    except OSError as exc:
+        raise MigrationError(f"candidate parent identity changed: {candidate.parent}") from exc
+    if (named_parent.st_dev, named_parent.st_ino, named_parent.st_mode) != (parent_stat.st_dev, parent_stat.st_ino, parent_stat.st_mode):
+        raise MigrationError(f"candidate lexical parent identity changed: {candidate.parent}")
     if (current_root.st_dev, current_root.st_ino, current_root.st_mode) != (root_stat.st_dev, root_stat.st_ino, root_stat.st_mode):
         raise MigrationError(f"candidate identity changed: {candidate}")
 
@@ -642,6 +642,7 @@ class RuntimeServiceAdapter:
         candidate_parent_fd = candidate_fd = quarantine_fd = temporary_fd = -1
         temporary_name = quarantine_name = None
         published = False
+        committed = False
         reopened = None
         old_service = self.service
         try:
@@ -733,27 +734,44 @@ class RuntimeServiceAdapter:
                         )
                 reopened._runtime_state = reopened.store.runtime_lifecycle()
 
-            # The old root was moved to quarantine above through the retained
-            # parent descriptor. Its open SQLite/lock descriptors remain
-            # valid while the replacement is prepared; close the owner only
-            # after all candidate/control-state copies are complete.
-            old_service.close()
             _rename_at(parent_fd, temporary_name, target.name)
             published = True
             # The target inode is now intentionally different; validate only
             # the parent boundary before any path-based reopen or retargeting.
             revalidate_activation_parent(target, target_identity)
+            if support_root is not None:
+                from runtime_protocol.catalog import RealmCatalog
+                catalog_path = Path(support_root) / "catalog.json"
+                catalog_identity = _capture_parent(catalog_path)
+                try:
+                    catalog = RealmCatalog(catalog_path)
+                    # Keep both catalog publications on the same retained
+                    # parent. A swap between register and select must fail
+                    # closed rather than redirecting the second write.
+                    catalog.register(realm_id=realm_id, display_name=display_name, data_root=str(target), path_identity=catalog_identity)
+                    catalog.select(realm_id, path_identity=catalog_identity)
+                finally:
+                    _close_pinned(catalog_identity)
+            old_service.close()
             _retarget_runtime_paths(reopened, target)
             old_service.__dict__.update(reopened.__dict__)
             self.service = old_service
-            if support_root is not None:
-                from runtime_protocol.catalog import RealmCatalog
-                catalog = RealmCatalog(Path(support_root) / "catalog.json")
-                catalog.register(realm_id=realm_id, display_name=display_name, data_root=str(target))
-                catalog.select(realm_id)
+            # Close the former owner only after the publication and all
+            # lexical/descriptor validation seams have succeeded. Until this
+            # point its pinned SQLite and lock descriptors provide an operable
+            # rollback authority.
+            committed = True
             return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": str(target.parent / quarantine_name), "realm_id": realm_id, "candidate_verification": candidate_verification}
         except Exception:
-            if reopened is not None and not published:
+            if published and not committed:
+                try:
+                    failed_name = f".{target.name}.failed-{time.time_ns()}"
+                    _rename_at(parent_fd, target.name, failed_name)
+                    _rename_at(parent_fd, quarantine_name, target.name)
+                    _remove_tree_at(parent_fd, failed_name)
+                except (OSError, MigrationError):
+                    pass
+            if reopened is not None and not committed:
                 try:
                     reopened.close()
                 except Exception:
@@ -786,9 +804,23 @@ class MigrationJournal:
     """Small durable state journal whose transitions are safe to repeat."""
 
     def __init__(self, path: str | Path, *, fault_injector=None, crash_at: str | None = None):
-        self.path = Path(path).expanduser().resolve()
+        self.path = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+        # Retain the nearest existing parent for the complete journal life;
+        # every transition/effect is then published relative to this inode.
+        self._path_identity = _capture_parent(self.path)
         self.fault_injector = fault_injector
         self.crash_at = crash_at
+
+    def __del__(self):  # pragma: no cover - interpreter cleanup
+        try:
+            _close_pinned(self._path_identity)
+        except Exception:
+            pass
+
+    def refresh_identity(self) -> None:
+        """Re-pin the journal parent after an authority root publication."""
+        _close_pinned(self._path_identity)
+        self._path_identity = _capture_parent(self.path)
 
     @staticmethod
     def _entry_hash(entry: Mapping[str, Any]) -> str:
@@ -836,7 +868,7 @@ class MigrationJournal:
             raise MigrationError("migration request binding must be established while prepared")
         self._inject("before_bind")
         result = current | {"binding": dict(payload)}
-        _write_json(self.path, result)
+        _write_json(self.path, result, identity=self._path_identity)
         self._inject("after_bind")
         return result
 
@@ -867,7 +899,7 @@ class MigrationJournal:
         if "binding" in current:
             result["binding"] = current["binding"]
         self._inject(f"before_{current['state']}_to_{state}")
-        _write_json(self.path, result)
+        _write_json(self.path, result, identity=self._path_identity)
         self._inject(f"after_{current['state']}_to_{state}")
         return result
 
@@ -887,7 +919,7 @@ class MigrationJournal:
         effect = {"name": name, "payload": payload, "generation": int(current["generation"]), "effect_sha256": self._entry_hash({"name": name, "payload": payload, "generation": int(current["generation"])})}
         result = current | {"effects": [*current.get("effects", []), effect]}
         self._inject(f"before_effect_{name}")
-        _write_json(self.path, result)
+        _write_json(self.path, result, identity=self._path_identity)
         self._inject(f"after_effect_{name}")
         return result
 
@@ -954,6 +986,7 @@ class Rehearsal:
                 if not callable(activate):
                     raise MigrationError("migration journal cannot resume without destination activation")
                 rollback_activation = activate(rollback_root, state="rolled_back")
+                journal.refresh_identity()
             journal.transition("rolled_back", backup=effects.get("pre_migration_backup", {}).get("payload"), restore=rollback_payload)
             current = journal._read()
             state = current["state"]
@@ -974,6 +1007,7 @@ class Rehearsal:
             if not callable(activate):
                 raise MigrationError("migration journal cannot resume without destination activation")
             reactivation_activation = activate(reactivation_root, state="reactivated")
+            journal.refresh_identity()
         reactivated = journal.transition("reactivated", destination=str(self.config.destination_root), candidate_restore=reactivation_result)
         return {
             "packet": "B10",
@@ -986,7 +1020,8 @@ class Rehearsal:
 
     def run(self) -> dict[str, Any]:
         evidence_root = (self.config.evidence_root or self.config.destination_root / "migration-evidence").resolve()
-        evidence_root.mkdir(parents=True, exist_ok=True)
+        evidence_identity = _ensure_directory(evidence_root)
+        _close_pinned(evidence_identity)
         journal = MigrationJournal(self.config.destination_root / "migration-journal.json", fault_injector=self.fault_injector, crash_at=self.crash_at)
         # Recovery begins by reading the durable cursor.  In particular, do
         # not replay migration writes once rollback or reactivation has been
@@ -1105,6 +1140,8 @@ class Rehearsal:
             activate = getattr(self.client, "activate_destination", None)
             self._inject("before_rollback_activation")
             rollback_activation = activate(restore_root, state="rolled_back") if callable(activate) else None
+            if callable(activate):
+                journal.refresh_identity()
             self._inject("after_rollback_activation")
             rollback_active_snapshot = self.client.destination_snapshot() if callable(getattr(self.client, "destination_snapshot", None)) else None
             if rollback_active_snapshot is not None and any(rollback_active_snapshot.get(table) for table in ("projects", "runs", "tasks", "objects")):
@@ -1117,6 +1154,8 @@ class Rehearsal:
             journal.effect("reactivation_restore", destination=str(reactivation_root))
             self._inject("before_reactivation_activation")
             reactivation_activation = activate(reactivation_root, state="reactivated") if callable(activate) else None
+            if callable(activate):
+                journal.refresh_identity()
             self._inject("after_reactivation_activation")
             reactivation_active_snapshot = self.client.destination_snapshot() if callable(getattr(self.client, "destination_snapshot", None)) else None
             if reactivation_active_snapshot is not None and not any(reactivation_active_snapshot.get(table) for table in ("projects", "runs", "tasks", "objects")):
@@ -1170,7 +1209,11 @@ class Rehearsal:
                 return result
             except Exception as exc:
                 raise MigrationError(f"existing backup is not a verified reusable artifact: {destination}") from exc
-        return self.runtime.backup(destination, binding=expected)
+        identity = _capture_parent(destination)
+        try:
+            return self.runtime.backup(destination, binding=expected, destination_identity=identity)
+        finally:
+            _close_pinned(identity)
 
     def _destination_binding(self) -> dict[str, Any]:
         """Identity of the exact authority whose prebackup may be reused."""
@@ -1206,7 +1249,15 @@ class Rehearsal:
             except Exception as exc:
                 raise MigrationError(f"existing restore destination failed verification: {destination}") from exc
             return {"destination": str(destination), "realm_id": value.get("realm_id"), "activation_handoff": str(handoff), "source_manifest_sha256": value.get("source_manifest_sha256"), "verification": source_manifest, "candidate_verification": candidate_verification}
-        return self.runtime.restore(backup, destination)
+        identity = _capture_parent(destination)
+        source_identity = None
+        try:
+            source_identity = _capture_parent(backup)
+            return self.runtime.restore(backup, destination, destination_identity=identity, source_identity=source_identity)
+        finally:
+            _close_pinned(identity)
+            if source_identity is not None:
+                _close_pinned(source_identity)
 
 
 def run_rehearsal(config: MigrationConfig, client: Any, *, runtime: Any | None = None, rollback_root: str | Path | None = None, fault_injector=None, crash_at: str | None = None) -> dict[str, Any]:

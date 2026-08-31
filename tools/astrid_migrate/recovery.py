@@ -17,16 +17,15 @@ import os
 from pathlib import Path
 import subprocess
 import secrets
-import shutil
 import sqlite3
-import tempfile
 import time
 from typing import Any, Callable, Mapping
 
 from runtime_protocol.backup import restore_backup, verify_backup, verify_restore_candidate
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
-from runtime_protocol.util import atomic_json_write, canonical_json, new_id
+from runtime_protocol.util import canonical_json, new_id
+from runtime_protocol.dirfd import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at
 
 from .migrator import MigrationError, _sha256_file
 from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path
@@ -99,7 +98,7 @@ def actual_reboot_executor(command: str, checkpoint: Mapping[str, Any]) -> Any:
 
 def _stat_identity(path: Path) -> dict[str, Any]:
     try:
-        value = path.stat()
+        value = path.stat(follow_symlinks=False)
     except OSError as exc:
         raise MigrationError(f"B13.2 purge target identity is unavailable: {path}") from exc
     return {"st_dev": int(value.st_dev), "st_ino": int(value.st_ino), "st_mode": int(value.st_mode), "path": str(_absolute_path(path))}
@@ -121,22 +120,57 @@ def _catalog_paths(value: Any, *, key: str = "") -> list[tuple[str, str]]:
 
 def _database_snapshot_sha256(path: Path) -> str:
     """Hash a consistent SQLite view, including committed WAL frames."""
-    source = sqlite3.connect(str(path), timeout=10)
-    snapshot_fd, snapshot_name = tempfile.mkstemp(prefix=".b13-db-snapshot-", dir=str(path.parent))
-    os.close(snapshot_fd)
-    snapshot = Path(snapshot_name)
-    snapshot.unlink(missing_ok=True)
+    path = _absolute_path(path)
+    parent_identity = _capture_parent(path)
+    parent_fd = int(parent_identity.get("_parent_fd"))
+    source = None
+    temporary_name = None
+    temporary_fd = -1
+    cwd_fd = -1
     try:
-        target = sqlite3.connect(str(snapshot), timeout=10)
+        source = sqlite3.connect(str(path), timeout=10)
+        temporary_name, temporary_fd = _mkdir_temp_at(parent_fd, ".b13-db-snapshot-")
+        cwd_fd = os.open(".", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            source.backup(target)
-            target.commit()
+            os.fchdir(parent_fd)
+            target = sqlite3.connect(str(Path(temporary_name) / "snapshot.sqlite3"), timeout=10)
+            try:
+                source.backup(target)
+                target.commit()
+            finally:
+                target.close()
         finally:
-            target.close()
-        return _sha256_file(snapshot)
+            os.fchdir(cwd_fd)
+            os.close(cwd_fd)
+            cwd_fd = -1
+        snapshot_fd = os.open("snapshot.sqlite3", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=temporary_fd)
+        try:
+            digest = hashlib.sha256()
+            while True:
+                block = os.read(snapshot_fd, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+            return digest.hexdigest()
+        finally:
+            os.close(snapshot_fd)
     finally:
-        source.close()
-        snapshot.unlink(missing_ok=True)
+        if cwd_fd >= 0:
+            try:
+                os.fchdir(cwd_fd)
+            finally:
+                os.close(cwd_fd)
+        if source is not None:
+            source.close()
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if temporary_name is not None:
+            try:
+                _remove_tree_at(parent_fd, temporary_name)
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+        _close_pinned(parent_identity)
 
 
 def _database_semantic_sha256(path: Path) -> str:
@@ -205,9 +239,16 @@ class RecoveryJournal:
     }
 
     def __init__(self, path: str | Path, *, crash_at: str | None = None, fault_injector: Callable[[str], None] | None = None):
-        self.path = Path(path).expanduser().resolve()
+        self.path = _absolute_path(path)
+        self._path_identity = _capture_parent(self.path)
         self.crash_at = crash_at
         self.fault_injector = fault_injector
+
+    def __del__(self):  # pragma: no cover - interpreter cleanup
+        try:
+            _close_pinned(self._path_identity)
+        except Exception:
+            pass
 
     def _inject(self, seam: str) -> None:
         if self.crash_at == seam:
@@ -256,7 +297,7 @@ class RecoveryJournal:
             raise MigrationError("B13.2 recovery binding must be established while prepared")
         result = current | {"binding": dict(payload)}
         self._inject("before_bind")
-        atomic_json_write(self.path, result)
+        _atomic_json_write(self.path, (canonical_json(result) + "\n").encode(), identity=self._path_identity)
         self._inject("after_bind")
         return result
 
@@ -271,7 +312,7 @@ class RecoveryJournal:
         effect["effect_sha256"] = self._hash(effect)
         result = current | {"effects": [*current["effects"], effect]}
         self._inject(f"before_effect_{name}")
-        atomic_json_write(self.path, result)
+        _atomic_json_write(self.path, (canonical_json(result) + "\n").encode(), identity=self._path_identity)
         self._inject(f"after_effect_{name}")
         return result
 
@@ -290,7 +331,7 @@ class RecoveryJournal:
         entry["entry_sha256"] = self._hash(entry)
         result = current | {"state": state, "generation": entry["generation"], "entries": [*current["entries"], entry]}
         self._inject(f"before_{current['state']}_to_{state}")
-        atomic_json_write(self.path, result)
+        _atomic_json_write(self.path, (canonical_json(result) + "\n").encode(), identity=self._path_identity)
         self._inject(f"after_{current['state']}_to_{state}")
         return result
 
@@ -374,7 +415,11 @@ class B13Recovery:
         if reservation is not None:
             reservation.recheck()
         path = self.evidence_root / name
-        atomic_json_write(path, dict(value))
+        identity = _capture_parent(path)
+        try:
+            _atomic_json_write(path, (canonical_json(dict(value)) + "\n").encode(), identity=identity)
+        finally:
+            _close_pinned(identity)
         return path
 
     def _capacity_plan(self) -> tuple[CapacityPlan, dict[str, Any]]:
@@ -435,10 +480,14 @@ class B13Recovery:
             # be covered by the same storage-domain lock.
             reservation_id = secrets.token_urlsafe(18)
             reservation = CapacityReservation.acquire(plan=plan, reservation_id=reservation_id)
-            receipt["reserved"] = True
-            self._write("capacity-receipt-b13.json", receipt)
-            journal.effect("capacity-reservation", reservation_id=reservation_id, domain_ids=sorted(plan.domains), required_bytes=receipt["required_bytes"], receipt_sha256=_sha256_file(capacity_path))
-            return reservation
+            try:
+                receipt["reserved"] = True
+                self._write("capacity-receipt-b13.json", receipt)
+                journal.effect("capacity-reservation", reservation_id=reservation_id, domain_ids=sorted(plan.domains), required_bytes=receipt["required_bytes"], receipt_sha256=_sha256_file(capacity_path))
+                return reservation
+            except Exception:
+                reservation.release()
+                raise
         reservation_id = str(effect["payload"].get("reservation_id") or "")
         if not reservation_id:
             raise MigrationError("B13.2 capacity reservation has no durable identity")
@@ -481,16 +530,23 @@ class B13Recovery:
             if reservation is not None:
                 reservation.recheck()
             write_identity = capture_write_path(destination)
-            journal._inject(f"before_{seam}")
-            if reservation is not None:
-                reservation.recheck()
-            # The seam is inside the storage-domain lease.  Revalidate the
-            # complete parent chain after the seam and immediately before
-            # restore so a hostile parent rename/symlink/device swap cannot
-            # redirect restore_backup's temporary directory or final rename.
-            revalidate_write_path(destination, write_identity)
-            restore_backup(backup, destination)
-            journal._inject(f"after_{seam}")
+            source_identity = None
+            try:
+                source_identity = _capture_parent(backup)
+                journal._inject(f"before_{seam}")
+                if reservation is not None:
+                    reservation.recheck()
+                # The seam is inside the storage-domain lease.  Revalidate the
+                # complete parent chain after the seam and immediately before
+                # restore so a hostile parent rename/symlink/device swap cannot
+                # redirect restore_backup's temporary directory or final rename.
+                revalidate_write_path(destination, write_identity)
+                restore_backup(backup, destination, destination_identity=write_identity, source_identity=source_identity)
+                journal._inject(f"after_{seam}")
+            finally:
+                _close_pinned(write_identity)
+                if source_identity is not None:
+                    _close_pinned(source_identity)
             verification = verify_restore_candidate(destination)
         if verification["manifest"].get("realm_id") != realm_id:
             raise MigrationError("B13.2 restore candidate realm identity mismatch")
@@ -710,8 +766,7 @@ class B13Recovery:
             tombstoned_tree = _tree_digest(target)
             tombstoned_database = _sha256_file(target / "realm.sqlite3")
             marker = {"packet": "B13.2", "marker_version": 1, "marker_id": secrets.token_urlsafe(18), "target": str(_absolute_path(target)), "realm_id": realm_id, "target_identity": target_identity, "parent_identity": parent_identity, "pre_purge_tree_sha256": pre_purge_tree, "pre_purge_database_sha256": pre_purge_database, "tombstoned_tree_sha256": tombstoned_tree, "tombstoned_database_sha256": tombstoned_database, "classification": dict(base)}
-            marker_path = self.evidence_root / "purge-marker-b13.json"
-            atomic_json_write(marker_path, marker)
+            marker_path = self._write("purge-marker-b13.json", marker)
             payload = {"target": str(_absolute_path(target)), "realm_id": realm_id, "pre_purge_tree_sha256": pre_purge_tree, "pre_purge_database_sha256": pre_purge_database, "tombstoned_tree_sha256": tombstoned_tree, "tombstoned_database_sha256": tombstoned_database, "lifecycle": tombstoned, "classification": dict(base), "target_identity": target_identity, "parent_identity": parent_identity, "marker_path": str(marker_path), "marker_sha256": _canonical_digest(marker), "marker": marker}
             journal.effect("purge-started", **payload)
             started = journal.effects()["purge-started"]
@@ -730,6 +785,7 @@ class B13Recovery:
         reservation = getattr(self, "_capacity_reservation", None)
         if reservation is not None:
             reservation.recheck()
+        purge_parent = _capture_parent(target)
         journal._inject("before_purge")
         # Fault/restart hooks are an adversarial boundary: validate again after
         # the hook and immediately before the destructive syscall so a
@@ -737,8 +793,19 @@ class B13Recovery:
         self._revalidate_purge_target(target, realm_id, payload)
         if reservation is not None:
             reservation.recheck()
-        if os.path.lexists(str(target)):
-            shutil.rmtree(target)
+        try:
+            parent_fd = int(purge_parent.get("_parent_fd"))
+            parent_stat = os.fstat(parent_fd)
+            expected_parent = payload.get("parent_identity") or {}
+            if (int(parent_stat.st_dev), int(parent_stat.st_ino), int(parent_stat.st_mode)) != tuple(int(expected_parent[key]) for key in ("st_dev", "st_ino", "st_mode")):
+                raise MigrationError("B13.2 purge target parent identity changed before deletion")
+            if os.path.lexists(str(target)):
+                # Delete only through the retained parent descriptor. A
+                # replacement at the lexical parent cannot redirect this call.
+                _remove_tree_at(parent_fd, target.name)
+                os.fsync(parent_fd)
+        finally:
+            _close_pinned(purge_parent)
         if os.path.lexists(str(target)):
             raise MigrationError("B13.2 disposable purge did not remove its exact target")
         journal._inject("after_purge")
@@ -1066,6 +1133,8 @@ class B13Recovery:
         """Run B13.2 while holding all affected storage-domain reservations."""
         # Terminal replay has no writes and the prior run has already sealed
         # its release receipt, so do not reacquire a capacity lease here.
+        evidence_identity = _ensure_directory(self.evidence_root)
+        _close_pinned(evidence_identity)
         journal = RecoveryJournal(self.evidence_root / "migration-journal-b13.json", crash_at=self.crash_at, fault_injector=self.fault_injector)
         if journal.read()["state"] == "reactivated":
             return self._terminal_replay(journal, str(self.active_runtime.realm["id"]))
@@ -1082,7 +1151,6 @@ class B13Recovery:
         realm_id = str(self.active_runtime.realm["id"])
         for authorization_id in B13_AUTHORIZATION_IDS:
             self._validate_auth(authorization_id, realm_id)
-        self.evidence_root.mkdir(parents=True, exist_ok=True)
         journal = RecoveryJournal(self.evidence_root / "migration-journal-b13.json", crash_at=self.crash_at, fault_injector=self.fault_injector)
         current = journal.read()
         if current["state"] == "reactivated":
@@ -1098,7 +1166,11 @@ class B13Recovery:
                 self._verify_backup(self.recovery_base_backup, realm_id)
             else:
                 self._capacity_reservation.recheck()
-                self.active_runtime.backup(self.recovery_base_backup)
+                identity = _capture_parent(self.recovery_base_backup)
+                try:
+                    self.active_runtime.backup(self.recovery_base_backup, destination_identity=identity)
+                finally:
+                    _close_pinned(identity)
             base = self._verify_backup(self.recovery_base_backup, realm_id)
             rollback = self._verify_backup(self.rollback_archive, realm_id)
             base_effect = journal.effects().get("recovery-base")

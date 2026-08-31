@@ -150,11 +150,10 @@ def capture_write_path(path: str | Path) -> dict[str, Any]:
         identity = os.fstat(parent_fd)
     except OSError as exc:
         raise MigrationError(f"capacity write parent identity unavailable: {parent}") from exc
-    finally:
-        os.close(parent_fd)
     if not stat.S_ISDIR(identity.st_mode):
+        os.close(parent_fd)
         raise MigrationError(f"capacity write parent is not an ordinary directory: {parent}")
-    return {
+    return _ActivationIdentity({
         "path": str(target),
         "parent": str(parent),
         "target_parent": str(target_parent),
@@ -162,7 +161,7 @@ def capture_write_path(path: str | Path) -> dict[str, Any]:
         "st_dev": int(identity.st_dev),
         "st_ino": int(identity.st_ino),
         "st_mode": int(identity.st_mode),
-    }
+    }, parent_fd)
 
 
 def revalidate_write_path(path: str | Path, identity: Mapping[str, Any]) -> None:
@@ -183,20 +182,25 @@ def revalidate_write_path(path: str | Path, identity: Mapping[str, Any]) -> None
     elif not os.path.lexists(str(target_parent)):
         raise MigrationError(f"capacity write parent disappeared before material write: {target_parent}")
     parent = Path(str(identity["parent"]))
+    parent_fd = identity.get("_parent_fd")
+    if parent_fd is None:
+        raise MigrationError(f"capacity write parent has no retained descriptor: {parent}")
     try:
-        parent_fd = _open_directory_chain(parent)
-    except OSError as exc:
-        raise MigrationError(f"capacity write parent changed before material write: {parent}") from exc
-    try:
-        current = os.fstat(parent_fd)
+        current = os.fstat(int(parent_fd))
     except OSError as exc:
         raise MigrationError(f"capacity write parent identity unavailable: {parent}") from exc
-    finally:
-        os.close(parent_fd)
     if not stat.S_ISDIR(current.st_mode) or any(
         int(getattr(current, key)) != int(identity[key]) for key in ("st_dev", "st_ino", "st_mode")
     ):
         raise MigrationError(f"capacity write parent identity changed before material write: {parent}")
+    try:
+        named = os.stat(target_parent, follow_symlinks=False)
+    except OSError as exc:
+        if not identity.get("parent_was_missing"):
+            raise MigrationError(f"capacity write parent changed before material write: {target_parent}") from exc
+    else:
+        if not identity.get("parent_was_missing") and any(int(getattr(named, key)) != int(identity.get(f"parent_{key}", identity[key])) for key in ("st_dev", "st_ino", "st_mode")):
+            raise MigrationError(f"capacity write lexical parent identity changed before material write: {target_parent}")
 
 
 def capture_activation_path(path: str | Path) -> dict[str, Any]:

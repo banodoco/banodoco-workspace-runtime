@@ -17,19 +17,18 @@ import json
 import os
 import secrets
 import sqlite3
-import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from runtime_protocol.backup import restore_backup, verify_backup, verify_restore_candidate
+from runtime_protocol.dirfd import capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, ensure_parent_at as _ensure_parent_at, pin_directory as _pin_directory, copy_file_at as _copy_file_at, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_created_parent as _validate_created_parent, validate_parent as _validate_parent
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.util import canonical_json
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _sha256_file, _tree_size
-from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path
+from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path, close_activation_path
 from .rehearsal import MigrationJournal, RuntimeServiceAdapter, _tree_digest, _write_json
 
 
@@ -42,6 +41,8 @@ LIVE_AUTHORIZATION_IDS = (
     "AUTH-REACTIVATION-B12",
 )
 
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
 
 def _database_snapshot_sha256(path: Path) -> str:
     """Hash a consistent SQLite snapshot, including committed WAL state.
@@ -53,22 +54,60 @@ def _database_snapshot_sha256(path: Path) -> str:
     snapshot, so checking terminal identity never checkpoints or otherwise
     mutates the live runtime.
     """
-    source = sqlite3.connect(str(path), timeout=10)
-    snapshot_fd, snapshot_name = tempfile.mkstemp(prefix=".b12-db-snapshot-")
-    os.close(snapshot_fd)
-    snapshot = Path(snapshot_name)
-    snapshot.unlink(missing_ok=True)
+    path = _absolute_path(path)
+    parent_identity = _capture_parent(path)
+    parent_fd = int(parent_identity.get("_parent_fd"))
+    source = None
+    temporary_name = None
+    temporary_fd = -1
+    cwd_fd = -1
     try:
-        target = sqlite3.connect(str(snapshot), timeout=10)
+        source = sqlite3.connect(str(path), timeout=10)
+        temporary_name, temporary_fd = _mkdir_temp_at(parent_fd, ".b12-db-snapshot-")
+        cwd_fd = os.open(".", _DIR_FLAGS)
         try:
-            source.backup(target)
-            target.commit()
+            # SQLite accepts a relative URI/path, but only while cwd is the
+            # retained parent. No pathname is resolved through a replaceable
+            # parent after capture.
+            os.fchdir(parent_fd)
+            target = sqlite3.connect(str(Path(temporary_name) / "snapshot.sqlite3"), timeout=10)
+            try:
+                source.backup(target)
+                target.commit()
+            finally:
+                target.close()
         finally:
-            target.close()
-        return _sha256_file(snapshot)
+            os.fchdir(cwd_fd)
+            os.close(cwd_fd)
+            cwd_fd = -1
+        snapshot_fd = os.open("snapshot.sqlite3", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=temporary_fd)
+        try:
+            digest = hashlib.sha256()
+            while True:
+                block = os.read(snapshot_fd, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+            return digest.hexdigest()
+        finally:
+            os.close(snapshot_fd)
     finally:
-        source.close()
-        snapshot.unlink(missing_ok=True)
+        if cwd_fd >= 0:
+            try:
+                os.fchdir(cwd_fd)
+            finally:
+                os.close(cwd_fd)
+        if source is not None:
+            source.close()
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if temporary_name is not None:
+            try:
+                _remove_tree_at(parent_fd, temporary_name)
+                os.fsync(parent_fd)
+            except OSError:
+                pass
+        _close_pinned(parent_identity)
 
 
 def _canonical_digest(value: Any) -> str:
@@ -455,8 +494,11 @@ class LiveMigration:
             if reservation is not None:
                 reservation.recheck()
             revalidate_write_path(destination, write_identity)
-            verified = runtime.backup(destination, binding=dict(binding))
-            journal._inject(f"after_{seam}")
+            try:
+                verified = runtime.backup(destination, binding=dict(binding), destination_identity=write_identity)
+                journal._inject(f"after_{seam}")
+            finally:
+                close_activation_path(write_identity)
         journal.effect(effect_name, path=str(destination), manifest_sha256=_sha256_file(destination / "manifest.json"), realm_id=binding.get("selected_realm_id"))
         return verified
 
@@ -507,12 +549,19 @@ class LiveMigration:
             if reservation is not None:
                 reservation.recheck()
             write_identity = capture_write_path(destination)
-            journal._inject(f"before_{seam}")
-            if reservation is not None:
-                reservation.recheck()
-            revalidate_write_path(destination, write_identity)
-            restored = restore_backup(backup, destination)
-            journal._inject(f"after_{seam}")
+            source_identity = None
+            try:
+                source_identity = _capture_parent(backup)
+                journal._inject(f"before_{seam}")
+                if reservation is not None:
+                    reservation.recheck()
+                revalidate_write_path(destination, write_identity)
+                restored = restore_backup(backup, destination, destination_identity=write_identity, source_identity=source_identity)
+                journal._inject(f"after_{seam}")
+            finally:
+                close_activation_path(write_identity)
+                if source_identity is not None:
+                    _close_pinned(source_identity)
             verification = verify_restore_candidate(destination)
         if verification["manifest"].get("realm_id") != realm_id:
             raise MigrationError(f"B12 restore candidate has the wrong realm: {destination}")
@@ -686,13 +735,14 @@ class LiveMigration:
         active = self.active_runtime
         realm_id = str(active.realm["id"])
         evidence_root = (self.config.evidence_root or self.config.destination_root.parent / "migration-evidence-b12").resolve()
+        evidence_identity = _ensure_directory(evidence_root)
+        _close_pinned(evidence_identity)
         journal = MigrationJournal(evidence_root / "migration-journal-b12.json", fault_injector=self.fault_injector, crash_at=self.crash_at)
         current = journal._read()
         if current["state"] == "reactivated":
             return self._terminal_replay(journal, realm_id=realm_id)
         if current["state"] not in {"prepared", "active", "rolled_back"}:
             raise MigrationError("B12 live migration journal is interrupted; inspect it before resuming")
-        evidence_root.mkdir(parents=True, exist_ok=True)
         if current["state"] == "prepared" and current.get("binding") is None:
             self._fresh_destination(self.config.destination_root)
         archive_root = self.config.archive_root
@@ -822,7 +872,44 @@ class LiveMigration:
                 if _has_symlink_component(self.config.destination_root):
                     raise MigrationError("B12 destination must not contain a symlink component")
                 reservation.recheck()
-                destination = RuntimeService(self.config.destination_root, display_name=active.realm["display_name"], realm_id=realm_id)
+                # Create/open the destination root relative to its retained
+                # parent, and keep cwd pinned while RealmStore performs its
+                # startup migrations and control writes.
+                destination_pin = _capture_parent(self.config.destination_root, require_fresh_target=not os.path.lexists(str(self.config.destination_root)))
+                destination_parent_fd = -1
+                destination_root_fd = -1
+                try:
+                    destination_parent_fd, destination_name = _ensure_parent_at(self.config.destination_root, destination_pin)
+                    _validate_parent(self.config.destination_root, destination_pin, allow_parent_appeared=True)
+                    destination_exists = os.path.lexists(str(self.config.destination_root))
+                    if not destination_exists:
+                        try:
+                            os.mkdir(destination_name, 0o700, dir_fd=destination_parent_fd)
+                        except FileExistsError:
+                            raise MigrationError("B12 destination appeared before runtime initialization")
+                    _validate_created_parent(self.config.destination_root, destination_pin, destination_parent_fd)
+                    # Retain the newly created/existing root itself before
+                    # invoking RealmStore. Opening it with O_NOFOLLOW closes
+                    # the final name-to-inode gap after the mkdir seam; cwd is
+                    # then pinned to this descriptor for all startup writes.
+                    destination_root_fd = os.open(destination_name, _DIR_FLAGS, dir_fd=destination_parent_fd)
+                    root_stat = os.fstat(destination_root_fd)
+                    named_stat = os.stat(destination_name, dir_fd=destination_parent_fd, follow_symlinks=False)
+                    if (int(root_stat.st_dev), int(root_stat.st_ino), int(root_stat.st_mode)) != (int(named_stat.st_dev), int(named_stat.st_ino), int(named_stat.st_mode)):
+                        raise MigrationError("B12 destination root identity changed before runtime initialization")
+                    cwd_fd = os.open(".", _DIR_FLAGS)
+                    try:
+                        os.fchdir(destination_root_fd)
+                        destination = RuntimeService(Path("."), display_name=active.realm["display_name"], realm_id=realm_id)
+                    finally:
+                        os.fchdir(cwd_fd)
+                        os.close(cwd_fd)
+                finally:
+                    if destination_root_fd >= 0:
+                        os.close(destination_root_fd)
+                    if destination_parent_fd >= 0 and destination_parent_fd != destination_pin.get("_parent_fd"):
+                        os.close(destination_parent_fd)
+                    _close_pinned(destination_pin)
                 destination_adapter = RuntimeServiceAdapter(destination)
                 try:
                     migration_effect = self._existing_effect(journal, "migration-receipt")
@@ -880,7 +967,16 @@ class LiveMigration:
                 if _has_symlink_component(destination_activation_manifest):
                     raise MigrationError("B12 destination activation manifest contains a symlink component")
                 if destination_activation_manifest.is_file() and not (candidate_root / "activation-manifest.json").is_file():
-                    shutil.copy2(destination_activation_manifest, candidate_root / "activation-manifest.json")
+                    source_pin, source_fd, _ = _pin_directory(self.config.destination_root)
+                    candidate_pin, candidate_fd, _ = _pin_directory(candidate_root)
+                    try:
+                        _copy_file_at(source_fd, "activation-manifest.json", candidate_fd, "activation-manifest.json")
+                        os.fsync(candidate_fd)
+                    finally:
+                        os.close(source_fd)
+                        os.close(candidate_fd)
+                        _close_pinned(source_pin)
+                        _close_pinned(candidate_pin)
                 # The activation manifest is a control-plane handoff, not
                 # part of the realm backup. Re-verify after attaching it.
                 candidate_verification = verify_restore_candidate(candidate_root)

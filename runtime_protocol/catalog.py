@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from typing import Mapping, Any
 
 from .util import atomic_json_write, new_id, now
 
@@ -54,20 +55,20 @@ class RealmCatalog:
             value = json.load(stream)
         return value
 
-    def register(self, *, realm_id: str, display_name: str, data_root: str) -> dict:
+    def register(self, *, realm_id: str, display_name: str, data_root: str, path_identity: Mapping[str, Any] | None = None) -> dict:
         catalog = self.read()
         realms = [r for r in catalog.get("realms", []) if r.get("realm_id") != realm_id]
         realms.append({"realm_id": realm_id, "display_name": display_name, "data_root": str(Path(data_root).resolve()), "registered_at": now()})
         catalog.update(version=1, realms=realms, selected_realm_id=catalog.get("selected_realm_id") or realm_id)
-        atomic_json_write(self.path, catalog)
+        atomic_json_write(self.path, catalog, identity=path_identity)
         return catalog
 
-    def select(self, realm_id: str) -> dict:
+    def select(self, realm_id: str, *, path_identity: Mapping[str, Any] | None = None) -> dict:
         catalog = self.read()
         if not any(row.get("realm_id") == realm_id for row in catalog.get("realms", [])):
             raise KeyError(realm_id)
         catalog["selected_realm_id"] = realm_id
-        atomic_json_write(self.path, catalog)
+        atomic_json_write(self.path, catalog, identity=path_identity)
         return catalog
 
 

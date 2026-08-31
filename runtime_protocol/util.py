@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .dirfd import atomic_json_write as _atomic_json_write
 
 
 def now() -> str:
@@ -36,18 +36,6 @@ def durable_json_bytes(value) -> bytes:
     return (json.dumps(value, sort_keys=True, indent=2).encode("utf-8") + b"\n")
 
 
-def atomic_json_write(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(durable_json_bytes(value))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(name, 0o600)
-        os.replace(name, path)
-    finally:
-        try:
-            os.unlink(name)
-        except FileNotFoundError:
-            pass
+def atomic_json_write(path: Path, value, *, identity=None) -> None:
+    """Atomically publish JSON below a retained parent directory descriptor."""
+    _atomic_json_write(path, durable_json_bytes(value), identity=identity)

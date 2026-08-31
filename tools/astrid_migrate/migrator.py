@@ -10,10 +10,24 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-import tempfile
+import stat
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Mapping
+
+from runtime_protocol.dirfd import (
+    capture_parent as _capture_parent,
+    close_pinned as _close_pinned,
+    copy_tree_at as _copy_tree_at,
+    ensure_directory as _ensure_directory,
+    ensure_parent_at as _ensure_parent_at,
+    mkdir_temp_at as _mkdir_temp_at,
+    pin_directory as _pin_directory,
+    remove_tree_at as _remove_tree_at,
+    validate_created_parent as _validate_created_parent,
+    validate_parent as _validate_parent,
+    write_bytes_at as _write_bytes_at,
+)
 
 
 class MigrationError(RuntimeError):
@@ -733,10 +747,16 @@ class Migrator:
             pass
         else:
             raise MigrationError("archive must be outside source root")
-        self.config.archive_root.parent.mkdir(parents=True, exist_ok=True)
-        temporary = Path(tempfile.mkdtemp(prefix=f".{self.config.archive_root.name}.", dir=self.config.archive_root.parent))
+        archive_identity = _capture_parent(self.config.archive_root, require_fresh_target=True)
+        parent_fd, archive_name = _ensure_parent_at(self.config.archive_root, archive_identity)
+        source_identity, source_fd, _ = _pin_directory(self.config.source_root)
+        temporary_name = None
+        temporary_fd = -1
+        temporary = None
         try:
-            shutil.copytree(self.config.source_root, temporary / "source", symlinks=True)
+            temporary_name, temporary_fd = _mkdir_temp_at(parent_fd, f".{self.config.archive_root.name}.")
+            temporary = self.config.archive_root.parent / temporary_name
+            _copy_tree_at(source_fd, ".", temporary_fd, "source", preserve_symlinks=True)
             archived_files = _file_map(temporary / "source")
             self._report["archive_peak_bytes"] = _tree_size(temporary)
             escaping = [name for name, detail in archived_files.items() if detail.get("kind") == "symlink" and not detail.get("resolved_inside_root", False)]
@@ -746,17 +766,41 @@ class Migrator:
                 raise MigrationError("source changed while archive was being copied; discard the clone and restart rehearsal")
             archived_db = temporary / "source" / self.database.relative_to(self.config.source_root)
             manifest = {"format_version": 2, "source_version": self.config.source_version, "source_root": str(self.config.source_root), "files": archived_files, "files_sha256": _files_digest(archived_files), "database_sha256": _sha256_file(archived_db), "source_manifest_sha256": inventory["source_manifest_sha256"], "source_manifest": inventory["source_manifest"], "archive_source_tree_sha256": _files_digest(archived_files), "created_at": time.time()}
-            (temporary / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
-            (temporary / "ROLLBACK.md").write_text("# Astrid migration rollback\n\nThe original source is untouched. Stop the runtime, remove the activated realm, restore the verified source archive under `source/`, and rerun the legacy launcher only after review.\n\nArchive manifest: `manifest.json`.\n")
-            for path in temporary.rglob("*"):
-                if path.is_file() and not path.is_symlink():
-                    path.chmod(0o400)
+            _write_bytes_at(temporary_fd, "manifest.json", (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode())
+            _write_bytes_at(temporary_fd, "ROLLBACK.md", b"# Astrid migration rollback\n\nThe original source is untouched. Stop the runtime, remove the activated realm, restore the verified source archive under `source/`, and rerun the legacy launcher only after review.\n\nArchive manifest: `manifest.json`.\n")
             if _file_map(temporary / "source") != archived_files or _sha256_file(archived_db) != manifest["database_sha256"]:
                 raise MigrationError("archive bytes failed post-copy verification")
-            temporary.rename(self.config.archive_root)
+            os.fsync(temporary_fd)
+            os.close(temporary_fd)
+            temporary_fd = -1
+            _validate_created_parent(self.config.archive_root, archive_identity, parent_fd)
+            try:
+                os.stat(archive_name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise MigrationError("archive destination appeared before publication")
+            os.rename(temporary_name, archive_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            _validate_created_parent(self.config.archive_root, archive_identity, parent_fd)
         except Exception:
-            shutil.rmtree(temporary, ignore_errors=True)
+            if temporary_fd >= 0:
+                os.close(temporary_fd)
+                temporary_fd = -1
+            if temporary_name is not None:
+                try:
+                    _remove_tree_at(parent_fd, temporary_name)
+                except OSError:
+                    pass
             raise
+        finally:
+            if temporary_fd >= 0:
+                os.close(temporary_fd)
+            if parent_fd != archive_identity.get("_parent_fd"):
+                os.close(parent_fd)
+            os.close(source_fd)
+            _close_pinned(source_identity)
+            _close_pinned(archive_identity)
         return self.config.archive_root
 
     def _import(self, data):
@@ -1317,20 +1361,47 @@ class Migrator:
         return {"ok": not blockers, "expected": expected, "mapped": actual, "unresolved": unresolved, "blockers": blockers, "event_heads": {"source_events": len(data.get("events", [])), "source_streams": len(data.get("event_streams", []))}, "foreign_keys": "ok", "sqlite_integrity": "ok", "source_facts_sha256": source_facts_sha256, "source_counts": expected, "mapped_counts": actual, "destination_truth": destination}
 
     def _activation(self, archive: Path, reconciliation: Mapping[str, Any]) -> Path:
-        self.config.destination_root.mkdir(parents=True, exist_ok=True)
         payload = {"format_version": 1, "state": "activated", "source_archive": str(archive), "source_archive_sha256": _sha256_file(archive / "manifest.json"), "source_version": self.config.source_version, "destination_root": str(self.config.destination_root), "reconciliation": reconciliation, "rollback_archive": str(archive), "created_at": time.time()}
         target = self.config.destination_root / "activation-manifest.json"
-        fd, temporary = tempfile.mkstemp(prefix=".activation-", dir=self.config.destination_root)
+        # Keep the destination realm authority pinned for the complete
+        # activation-manifest publication.  The temporary file and rename are
+        # both direct children of this retained inode.
+        if os.path.lexists(str(self.config.destination_root)):
+            destination_pin, destination_fd, _ = _pin_directory(self.config.destination_root)
+            close_destination_fd = True
+        else:
+            # A fake/offline client may not have materialized its destination
+            # root yet.  Create it below the retained parent and keep the
+            # resulting target descriptor as the write authority.
+            destination_pin = _ensure_directory(self.config.destination_root)
+            destination_fd = int(destination_pin.get("_parent_fd"))
+            close_destination_fd = False
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, sort_keys=True, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, target)
-            target.chmod(0o600)
+            def validate_target_inode() -> None:
+                """Ensure the lexical destination still names the pinned root."""
+                try:
+                    named = os.stat(self.config.destination_root, follow_symlinks=False)
+                    retained = os.fstat(destination_fd)
+                except OSError as exc:
+                    raise MigrationError("activation destination identity is unavailable") from exc
+                if not stat.S_ISDIR(named.st_mode) or not stat.S_ISDIR(retained.st_mode) or (
+                    int(named.st_dev), int(named.st_ino), int(named.st_mode)
+                ) != (
+                    int(retained.st_dev), int(retained.st_ino), int(retained.st_mode)
+                ):
+                    raise MigrationError("activation destination identity changed")
+
+            if close_destination_fd:
+                _validate_parent(self.config.destination_root, destination_pin)
+            validate_target_inode()
+            _write_bytes_at(destination_fd, target.name, (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode())
+            validate_target_inode()
+            if close_destination_fd:
+                _validate_parent(self.config.destination_root, destination_pin)
         finally:
-            Path(temporary).unlink(missing_ok=True)
+            if close_destination_fd:
+                os.close(destination_fd)
+            _close_pinned(destination_pin)
         return target
 
 
