@@ -5,7 +5,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
-from .errors import RuntimeErrorBase, AuthorizationError, NotFoundError, ProtocolError
+from .errors import RuntimeErrorBase, AuthorizationError, NotFoundError, ProtocolError, InvalidRequestError
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -40,6 +40,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProtocolError("request body must be valid JSON") from exc
+
+    def _project_mutation_body(self):
+        body = self._body()
+        if not isinstance(body, dict):
+            raise InvalidRequestError("request body must be a JSON object")
+        return body
 
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         self.send_response(status)
@@ -226,7 +232,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 key = self.headers.get("Idempotency-Key")
                 if method in ("PATCH", "POST") and path[5:] in ([], ["archive"], ["recover"]):
-                    body = self._body()
+                    body = self._project_mutation_body()
                     if path[5:] == ["archive"] or path[5:] == ["recover"]:
                         if not key: raise ProtocolError("Idempotency-Key header is required")
                         value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"]) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key, archived=path[5:] == ["archive"])
@@ -236,33 +242,39 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "GET" and not path[5:]:
                     return self._send(200, self.runtime.get_project_shot(selector, resource_id) if kind == "shots" else self.runtime.get_project_reference(selector, resource_id))
                 if kind == "shots" and path[5:] == ["items"] and method == "POST":
+                    body = self._project_mutation_body()
                     if not key: raise ProtocolError("Idempotency-Key header is required")
-                    return self._send(200, self.runtime.add_shot_item(selector, resource_id, self._body(), idempotency_key=key))
+                    return self._send(200, self.runtime.add_shot_item(selector, resource_id, body, idempotency_key=key))
                 if kind == "shots" and len(path) == 7 and path[5] == "items" and method == "DELETE":
+                    body = self._project_mutation_body()
                     if not key: raise ProtocolError("Idempotency-Key header is required")
-                    return self._send(200, self.runtime.remove_shot_item(selector, resource_id, path[6], self._body(), idempotency_key=key))
+                    return self._send(200, self.runtime.remove_shot_item(selector, resource_id, path[6], body, idempotency_key=key))
                 if kind == "shots" and path[5:] == ["reorder"] and method == "POST":
+                    body = self._project_mutation_body()
                     if not key: raise ProtocolError("Idempotency-Key header is required")
-                    return self._send(200, self.runtime.reorder_shot_items(selector, resource_id, self._body(), idempotency_key=key))
+                    return self._send(200, self.runtime.reorder_shot_items(selector, resource_id, body, idempotency_key=key))
                 if kind == "references" and path[5:] == ["associations"] and method == "POST":
+                    body = self._project_mutation_body()
                     if not key: raise ProtocolError("Idempotency-Key header is required")
-                    return self._send(200, self.runtime.associate_reference(selector, resource_id, self._body(), idempotency_key=key))
+                    return self._send(200, self.runtime.associate_reference(selector, resource_id, body, idempotency_key=key))
                 if kind == "references" and path[5:] == ["primary"] and method == "POST":
+                    body = self._project_mutation_body()
                     if not key: raise ProtocolError("Idempotency-Key header is required")
-                    body = self._body(); return self._send(200, self.runtime.set_primary_reference(selector, resource_id, body.get("association_id"), body, idempotency_key=key))
+                    return self._send(200, self.runtime.set_primary_reference(selector, resource_id, body.get("association_id"), body, idempotency_key=key))
             if len(path) == 4 and path[3] in ("shots", "references") and method == "POST":
                 self._identity("projects:write")
+                body = self._project_mutation_body()
                 key = self.headers.get("Idempotency-Key")
                 if not key:
                     raise ProtocolError("Idempotency-Key header is required")
-                body = self._body()
                 value = self.runtime.create_project_shot(selector, body, idempotency_key=key) if path[3] == "shots" else self.runtime.create_project_reference(selector, body, idempotency_key=key)
                 return self._send(201, value)
             if len(path) == 4 and path[3] == "reference-links" and method == "POST":
                 self._identity("projects:write")
+                body = self._project_mutation_body()
                 key = self.headers.get("Idempotency-Key")
                 if not key: raise ProtocolError("Idempotency-Key header is required")
-                return self._send(200, self.runtime.link_references(selector, self._body(), idempotency_key=key))
+                return self._send(200, self.runtime.link_references(selector, body, idempotency_key=key))
             if len(path) == 4 and path[3] == "media-relations":
                 self._identity("objects:read" if method == "GET" else "objects:write")
                 if method == "GET":

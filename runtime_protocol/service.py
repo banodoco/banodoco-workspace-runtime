@@ -13,7 +13,7 @@ import os
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from .errors import ConflictError, NotFoundError, ValidationError, LeaseError
+from .errors import ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 
 
@@ -287,25 +287,59 @@ class RuntimeService:
         items.extend(self._reference_resource(row) for row in self.store.conn.execute(legacy_query + " ORDER BY r.id LIMIT ?", (project["id"], limit)).fetchall())
         return {"items": items[:limit], "next_cursor": None}
 
-    def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash):
+    @staticmethod
+    def _require_object_body(body):
+        if not isinstance(body, dict):
+            raise InvalidRequestError("request body must be a JSON object")
+
+    def _receipt_payload(self, row, *, project_id):
+        """Expose the existing idempotency row as the committed SDK receipt.
+
+        B7 predates the event-stream receipt tables.  Keeping the receipt in
+        the same command_idempotency row means the mutation and its replay
+        record still commit (or roll back) as one SQLite transaction.
+        """
+        result = json.loads(row["result_json"])
+        sequence = int(row["rowid"])
+        return {
+            "receipt_id": f"runtime-command-{sequence}",
+            "command_kind": row["command_kind"],
+            "idempotency_key": row["idempotency_key"],
+            "request_hash": row["request_hash"],
+            "project_id": project_id,
+            "project_seq": [sequence, sequence],
+            "event_ids": [],
+            "result": result,
+            "created_at": row["created_at"],
+        }
+
+    def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None):
         if not idempotency_key:
             return None
         prior = self.store.conn.execute(
-            "SELECT request_hash, result_json FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
+            "SELECT rowid, command_kind, idempotency_key, request_hash, result_json, created_at FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
             (kind, aggregate_id, idempotency_key),
         ).fetchone()
         if not prior:
             return None
         if prior["request_hash"] != request_hash:
             raise ConflictError("idempotency key was already used with different input")
+        if project_id is not None:
+            return {"data": json.loads(prior["result_json"]), "receipt": self._receipt_payload(prior, project_id=project_id)}
         return json.loads(prior["result_json"])
 
-    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result):
+    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None):
         if idempotency_key:
             self.store.conn.execute(
                 "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (kind, aggregate_id, idempotency_key, request_hash, canonical_json(result), now()),
             )
+            if project_id is not None:
+                row = self.store.conn.execute(
+                    "SELECT rowid, command_kind, idempotency_key, request_hash, result_json, created_at FROM command_idempotency WHERE rowid=last_insert_rowid()"
+                ).fetchone()
+                return {"data": result, "receipt": self._receipt_payload(row, project_id=project_id)}
+        return result
 
     def _project_shot_resource(self, row):
         value = dict(row)
@@ -324,6 +358,7 @@ class RuntimeService:
 
     @_durable_mutation
     def create_project_shot(self, project_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id)
         name = str(body.get("name") or "")
         if not name.strip():
@@ -334,7 +369,7 @@ class RuntimeService:
         shot_id = str(body.get("shot_id") or new_id())
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("shot.create", project["id"], idempotency_key, request_hash)
+            replay = self._command_replay("shot.create", project["id"], idempotency_key, request_hash, project_id=project["id"])
             if replay is not None:
                 return replay
             if self.store.conn.execute("SELECT 1 FROM project_shots WHERE id=?", (shot_id,)).fetchone():
@@ -342,11 +377,11 @@ class RuntimeService:
             timestamp = now()
             self.store.conn.execute("INSERT INTO project_shots(id, project_id, name, metadata_json, version, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, 1, ?, ?, NULL)", (shot_id, project["id"], name, canonical_json(metadata), timestamp, timestamp))
             result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone())
-            self._command_record("shot.create", project["id"], idempotency_key, request_hash, result)
-            return result
+            return self._command_record("shot.create", project["id"], idempotency_key, request_hash, result, project_id=project["id"])
 
     @_durable_mutation
     def create_project_reference(self, project_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id)
         kind, name = str(body.get("kind") or ""), str(body.get("name") or "")
         if kind not in {"character", "place", "object", "clothing", "other"}:
@@ -364,7 +399,7 @@ class RuntimeService:
             raise ValidationError("metadata must be an object")
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("reference.create", project["id"], idempotency_key, request_hash)
+            replay = self._command_replay("reference.create", project["id"], idempotency_key, request_hash, project_id=project["id"])
             if replay is not None:
                 return replay
             if self.store.conn.execute("SELECT 1 FROM project_references WHERE id=?", (reference_id,)).fetchone():
@@ -375,8 +410,7 @@ class RuntimeService:
             self.store.conn.execute("INSERT INTO project_references(id, project_id, kind, name, description, metadata_json, version, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)", (reference_id, project["id"], kind, name, str(body.get("description") or ""), canonical_json(metadata), timestamp, timestamp))
             self.store.conn.execute("INSERT INTO media_references(id, reference_id, media_id, role, ordinal, is_primary, metadata_json, created_at) VALUES (?, ?, ?, 'canonical', 0, 1, '{}', ?)", (new_id(), reference_id, media_id, timestamp))
             result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone())
-            self._command_record("reference.create", project["id"], idempotency_key, request_hash, result)
-            return result
+            return self._command_record("reference.create", project["id"], idempotency_key, request_hash, result, project_id=project["id"])
 
     def get_project_shot(self, project_id, shot_id):
         project = self.store.get_project(project_id)
@@ -386,12 +420,13 @@ class RuntimeService:
 
     @_durable_mutation
     def update_project_shot(self, project_id, shot_id, body, *, idempotency_key=None, archived=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id)
         expected = self._expected_version(body)
         action = "update" if archived is None else "archive" if archived else "recover"
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay(f"shot.{action}", shot_id, idempotency_key, request_hash)
+            replay = self._command_replay(f"shot.{action}", shot_id, idempotency_key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             row = self.store.conn.execute("SELECT * FROM project_shots WHERE id=? AND project_id=?", (shot_id, project["id"])).fetchone()
             if not row: raise NotFoundError("shot not found")
@@ -403,11 +438,11 @@ class RuntimeService:
             archived_at = (timestamp if archived is True else None if archived is False else row["archived_at"])
             self.store.conn.execute("UPDATE project_shots SET name=?, metadata_json=?, version=?, updated_at=?, archived_at=? WHERE id=?", (name, canonical_json(metadata), expected + 1, timestamp, archived_at, shot_id))
             result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone())
-            self._command_record(f"shot.{action}", shot_id, idempotency_key, request_hash, result)
-            return result
+            return self._command_record(f"shot.{action}", shot_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     @_durable_mutation
     def add_shot_item(self, project_id, shot_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id)
         media_id = str(body.get("media_id") or "").removeprefix("sha256:")
         if not media_id: raise ValidationError("media_id is required")
@@ -416,7 +451,7 @@ class RuntimeService:
         key = idempotency_key
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("shot.item.add", shot_id, key, request_hash)
+            replay = self._command_replay("shot.item.add", shot_id, key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project["id"], media_id)).fetchone(): raise NotFoundError("media is not owned by project")
             position = body.get("position")
@@ -431,8 +466,7 @@ class RuntimeService:
             for index, ordered_id in enumerate(ordered_ids): self.store.conn.execute("UPDATE shot_items SET sort_key=? WHERE id=?", (f"{index:08d}", ordered_id))
             self.store.conn.execute("UPDATE project_shots SET version=version+1, updated_at=? WHERE id=?", (stamp, shot_id))
             result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone())
-            self._command_record("shot.item.add", shot_id, key, request_hash, result)
-            return result
+            return self._command_record("shot.item.add", shot_id, key, request_hash, result, project_id=project["id"])
 
     def _renumber_shot_items(self, shot_id):
         rows = self.store.conn.execute("SELECT id FROM shot_items WHERE shot_id=? ORDER BY sort_key, id", (shot_id,)).fetchall()
@@ -440,33 +474,37 @@ class RuntimeService:
 
     @_durable_mutation
     def remove_shot_item(self, project_id, shot_id, item_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
+        project = self.store.get_project(project_id)
         self.get_project_shot(project_id, shot_id)
         expected = self._expected_version(body)
         request_hash = hashlib.sha256(canonical_json({"item_id": item_id, **body}).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("shot.item.remove", shot_id, idempotency_key, request_hash)
+            replay = self._command_replay("shot.item.remove", shot_id, idempotency_key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             row = self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone()
             if int(row["version"]) != expected: raise ConflictError("shot version conflict", details={"expected": expected, "actual": int(row["version"])})
             if not self.store.conn.execute("SELECT 1 FROM shot_items WHERE id=? AND shot_id=?", (item_id, shot_id)).fetchone(): raise NotFoundError("shot item not found")
             self.store.conn.execute("DELETE FROM shot_items WHERE id=?", (item_id,)); self._renumber_shot_items(shot_id)
             self.store.conn.execute("UPDATE project_shots SET version=version+1, updated_at=? WHERE id=?", (now(), shot_id))
-            result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone()); self._command_record("shot.item.remove", shot_id, idempotency_key, request_hash, result); return result
+            result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone()); return self._command_record("shot.item.remove", shot_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     @_durable_mutation
     def reorder_shot_items(self, project_id, shot_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
+        project = self.store.get_project(project_id)
         self.get_project_shot(project_id, shot_id); expected = self._expected_version(body); item_ids = body.get("item_ids") or body.get("items")
         if not isinstance(item_ids, list) or any(not isinstance(item_id, str) for item_id in item_ids) or len(item_ids) != len(set(item_ids)): raise ValidationError("items must be a unique complete permutation")
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("shot.item.reorder", shot_id, idempotency_key, request_hash)
+            replay = self._command_replay("shot.item.reorder", shot_id, idempotency_key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             row = self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone(); current = [x["id"] for x in self.store.conn.execute("SELECT id FROM shot_items WHERE shot_id=?", (shot_id,))]
             if int(row["version"]) != expected: raise ConflictError("shot version conflict", details={"expected": expected, "actual": int(row["version"])})
             if set(map(str, item_ids)) != set(current): raise ValidationError("items must name the complete shot permutation")
             for index, item_id in enumerate(item_ids): self.store.conn.execute("UPDATE shot_items SET sort_key=? WHERE id=?", (f"tmp-{index:08d}-{shot_id}", item_id))
             for index, item_id in enumerate(item_ids): self.store.conn.execute("UPDATE shot_items SET sort_key=? WHERE id=?", (f"{index:08d}", item_id))
-            self.store.conn.execute("UPDATE project_shots SET version=version+1, updated_at=? WHERE id=?", (now(), shot_id)); result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone()); self._command_record("shot.item.reorder", shot_id, idempotency_key, request_hash, result); return result
+            self.store.conn.execute("UPDATE project_shots SET version=version+1, updated_at=? WHERE id=?", (now(), shot_id)); result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone()); return self._command_record("shot.item.reorder", shot_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     def _project_reference_resource(self, row):
         value = dict(row); value["reference_id"] = value.pop("id"); value["metadata"] = json.loads(value.pop("metadata_json")); value["archived"] = bool(value.pop("archived_at")); value["media_references"] = []
@@ -482,9 +520,10 @@ class RuntimeService:
 
     @_durable_mutation
     def update_project_reference(self, project_id, reference_id, body, *, idempotency_key=None, archived=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id); expected = self._expected_version(body); action = "update" if archived is None else "archive" if archived else "recover"; request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay(f"reference.{action}", reference_id, idempotency_key, request_hash)
+            replay = self._command_replay(f"reference.{action}", reference_id, idempotency_key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             row = self.store.conn.execute("SELECT * FROM project_references WHERE id=? AND project_id=?", (reference_id, project["id"])).fetchone()
             if not row: raise NotFoundError("reference not found")
@@ -492,49 +531,52 @@ class RuntimeService:
             name = str(body.get("name", row["name"])); metadata = body.get("metadata", json.loads(row["metadata_json"]));
             if not name.strip() or not isinstance(metadata, dict): raise ValidationError("invalid reference name or metadata")
             self.store.conn.execute("UPDATE project_references SET name=?, description=?, metadata_json=?, version=version+1, updated_at=?, archived_at=? WHERE id=?", (name, str(body.get("description", row["description"])), canonical_json(metadata), now(), now() if archived is True else None if archived is False else row["archived_at"], reference_id))
-            result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()); self._command_record(f"reference.{action}", reference_id, idempotency_key, request_hash, result); return result
+            result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()); return self._command_record(f"reference.{action}", reference_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     @_durable_mutation
     def associate_reference(self, project_id, reference_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id); media_id = str(body.get("media_id") or "").removeprefix("sha256:"); role = body.get("role") or "depicts"
         if role not in {"canonical", "used_as_input", "depicts", "inspired_by"}: raise ValidationError("invalid reference role")
         self.get_project_reference(project["id"], reference_id)
         if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project["id"], media_id)).fetchone(): raise NotFoundError("media is not owned by project")
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("reference.associate", reference_id, idempotency_key, request_hash)
+            replay = self._command_replay("reference.associate", reference_id, idempotency_key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             if not isinstance(body.get("metadata", {}), dict): raise ValidationError("metadata must be an object")
             association_id = str(body.get("association_id") or new_id()); stamp = now()
             if role == "canonical": self.store.conn.execute("UPDATE media_references SET is_primary=0 WHERE reference_id=?", (reference_id,))
             self.store.conn.execute("INSERT INTO media_references(id, reference_id, media_id, role, ordinal, is_primary, metadata_json, created_at) VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(ordinal)+1,0) FROM media_references WHERE reference_id=?), ?, ?, ?)", (association_id, reference_id, media_id, role, reference_id, 1 if role == "canonical" else 0, canonical_json(body.get("metadata", {})), stamp))
-            self.store.conn.execute("UPDATE project_references SET version=version+1, updated_at=? WHERE id=?", (stamp, reference_id)); result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()); self._command_record("reference.associate", reference_id, idempotency_key, request_hash, result); return result
+            self.store.conn.execute("UPDATE project_references SET version=version+1, updated_at=? WHERE id=?", (stamp, reference_id)); result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()); return self._command_record("reference.associate", reference_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     @_durable_mutation
     def link_references(self, project_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id); source, target, kind = body.get("from_reference_id"), body.get("to_reference_id"), body.get("kind")
         if kind not in {"belongs_to", "wears", "located_in", "associated_with", "related_to"}: raise ValidationError("invalid reference link kind")
         self.get_project_reference(project["id"], source); self.get_project_reference(project["id"], target)
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("reference.link", source, idempotency_key, request_hash)
+            replay = self._command_replay("reference.link", source, idempotency_key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             stamp = now(); metadata = canonical_json(body.get("metadata", {}))
             self.store.conn.execute("INSERT OR IGNORE INTO reference_links VALUES (?, ?, ?, ?, ?)", (source, target, kind, metadata, stamp))
             if kind == "related_to": self.store.conn.execute("INSERT OR IGNORE INTO reference_links VALUES (?, ?, ?, ?, ?)", (target, source, kind, metadata, stamp))
-            result = {"from_reference_id": source, "to_reference_id": target, "kind": kind}; self._command_record("reference.link", source, idempotency_key, request_hash, result); return result
+            result = {"from_reference_id": source, "to_reference_id": target, "kind": kind}; return self._command_record("reference.link", source, idempotency_key, request_hash, result, project_id=project["id"])
 
     @_durable_mutation
     def set_primary_reference(self, project_id, reference_id, association_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id); self.get_project_reference(project["id"], reference_id); expected = self._expected_version(body); request_hash = hashlib.sha256(canonical_json({"association_id": association_id, **body}).encode()).hexdigest()
         with self.store._mutex:
-            replay = self._command_replay("reference.primary", reference_id, idempotency_key, request_hash)
+            replay = self._command_replay("reference.primary", reference_id, idempotency_key, request_hash, project_id=project["id"])
             if replay is not None: return replay
             row = self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()
             if int(row["version"]) != expected: raise ConflictError("reference version conflict", details={"expected": expected, "actual": int(row["version"])})
             assoc = self.store.conn.execute("SELECT * FROM media_references WHERE id=? AND reference_id=?", (association_id, reference_id)).fetchone()
             if not assoc: raise NotFoundError("media association not found")
-            self.store.conn.execute("UPDATE media_references SET is_primary=0 WHERE reference_id=?", (reference_id,)); self.store.conn.execute("UPDATE media_references SET is_primary=1, role='canonical' WHERE id=?", (association_id,)); self.store.conn.execute("UPDATE project_references SET version=version+1, updated_at=? WHERE id=?", (now(), reference_id)); result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()); self._command_record("reference.primary", reference_id, idempotency_key, request_hash, result); return result
+            self.store.conn.execute("UPDATE media_references SET is_primary=0 WHERE reference_id=?", (reference_id,)); self.store.conn.execute("UPDATE media_references SET is_primary=1, role='canonical' WHERE id=?", (association_id,)); self.store.conn.execute("UPDATE project_references SET version=version+1, updated_at=? WHERE id=?", (now(), reference_id)); result = self._project_reference_resource(self.store.conn.execute("SELECT * FROM project_references WHERE id=?", (reference_id,)).fetchone()); return self._command_record("reference.primary", reference_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     def list_timeline_history(self, timeline_id, *, limit=50):
         self._timeline_resource(timeline_id)

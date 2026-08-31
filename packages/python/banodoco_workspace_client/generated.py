@@ -370,6 +370,14 @@ def _decode_error(status: int, body: bytes) -> ApiError:
     return ApiError(status, str(value.get("code", "http_error")), str(value.get("message", f"HTTP {status}")), str(value.get("request_id", "")), value.get("details", {}))
 
 
+class MutationResult(dict):
+    """Resource mapping carrying its committed receipt out-of-band."""
+
+    def __init__(self, data: Mapping[str, Any], receipt: Mapping[str, Any] | None):
+        super().__init__(data)
+        self.receipt = receipt
+
+
 class WorkspaceClient:
     """Small stdlib HTTP client generated from the neutral OpenAPI contract.
 
@@ -407,6 +415,15 @@ class WorkspaceClient:
         value = json.loads(body.decode("utf-8"))
         if not isinstance(value, dict):
             raise ApiError(0, "invalid_response", "expected JSON object")
+        return value
+
+    def _mutation_json(self, body: bytes) -> Mapping[str, Any]:
+        value = self._json(body)
+        if set(value) >= {"data", "receipt"}:
+            data = value.get("data")
+            if not isinstance(data, Mapping):
+                raise ApiError(0, "invalid_response", "expected mutation data object")
+            return MutationResult(data, value.get("receipt"))
         return value
 
     def health(self) -> Health:
@@ -599,7 +616,7 @@ class WorkspaceClient:
         return list(value.get("items", [])), value.get("next_cursor")
 
     def create_project_shot(self, project_id: str, shot: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots", body=json.dumps(dict(shot), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots", body=json.dumps(dict(shot), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
 
     def get_project_shot(self, project_id: str, shot_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}")[2])
@@ -608,22 +625,22 @@ class WorkspaceClient:
         payload: dict[str, Any] = {"expected_version": expected_version}
         if name is not None: payload["name"] = name
         if metadata is not None: payload["metadata"] = metadata
-        return self._json(self._request("PATCH", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("PATCH", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def archive_project_shot(self, project_id: str, shot_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def recover_project_shot(self, project_id: str, shot_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def add_shot_item(self, project_id: str, shot_id: str, item: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items", body=json.dumps(dict(item), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items", body=json.dumps(dict(item), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def remove_shot_item(self, project_id: str, shot_id: str, item_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("DELETE", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items/{_path_part(item_id)}", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("DELETE", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items/{_path_part(item_id)}", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def reorder_shot_items(self, project_id: str, shot_id: str, item_ids: list[str], *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/reorder", body=json.dumps({"expected_version": expected_version, "item_ids": item_ids}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/reorder", body=json.dumps({"expected_version": expected_version, "item_ids": item_ids}, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def update_shot(self, shot_id: str, *, expected_version: int, start_ms: int | None = None, duration_ms: int | None = None, reference_ids: list[str] | None = None, idempotency_key: str | None = None) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"expected_version": expected_version}
@@ -652,7 +669,7 @@ class WorkspaceClient:
         return list(value.get("items", [])), value.get("next_cursor")
 
     def create_project_reference(self, project_id: str, reference: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references", body=json.dumps(dict(reference), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references", body=json.dumps(dict(reference), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
 
     def get_project_reference(self, project_id: str, reference_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}")[2])
@@ -662,22 +679,22 @@ class WorkspaceClient:
         if name is not None: payload["name"] = name
         if description is not None: payload["description"] = description
         if metadata is not None: payload["metadata"] = metadata
-        return self._json(self._request("PATCH", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("PATCH", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def archive_project_reference(self, project_id: str, reference_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/archive", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def recover_project_reference(self, project_id: str, reference_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/recover", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def associate_reference(self, project_id: str, reference_id: str, association: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/associations", body=json.dumps(dict(association), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/associations", body=json.dumps(dict(association), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def set_primary_reference(self, project_id: str, reference_id: str, association_id: str, *, expected_version: int, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/primary", body=json.dumps({"association_id": association_id, "expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/references/{_path_part(reference_id)}/primary", body=json.dumps({"association_id": association_id, "expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def link_references(self, project_id: str, link: Mapping[str, Any], *, idempotency_key: str) -> Mapping[str, Any]:
-        return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/reference-links", body=json.dumps(dict(link), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/reference-links", body=json.dumps(dict(link), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def update_reference(self, reference_id: str, *, expected_version: int, object_id: str | None = None, role: str | None = None, idempotency_key: str | None = None) -> Mapping[str, Any]:
         payload: dict[str, Any] = {"expected_version": expected_version}

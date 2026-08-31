@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -11,6 +14,42 @@ from runtime_protocol.service import RuntimeService
 
 def _digest(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("method", "route"),
+    [
+        ("POST", "shots"),
+        ("POST", "references"),
+        ("PATCH", "shots/does-not-exist"),
+        ("PATCH", "references/does-not-exist"),
+        ("POST", "shots/does-not-exist/archive"),
+        ("POST", "references/does-not-exist/archive"),
+    ],
+)
+def test_project_shot_reference_routes_reject_non_object_json_as_typed_400(tmp_path, route, method):
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Malformed", slug="malformed", idempotency_key="malformed-project")
+        url = f"{daemon.endpoint}/v1/projects/{project.slug}/{route}"
+        request = urllib.request.Request(
+            url,
+            data=b"[1]",
+            method=method,
+            headers={
+                "Authorization": f"Bearer {daemon.token}",
+                "Content-Type": "application/json",
+                "Idempotency-Key": f"malformed-{method}-{route}",
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(request)
+        assert error.value.code == 400
+        payload = json.loads(error.value.read())
+        assert payload["code"] == "invalid_request"
+    finally:
+        daemon.stop()
 
 
 def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_path):

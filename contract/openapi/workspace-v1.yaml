@@ -211,7 +211,7 @@ paths:
       operationId: createProjectShot
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotCreate' } } } }
-      responses: { '201': { description: Project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+      responses: { '201': { description: Project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
     get:
       operationId: listProjectShots
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: include_archived, in: query, required: false, schema: { type: boolean, default: false } } ]
@@ -225,43 +225,43 @@ paths:
       operationId: updateProjectShot
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShotUpdate' } } } }
-      responses: { '200': { description: Updated project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+      responses: { '200': { description: Updated project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/shots/{shot_id}/archive:
     post:
       operationId: archiveProjectShot
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Archived project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+      responses: { '200': { description: Archived project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/shots/{shot_id}/recover:
     post:
       operationId: recoverProjectShot
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Recovered project shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+      responses: { '200': { description: Recovered project shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/shots/{shot_id}/items:
     post:
       operationId: addShotItem
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotItemCreate' } } } }
-      responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+      responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/shots/{shot_id}/items/{item_id}:
     delete:
       operationId: removeShotItem
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { name: item_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+      responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/shots/{shot_id}/reorder:
     post:
       operationId: reorderShotItems
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotReorder' } } } }
-      responses: { '200': { description: Updated shot, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectShot' } } } } }
+      responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/references:
     post:
       operationId: createProjectReference
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferenceCreate' } } } }
-      responses: { '201': { description: Project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+      responses: { '201': { description: Project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
     get:
       operationId: listProjectReferences
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: include_archived, in: query, required: false, schema: { type: boolean, default: false } } ]
@@ -275,37 +275,37 @@ paths:
       operationId: updateProjectReference
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReferenceUpdate' } } } }
-      responses: { '200': { description: Updated project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+      responses: { '200': { description: Updated project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/references/{reference_id}/archive:
     post:
       operationId: archiveProjectReference
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Archived project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+      responses: { '200': { description: Archived project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/references/{reference_id}/recover:
     post:
       operationId: recoverProjectReference
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Recovered project reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+      responses: { '200': { description: Recovered project reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/references/{reference_id}/associations:
     post:
       operationId: associateReference
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceAssociation' } } } }
-      responses: { '200': { description: Updated reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+      responses: { '200': { description: Updated reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/references/{reference_id}/primary:
     post:
       operationId: setPrimaryReference
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ReferenceId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/SetPrimaryReference' } } } }
-      responses: { '200': { description: Updated reference, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectReference' } } } } }
+      responses: { '200': { description: Updated reference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/reference-links:
     post:
       operationId: linkReferences
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceLink' } } } }
-      responses: { '200': { description: Reference link, content: { application/json: { schema: { $ref: '#/components/schemas/ReferenceLink' } } } } }
+      responses: { '200': { description: Reference link mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/references/{reference_id}:
     get:
       operationId: getReference
@@ -791,6 +791,17 @@ components:
       additionalProperties: false
       required: [shot_id, project_id, name, metadata, version, items, archived]
       properties: { shot_id: { type: string }, project_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object }, version: { type: integer, minimum: 1 }, items: { type: array, items: { $ref: '#/components/schemas/ShotItem' } }, archived: { type: boolean }, created_at: { type: string }, updated_at: { type: string } }
+    CommittedMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { type: object }
+        receipt:
+          type: object
+          additionalProperties: false
+          required: [receipt_id, command_kind, idempotency_key, request_hash, project_id, project_seq, event_ids, result, created_at]
+          properties: { receipt_id: { type: string }, command_kind: { type: string }, idempotency_key: { type: string }, request_hash: { type: string }, project_id: { type: string }, project_seq: { type: array, minItems: 2, maxItems: 2, items: { type: integer, minimum: 1 } }, event_ids: { type: array, items: { type: string } }, result: {}, created_at: { type: string } }
     ProjectShotCreate:
       type: object
       additionalProperties: false
