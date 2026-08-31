@@ -160,6 +160,12 @@ def join_plan_remote_targets(rows:Sequence[Mapping[str,Any]],*,strict:bool=True,
         if t["identity_transition_sha256"]!=_transition(t["component_id"],t["local_repository_identity"],t["repository_identity"],t["canonical_url"],t["destination_ref_or_prefix"]):raise ReleaseIdentityError("plan registry identity transition mismatch")
         item=copy.deepcopy(t); item["reviewed_source_oid"]=s["integrated_oid"]; out.append(item)
     out.append(plan_publication_row()); return out
+def _seed_info(seed:str,metadata:Mapping[str,Any]|None)->tuple[str,str]:
+    item=((metadata or {}).get("seed_artifacts",{}) or {}).get(seed,{})
+    if not isinstance(item,Mapping):item={}
+    producer,media=item.get("producer_id","CMD-PRELIVE-MANIFEST"),item.get("media_type","application/json")
+    if not isinstance(producer,str) or not isinstance(media,str) or not producer or not media:raise ReleaseIdentityError("seed media/producer definitions must be non-empty strings")
+    return producer,media
 def build_prelive_manifest(seed_outputs:Mapping[str,Any]|None=None,*,metadata:Mapping[str,Any]|None=None)->dict[str,Any]:
     if seed_outputs is None or seed_outputs=={}:raise ReleaseIdentityError("PRELIVE-MANIFEST requires actual seed bytes")
     outputs=seed_outputs; seeds=list(PRELIVE_SEEDS); epochs=dict((metadata or {}).get("epochs",{"contract_epoch":NONE,"runtime_epoch":NONE,"source_epoch":NONE,"migration_epoch":NONE,"activation_epoch":NONE,"release_epoch":NONE})); evidence=[]
@@ -167,15 +173,15 @@ def build_prelive_manifest(seed_outputs:Mapping[str,Any]|None=None,*,metadata:Ma
     for s in seeds:
         v=outputs[s]
         if not isinstance(v,(bytes,bytearray)):raise ReleaseIdentityError("PRELIVE seed outputs must be complete bytes")
-        data=bytes(v); d=hashlib.sha256(data).hexdigest(); evidence.append({"path":f"evidence/sha256/{d[:2]}/{d}","sha256":d,"producer_id":"CMD-PRELIVE-MANIFEST","token_ids":[s],"epochs":_nfc(epochs),"media_type":"application/json"})
+        data=bytes(v); d=hashlib.sha256(data).hexdigest(); producer,media=_seed_info(s,metadata); evidence.append({"path":f"evidence/sha256/{d[:2]}/{d}","sha256":d,"producer_id":producer,"token_ids":[s],"epochs":_nfc(epochs),"media_type":media})
     evidence.sort(key=lambda x:(x["path"],x["sha256"],x["producer_id"])); m={"schema_version":PRELIVE_MANIFEST_SCHEMA,"governance_binding":"LOCAL-STAGE1-RELEASE","seed_ids":seeds,"evidence_rows":evidence,"excluded_ids":list(PRELIVE_EXCLUDED_IDS),"epochs":_nfc(epochs)}; m["manifest_sha256"]=framed_hash("banodoco.pre-live-manifest.v1",m); return m
-def _seed_payload_wrappers(outputs:Mapping[str,Any])->list[dict[str,Any]]:
+def _seed_payload_wrappers(outputs:Mapping[str,Any],metadata:Mapping[str,Any]|None=None)->list[dict[str,Any]]:
     if set(outputs)!=set(PRELIVE_SEEDS):raise ReleaseIdentityError("PRELIVE seed payload set is not exactly 47 seeds")
     out=[]
     for seed in PRELIVE_SEEDS:
         content=outputs[seed]
         if not isinstance(content,(bytes,bytearray)):raise ReleaseIdentityError("PRELIVE seed outputs must be complete bytes")
-        out.append(_artifact_wrapper(f"PRELIVE-SEED:{seed}","CMD-PRELIVE-MANIFEST",bytes(content)))
+        producer,media=_seed_info(seed,metadata);out.append(_artifact_wrapper(f"PRELIVE-SEED:{seed}",producer,bytes(content),media_type=media,detail_schema_id="pre-live-seed-v1"))
     return out
 def _rd(r:Mapping[str,Any])->str:return framed_hash("banodoco.release-receipt.v1",{k:v for k,v in r.items() if k not in {"receipt_sha256","identity"}})
 def _decode_artifact(item:Mapping[str,Any],*,artifact_id:str|None=None,producer_id:str|None=None,media_type:str|None=None)->bytes:
@@ -187,6 +193,17 @@ def _decode_artifact(item:Mapping[str,Any],*,artifact_id:str|None=None,producer_
     except (ValueError,TypeError):raise ReleaseIdentityError("evidence-artifact base64 is invalid")
     if item.get("byte_length")!=len(content) or item.get("content_sha256")!=hashlib.sha256(content).hexdigest():raise ReleaseIdentityError("evidence-artifact content digest mismatch")
     return content
+def _decode_generator_receipt(wrapper:Mapping[str,Any],observation:Mapping[str,Any])->bytes:
+    raw=_decode_artifact(wrapper,producer_id="PROD-CMD-PACKET:B11.1")
+    try:rec=json.loads(raw.decode())
+    except (UnicodeDecodeError,json.JSONDecodeError):raise ReleaseIdentityError("generator receipt is not canonical JSON")
+    if canonical_bytes(rec)!=raw or set(rec)!=set(("schema_version","artifact_kind","generator_id","run_ordinal","argv","argv_sha256","output_rows","exit_code")) or rec.get("schema_version")!=1 or rec.get("artifact_kind")!="generator-run-receipt" or rec.get("generator_id")!=observation.get("generator_id"):raise ReleaseIdentityError("generator-run-receipt-v1 schema mismatch")
+    if wrapper.get("detail_schema_id")!="generator-run-receipt-v1" or wrapper.get("artifact_id")!=f"GENERATOR-RUN:{rec['generator_id']}:{rec['run_ordinal']}":raise ReleaseIdentityError("generator receipt artifact binding mismatch")
+    argv=rec.get("argv")
+    if not isinstance(argv,list) or rec.get("argv_sha256")!=framed_hash("banodoco.generator-run-argv.v1",argv) or any(Path(str(x)).is_absolute() or ".." in Path(str(x)).parts for x in argv):raise ReleaseIdentityError("generator receipt argv is not portable")
+    if not isinstance(rec.get("output_rows"),list) or any(set(x)!={"path","sha256","byte_length"} or Path(str(x.get("path"))).is_absolute() or ".." in Path(str(x.get("path"))).parts or not re.fullmatch(r"[0-9a-f]{64}",str(x.get("sha256"))) or not isinstance(x.get("byte_length"),int) or x.get("byte_length")<0 for x in rec["output_rows"]):raise ReleaseIdentityError("generator receipt output inventory schema mismatch")
+    if rec.get("exit_code")!=0:raise ReleaseIdentityError("generator receipt exit code is not successful")
+    return raw
 def _validate_git_identity_bytes(content:bytes,row:Mapping[str,Any])->None:
     try:identity=json.loads(content.decode())
     except (UnicodeDecodeError,json.JSONDecodeError):raise ReleaseIdentityError("Git identity evidence is not canonical JSON")
@@ -202,7 +219,7 @@ def create_pre_live_identity(components:Mapping[str,str|os.PathLike[str]],*,meta
         rows=run_b11_1(rows,generator_definitions,contract_bytes=contract_bytes,schema_manifest_bytes=schema_manifest_bytes)
     planned=set(components)=={"ASTRID-CLIENT","NEUTRAL-RUNTIME"}
     if seed_outputs is None:raise ReleaseIdentityError("PRELIVE-MANIFEST requires actual bytes for all 47 seeds")
-    meta=dict(metadata or {}); manifest=build_prelive_manifest(seed_outputs,metadata=meta); seed_wrappers=_seed_payload_wrappers(seed_outputs); evidence=[]
+    meta=dict(metadata or {}); manifest=build_prelive_manifest(seed_outputs,metadata=meta); seed_wrappers=_seed_payload_wrappers(seed_outputs,metadata=meta); evidence=[]
     for r in rows:
         b=canonical_bytes(r); d=hashlib.sha256(b).hexdigest(); evidence.append({"path":f"evidence/sha256/{d[:2]}/{d}","sha256":d,"producer_id":"CMD-IDENTITY:pre-live-root","token_ids":[r["component_id"]],"epochs":meta.get("epochs",{}),"media_type":"application/json"})
     evidence.sort(key=lambda x:(x["path"],x["sha256"],x["producer_id"])); identity=framed_hash("banodoco.pre-live-evidence-root.v1",{"component_rows":rows,"evidence_rows":evidence,"manifest_sha256":manifest["manifest_sha256"]}); strict=set(r["component_id"] for r in rows)=={"ASTRID-CLIENT","NEUTRAL-RUNTIME"}; locators=join_plan_remote_targets(rows) if strict else []; identities=[]
@@ -228,7 +245,7 @@ def create_candidate_core_identity(pre_live:Mapping[str,Any]|str|os.PathLike[str
     if set(old)!=set(new):raise ReleaseIdentityError("candidate component set is not a total bijection")
     for c in old:
         if canonical_bytes(old[c])!=canonical_bytes(new[c]):raise ReleaseIdentityError(f"candidate component field mismatch after pre-live capture: {c}")
-    meta=dict(metadata or {}); core={"schema_version":1,"governance_binding":meta.get("governance_binding","LOCAL-STAGE1-RELEASE"),"component_manifest_sha256":framed_hash("banodoco.component-manifest.v1",rows),"contract_id":meta.get("contract_id",framed_hash("banodoco.contract.v1",[r["contract_sha256"] for r in rows])),"runtime_build_id":meta.get("runtime_build_id",framed_hash("banodoco.runtime-build.v1",[r["integrated_oid"] for r in rows])),"source_manifest_id":meta.get("source_manifest_id",framed_hash("banodoco.source-manifest.v1",[r["subtree_sha256"] for r in rows])),"migration_manifest_id":meta.get("migration_manifest_id",NONE),"selected_realm_id":meta.get("selected_realm_id",NONE),"trusted_disposition_sha256":meta.get("trusted_disposition_sha256",NONE),"pre_live_evidence_root":prior["identity"],"contract_epoch":meta.get("contract_epoch",NONE),"runtime_epoch":meta.get("runtime_epoch",NONE),"source_epoch":meta.get("source_epoch",NONE),"migration_epoch":meta.get("migration_epoch",NONE),"activation_epoch":meta.get("activation_epoch",NONE),"release_epoch":NONE,"component_rows":rows}; rec={"schema_version":SCHEMA_VERSION,"kind":"candidate-core","operation_id":"CMD-IDENTITY:candidate-core","identity":framed_hash("banodoco.candidate-core.v1",core),"candidate_core":core,"pre_live_root":prior["identity"],"pre_live_component_rows":copy.deepcopy(prior["component_rows"]),"pre_live_manifest":copy.deepcopy(prior["pre_live_manifest"]),"pre_live_manifest_sha256":prior["pre_live_manifest"]["manifest_sha256"],"metadata":_nfc(meta)}; rec["receipt_sha256"]=_rd(rec); _write(rec,output); return rec
+    meta=dict(metadata or {}); core={"schema_version":1,"governance_binding":meta.get("governance_binding","LOCAL-STAGE1-RELEASE"),"component_manifest_sha256":framed_hash("banodoco.component-manifest.v1",rows),"contract_id":meta.get("contract_id",framed_hash("banodoco.contract.v1",[r["contract_sha256"] for r in rows])),"runtime_build_id":meta.get("runtime_build_id",framed_hash("banodoco.runtime-build.v1",[r["integrated_oid"] for r in rows])),"source_manifest_id":meta.get("source_manifest_id",framed_hash("banodoco.source-manifest.v1",[r["subtree_sha256"] for r in rows])),"migration_manifest_id":meta.get("migration_manifest_id",NONE),"selected_realm_id":meta.get("selected_realm_id",NONE),"trusted_disposition_sha256":meta.get("trusted_disposition_sha256",NONE),"pre_live_evidence_root":prior["identity"],"contract_epoch":meta.get("contract_epoch",NONE),"runtime_epoch":meta.get("runtime_epoch",NONE),"source_epoch":meta.get("source_epoch",NONE),"migration_epoch":meta.get("migration_epoch",NONE),"activation_epoch":meta.get("activation_epoch",NONE),"release_epoch":NONE,"component_rows":rows}; rec={"schema_version":SCHEMA_VERSION,"kind":"candidate-core","operation_id":"CMD-IDENTITY:candidate-core","identity":framed_hash("banodoco.candidate-core.v1",core),"candidate_core":core,"pre_live_root":prior["identity"],"pre_live_component_rows":copy.deepcopy(prior["component_rows"]),"pre_live_evidence_rows":copy.deepcopy(prior["evidence_rows"]),"pre_live_manifest":copy.deepcopy(prior["pre_live_manifest"]),"pre_live_manifest_sha256":prior["pre_live_manifest"]["manifest_sha256"],"metadata":_nfc(meta)}; rec["receipt_sha256"]=_rd(rec); _write(rec,output); return rec
 def _configured_root()->Path|None:
     for name in RECEIPT_ROOT_ENVIRONMENTS:
         value=os.environ.get(name)
@@ -258,14 +275,15 @@ def verify_receipt(r:Mapping[str,Any])->str:
         evidence=m.get("evidence_rows")
         if not isinstance(evidence,list) or len(evidence)!=47:raise ReleaseIdentityError("PRELIVE-MANIFEST evidence cardinality mismatch")
         for row in evidence:
-            if set(row)!={"path","sha256","producer_id","token_ids","epochs","media_type"} or row.get("producer_id")!="CMD-PRELIVE-MANIFEST" or row.get("media_type")!="application/json" or not isinstance(row.get("token_ids"),list) or len(row["token_ids"])!=1 or row["token_ids"][0] not in PRELIVE_SEEDS or row.get("path")!=f"evidence/sha256/{row.get('sha256','')[:2]}/{row.get('sha256','')}" or not re.fullmatch(r"[0-9a-f]{64}",str(row.get("sha256"))):raise ReleaseIdentityError("PRELIVE-MANIFEST evidence row mismatch")
+            if set(row)!={"path","sha256","producer_id","token_ids","epochs","media_type"} or not isinstance(row.get("token_ids"),list) or len(row["token_ids"])!=1 or row["token_ids"][0] not in PRELIVE_SEEDS or row.get("path")!=f"evidence/sha256/{row.get('sha256','')[:2]}/{row.get('sha256','')}" or not re.fullmatch(r"[0-9a-f]{64}",str(row.get("sha256"))) or not isinstance(row.get("producer_id"),str) or not isinstance(row.get("media_type"),str):raise ReleaseIdentityError("PRELIVE-MANIFEST evidence row mismatch")
         if {row["token_ids"][0] for row in evidence}!=set(PRELIVE_SEEDS):raise ReleaseIdentityError("PRELIVE-MANIFEST evidence is not a bijection")
         payloads=r.get("pre_live_seed_payloads")
         if not isinstance(payloads,list) or len(payloads)!=47 or {p.get("artifact_id","").removeprefix("PRELIVE-SEED:") for p in payloads if isinstance(p,Mapping)}!=set(PRELIVE_SEEDS):raise ReleaseIdentityError("PRELIVE seed payload wrappers are incomplete")
         for payload in payloads:
             seed=payload["artifact_id"].removeprefix("PRELIVE-SEED:");matching=next((x for x in evidence if x["token_ids"]==[seed]),None)
-            _decode_artifact(payload,artifact_id=f"PRELIVE-SEED:{seed}",producer_id="CMD-PRELIVE-MANIFEST",media_type="application/json")
-            if matching is None or matching["sha256"]!=payload["content_sha256"]:raise ReleaseIdentityError("PRELIVE seed wrapper is not bound to manifest evidence")
+            if matching is None:raise ReleaseIdentityError("PRELIVE seed wrapper is not bound to manifest evidence")
+            _decode_artifact(payload,artifact_id=f"PRELIVE-SEED:{seed}",producer_id=matching["producer_id"],media_type=matching["media_type"])
+            if matching["sha256"]!=payload["content_sha256"]:raise ReleaseIdentityError("PRELIVE seed wrapper is not bound to manifest evidence")
         ids=r.get("component_identity_evidence"); component_rows=r.get("component_rows",[])
         if not isinstance(ids,list) or len(ids)!=len(component_rows):raise ReleaseIdentityError("component identity evidence is incomplete")
         for row in component_rows:
@@ -282,8 +300,9 @@ def verify_receipt(r:Mapping[str,Any])->str:
                 if set(observation)!=set(GENERATOR_ROW_FIELDS):raise ReleaseIdentityError("generator observation schema mismatch")
                 wrappers=observation.get("run_receipt_evidence_rows")
                 if not isinstance(wrappers,list) or len(wrappers)!=2:raise ReleaseIdentityError("generator receipt evidence is incomplete")
-                for wrapper in wrappers:
-                    _decode_artifact(wrapper,producer_id="PROD-CMD-PACKET:B11.1")
+                for i,wrapper in enumerate(wrappers):
+                    raw=_decode_generator_receipt(wrapper,observation);expected_sha=observation["first_run_receipt_sha256"] if i==0 else observation["second_run_receipt_sha256"]
+                    if hashlib.sha256(raw).hexdigest()!=expected_sha:raise ReleaseIdentityError("generator receipt wrapper is not bound to its observation row")
         if m.get("manifest_sha256")!=framed_hash("banodoco.pre-live-manifest.v1",{k:m[k] for k in m if k!="manifest_sha256"}):raise ReleaseIdentityError("pre-live manifest digest mismatch")
         rows=_sets(r.get("component_rows",[])); expected=framed_hash("banodoco.pre-live-evidence-root.v1",{"component_rows":[rows[k] for k in sorted(rows)],"evidence_rows":r.get("evidence_rows"),"manifest_sha256":m["manifest_sha256"]})
         planned={x.get("component_id") for x in r.get("component_rows",[])}=={"ASTRID-CLIENT","NEUTRAL-RUNTIME"}
@@ -338,10 +357,34 @@ def _args(values:Sequence[str])->dict[str,str]:
         out[k]=p
     if not out:raise ReleaseIdentityError("at least one --component is required")
     return out
+def _load_seed_inputs(seed_dir:str|os.PathLike[str],manifest_path:str|os.PathLike[str])->tuple[dict[str,bytes],dict[str,Any]]:
+    root=Path(seed_dir).expanduser().resolve()
+    if not root.is_dir():raise ReleaseIdentityError("--seed-dir must be an existing directory")
+    try:descriptor=json.loads(Path(manifest_path).expanduser().read_text(encoding="utf-8"))
+    except (OSError,UnicodeDecodeError,json.JSONDecodeError) as e:raise ReleaseIdentityError("--seed-manifest must be readable canonical JSON") from e
+    entries=descriptor.get("seeds") if isinstance(descriptor,Mapping) and "seeds" in descriptor else descriptor
+    if isinstance(entries,list):entries={x.get("seed_id"):x for x in entries if isinstance(x,Mapping)}
+    if not isinstance(entries,Mapping) or set(entries)!=set(PRELIVE_SEEDS):raise ReleaseIdentityError("seed manifest must enumerate exactly all 47 seed IDs")
+    outputs={};defs={}
+    for seed in PRELIVE_SEEDS:
+        item=entries[seed];item={"path":item} if isinstance(item,str) else item
+        if not isinstance(item,Mapping) or not isinstance(item.get("path"),str):raise ReleaseIdentityError(f"seed manifest entry is invalid: {seed}")
+        rel=Path(item["path"])
+        if rel.is_absolute() or ".." in rel.parts:raise ReleaseIdentityError(f"seed path is not relative and contained: {seed}")
+        raw_target=root/rel
+        if raw_target.is_symlink():raise ReleaseIdentityError(f"seed payload path may not be a symlink: {seed}")
+        target=raw_target.resolve()
+        try:target.relative_to(root)
+        except ValueError as e:raise ReleaseIdentityError(f"seed path escapes --seed-dir: {seed}") from e
+        if not target.is_file() or target.is_symlink():raise ReleaseIdentityError(f"seed payload is missing or not a regular file: {seed}")
+        outputs[seed]=target.read_bytes();producer,media=item.get("producer_id","CMD-PRELIVE-MANIFEST"),item.get("media_type","application/json")
+        if not isinstance(producer,str) or not isinstance(media,str) or not producer or not media:raise ReleaseIdentityError(f"seed media/producer definition is invalid: {seed}")
+        defs[seed]={"producer_id":producer,"media_type":media}
+    return outputs,{"seed_artifacts":defs}
 def main(argv:Sequence[str]|None=None)->int:
-    p=argparse.ArgumentParser(prog="banodoco-runtime-identity");s=p.add_subparsers(dest="op",required=True);a=s.add_parser("pre-live");a.add_argument("--component",action="append",default=[]);a.add_argument("--output");b=s.add_parser("candidate-core");b.add_argument("--pre-live",required=True);b.add_argument("--component",action="append",default=[]);b.add_argument("--output");c=s.add_parser("verify");c.add_argument("receipt");x=p.parse_args(argv)
+    p=argparse.ArgumentParser(prog="banodoco-runtime-identity");s=p.add_subparsers(dest="op",required=True);a=s.add_parser("pre-live");a.add_argument("--component",action="append",default=[]);a.add_argument("--output");a.add_argument("--seed-dir",required=True);a.add_argument("--seed-manifest",required=True);b=s.add_parser("candidate-core");b.add_argument("--pre-live",required=True);b.add_argument("--component",action="append",default=[]);b.add_argument("--output");c=s.add_parser("verify");c.add_argument("receipt");x=p.parse_args(argv)
     try:
-        if x.op=="pre-live":r=create_pre_live_identity(_args(x.component),output=x.output)
+        if x.op=="pre-live":seed_outputs,seed_metadata=_load_seed_inputs(x.seed_dir,x.seed_manifest);r=create_pre_live_identity(_args(x.component),output=x.output,seed_outputs=seed_outputs,metadata=seed_metadata)
         elif x.op=="candidate-core":r=create_candidate_core_identity(x.pre_live,_args(x.component),output=x.output)
         else:r={"ok":True,"identity":load_receipt(x.receipt)["identity"]}
         print(json.dumps(r,sort_keys=True,indent=2));return 0
