@@ -29,7 +29,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.util import atomic_json_write, canonical_json, new_id
 
 from .migrator import MigrationError, _sha256_file
-from .capacity import CapacityPlan, CapacityReservation, StorageDomain
+from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_write_path, revalidate_write_path
 from .rehearsal import RuntimeServiceAdapter, _tree_digest
 
 
@@ -480,9 +480,15 @@ class B13Recovery:
             reservation = getattr(self, "_capacity_reservation", None)
             if reservation is not None:
                 reservation.recheck()
+            write_identity = capture_write_path(destination)
             journal._inject(f"before_{seam}")
             if reservation is not None:
                 reservation.recheck()
+            # The seam is inside the storage-domain lease.  Revalidate the
+            # complete parent chain after the seam and immediately before
+            # restore so a hostile parent rename/symlink/device swap cannot
+            # redirect restore_backup's temporary directory or final rename.
+            revalidate_write_path(destination, write_identity)
             restore_backup(backup, destination)
             journal._inject(f"after_{seam}")
             verification = verify_restore_candidate(destination)

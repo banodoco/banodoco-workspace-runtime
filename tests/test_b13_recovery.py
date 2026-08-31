@@ -254,6 +254,32 @@ def test_b13_interrupted_purge_rejects_a_symlinked_parent(tmp_path):
         active.close()
 
 
+@pytest.mark.parametrize("swap_mode", ["symlink", "replacement"])
+def test_b13_disposable_restore_parent_swap_fails_closed_before_material_write(tmp_path, swap_mode):
+    active, rollback_archive, auth = _setup(tmp_path)
+    disposable_parent = tmp_path / "disposable-parent"
+    disposable_parent.mkdir()
+    disposable = disposable_parent / "disposable"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=disposable, authorizations=auth)
+
+    def swap_parent(seam):
+        if seam == "before_disposable_restore":
+            disposable_parent.rename(tmp_path / "disposable-parent-real")
+            if swap_mode == "symlink":
+                disposable_parent.symlink_to(outside, target_is_directory=True)
+            else:
+                disposable_parent.mkdir()
+
+    try:
+        with pytest.raises(MigrationError, match="symlink|identity|material"):
+            run_b13_recovery(active, **kwargs, fault_injector=swap_parent)
+        assert not (outside / "disposable").exists()
+    finally:
+        active.close()
+
+
 def test_b13_interrupted_purge_rejects_catalog_reclassification(tmp_path):
     support = tmp_path / "support"
     active = RuntimeService(tmp_path / "active", display_name="Selected", support_root=support)

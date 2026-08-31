@@ -160,6 +160,33 @@ def test_b12_destination_parent_symlink_is_rejected_before_any_write(tmp_path):
         active.close()
 
 
+@pytest.mark.parametrize("swap_mode", ["symlink", "replacement"])
+def test_b12_active_backup_parent_swap_fails_closed_before_material_write(tmp_path, swap_mode):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    archive_parent = tmp_path / "archive-parent"
+    archive_parent.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config = replace(_config(source, tmp_path), archive_root=archive_parent / "archive")
+    active = RuntimeService(tmp_path / "active")
+
+    def swap_parent(seam):
+        if seam == "before_active_backup":
+            archive_parent.rename(tmp_path / "archive-parent-real")
+            if swap_mode == "symlink":
+                archive_parent.symlink_to(outside, target_is_directory=True)
+            else:
+                archive_parent.mkdir()
+
+    try:
+        with pytest.raises(MigrationError, match="symlink|identity|material"):
+            run_live_migration(config, active, _auth(config, active), writer_stop=lambda: {"stopped": True}, fault_injector=swap_parent)
+        assert not (outside / "archive-live-pre-migration-backup").exists()
+    finally:
+        active.close()
+
+
 def test_b12_reconciliation_rechecks_destination_after_migration_callback(tmp_path):
     source = tmp_path / "source"
     build_synthetic_fixture(source)

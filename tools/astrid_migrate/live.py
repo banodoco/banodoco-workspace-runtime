@@ -29,7 +29,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.util import canonical_json
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _sha256_file, _tree_size
-from .capacity import CapacityPlan, CapacityReservation, StorageDomain
+from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_write_path, revalidate_write_path
 from .rehearsal import MigrationJournal, RuntimeServiceAdapter, _tree_digest, _write_json
 
 
@@ -443,7 +443,18 @@ class LiveMigration:
             if not self._backup_binding_compatible(actual, binding):
                 raise MigrationError(f"B12 existing backup has a conflicting binding: {destination}")
         else:
+            reservation = getattr(self, "_capacity_reservation", None)
+            if reservation is not None:
+                reservation.recheck()
+            write_identity = capture_write_path(destination)
             journal._inject(f"before_{seam}")
+            # The injection seam is intentionally inside the reservation:
+            # tests and operators can model a hostile rename/symlink/device
+            # swap here, and no backup bytes may be written until both the
+            # capacity lease and the exact parent identity are revalidated.
+            if reservation is not None:
+                reservation.recheck()
+            revalidate_write_path(destination, write_identity)
             verified = runtime.backup(destination, binding=dict(binding))
             journal._inject(f"after_{seam}")
         journal.effect(effect_name, path=str(destination), manifest_sha256=_sha256_file(destination / "manifest.json"), realm_id=binding.get("selected_realm_id"))
@@ -492,7 +503,14 @@ class LiveMigration:
             except Exception as exc:
                 raise MigrationError(f"B12 existing restore candidate is not reusable: {destination}") from exc
         else:
+            reservation = getattr(self, "_capacity_reservation", None)
+            if reservation is not None:
+                reservation.recheck()
+            write_identity = capture_write_path(destination)
             journal._inject(f"before_{seam}")
+            if reservation is not None:
+                reservation.recheck()
+            revalidate_write_path(destination, write_identity)
             restored = restore_backup(backup, destination)
             journal._inject(f"after_{seam}")
             verification = verify_restore_candidate(destination)
@@ -746,6 +764,7 @@ class LiveMigration:
             else:
                 reservation_id = secrets.token_urlsafe(18)
             reservation = _CapacityReservation.acquire(plan=plan, reservation_id=reservation_id)
+            object.__setattr__(self, "_capacity_reservation", reservation)
             stack.callback(reservation.release)
             immediate_free = reservation.recheck()
             if not capacity_effect:

@@ -57,3 +57,25 @@ def test_symlink_swap_is_rejected_and_release_is_idempotent(tmp_path: Path):
     reservation.release()
     again = CapacityReservation.acquire(plan=plan, reservation_id="replay")
     again.release()
+
+
+def test_failed_probe_acquisition_releases_lock_for_immediate_retry(monkeypatch, tmp_path: Path):
+    """A probe failure must not strand the lock acquired for that domain."""
+    import tools.astrid_migrate.capacity as capacity
+
+    plan = CapacityPlan.from_allocations((("destination", tmp_path / "destination", 1),), margin_bytes=0)
+    original = capacity._open_directory_chain
+    calls = 0
+
+    def fail_once(path):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected probe failure")
+        return original(path)
+
+    monkeypatch.setattr(capacity, "_open_directory_chain", fail_once)
+    with pytest.raises(MigrationError, match="probe path"):
+        CapacityReservation.acquire(plan=plan, reservation_id="failed")
+    retry = CapacityReservation.acquire(plan=plan, reservation_id="retry")
+    retry.release()

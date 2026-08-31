@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import os
 from pathlib import Path
+import stat
 import tempfile
 from typing import Any, Iterable, Mapping
 
@@ -86,6 +87,82 @@ def _open_directory_chain(path: Path) -> int:
     except Exception:
         os.close(fd)
         raise
+
+
+def capture_write_path(path: str | Path) -> dict[str, Any]:
+    """Capture the ordinary parent identity for a new material write.
+
+    The lifecycle writers create a temporary directory below ``path.parent``
+    and rename it into ``path``.  A lexical symlink check alone is not enough:
+    an attacker can rename the checked parent and replace it with another
+    directory (or mount/device) between the check and the write.  Opening the
+    complete parent chain with ``O_NOFOLLOW`` gives us the identity that must
+    still be present immediately before the write seam.
+    """
+    target = _absolute_path(path)
+    if _has_symlink_component(target) or os.path.lexists(str(target)):
+        raise MigrationError(f"capacity write target is not a fresh ordinary path: {target}")
+    target_parent = target.parent
+    parent = target_parent
+    while not os.path.lexists(str(parent)):
+        if parent == parent.parent:
+            raise MigrationError(f"capacity write path has no existing parent: {target}")
+        parent = parent.parent
+    try:
+        parent_fd = _open_directory_chain(parent)
+    except OSError as exc:
+        raise MigrationError(f"capacity write parent cannot be opened safely: {parent}") from exc
+    try:
+        identity = os.fstat(parent_fd)
+    except OSError as exc:
+        raise MigrationError(f"capacity write parent identity unavailable: {parent}") from exc
+    finally:
+        os.close(parent_fd)
+    if not stat.S_ISDIR(identity.st_mode):
+        raise MigrationError(f"capacity write parent is not an ordinary directory: {parent}")
+    return {
+        "path": str(target),
+        "parent": str(parent),
+        "target_parent": str(target_parent),
+        "parent_was_missing": target_parent != parent,
+        "st_dev": int(identity.st_dev),
+        "st_ino": int(identity.st_ino),
+        "st_mode": int(identity.st_mode),
+    }
+
+
+def revalidate_write_path(path: str | Path, identity: Mapping[str, Any]) -> None:
+    """Fail closed if a captured new-write path or its parent changed."""
+    target = _absolute_path(path)
+    target_parent = target.parent
+    if identity.get("path") != str(target) or identity.get("target_parent") != str(target_parent):
+        raise MigrationError(f"capacity write path identity changed: {target}")
+    if _has_symlink_component(target) or os.path.lexists(str(target)):
+        raise MigrationError(f"capacity write target changed before material write: {target}")
+    # ``restore_backup`` is allowed to create a missing destination parent.
+    # Preserve that behavior, but require the same missing-path shape at the
+    # final seam; an attacker-created replacement directory must not be
+    # mistaken for the parent that was observed during capture.
+    if bool(identity.get("parent_was_missing")):
+        if os.path.lexists(str(target_parent)):
+            raise MigrationError(f"capacity write parent appeared before material write: {target_parent}")
+    elif not os.path.lexists(str(target_parent)):
+        raise MigrationError(f"capacity write parent disappeared before material write: {target_parent}")
+    parent = Path(str(identity["parent"]))
+    try:
+        parent_fd = _open_directory_chain(parent)
+    except OSError as exc:
+        raise MigrationError(f"capacity write parent changed before material write: {parent}") from exc
+    try:
+        current = os.fstat(parent_fd)
+    except OSError as exc:
+        raise MigrationError(f"capacity write parent identity unavailable: {parent}") from exc
+    finally:
+        os.close(parent_fd)
+    if not stat.S_ISDIR(current.st_mode) or any(
+        int(getattr(current, key)) != int(identity[key]) for key in ("st_dev", "st_ino", "st_mode")
+    ):
+        raise MigrationError(f"capacity write parent identity changed before material write: {parent}")
 
 
 def _mount_identity(directory: Path, device: int) -> str:
@@ -215,25 +292,46 @@ class CapacityReservation:
                 lock_path = lock_root / f"{domain.key}.lock"
                 domain.lock_path = lock_path
                 flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(str(lock_path), flags, 0o600)
+                fd: int | None = None
+                probe_fd: int | None = None
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except (BlockingIOError, OSError) as exc:
-                    os.close(fd)
-                    raise MigrationError("B12.1 capacity reservation is already held") from exc
-                try:
-                    probe_fd = _open_directory_chain(domain.probe_path)
-                except OSError as exc:
-                    raise MigrationError("capacity probe path changed or escaped during reservation") from exc
-                actual = os.fstat(probe_fd)
-                if int(actual.st_dev) != domain.device:
-                    os.close(probe_fd)
-                    raise MigrationError("capacity storage domain changed during reservation")
-                handles.append((fd, probe_fd))
+                    fd = os.open(str(lock_path), flags, 0o600)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except (BlockingIOError, OSError) as exc:
+                        raise MigrationError("B12.1 capacity reservation is already held") from exc
+                    try:
+                        probe_fd = _open_directory_chain(domain.probe_path)
+                    except OSError as exc:
+                        raise MigrationError("capacity probe path changed or escaped during reservation") from exc
+                    actual = os.fstat(probe_fd)
+                    if int(actual.st_dev) != domain.device:
+                        raise MigrationError("capacity storage domain changed during reservation")
+                    # Do not append until both descriptors have been fully
+                    # verified.  This local guard releases the just-acquired
+                    # lock if probe opening/fstat fails, so an immediate
+                    # retry cannot be blocked by a leaked descriptor.
+                    handles.append((fd, probe_fd))
+                    fd = None
+                    probe_fd = None
+                except Exception:
+                    if probe_fd is not None:
+                        try:
+                            os.close(probe_fd)
+                        except OSError:
+                            pass
+                    if fd is not None:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
+                    raise
             reservation = cls(domains, handles, reservation_id)
             reservation.recheck(minimum_free_bytes=minimum_free_bytes or None)
             return reservation
         except Exception:
+            # The current iteration's descriptors are cleaned in its local
+            # guard; ``handles`` contains only completed pairs.
             for lock_fd, probe_fd in reversed(handles):
                 try:
                     os.close(probe_fd)
@@ -275,4 +373,4 @@ class CapacityReservation:
             pass
 
 
-__all__ = ["CapacityPlan", "CapacityReservation", "StorageDomain"]
+__all__ = ["CapacityPlan", "CapacityReservation", "StorageDomain", "capture_write_path", "revalidate_write_path"]
