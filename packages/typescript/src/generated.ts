@@ -16,8 +16,8 @@ export interface ManagedObject { object_id: string; digest: string; media_type: 
 export interface MediaRelation { project_id: string; from_object_id: string; to_object_id: string; kind: "derived_from" | "variant_of" | "uses_as_input" | "mask_for" | "audio_for"; metadata: Record<string, unknown>; created_at: string }
 export interface ByteResponse { data: Uint8Array; status: number; headers: HeadersLike; etag?: string; content_range?: string }
 export type TaskState = "queued" | "ready" | "running" | "succeeded" | "failed" | "cancel_requested" | "cancelled" | "retrying";
-export interface Task { task_id: string; run_id: string; state: TaskState; version: number; capability_id: string; capability_digest: string; idempotency_key: string; created_at: string; updated_at: string; attempt_id?: string | null; runtime_epoch: number; result?: Record<string, unknown> | null }
-export interface AttemptFence { attempt_id: string; task_id: string; lease_id: string; fence: number; lease_expires_at: string; runtime_epoch: number }
+export interface Task { task_id: string; run_id: string; state: TaskState; version: number; capability_id: string; capability_digest: string; idempotency_key: string; created_at: string; updated_at: string; attempt_id?: string | null; runtime_epoch: number; spec: Record<string, unknown>; result?: Record<string, unknown> | null }
+export interface AttemptFence { attempt_id: string; task_id: string; lease_id: string; fence: number; lease_expires_at: string; runtime_epoch: number; spec: Record<string, unknown> }
 export interface ClaimWaiting { task: Task; waiting_reason: "waiting_for_worker" | "capability_unavailable" | "insufficient_storage" | "waiting_for_gpu" | "waiting_for_cpu" | "waiting_for_network" }
 export interface RecoveryAuthorization { attempt_id: string; task_id: string; executor_id: string; runtime_epoch: number; nonce: string; expires_in_seconds: number }
 export interface RecoveryCheckpointReceipt { checkpoint_id: string; attempt_id: string; task_id: string; runtime_epoch: number; nonce: string; digest: string; size: number; state: string; path?: string }

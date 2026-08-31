@@ -37,7 +37,8 @@
         "lease_id": { "type": "string", "minLength": 1 },
         "fence": { "type": "integer", "minimum": 1 },
         "lease_expires_at": { "type": "string", "format": "date-time" },
-        "runtime_epoch": { "type": "integer", "minimum": 1 }
+        "runtime_epoch": { "type": "integer", "minimum": 1 },
+        "spec": { "type": "object", "additionalProperties": true }
       }
     },
     "ClaimWaiting": {

@@ -18,7 +18,8 @@
     "updated_at": { "type": "string", "format": "date-time" },
     "attempt_id": { "type": ["string", "null"] },
     "runtime_epoch": { "type": "integer", "minimum": 1 },
-    "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }
+    "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "spec": { "type": "object", "additionalProperties": true }
     ,"waiting_reason": { "type": "string" }
     ,"lease_fence": { "type": "integer", "minimum": 1 }
     ,"lease_expires_at": { "type": "string", "format": "date-time" }
