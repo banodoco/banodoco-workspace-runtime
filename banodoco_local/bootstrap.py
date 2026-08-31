@@ -183,6 +183,9 @@ class BootstrapResult:
     source_profile: str
     diagnostics: tuple[str, ...] = ()
     discovery_path: Path | None = field(default=None, compare=False)
+    # The handoff exposes only the owner-only credential *path*.  The secret
+    # itself never crosses the launcher stdout boundary.
+    credential_file: Path | None = field(default=None, compare=False)
 
     @property
     def ready(self) -> bool:
@@ -664,7 +667,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             realm_id = str(discovery["active_realm"])
             _provision_connection(connection, actor_id, token, realm_id)
             diagnostics.append("runtime checkout differences are provenance only")
-            return BootstrapResult("reconnected", realm_id, str(realm.get("display_name", "Astrid Workspace")) if realm else "Astrid Workspace", endpoint, actor_id, source.profile, tuple(diagnostics), paths.discovery_path)
+            return BootstrapResult("reconnected", realm_id, str(realm.get("display_name", "Astrid Workspace")) if realm else "Astrid Workspace", endpoint, actor_id, source.profile, tuple(diagnostics), paths.discovery_path, paths.credentials_dir / "astrid.json")
         # A dead advertisement is ephemeral support state.  Remove it before
         # starting so a crash cannot be mistaken for a live owner.
         remove_file(paths.discovery_path)
@@ -752,7 +755,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         "advertised_at": time.time(),
     }
     atomic_write_json(paths.discovery_path, discovery_value)
-    return BootstrapResult("started", realm_id, str(realm["display_name"]), endpoint, actor_id, source.profile, tuple(diagnostics), paths.discovery_path)
+    return BootstrapResult("started", realm_id, str(realm["display_name"]), endpoint, actor_id, source.profile, tuple(diagnostics), paths.discovery_path, paths.credentials_dir / "astrid.json")
 
 
 def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
@@ -780,7 +783,7 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     actor_id, token = _credential(paths)
     connection = boundary.connect(endpoint=endpoint, credential=token)
     _provision_connection(connection, actor_id, token, str(realm["realm_id"]))
-    return BootstrapResult("reconnected", str(realm["realm_id"]), str(realm.get("display_name", "Astrid Workspace")), endpoint, actor_id, source.profile, (), paths.discovery_path)
+    return BootstrapResult("reconnected", str(realm["realm_id"]), str(realm.get("display_name", "Astrid Workspace")), endpoint, actor_id, source.profile, (), paths.discovery_path, paths.credentials_dir / "astrid.json")
 
 
 def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
@@ -812,7 +815,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     if restart_fn is None:
         remove_file(paths.discovery_path)
         result = bootstrap(paths, boundary, config)
-        return BootstrapResult("restarted", result.realm_id, result.display_name, result.endpoint, result.actor_id, result.source_profile, result.diagnostics, result.discovery_path)
+        return BootstrapResult("restarted", result.realm_id, result.display_name, result.endpoint, result.actor_id, result.source_profile, result.diagnostics, result.discovery_path, result.credential_file)
     handle = restart_fn(endpoint=endpoint, pid=pid, instance_id=instance_id, process_birth_id=process_birth_id, realm_id=realm_id, owner_lock=paths.instance_lock_path, discovery_path=paths.discovery_path)
     # The boundary restart returns the same metadata shape as start.  Publish
     # its fresh advertisement, then let normal bootstrap validation reconnect;
@@ -837,7 +840,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     })
     atomic_write_json(paths.discovery_path, refreshed)
     result = bootstrap(paths, boundary, config)
-    return BootstrapResult("restarted", result.realm_id, result.display_name, result.endpoint, result.actor_id, result.source_profile, result.diagnostics, result.discovery_path)
+    return BootstrapResult("restarted", result.realm_id, result.display_name, result.endpoint, result.actor_id, result.source_profile, result.diagnostics, result.discovery_path, result.credential_file)
 
 
 def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict[str, Any]:

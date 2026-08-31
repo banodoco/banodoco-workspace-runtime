@@ -106,6 +106,7 @@ class BootstrapTests(unittest.TestCase):
     def test_first_launch_writes_catalog_discovery_without_synthesizing_activation(self):
         result = bootstrap(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "started")
+        self.assertEqual(result.credential_file, self.paths.credentials_dir / "astrid.json")
         self.assertEqual(len(self.boundary.starts), 1)
         self.assertEqual(result.realm_id, json.loads(self.paths.discovery_path.read_text())["active_realm"])
         catalog = json.loads(self.paths.catalog_path.read_text())
