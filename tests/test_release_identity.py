@@ -37,7 +37,7 @@ def test_runtime_identity_rejects_dirty_checkout(tmp_path: Path) -> None:
 
 
 def test_runtime_manifest_rejects_missing_seeds(tmp_path: Path) -> None:
-    with pytest.raises(ReleaseIdentityError, match="missing"):
+    with pytest.raises(ReleaseIdentityError, match="actual"):
         build_prelive_manifest({})
 
 
