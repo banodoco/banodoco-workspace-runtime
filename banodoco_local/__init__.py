@@ -16,7 +16,9 @@ from .bootstrap import (
     SourceProfile,
     UnsupportedRealmError,
     bootstrap,
+    connect,
     doctor,
+    restart,
 )
 from .paths import RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
@@ -34,7 +36,9 @@ __all__ = [
     "SourceProfile",
     "UnsupportedRealmError",
     "bootstrap",
+    "connect",
     "doctor",
+    "restart",
 ]
 
 __version__ = "0.1.0"
