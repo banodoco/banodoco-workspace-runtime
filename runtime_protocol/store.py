@@ -6,6 +6,7 @@ import os
 import sqlite3
 import shutil
 import threading
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 LEASE_SECONDS = 30
 
 
@@ -163,6 +164,86 @@ class RealmStore:
             version = 15
         if version < 16:
             self._run_migration(16)
+            version = 16
+        if version < 17:
+            self._run_receipt_backfill_migration()
+
+    def _run_receipt_backfill_migration(self):
+        """Backfill pre-016 rows inside one retryable migration transaction."""
+        migration = Path(__file__).parent / "migrations" / "017_backfill_canonical_receipts.sql"
+        statements = [statement.strip() for statement in migration.read_text(encoding="utf-8").split(";") if statement.strip()]
+        with self._transaction():
+            for statement in statements:
+                self.conn.execute(statement)
+            rows = self.conn.execute(
+                "SELECT command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at "
+                "FROM command_idempotency WHERE txn_id IS NULL "
+                "ORDER BY created_at, command_kind, aggregate_id, idempotency_key"
+            ).fetchall()
+            # Existing post-016 rows, if any, already own canonical sequence
+            # numbers. Historical rows continue after those numbers.
+            next_seq = defaultdict(int)
+            for row in self.conn.execute(
+                "SELECT command_kind, aggregate_id, result_json, last_project_seq "
+                "FROM command_idempotency WHERE txn_id IS NOT NULL"
+            ):
+                existing_result = json.loads(row["result_json"])
+                existing_project = str(self._legacy_receipt_project(row["command_kind"], row["aggregate_id"], existing_result) or "unscoped")
+                next_seq[existing_project] = max(next_seq[existing_project], int(row["last_project_seq"] or 0))
+            for row in rows:
+                result = json.loads(row["result_json"])
+                project_id = self._legacy_receipt_project(row["command_kind"], row["aggregate_id"], result)
+                project_id = str(project_id or "unscoped")
+                next_seq[project_id] += 1
+                project_seq = next_seq[project_id]
+                event_ids, stream_id, stream_seq = self._legacy_receipt_events(row, result)
+                txn_material = {
+                    "command_kind": row["command_kind"],
+                    "aggregate_id": row["aggregate_id"],
+                    "idempotency_key": row["idempotency_key"],
+                    "request_hash": row["request_hash"],
+                    "created_at": row["created_at"],
+                }
+                txn_id = "txn-legacy-" + hashlib.sha256(canonical_json(txn_material).encode()).hexdigest()
+                self.conn.execute(
+                    "UPDATE command_idempotency SET txn_id=?, primary_stream_id=?, resulting_stream_seq=?, "
+                    "first_project_seq=?, last_project_seq=?, event_ids_json=? "
+                    "WHERE command_kind=? AND aggregate_id=? AND idempotency_key=? AND txn_id IS NULL",
+                    (txn_id, stream_id, stream_seq, project_seq, project_seq,
+                     canonical_json(event_ids), row["command_kind"], row["aggregate_id"], row["idempotency_key"]),
+                )
+            self.conn.execute(
+                "INSERT INTO canonical_receipt_backfills(id, source_schema_version, backfilled_count, completed_at) "
+                "VALUES (1, 16, ?, ?) ON CONFLICT(id) DO NOTHING",
+                (len(rows), now()),
+            )
+            self.conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (17, datetime('now'))"
+            )
+
+    def _legacy_receipt_project(self, command_kind, aggregate_id, result):
+        """Resolve project identity from facts persisted before receipt fields."""
+        if command_kind == "project.create":
+            return result.get("id") or aggregate_id
+        if command_kind == "project.select":
+            return (result.get("project") or {}).get("id")
+        if command_kind in {"run.cancel", "run.retry"}:
+            row = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (aggregate_id,)).fetchone()
+            return row[0] if row and row[0] else "unscoped"
+        return result.get("project_id") or (result.get("project") or {}).get("id") or aggregate_id
+
+    def _legacy_receipt_events(self, row, result):
+        """Recover only event identities provably linked to the old result."""
+        if row["command_kind"] == "task.create":
+            run_id = (result.get("run") or {}).get("id")
+            event = self.conn.execute(
+                "SELECT id FROM events WHERE run_id=? AND kind='task.admitted' ORDER BY id LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if event:
+                count = self.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
+                return [str(event[0])], str(run_id), int(count)
+        return [], None, None
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
@@ -535,10 +616,14 @@ class RealmStore:
         previous_hash = previous[0] if previous else ""
         timestamp = now()
         event_hash = hashlib.sha256(canonical_json({"run_id":run_id,"task_id":task_id,"kind":kind,"payload":payload,"previous_hash":previous_hash,"created_at":timestamp}).encode()).hexdigest()
-        cursor = self.conn.execute("INSERT INTO events(run_id, task_id, kind, payload_json, previous_hash, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, task_id, kind, canonical_json(payload), previous_hash, event_hash, timestamp))
-        # Event IDs are the committed event-table identities, never an
-        # idempotency-ledger rowid or a process-local surrogate.
-        return str(cursor.lastrowid)
+        self.conn.execute("INSERT INTO events(run_id, task_id, kind, payload_json, previous_hash, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, task_id, kind, canonical_json(payload), previous_hash, event_hash, timestamp))
+        # Event IDs are the committed event-table identities, never a ledger
+        # identity or a process-local surrogate.
+        event = self.conn.execute(
+            "SELECT id FROM events WHERE run_id=? AND event_hash=? AND created_at=? LIMIT 1",
+            (run_id, event_hash, timestamp),
+        ).fetchone()
+        return str(event[0])
 
     def _allocate_project_seq(self, project_id):
         """Allocate the next canonical project transaction sequence."""
@@ -1052,6 +1137,7 @@ class RealmStore:
             "timeline_shots", "timeline_references", "timeline_revisions",
             "timeline_shot_state", "timeline_reference_state", "media_relations",
             "command_idempotency", "project_sequences",
+            "canonical_receipt_backfills",
             "runtime_lifecycle",
             "recovery_checkpoints",
             "realm_lifecycle",
