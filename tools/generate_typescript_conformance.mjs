@@ -20,7 +20,7 @@ function bytes(path, label) {
 const contract = bytes(argument("--contract"), "--contract");
 const schema = bytes(argument("--schema-manifest"), "--schema-manifest");
 const output = resolve(argument("--output-root"));
-const root = join(output, "clients", "typescript", "generated");
+const root = output;
 mkdirSync(root, { recursive: true });
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const text = contract.toString("utf8");

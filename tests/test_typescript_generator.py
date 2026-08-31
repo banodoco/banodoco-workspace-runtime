@@ -18,6 +18,6 @@ def test_typescript_conformance_generator_is_byte_stable(tmp_path: Path) -> None
     def inventory(path: Path) -> dict[str, str]:
         return {item.relative_to(path).as_posix(): hashlib.sha256(item.read_bytes()).hexdigest() for item in path.rglob("*") if item.is_file()}
     assert inventory(first) == inventory(second)
-    manifest = json.loads((first / "clients/typescript/generated/manifest.json").read_text())
+    manifest = json.loads((first / "manifest.json").read_text())
     assert manifest["generator"] == "GENERATOR-TYPESCRIPT-CONFORMANCE"
     assert manifest["operations"]
