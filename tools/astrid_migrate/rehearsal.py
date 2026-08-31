@@ -489,6 +489,16 @@ class RuntimeServiceAdapter:
         display_name = old_service.realm["display_name"]
         realm_id = old_service.realm["id"]
         support_root = old_service.support_root
+        # When no separate support root is configured, the authenticated
+        # backup key lives beside the active realm. Preserve that private key
+        # across the root swap: restore handoffs remain HMAC-bound to the same
+        # operator key after rollback/reactivation. Never copy a symlink or a
+        # non-regular path into the new authority.
+        operator_key = None
+        if support_root is None:
+            candidate_key = old_service.store.root / ".operator-backup-key"
+            if candidate_key.is_file() and not candidate_key.is_symlink():
+                operator_key = candidate_key
         old_service.close()
         quarantine = target.parent / f".{target.name}.inactive-{state}-{time.time_ns()}"
         target.rename(quarantine)
@@ -497,6 +507,8 @@ class RuntimeServiceAdapter:
             shutil.copy2(candidate / "realm.sqlite3", temporary / "realm.sqlite3")
             shutil.copytree(candidate / "cas", temporary / "cas")
             shutil.copy2(handoff, temporary / "activation-handoff.json")
+            if operator_key is not None:
+                shutil.copy2(quarantine / ".operator-backup-key", temporary / ".operator-backup-key")
             # Rehearsal control state is not part of a realm backup.  Carry it
             # across the authority swap so a crash after the swap can resume
             # from the same journal/evidence rather than starting over.

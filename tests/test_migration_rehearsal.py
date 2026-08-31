@@ -44,6 +44,10 @@ def test_b10_rehearsal_preserves_evidence_and_reactivates_idempotently(tmp_path)
     assert json.loads((evidence_root / "reconciliation-b10.json").read_text())["source_counts"]["projects"] == 1
     assert (archive_root / "manifest.json").is_file()
     assert (rollback_root / "activation-handoff.json").is_file()
+    # The default operator key is kept beside the active realm. Activation
+    # swaps that directory, so the key must survive the swap for later
+    # authenticated restore/handoff verification.
+    assert (runtime_root / ".operator-backup-key").is_file()
 
 
 def test_b10_rehearsal_preserves_all_source_streams_and_relationships(tmp_path):

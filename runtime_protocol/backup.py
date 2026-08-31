@@ -345,12 +345,25 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
         raise
 
 
-def restore_backup(backup_dir: str | Path, destination: str | Path) -> dict:
+def restore_backup(
+    backup_dir: str | Path,
+    destination: str | Path,
+    *,
+    key: bytes | None = None,
+    key_path: str | Path | None = None,
+) -> dict:
+    """Restore an authenticated backup into a new inactive realm.
+
+    ``key``/``key_path`` are explicit escape hatches for callers that keep the
+    operator key in a stable support root. When omitted, the authenticated
+    manifest's recorded key path is used. Every path still goes through the
+    manifest key-id and HMAC checks in :func:`verify_backup`.
+    """
     source = Path(backup_dir).expanduser().resolve()
     destination = Path(destination).expanduser().resolve()
     if destination.exists():
         raise ConflictError("restore destination must be a new inactive realm", details={"destination": str(destination)})
-    verified = verify_backup(source)
+    verified = verify_backup(source, key=key, key_path=key_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     try:
@@ -367,7 +380,7 @@ def restore_backup(backup_dir: str | Path, destination: str | Path) -> dict:
             restored.close()
         handoff = {"format_version": 2, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _sha256(temporary / "realm.sqlite3"), "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
         handoff["handoff_sha256"] = _authenticated_digest(handoff)
-        auth_key = _resolve_key(verified["manifest"])
+        auth_key = _resolve_key(verified["manifest"], key=key, key_path=key_path)
         handoff["handoff_hmac"] = hmac.new(auth_key, canonical_json(_auth_payload(handoff)).encode("utf-8"), hashlib.sha256).hexdigest()
         atomic_json_write(temporary / "activation-handoff.json", handoff)
         temporary.rename(destination)

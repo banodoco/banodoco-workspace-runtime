@@ -45,7 +45,12 @@ class RuntimeService:
         return create_backup(self.store, destination, binding=binding, key_path=key_path)
 
     def restore(self, backup_dir, destination):
-        return restore_backup(backup_dir, destination)
+        key_path = (self.support_root / "backup-auth.key") if self.support_root else (self.store.root / ".operator-backup-key")
+        # A backup may have been created by a prior active root whose path is
+        # now inactive. Let restore fall back to the manifest path in that
+        # case; when this service owns a stable support key, bind verification
+        # to it explicitly and retain the same HMAC key for the handoff.
+        return restore_backup(backup_dir, destination, key_path=key_path if key_path.is_file() else None)
 
     def export_structured(self, destination=None):
         value = structured_export(self.store)

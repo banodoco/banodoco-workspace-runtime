@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
 
-from runtime_protocol.backup import verify_backup
+from runtime_protocol.backup import restore_backup, verify_backup
 from runtime_protocol.errors import ConflictError, LeaseError, ValidationError
 from runtime_protocol.daemon import RuntimeDaemon
 from http_helpers import Api
@@ -160,6 +161,19 @@ def test_backup_restore_and_structured_export_verify_cas_and_sqlite(tmp_path):
         assert handoff["state"] == "prepared"
         with pytest.raises(ConflictError):
             service.restore(backup, tmp_path / "restored")
+    finally:
+        service.close()
+
+
+def test_restore_explicit_key_path_still_rejects_a_mismatched_key(tmp_path):
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        backup = tmp_path / "backup"
+        service.backup(backup)
+        wrong_key = tmp_path / "wrong.key"
+        wrong_key.write_bytes(os.urandom(32))
+        with pytest.raises(ConflictError, match="does not match manifest realm"):
+            restore_backup(backup, tmp_path / "restored", key_path=wrong_key)
     finally:
         service.close()
 
