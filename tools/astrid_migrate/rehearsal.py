@@ -426,7 +426,12 @@ class RuntimeServiceAdapter:
         return {"project_id": str(project_id), "digest": str(digest).removeprefix("sha256:"), "relation": relation}
 
     def create_timeline(self, project_id, timeline_id, *, idempotency_key=None):
-        return self.service.create_timeline(project_id, timeline_id)
+        result = self.service.create_timeline(
+            project_id, timeline_id, idempotency_key=idempotency_key
+        )
+        # The HTTP/generated-client boundary unwraps command envelopes.  Keep
+        # the in-process rehearsal adapter shaped exactly like that client.
+        return result.get("data", result) if isinstance(result, dict) else result
 
     def create_shot(self, timeline_id, shot, *, idempotency_key=None):
         return self.service.create_shot(timeline_id, shot)
