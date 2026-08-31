@@ -33,6 +33,14 @@ def test_runtime_identity_round_trip(tmp_path: Path) -> None:
     core = create_candidate_core_identity(path, {"NEUTRAL-RUNTIME": repo})
     assert core["candidate_core"]["pre_live_evidence_root"] == pre["identity"]
 
+def test_runtime_candidate_root_tamper_rehash_is_rejected(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path); pre = create_pre_live_identity({"NEUTRAL-RUNTIME": repo}, seed_outputs=_seeds()); core = create_candidate_core_identity(pre, {"NEUTRAL-RUNTIME": repo})
+    core["candidate_core"]["pre_live_evidence_root"] = "tampered"
+    from runtime_protocol.release_identity import _rd, framed_hash
+    core["identity"] = framed_hash("banodoco.candidate-core.v1", core["candidate_core"]); core["receipt_sha256"] = _rd(core)
+    with pytest.raises(ReleaseIdentityError, match="pre-live root"):
+        __import__("runtime_protocol.release_identity", fromlist=["verify_receipt"]).verify_receipt(core)
+
 
 def test_runtime_identity_rejects_dirty_checkout(tmp_path: Path) -> None:
     repo = _git_repo(tmp_path)
