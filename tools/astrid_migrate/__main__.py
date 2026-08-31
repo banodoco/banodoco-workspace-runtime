@@ -21,9 +21,14 @@ def main(argv=None) -> int:
     if args.runtime_endpoint:
         if not args.credential_file:
             parser.error("--credential-file is required with --runtime-endpoint")
-        client_root = Path(__file__).parents[2] / "packages" / "python"
-        sys.path.insert(0, str(client_root))
-        from banodoco_workspace_client import WorkspaceClient
+        # The generated client is a separately pinned/installable package.  A
+        # Checkout-relative import mutation would make this command depend on
+        # an untracked source tree and could silently select a different
+        # protocol revision.
+        try:
+            from banodoco_workspace_client import WorkspaceClient
+        except ImportError:
+            parser.error("the pinned banodoco-workspace-client package is not installed")
         client = WorkspaceClient(args.runtime_endpoint, args.credential_file.read_text(encoding="utf-8").strip())
     try:
         report = migrate(MigrationConfig(args.source_root, args.archive_root, args.destination_root, dry_run=args.dry_run), client)
