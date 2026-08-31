@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 LEASE_SECONDS = 30
 
 
@@ -160,6 +160,9 @@ class RealmStore:
             version = 14
         if version < 15:
             self._run_migration(15)
+            version = 15
+        if version < 16:
+            self._run_migration(16)
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
@@ -313,9 +316,9 @@ class RealmStore:
                         if prior["slug"] != slug or prior["name"] != name or json.loads(prior["metadata_json"]) != (metadata or {}):
                             raise ConflictError("idempotency key was already used with different input")
                         result = self._project(prior["id"])
-                        self.conn.execute(
-                            "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                            ("project.create", prior["id"], idempotency_key, request_hash, canonical_json(result), prior["created_at"]),
+                        self._record_command_receipt(
+                            "project.create", prior["id"], idempotency_key, request_hash,
+                            result, project_id=prior["id"], created_at=prior["created_at"],
                         )
                         return result
                 try:
@@ -326,9 +329,9 @@ class RealmStore:
                     raise ConflictError("project slug already exists") from exc
                 result = self._project(pid)
                 if idempotency_key:
-                    self.conn.execute(
-                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        ("project.create", pid, idempotency_key, request_hash, canonical_json(result), result["created_at"]),
+                    self._record_command_receipt(
+                        "project.create", pid, idempotency_key, request_hash,
+                        result, project_id=pid, created_at=result["created_at"],
                     )
                 return result
 
@@ -372,9 +375,9 @@ class RealmStore:
                 )
                 result = {"actor_id": actor_id, "scope": scope, "project": self._project(project["id"]), "updated_at": timestamp}
                 if idempotency_key:
-                    self.conn.execute(
-                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        ("project.select", aggregate_id, idempotency_key, request_hash, canonical_json(result), timestamp),
+                    self._record_command_receipt(
+                        "project.select", aggregate_id, idempotency_key, request_hash,
+                        result, project_id=project["id"], created_at=timestamp,
                     )
                 return result
 
@@ -491,14 +494,15 @@ class RealmStore:
                 timestamp, run_id, task_id = now(), new_id(), new_id()
                 self.conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)", (run_id, project_id, capability, canonical_json(spec), idempotency_key, timestamp, timestamp))
                 self.conn.execute("INSERT INTO tasks(id, run_id, capability, spec_json, status, capability_digest, waiting_reason, expected_effect_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)", (task_id, run_id, capability, canonical_json(spec), capability_digest, waiting_reason, canonical_json(expected_effect) if expected_effect else None, timestamp, timestamp))
-                self._append_event(run_id, task_id, "task.admitted", {"capability": capability})
+                admitted_event_id = self._append_event(run_id, task_id, "task.admitted", {"capability": capability})
                 run = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
                 task = dict(self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
                 result = self._task_result(run, task)
                 if idempotency_key:
-                    self.conn.execute(
-                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        ("task.create", aggregate_id, idempotency_key, request_hash, canonical_json(result), timestamp),
+                    self._record_command_receipt(
+                        "task.create", aggregate_id, idempotency_key, request_hash,
+                        result, project_id=project_id or "unscoped", event_ids=[admitted_event_id],
+                        primary_stream_id=run_id, resulting_stream_seq=1, created_at=timestamp,
                     )
                 return result
 
@@ -531,8 +535,45 @@ class RealmStore:
         previous_hash = previous[0] if previous else ""
         timestamp = now()
         event_hash = hashlib.sha256(canonical_json({"run_id":run_id,"task_id":task_id,"kind":kind,"payload":payload,"previous_hash":previous_hash,"created_at":timestamp}).encode()).hexdigest()
-        self.conn.execute("INSERT INTO events(run_id, task_id, kind, payload_json, previous_hash, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, task_id, kind, canonical_json(payload), previous_hash, event_hash, timestamp))
-        return event_hash
+        cursor = self.conn.execute("INSERT INTO events(run_id, task_id, kind, payload_json, previous_hash, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, task_id, kind, canonical_json(payload), previous_hash, event_hash, timestamp))
+        # Event IDs are the committed event-table identities, never an
+        # idempotency-ledger rowid or a process-local surrogate.
+        return str(cursor.lastrowid)
+
+    def _allocate_project_seq(self, project_id):
+        """Allocate the next canonical project transaction sequence."""
+        self.conn.execute(
+            "INSERT INTO project_sequences(project_id, next_seq) VALUES (?, 2) "
+            "ON CONFLICT(project_id) DO UPDATE SET next_seq=next_seq+1",
+            (str(project_id),),
+        )
+        return int(self.conn.execute(
+            "SELECT next_seq - 1 FROM project_sequences WHERE project_id=?",
+            (str(project_id),),
+        ).fetchone()[0])
+
+    def _record_command_receipt(
+        self, command_kind, aggregate_id, idempotency_key, request_hash, result,
+        *, project_id, event_ids=(), primary_stream_id=None,
+        resulting_stream_seq=None, created_at=None,
+    ):
+        """Persist complete receipt facts in the active mutation transaction."""
+        project_seq = self._allocate_project_seq(project_id)
+        txn_id = "txn-" + new_id()
+        timestamp = created_at or now()
+        self.conn.execute(
+            "INSERT INTO command_idempotency("
+            "command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at, "
+            "txn_id, primary_stream_id, resulting_stream_seq, first_project_seq, last_project_seq, event_ids_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                command_kind, aggregate_id, idempotency_key, request_hash,
+                canonical_json(result), timestamp, txn_id, primary_stream_id,
+                resulting_stream_seq, project_seq, project_seq,
+                canonical_json([str(event_id) for event_id in event_ids]),
+            ),
+        )
+        return txn_id
 
     @staticmethod
     def _waiting_for_resource(resource_key):
@@ -1010,6 +1051,7 @@ class RealmStore:
             "project_documents", "generations", "generation_variants", "timelines",
             "timeline_shots", "timeline_references", "timeline_revisions",
             "timeline_shot_state", "timeline_reference_state", "media_relations",
+            "command_idempotency", "project_sequences",
             "runtime_lifecycle",
             "recovery_checkpoints",
             "realm_lifecycle",

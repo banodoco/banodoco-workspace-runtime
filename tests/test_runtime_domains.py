@@ -72,6 +72,31 @@ def test_receipts_are_identical_across_concurrent_replay_and_restart(tmp_path):
             daemon.stop()
 
 
+def test_task_receipt_binds_committed_admission_event_and_canonical_sequence(tmp_path):
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Receipt facts", slug="receipt-facts", idempotency_key="receipt-project")
+        task = client.admit_task(
+            capability_id="render.basic",
+            capability_digest=_digest("render.basic"),
+            input_object_ids=[], project_id=project.project_id,
+            idempotency_key="receipt-task", spec={},
+        )
+        events = client.list_run_events(task.run_id)
+        admitted = next(event for event in events if event.event_type == "task.admitted")
+        assert task.receipt["event_ids"] == [admitted.event_id]
+        assert task.receipt["receipt_id"].startswith("txn-")
+        assert task.receipt["project_seq"] == [2, 2]
+        ledger_rowid = daemon.service.store.conn.execute(
+            "SELECT rowid FROM command_idempotency WHERE idempotency_key=?",
+            ("receipt-task",),
+        ).fetchone()[0]
+        assert task.receipt["receipt_id"] != f"runtime-command-{ledger_rowid}"
+    finally:
+        daemon.stop()
+
+
 def test_unready_capability_rejected_before_any_ledger_rows(tmp_path):
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:

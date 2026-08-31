@@ -311,22 +311,18 @@ class RuntimeService:
             raise InvalidRequestError("request body must be a JSON object")
 
     def _receipt_payload(self, row, *, project_id):
-        """Expose the existing idempotency row as the committed SDK receipt.
-
-        B7 predates the event-stream receipt tables.  Keeping the receipt in
-        the same command_idempotency row means the mutation and its replay
-        record still commit (or roll back) as one SQLite transaction.
-        """
+        """Expose the canonical receipt facts committed with the mutation."""
+        if row is None or row["txn_id"] is None:
+            return None
         result = json.loads(row["result_json"])
-        sequence = int(row["rowid"])
         return {
-            "receipt_id": f"runtime-command-{sequence}",
+            "receipt_id": row["txn_id"],
             "command_kind": row["command_kind"],
             "idempotency_key": row["idempotency_key"],
             "request_hash": row["request_hash"],
             "project_id": project_id,
-            "project_seq": [sequence, sequence],
-            "event_ids": [],
+            "project_seq": [int(row["first_project_seq"]), int(row["last_project_seq"])],
+            "event_ids": json.loads(row["event_ids_json"]),
             "result": result,
             "created_at": row["created_at"],
         }
@@ -340,7 +336,8 @@ class RuntimeService:
         if not idempotency_key:
             return None
         row = self.store.conn.execute(
-            "SELECT rowid, command_kind, idempotency_key, request_hash, result_json, created_at "
+            "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
+            "first_project_seq, last_project_seq, event_ids_json, created_at "
             "FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
             (command_kind, aggregate_id, idempotency_key),
         ).fetchone()
@@ -350,7 +347,9 @@ class RuntimeService:
         if not idempotency_key:
             return None
         prior = self.store.conn.execute(
-            "SELECT rowid, command_kind, idempotency_key, request_hash, result_json, created_at FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
+            "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
+            "first_project_seq, last_project_seq, event_ids_json, created_at "
+            "FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
             (kind, aggregate_id, idempotency_key),
         ).fetchone()
         if not prior:
@@ -363,15 +362,22 @@ class RuntimeService:
 
     def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None):
         if idempotency_key:
+            if project_id is not None:
+                self.store._record_command_receipt(
+                    kind, aggregate_id, idempotency_key, request_hash, result,
+                    project_id=project_id,
+                )
+                row = self.store.conn.execute(
+                    "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
+                    "first_project_seq, last_project_seq, event_ids_json, created_at "
+                    "FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
+                    (kind, aggregate_id, idempotency_key),
+                ).fetchone()
+                return {"data": result, "receipt": self._receipt_payload(row, project_id=project_id)}
             self.store.conn.execute(
                 "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (kind, aggregate_id, idempotency_key, request_hash, canonical_json(result), now()),
             )
-            if project_id is not None:
-                row = self.store.conn.execute(
-                    "SELECT rowid, command_kind, idempotency_key, request_hash, result_json, created_at FROM command_idempotency WHERE rowid=last_insert_rowid()"
-                ).fetchone()
-                return {"data": result, "receipt": self._receipt_payload(row, project_id=project_id)}
         return result
 
     def _project_shot_resource(self, row):
