@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,45 @@ from tools.astrid_migrate import (
     issue_b13_authorizations,
     run_b13_recovery,
 )
+
+
+class _FakeReboot:
+    """Faithful test executor: reopen once and publish a changed boot id."""
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.boot = "fake-boot-before"
+        self.calls = 0
+
+    def identity(self):
+        return self.boot
+
+    def execute(self, command, checkpoint):
+        assert command == "reboot"
+        old = self.runtime
+        root = old.store.root
+        display_name = old.realm["display_name"]
+        realm_id = old.realm["id"]
+        support_root = old.support_root
+        old.close()
+        reopened = RuntimeService(root, display_name=display_name, realm_id=realm_id, support_root=support_root)
+        self.runtime = reopened
+        self.boot = f"fake-boot-after:{checkpoint['checkpoint_id']}"
+        self.calls += 1
+        return {
+            "status": "executed",
+            "before_boot_identity": checkpoint["boot_identity_before"],
+            "after_boot_identity": self.boot,
+            "runtime_epoch_before": checkpoint["runtime_epoch"],
+            "runtime_epoch_after": int(reopened.health()["runtime_epoch"]),
+            "before_runtime_session_id": checkpoint["runtime_session_id_before"],
+            "runtime": reopened,
+        }
+
+
+def _r2_kwargs(active):
+    fake = _FakeReboot(active)
+    return {"reboot_executor": fake.execute, "boot_identity_provider": fake.identity}, fake
 
 
 def _setup(tmp_path):
@@ -27,6 +68,7 @@ def _setup(tmp_path):
 
 def test_b13_r2_purges_only_disposable_target_and_reactivates_verified_state(tmp_path):
     active, rollback_archive, auth = _setup(tmp_path)
+    r2, _fake = _r2_kwargs(active)
     try:
         report = run_b13_recovery(
             active,
@@ -35,6 +77,7 @@ def test_b13_r2_purges_only_disposable_target_and_reactivates_verified_state(tmp
             evidence_root=tmp_path / "evidence",
             disposable_root=tmp_path / "disposable",
             authorizations=auth,
+            **r2,
         )
         assert report["packet"] == "B13.2"
         assert report["journal"]["state"] == "reactivated"
@@ -52,6 +95,7 @@ def test_b13_r2_purges_only_disposable_target_and_reactivates_verified_state(tmp
             evidence_root=tmp_path / "evidence",
             disposable_root=tmp_path / "disposable",
             authorizations=auth,
+            **r2,
         )
         assert replay["idempotent"] is True
     finally:
@@ -63,6 +107,7 @@ def test_b13_r2_purges_only_disposable_target_and_reactivates_verified_state(tmp
 @pytest.mark.parametrize(
     "crash_at",
     [
+        "after_disposable_restore",
         "after_recovery_base",
         "after_purge",
         "after_reboot_execute",
@@ -72,6 +117,7 @@ def test_b13_r2_purges_only_disposable_target_and_reactivates_verified_state(tmp
 )
 def test_b13_r2_resumes_from_each_durable_crash_seam(tmp_path, crash_at):
     active, rollback_archive, auth = _setup(tmp_path)
+    r2, fake = _r2_kwargs(active)
     kwargs = dict(
         recovery_base_backup=tmp_path / "recovery-base",
         rollback_archive=rollback_archive,
@@ -79,7 +125,7 @@ def test_b13_r2_resumes_from_each_durable_crash_seam(tmp_path, crash_at):
         disposable_root=tmp_path / "disposable",
         authorizations=auth,
     )
-    recovery = B13Recovery(active, **kwargs)
+    recovery = B13Recovery(active, **kwargs, **r2)
     try:
         with pytest.raises(MigrationError, match="injected B13.2 crash"):
             recovery.crash_at = crash_at
@@ -143,6 +189,159 @@ def test_b13_authorizations_are_operation_scoped_and_realm_bound(tmp_path):
         active.close()
 
 
+def test_b13_purge_rejects_a_catalog_selected_or_live_target(tmp_path):
+    support = tmp_path / "support"
+    active = RuntimeService(tmp_path / "active", support_root=support)
+    target = tmp_path / "disposable"
+    support.mkdir(parents=True, exist_ok=True)
+    (support / "catalog.json").write_text(json.dumps({"version": 1, "selected_realm_id": active.realm["id"], "realms": [{"realm_id": active.realm["id"], "display_name": "Selected", "data_root": str(target)}]}), encoding="utf-8")
+    rollback_archive = tmp_path / "rollback"
+    active.backup(rollback_archive)
+    auth = issue_b13_authorizations(selected_realm_id=active.realm["id"])
+    try:
+        with pytest.raises(MigrationError, match="classified|authoritative"):
+            run_b13_recovery(active, recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=target, authorizations=auth)
+        assert not target.exists()
+    finally:
+        active.close()
+
+
+def test_b13_purge_rejects_a_source_target(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    source = tmp_path / "source-target"
+    try:
+        with pytest.raises(MigrationError, match="classified|authoritative"):
+            run_b13_recovery(active, recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=source, source_root=source, authorizations=auth)
+        assert not source.exists()
+    finally:
+        active.close()
+
+
+def test_b13_interrupted_purge_revalidates_target_inode_and_parent(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    disposable = tmp_path / "disposable-parent" / "disposable"
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=disposable, authorizations=auth)
+    try:
+        with pytest.raises(MigrationError, match="injected B13.2 crash"):
+            run_b13_recovery(active, **kwargs, crash_at="before_purge")
+        replacement = disposable
+        shutil.rmtree(replacement)
+        replacement.mkdir()
+        (replacement / "replacement-marker").write_text("must survive", encoding="utf-8")
+        with pytest.raises(MigrationError, match="identity|bytes"):
+            run_b13_recovery(active, **kwargs)
+        assert (replacement / "replacement-marker").exists()
+    finally:
+        active.close()
+
+
+def test_b13_interrupted_purge_rejects_a_symlinked_parent(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    parent = tmp_path / "disposable-parent"
+    disposable = parent / "disposable"
+    outside = tmp_path / "outside"
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=disposable, authorizations=auth)
+    try:
+        with pytest.raises(MigrationError, match="injected B13.2 crash"):
+            run_b13_recovery(active, **kwargs, crash_at="before_purge")
+        parent.rename(tmp_path / "real-disposable-parent")
+        outside.mkdir()
+        parent.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(MigrationError, match="unsafe|ordinary|symlink"):
+            run_b13_recovery(active, **kwargs)
+        assert parent.is_symlink()
+    finally:
+        active.close()
+
+
+def test_b13_interrupted_purge_rejects_catalog_reclassification(tmp_path):
+    support = tmp_path / "support"
+    active = RuntimeService(tmp_path / "active", display_name="Selected", support_root=support)
+    support.mkdir(parents=True, exist_ok=True)
+    catalog_path = support / "catalog.json"
+    catalog_path.write_text(json.dumps({"version": 1, "selected_realm_id": active.realm["id"], "realms": [{"realm_id": active.realm["id"], "display_name": "Selected", "data_root": str(active.store.root)}]}), encoding="utf-8")
+    rollback_archive = tmp_path / "rollback"
+    active.backup(rollback_archive)
+    auth = issue_b13_authorizations(selected_realm_id=active.realm["id"])
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=tmp_path / "disposable", authorizations=auth)
+    try:
+        with pytest.raises(MigrationError, match="injected B13.2 crash"):
+            run_b13_recovery(active, **kwargs, crash_at="before_purge")
+        value = json.loads(catalog_path.read_text(encoding="utf-8"))
+        value["realms"][0]["data_root"] = str(tmp_path / "disposable")
+        catalog_path.write_text(json.dumps(value), encoding="utf-8")
+        with pytest.raises(MigrationError, match="classification"):
+            run_b13_recovery(active, **kwargs)
+        assert (tmp_path / "disposable").exists()
+    finally:
+        active.close()
+
+
+def test_b13_terminal_replay_requires_purged_target_to_remain_absent(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    r2, _fake = _r2_kwargs(active)
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=tmp_path / "disposable", authorizations=auth, **r2)
+    try:
+        report = run_b13_recovery(active, **kwargs)
+        Path(tmp_path / "disposable").mkdir()
+        with pytest.raises(MigrationError, match="purged target"):
+            run_b13_recovery(report["active_runtime"], **kwargs)
+    finally:
+        try:
+            report["active_runtime"].close()
+        except (UnboundLocalError, KeyError):
+            active.close()
+
+
+def test_b13_requires_an_explicit_reboot_executor(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    try:
+        with pytest.raises(MigrationError, match="injectable reboot executor"):
+            run_b13_recovery(active, recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=tmp_path / "disposable", authorizations=auth)
+        assert not (tmp_path / "disposable").exists()
+    finally:
+        active.close()
+
+
+def test_b13_terminal_replay_survives_a_runtime_process_reopen(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    r2, fake = _r2_kwargs(active)
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=tmp_path / "disposable", authorizations=auth, **r2)
+    try:
+        report = run_b13_recovery(active, **kwargs)
+        runtime = report["active_runtime"]
+        root = runtime.store.root
+        display_name = runtime.realm["display_name"]
+        realm_id = runtime.realm["id"]
+        runtime.close()
+        reopened = RuntimeService(root, display_name=display_name, realm_id=realm_id)
+        fake.runtime = reopened
+        replay = run_b13_recovery(reopened, **kwargs)
+        assert replay["idempotent"] is True
+        replay["active_runtime"].close()
+    finally:
+        active.close()
+
+
+def test_b13_terminal_replay_rejects_corrupt_reachable_cas_bytes(tmp_path):
+    active, rollback_archive, auth = _setup(tmp_path)
+    active.ingest_object(b"b13-cas-content", media_type="application/octet-stream")
+    r2, _fake = _r2_kwargs(active)
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=tmp_path / "disposable", authorizations=auth, **r2)
+    try:
+        report = run_b13_recovery(active, **kwargs)
+        digest = next(report["active_runtime"].store.conn.execute("SELECT digest FROM objects"))[0]
+        cas_path = report["active_runtime"].store.cas_root / digest[:2] / digest[2:]
+        cas_path.write_bytes(b"corrupt-after-terminal")
+        with pytest.raises(MigrationError, match="unhealthy|CAS"):
+            run_b13_recovery(report["active_runtime"], **kwargs)
+    finally:
+        try:
+            report["active_runtime"].close()
+        except (UnboundLocalError, KeyError):
+            active.close()
+
+
 def test_b13_rejects_disposable_symlink_without_deleting_resolved_target(tmp_path):
     active, rollback_archive, auth = _setup(tmp_path)
     outside = tmp_path / "outside-target"
@@ -167,6 +366,7 @@ def test_b13_rejects_disposable_symlink_without_deleting_resolved_target(tmp_pat
 
 def test_b13_terminal_replay_binds_live_wal_identity(tmp_path):
     active, rollback_archive, auth = _setup(tmp_path)
+    r2, _fake = _r2_kwargs(active)
     kwargs = dict(
         recovery_base_backup=tmp_path / "recovery-base",
         rollback_archive=rollback_archive,
@@ -174,6 +374,7 @@ def test_b13_terminal_replay_binds_live_wal_identity(tmp_path):
         disposable_root=tmp_path / "disposable",
         authorizations=auth,
     )
+    kwargs.update(r2)
     try:
         report = run_b13_recovery(active, **kwargs)
         report["active_runtime"].store.conn.execute("UPDATE runtime_lifecycle SET boot_id='tampered' WHERE id=1")
@@ -190,6 +391,7 @@ def test_b13_terminal_replay_binds_live_wal_identity(tmp_path):
 @pytest.mark.parametrize("conflict", ["disposable_root", "authorization_nonce"])
 def test_b13_terminal_replay_rejects_complete_request_conflicts(tmp_path, conflict):
     active, rollback_archive, auth = _setup(tmp_path)
+    r2, _fake = _r2_kwargs(active)
     kwargs = dict(
         recovery_base_backup=tmp_path / "recovery-base",
         rollback_archive=rollback_archive,
@@ -197,6 +399,7 @@ def test_b13_terminal_replay_rejects_complete_request_conflicts(tmp_path, confli
         disposable_root=tmp_path / "disposable",
         authorizations=auth,
     )
+    kwargs.update(r2)
     try:
         report = run_b13_recovery(active, **kwargs)
         if conflict == "disposable_root":

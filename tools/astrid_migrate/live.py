@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
+import fcntl
 import hashlib
 import json
 import os
@@ -25,6 +26,8 @@ from typing import Any, Callable, Mapping
 
 from runtime_protocol.backup import restore_backup, verify_backup, verify_restore_candidate
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
+from runtime_protocol.util import canonical_json
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _sha256_file, _tree_size
 from .rehearsal import MigrationJournal, RuntimeServiceAdapter, _tree_digest, _write_json
@@ -68,6 +71,96 @@ def _database_snapshot_sha256(path: Path) -> str:
         snapshot.unlink(missing_ok=True)
 
 
+def _canonical_digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _database_semantic_sha256(path: Path) -> str:
+    """Hash durable realm data while excluding the boot/session control row."""
+    connection = sqlite3.connect(str(path))
+    connection.row_factory = sqlite3.Row
+    try:
+        # Runtime startup refreshes capability metadata and SQLite sequence
+        # counters; those control-plane details are not migration content.
+        # Keep every realm/project/event/media row so a post-reconciliation
+        # user mutation still changes this digest.
+        ignored = {"runtime_lifecycle", "capabilities", "sqlite_sequence"}
+        tables = [str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name") if row[0] not in ignored]
+        value = {table: [dict(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')] for table in tables}
+    finally:
+        connection.close()
+    return _canonical_digest(value)
+
+
+def _semantic_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): value for key, value in snapshot.items() if key != "database_sha256"}
+
+
+def _absolute_path(value: str | Path) -> Path:
+    """Normalize a path lexically without resolving symlinks."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
+
+
+def _has_symlink_component(path: str | Path) -> bool:
+    path = _absolute_path(path)
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            return True
+    return False
+
+
+class _CapacityReservation:
+    """A process-exclusive, durable capacity lease for one B12 journey.
+
+    The lease does not pretend to allocate bytes that the filesystem cannot
+    reserve atomically.  It serializes migrations and rechecks free space at
+    every write boundary; the receipt records the exact conservative peak
+    estimate and the observed free-space values.
+    """
+
+    def __init__(self, handle, path: Path, reservation_id: str, required_bytes: int):
+        self.handle = handle
+        self.path = path
+        self.reservation_id = reservation_id
+        self.required_bytes = int(required_bytes)
+
+    @classmethod
+    def acquire(cls, *, path: Path, reservation_id: str, required_bytes: int, minimum_free_bytes: int) -> "_CapacityReservation":
+        path = _absolute_path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError) as exc:
+            handle.close()
+            raise MigrationError("B12.1 capacity reservation is already held") from exc
+        reservation = cls(handle, path, reservation_id, required_bytes)
+        try:
+            reservation.recheck(minimum_free_bytes=minimum_free_bytes)
+        except Exception:
+            reservation.release()
+            raise
+        return reservation
+
+    def recheck(self, *, minimum_free_bytes: int | None = None) -> int:
+        free = int(shutil.disk_usage(self.path.parent).free)
+        required = self.required_bytes if minimum_free_bytes is None else int(minimum_free_bytes)
+        if free < required:
+            raise MigrationError(f"B12.1 capacity reservation failed immediate recheck: free={free}, required={required}")
+        return free
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+
 def issue_live_authorizations(*, source_manifest_sha256: str | None = None, selected_realm_id: str | None = None, ttl_seconds: int = 3600) -> dict[str, dict[str, Any]]:
     """Create a fresh set of B12 command authorizations.
 
@@ -77,6 +170,10 @@ def issue_live_authorizations(*, source_manifest_sha256: str | None = None, sele
     """
     if ttl_seconds <= 0:
         raise ValueError("authorization TTL must be positive")
+    if not isinstance(source_manifest_sha256, str) or not source_manifest_sha256.strip():
+        raise ValueError("B12 authorizations require an exact source manifest")
+    if not isinstance(selected_realm_id, str) or not selected_realm_id.strip():
+        raise ValueError("B12 authorizations require a concrete selected realm")
     expires_at = time.time() + ttl_seconds
     result = {}
     for authorization_id in LIVE_AUTHORIZATION_IDS:
@@ -109,11 +206,21 @@ class LiveMigration:
         nonces = []
         for authorization_id in LIVE_AUTHORIZATION_IDS:
             value = self.authorizations[authorization_id]
+            if not isinstance(value, Mapping):
+                raise MigrationError(f"invalid authorization instance {authorization_id}")
             if value.get("authorization_id") != authorization_id or not value.get("nonce"):
                 raise MigrationError(f"invalid authorization instance {authorization_id}")
+            if not isinstance(value.get("selected_realm_id"), str) or not value.get("selected_realm_id", "").strip():
+                raise MigrationError(f"{authorization_id} requires a concrete selected realm")
+            if not isinstance(value.get("source_manifest_sha256"), str) or not value.get("source_manifest_sha256", "").strip():
+                raise MigrationError(f"{authorization_id} requires an exact source manifest")
             nonces.append(str(value["nonce"]))
         if len(set(nonces)) != len(nonces):
             raise MigrationError("B12 authorizations must use distinct nonces")
+        realms = {str(self.authorizations[item]["selected_realm_id"]) for item in LIVE_AUTHORIZATION_IDS}
+        sources = {str(self.authorizations[item]["source_manifest_sha256"]) for item in LIVE_AUTHORIZATION_IDS}
+        if len(realms) != 1 or len(sources) != 1:
+            raise MigrationError("B12 authorizations must share one realm and source manifest")
         if self.config.destination_root == Path(self.active_runtime.store.root).resolve():
             raise MigrationError("B12 destination must be separate from the selected realm")
         if self.config.dry_run:
@@ -128,10 +235,10 @@ class LiveMigration:
         expected_scope = authorization_id.removeprefix("AUTH-").lower()
         if value.get("scope") != expected_scope:
             raise MigrationError(f"{authorization_id} scope does not match the requested operation")
-        if value.get("selected_realm_id") not in (None, realm_id):
+        if not isinstance(value.get("selected_realm_id"), str) or value.get("selected_realm_id") != realm_id:
             raise MigrationError(f"{authorization_id} selected realm does not match the active realm")
         bound_source = value.get("source_manifest_sha256")
-        if bound_source not in (None, source_manifest_sha256):
+        if not isinstance(bound_source, str) or not bound_source.strip() or not isinstance(source_manifest_sha256, str) or not source_manifest_sha256.strip() or bound_source != source_manifest_sha256:
             raise MigrationError(f"{authorization_id} source manifest does not match the frozen source")
         try:
             if float(value.get("expires_at", 0)) <= time.time():
@@ -139,6 +246,15 @@ class LiveMigration:
         except (TypeError, ValueError) as exc:
             raise MigrationError(f"{authorization_id} has an invalid expiry") from exc
         return dict(value)
+
+    def _requested_source_manifest(self) -> str:
+        values = {self.authorizations[item].get("source_manifest_sha256") for item in LIVE_AUTHORIZATION_IDS}
+        if len(values) != 1:
+            raise MigrationError("B12 authorizations do not share one exact source manifest")
+        value = next(iter(values))
+        if not isinstance(value, str) or not value.strip():
+            raise MigrationError("B12 authorizations require an exact source manifest")
+        return value
 
     def _consume_authorization(self, authorization_id: str, *, source_manifest_sha256: str, realm_id: str, journal: MigrationJournal) -> dict[str, Any]:
         value = self._validate_authorization(authorization_id, source_manifest_sha256=source_manifest_sha256, realm_id=realm_id)
@@ -169,11 +285,28 @@ class LiveMigration:
 
     def _capacity(self, inventory: Mapping[str, Any], evidence_root: Path) -> dict[str, Any]:
         source_bytes = _tree_size(self.config.source_root)
-        destination_bytes = _tree_size(self.config.destination_root) if self.config.destination_root.exists() else 0
+        estimated_cas = int(inventory.get("estimated_cas_bytes", 0))
+        # Peak accounting is intentionally conservative.  The source remains
+        # live while the archive, active rollback backup, destination, its
+        # backup, restore candidate, rollback/reactivation candidates, CAS,
+        # evidence, and safety margin coexist.
+        archive_bytes = max(source_bytes, _tree_size(self.config.archive_root) if self.config.archive_root.exists() else 0)
+        active_backup_bytes = _tree_size(self.active_runtime.store.root)
+        destination_bytes = max(_tree_size(self.config.destination_root) if self.config.destination_root.exists() else 0, source_bytes + estimated_cas)
+        destination_backup_bytes = destination_bytes
+        candidate_bytes = destination_bytes
+        rollback_bytes = active_backup_bytes
+        reactivation_bytes = destination_bytes
+        # The evidence directory is empty on a fresh run, but the journey
+        # necessarily writes multiple fsynced receipts and journals before it
+        # reaches the terminal state. Reserve a concrete export allowance so
+        # an empty preflight cannot claim that evidence costs zero bytes.
+        evidence_bytes = max(_tree_size(evidence_root), 1024 * 1024)
         margin = self.config.capacity_margin_bytes if self.config.capacity_margin_bytes is not None else max(int(source_bytes * 0.2), 10 * 1024**3)
-        required = source_bytes * 2 + destination_bytes * 2 + int(inventory.get("estimated_cas_bytes", 0)) + _tree_size(evidence_root) + margin
+        components = {"source_bytes": source_bytes, "archive_bytes": archive_bytes, "active_backup_bytes": active_backup_bytes, "destination_bytes": destination_bytes, "destination_backup_bytes": destination_backup_bytes, "candidate_bytes": candidate_bytes, "rollback_bytes": rollback_bytes, "reactivation_bytes": reactivation_bytes, "cas_bytes": estimated_cas, "evidence_bytes": evidence_bytes, "margin_bytes": margin}
+        required = sum(int(value) for value in components.values())
         available = int(inventory["destination_free_bytes"])
-        receipt = {"packet": "B12.1", "source_bytes": source_bytes, "archive_bytes": source_bytes, "destination_bytes": destination_bytes, "margin_bytes": margin, "required_bytes": required, "available_bytes": available, "reserved": available >= required}
+        receipt = {"packet": "B12.1", **components, "required_bytes": required, "available_bytes": available, "reserved": available >= required}
         if not receipt["reserved"]:
             raise MigrationError("B12.1 capacity reservation is insufficient")
         return receipt
@@ -199,6 +332,8 @@ class LiveMigration:
         return os.path.lexists(str(path))
 
     def _fresh_destination(self, destination: Path) -> None:
+        if _has_symlink_component(destination):
+            raise MigrationError("B12 destination must be fresh and must not contain a symlink component")
         if self._path_exists(destination):
             raise MigrationError("B12 destination must be a fresh, non-symlink path")
         if destination.is_symlink():
@@ -248,6 +383,15 @@ class LiveMigration:
             self._validate_authorization(authorization_id, source_manifest_sha256=source_manifest, realm_id=realm_id)
             if not isinstance(value, Mapping) or self._nonce_digest(value) != expected_nonces.get(authorization_id):
                 raise MigrationError(f"{authorization_id} replay conflicts with the durable authorization")
+        writer_effect = journal.effects().get("writer-stop")
+        if not writer_effect:
+            raise MigrationError("B12 terminal journal has no durable writer-stop completion")
+        writer_payload = writer_effect.get("payload", {})
+        if writer_payload.get("realm_id") != realm_id or writer_payload.get("source_manifest_sha256") != source_manifest or writer_payload.get("receipt", {}).get("stopped") is not True:
+            raise MigrationError("B12 terminal writer-stop receipt is not bound to the selected source")
+        completion_path = Path(str(writer_payload.get("completion_path", "")))
+        if _has_symlink_component(completion_path) or not completion_path.is_file() or writer_payload.get("completion_sha256") != _sha256_file(completion_path):
+            raise MigrationError("B12 terminal writer-stop completion is missing or changed")
         entries = current.get("entries", [])
         identity = entries[-1].get("identity") if entries else None
         if not isinstance(identity, Mapping) or identity.get("realm_id") != realm_id or identity.get("source_manifest_sha256") != source_manifest or identity.get("destination_root") != str(self.active_runtime.store.root):
@@ -255,11 +399,51 @@ class LiveMigration:
         final_effect = journal.effects().get("final-identity")
         if not final_effect or final_effect.get("payload", {}).get("identity") != dict(identity):
             raise MigrationError("B12 terminal journal final identity effect is missing or conflicting")
-        if identity.get("active_database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path):
-            raise MigrationError("B12 terminal replay conflicts with the active final identity")
+        try:
+            identity_epoch = int(identity.get("runtime_epoch"))
+        except (TypeError, ValueError) as exc:
+            raise MigrationError("B12 terminal final identity has no valid runtime epoch") from exc
+        current_epoch = int(self.active_runtime.health()["runtime_epoch"])
+        same_session = identity.get("runtime_session_id") == getattr(self.active_runtime, "runtime_session_id", None)
+        if same_session or current_epoch <= identity_epoch:
+            if identity.get("active_database_sha256") != _database_snapshot_sha256(self.active_runtime.store.db_path):
+                raise MigrationError("B12 terminal replay conflicts with the active final identity")
+        elif identity.get("active_database_semantic_sha256") != _database_semantic_sha256(self.active_runtime.store.db_path):
+            raise MigrationError("B12 terminal replay conflicts with the active durable database state")
+        doctor = self.active_runtime.doctor()
+        if not doctor.get("ok"):
+            raise MigrationError("B12 terminal replay current runtime failed doctor")
+        snapshot = RuntimeServiceAdapter(self.active_runtime).destination_snapshot()
+        if identity.get("active_semantic_snapshot_sha256") != _canonical_digest(_semantic_snapshot(snapshot)):
+            raise MigrationError("B12 terminal replay conflicts with the active semantic state")
+        if identity.get("active_cas_manifest_sha256") != self._cas_manifest_digest(snapshot):
+            raise MigrationError("B12 terminal replay conflicts with active CAS content")
+        archive_root = self.config.archive_root
+        active_backup_root = archive_root.parent / f"{archive_root.name}-live-pre-migration-backup"
+        destination_backup_root = archive_root.parent / f"{archive_root.name}-live-destination-backup"
+        for path, key in ((active_backup_root, "source_backup_manifest_sha256"), (destination_backup_root, "destination_backup_manifest_sha256")):
+            if _has_symlink_component(path) or not path.is_dir():
+                raise MigrationError(f"B12 terminal replay is missing backup {path}")
+            try:
+                verified_backup = verify_backup(path)
+            except Exception as exc:
+                raise MigrationError(f"B12 terminal replay backup verification failed: {path}") from exc
+            backup_binding = verified_backup["manifest"].get("destination_binding") or {}
+            if backup_binding.get("selected_realm_id") != realm_id or backup_binding.get("source_manifest_sha256") != source_manifest:
+                raise MigrationError(f"B12 terminal replay backup binding changed: {path}")
+            if identity.get(key) != _sha256_file(path / "manifest.json"):
+                raise MigrationError(f"B12 terminal replay backup manifest changed: {path}")
+        artifacts = self._runtime_artifact_identity(self.active_runtime, source_manifest_sha256=source_manifest, expected_activation_manifest_sha256=identity.get("activation_manifest_sha256"))
+        if identity.get("catalog_identity") != artifacts["catalog"]:
+            raise MigrationError("B12 terminal replay catalog identity changed")
+        release = journal.effects().get("capacity-release")
+        if not release or release.get("payload", {}).get("reservation_id") != journal.effects().get("capacity-reservation", {}).get("payload", {}).get("reservation_id"):
+            raise MigrationError("B12 terminal capacity reservation was not durably released")
         return {"packet": "B12", "journal": current, "identity": dict(identity), "idempotent": True}
 
     def _backup_or_reuse(self, runtime: RuntimeService, destination: Path, *, binding: Mapping[str, Any], journal: MigrationJournal, effect_name: str, seam: str) -> dict[str, Any]:
+        if _has_symlink_component(destination):
+            raise MigrationError(f"B12 {effect_name} path contains a symlink component")
         existing = self._existing_effect(journal, effect_name)
         if existing:
             payload = existing.get("payload", {})
@@ -269,7 +453,8 @@ class LiveMigration:
                 verified = verify_backup(destination)
             except Exception as exc:
                 raise MigrationError(f"B12 durable backup effect is not reusable: {destination}") from exc
-            if dict(verified["manifest"].get("destination_binding") or {}) != dict(binding):
+            actual_binding = verified["manifest"].get("destination_binding") or {}
+            if not self._backup_binding_compatible(actual_binding, binding):
                 raise MigrationError(f"B12 durable backup binding changed on disk: {destination}")
             if payload.get("manifest_sha256") != _sha256_file(destination / "manifest.json"):
                 raise MigrationError(f"B12 durable backup effect changed on disk: {destination}")
@@ -280,7 +465,7 @@ class LiveMigration:
             except Exception as exc:
                 raise MigrationError(f"B12 existing backup is not a verified reusable artifact: {destination}") from exc
             actual = verified["manifest"].get("destination_binding") or {}
-            if dict(actual) != dict(binding):
+            if not self._backup_binding_compatible(actual, binding):
                 raise MigrationError(f"B12 existing backup has a conflicting binding: {destination}")
         else:
             journal._inject(f"before_{seam}")
@@ -289,7 +474,31 @@ class LiveMigration:
         journal.effect(effect_name, path=str(destination), manifest_sha256=_sha256_file(destination / "manifest.json"), realm_id=binding.get("selected_realm_id"))
         return verified
 
+    @staticmethod
+    def _backup_binding_compatible(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+        """Compare immutable backup identity without binding volatile truth rows."""
+        for key in ("packet", "kind", "selected_realm_id", "source_manifest_sha256"):
+            if actual.get(key) != expected.get(key):
+                return False
+        actual_reconciliation = actual.get("reconciliation")
+        expected_reconciliation = expected.get("reconciliation")
+        if not isinstance(actual_reconciliation, Mapping) or not isinstance(expected_reconciliation, Mapping):
+            return actual_reconciliation == expected_reconciliation
+        # ``destination_truth`` carries paths, database bytes, and runtime
+        # generated ids.  The immutable reconciliation contract is the source
+        # mapping, counts, blockers, and success bit around that observation.
+        for key, value in expected_reconciliation.items():
+            if key == "destination_truth":
+                continue
+            if actual_reconciliation.get(key) != value:
+                return False
+        return actual_reconciliation.get("ok") is True
+
     def _restore_or_reuse(self, backup: Path, destination: Path, *, journal: MigrationJournal, effect_name: str, realm_id: str, seam: str) -> dict[str, Any]:
+        if _has_symlink_component(backup):
+            raise MigrationError(f"B12 {effect_name} backup contains a symlink component")
+        if _has_symlink_component(destination):
+            raise MigrationError(f"B12 {effect_name} destination contains a symlink component")
         existing = self._existing_effect(journal, effect_name)
         if existing:
             payload = existing.get("payload", {})
@@ -317,6 +526,169 @@ class LiveMigration:
         journal.effect(effect_name, destination=str(destination), realm_id=realm_id, source_manifest_sha256=verification["handoff"].get("source_manifest_sha256"), database_sha256=verification.get("database_sha256"))
         return {"destination": str(destination), "realm_id": realm_id, "verification": verification}
 
+    @staticmethod
+    def _cas_manifest_digest(snapshot: Mapping[str, Any]) -> str:
+        objects = [
+            {key: item.get(key) for key in ("digest", "size", "sha256")}
+            for item in snapshot.get("cas_objects", [])
+            if isinstance(item, Mapping)
+        ]
+        return _canonical_digest(sorted(objects, key=lambda item: str(item.get("digest"))))
+
+    @staticmethod
+    def _cas_content_map(root: Path) -> dict[str, str]:
+        cas_root = _absolute_path(root) / "cas" / "sha256"
+        result = {}
+        if cas_root.is_dir():
+            for path in cas_root.rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    result[path.parent.name + path.name] = _sha256_file(path)
+        return result
+
+    def _verify_root_against_backup(self, root: Path, backup: Path, *, realm_id: str) -> None:
+        if _has_symlink_component(root) or _has_symlink_component(backup):
+            raise MigrationError("B12 destination verification path contains a symlink component")
+        try:
+            verified = verify_backup(backup)
+        except Exception as exc:
+            raise MigrationError(f"B12 destination backup cannot be verified: {backup}") from exc
+        if verified["manifest"].get("realm_id") != realm_id:
+            raise MigrationError("B12 destination backup realm identity changed")
+        if _database_semantic_sha256(root / "realm.sqlite3") != _database_semantic_sha256(backup / "realm.sqlite3"):
+            raise MigrationError("B12 destination changed after reconciliation")
+        expected = {str(item["digest"]): str(item["sha256"]) for item in verified["cas_manifest"].get("objects", [])}
+        if self._cas_content_map(root) != expected:
+            raise MigrationError("B12 destination CAS changed after reconciliation")
+        store = RealmStore(root, acquire_owner=False)
+        try:
+            if store.realm["id"] != realm_id or not store.doctor()["ok"]:
+                raise MigrationError("B12 destination failed its final doctor check")
+        finally:
+            store.close()
+
+    def _active_matches_candidate(self, candidate: Path, realm_id: str) -> bool:
+        """Recognize an already-completed activation after process restart.
+
+        Runtime startup legitimately rewrites its epoch/session control rows,
+        so a raw SQLite byte comparison would miss a swap that happened just
+        before a crash and would perform the activation a second time. Compare
+        the candidate's authenticated realm content instead.
+        """
+        try:
+            if _has_symlink_component(candidate) or candidate.is_symlink():
+                return False
+            verify_restore_candidate(candidate)
+            if self.active_runtime.realm["id"] != realm_id or not self.active_runtime.doctor().get("ok"):
+                return False
+            if _database_semantic_sha256(self.active_runtime.store.db_path) != _database_semantic_sha256(candidate / "realm.sqlite3"):
+                return False
+            return self._cas_content_map(_absolute_path(self.active_runtime.store.root)) == self._cas_content_map(candidate)
+        except Exception:
+            return False
+
+    def _runtime_artifact_identity(self, runtime: RuntimeService, *, source_manifest_sha256: str, expected_activation_manifest_sha256: str | None = None) -> dict[str, Any]:
+        """Verify the control-plane artifacts that a terminal replay relies on."""
+        root = _absolute_path(runtime.store.root)
+        activation_path = root / "activation-manifest.json"
+        if _has_symlink_component(activation_path) or not activation_path.is_file():
+            raise MigrationError("B12 terminal replay is missing the activation manifest")
+        try:
+            activation = self._read_json(activation_path)
+        except MigrationError:
+            raise
+        if activation.get("format_version") != 1 or activation.get("state") != "activated" or _absolute_path(activation.get("destination_root", "")) != _absolute_path(self.config.destination_root):
+            raise MigrationError("B12 terminal activation manifest has an invalid identity")
+        source_archive = Path(str(activation.get("source_archive", "")))
+        if _absolute_path(source_archive) != _absolute_path(self.config.archive_root):
+            raise MigrationError("B12 terminal activation manifest archive identity changed")
+        source_archive_manifest = source_archive / "manifest.json"
+        if _has_symlink_component(source_archive_manifest) or not source_archive_manifest.is_file():
+            raise MigrationError("B12 terminal activation manifest source archive is missing")
+        if activation.get("source_archive_sha256") != _sha256_file(source_archive_manifest):
+            raise MigrationError("B12 terminal activation manifest source archive changed")
+        try:
+            source_archive_payload = self._read_json(source_archive_manifest)
+        except MigrationError:
+            raise MigrationError("B12 terminal activation manifest source archive is unreadable")
+        if source_archive_payload.get("source_manifest_sha256") != source_manifest_sha256:
+            raise MigrationError("B12 terminal activation manifest source identity changed")
+        # New manifests may also carry the source binding at the activation
+        # layer.  Accept older migrator output only when its authenticated
+        # archive manifest supplies the exact same binding above.
+        if activation.get("source_manifest_sha256") is not None and activation.get("source_manifest_sha256") != source_manifest_sha256:
+            raise MigrationError("B12 terminal activation manifest source identity changed")
+        reconciliation = activation.get("reconciliation")
+        if not isinstance(reconciliation, Mapping) or reconciliation.get("ok") is not True:
+            raise MigrationError("B12 terminal activation manifest source identity changed")
+        activation_sha256 = _sha256_file(activation_path)
+        if expected_activation_manifest_sha256 is not None and activation_sha256 != expected_activation_manifest_sha256:
+            raise MigrationError("B12 terminal activation manifest bytes changed")
+        catalog_identity: dict[str, Any] = {"status": "not_configured", "sha256": None}
+        if runtime.support_root is not None:
+            catalog_path = _absolute_path(runtime.support_root) / "catalog.json"
+            if _has_symlink_component(catalog_path) or not catalog_path.is_file():
+                raise MigrationError("B12 terminal catalog is missing")
+            try:
+                catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise MigrationError("B12 terminal catalog is unreadable") from exc
+            rows = [row for row in catalog.get("realms", []) if isinstance(row, Mapping) and row.get("realm_id") == runtime.realm["id"]]
+            if catalog.get("selected_realm_id") != runtime.realm["id"] or len(rows) != 1:
+                raise MigrationError("B12 terminal catalog selection or realm identity changed")
+            if _absolute_path(rows[0].get("data_root", "")) != root:
+                raise MigrationError("B12 terminal catalog data root changed")
+            catalog_identity = {"status": "ready", "sha256": _sha256_file(catalog_path), "selected_realm_id": runtime.realm["id"], "data_root": str(root)}
+        return {"activation_manifest_sha256": activation_sha256, "activation_state": activation.get("state"), "catalog": catalog_identity}
+
+    def _revalidate_destination(self, config: MigrationConfig, inventory: Mapping[str, Any], destination: RuntimeService, *, source_manifest_sha256: str) -> dict[str, Any]:
+        """Read and reconcile destination truth immediately before activation."""
+        current_inventory = Migrator(config, None).inventory()
+        if current_inventory.get("source_manifest_sha256") != source_manifest_sha256:
+            raise MigrationError("B12 source manifest changed before activation")
+        verifier = Migrator(config, RuntimeServiceAdapter(destination))
+        # Re-run the migration kernel against its idempotent destination
+        # operations.  This reconstructs source->destination identity maps,
+        # then performs a fresh exact reconciliation from runtime truth; a
+        # direct snapshot-only check cannot validate task/generation mappings.
+        try:
+            reconciliation = verifier.migrate().get("reconciliation")
+        except Exception as exc:
+            # Reconciliation is a migration boundary, so an idempotency or
+            # identity conflict discovered while replaying the kernel must be
+            # surfaced as a failed reconciliation rather than leaking an
+            # implementation-specific adapter exception.
+            raise MigrationError("B12.2 destination reconciliation changed before activation") from exc
+        if not isinstance(reconciliation, Mapping) or not reconciliation.get("ok"):
+            raise MigrationError("B12.2 destination reconciliation changed before activation")
+        doctor = destination.doctor()
+        if not doctor.get("ok") or destination.realm["id"] != str(self.active_runtime.realm["id"]):
+            raise MigrationError("B12.2 destination failed its final integrity or realm check")
+        return dict(reconciliation)
+
+    def _destination_truth(self, destination: RuntimeService) -> dict[str, Any]:
+        """Capture the durable destination identity at a write boundary."""
+        snapshot = RuntimeServiceAdapter(destination).destination_snapshot()
+        return {
+            "semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(snapshot)),
+            "cas_manifest_sha256": self._cas_manifest_digest(snapshot),
+            "database_semantic_sha256": _database_semantic_sha256(destination.store.db_path),
+            "realm_id": str(destination.realm["id"]),
+        }
+
+    def _assert_active_baseline(self, journal: MigrationJournal, active: RuntimeService) -> None:
+        effect = journal.effects().get("active-baseline")
+        if not effect:
+            raise MigrationError("B12 active baseline is missing before activation")
+        payload = effect.get("payload", {})
+        snapshot = RuntimeServiceAdapter(active).destination_snapshot()
+        if payload.get("semantic_snapshot_sha256") != _canonical_digest(_semantic_snapshot(snapshot)):
+            raise MigrationError("B12 active runtime changed after the writer-stop boundary")
+
+    def _assert_destination_baseline(self, destination: RuntimeService, payload: Mapping[str, Any]) -> None:
+        current = self._destination_truth(destination)
+        if any(payload.get(key) != current.get(key) for key in ("semantic_snapshot_sha256", "cas_manifest_sha256", "database_semantic_sha256", "realm_id")):
+            raise MigrationError("B12 destination changed after its final reconciliation")
+
     def run(self) -> dict[str, Any]:
         active = self.active_runtime
         realm_id = str(active.realm["id"])
@@ -337,33 +709,87 @@ class LiveMigration:
         rollback_root = archive_root.parent / f"{archive_root.name}-live-rollback"
         reactivation_root = archive_root.parent / f"{archive_root.name}-live-reactivated"
         with ExitStack() as stack:
-            self._validate_authorization("AUTH-LIVE-INPUT-B12", source_manifest_sha256=None, realm_id=realm_id)
-            writer_receipt = self._writer_boundary(stack)
-            self._validate_authorization("AUTH-WRITER-STOP-B12", source_manifest_sha256=None, realm_id=realm_id)
-
+            requested_source_manifest = self._requested_source_manifest()
+            # Bind the operator inputs before invoking the external writer-stop
+            # authority.  A stop completion is therefore never detached from
+            # its realm/source request, even if the process dies immediately
+            # after the callback returns.
+            for authorization_id in LIVE_AUTHORIZATION_IDS:
+                self._validate_authorization(authorization_id, source_manifest_sha256=requested_source_manifest, realm_id=realm_id)
+            binding = self._bind_request(journal, realm_id=realm_id, source_manifest_sha256=requested_source_manifest, evidence_root=evidence_root)
+            writer_effect = self._existing_effect(journal, "writer-stop")
+            writer_completion_path = evidence_root / "writer-stop-completion-b12.json"
+            if writer_effect:
+                writer_payload = writer_effect.get("payload", {})
+                if writer_payload.get("realm_id") != realm_id or writer_payload.get("source_manifest_sha256") != requested_source_manifest or writer_payload.get("receipt", {}).get("stopped") is not True:
+                    raise MigrationError("B12 durable writer-stop completion conflicts with this request")
+                writer_receipt = dict(writer_payload["receipt"])
+                if writer_payload.get("completion_sha256") != _sha256_file(writer_completion_path):
+                    raise MigrationError("B12 durable writer-stop completion file changed")
+            else:
+                if writer_completion_path.is_file():
+                    completion = self._read_json(writer_completion_path)
+                    if completion.get("realm_id") != realm_id or completion.get("source_manifest_sha256") != requested_source_manifest or completion.get("receipt", {}).get("stopped") is not True:
+                        raise MigrationError("B12 durable writer-stop completion file conflicts with this request")
+                    writer_receipt = dict(completion["receipt"])
+                else:
+                    writer_receipt = self._writer_boundary(stack)
+                    _write_json(writer_completion_path, {"packet": "B12.1", "realm_id": realm_id, "source_manifest_sha256": requested_source_manifest, "receipt": writer_receipt})
+                journal.effect("writer-stop", realm_id=realm_id, source_manifest_sha256=requested_source_manifest, receipt=writer_receipt, completion_path=str(writer_completion_path), completion_sha256=_sha256_file(writer_completion_path))
             probe = Migrator(self.config, None)
             inventory = probe.inventory()
             source_manifest_sha256 = inventory["source_manifest_sha256"]
-            binding = self._bind_request(journal, realm_id=realm_id, source_manifest_sha256=source_manifest_sha256, evidence_root=evidence_root)
-            for authorization_id in LIVE_AUTHORIZATION_IDS:
-                self._validate_authorization(authorization_id, source_manifest_sha256=source_manifest_sha256, realm_id=realm_id)
+            if source_manifest_sha256 != requested_source_manifest:
+                raise MigrationError("B12 source manifest changed at the writer-stop boundary")
             self._consume_authorization("AUTH-LIVE-INPUT-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
             self._consume_authorization("AUTH-WRITER-STOP-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
+            capacity_path = evidence_root / "capacity-receipt-b12.json"
+            capacity_effect = self._existing_effect(journal, "capacity-receipt")
+            if capacity_effect:
+                capacity = self._read_json(capacity_path)
+                if capacity_effect.get("payload", {}).get("receipt_sha256") != _sha256_file(capacity_path) or capacity.get("reserved") is not True:
+                    raise MigrationError("B12 durable capacity receipt is missing or changed")
+            else:
+                capacity = self._capacity(inventory, evidence_root)
+                _write_json(capacity_path, capacity)
+                journal.effect("capacity-receipt", path=str(capacity_path), receipt_sha256=_sha256_file(capacity_path), required_bytes=capacity["required_bytes"], available_bytes=capacity["available_bytes"])
+            capacity_lock_path = self.config.destination_root.parent / f".{self.config.destination_root.name}.capacity-b12.lock"
+            if _has_symlink_component(capacity_lock_path):
+                raise MigrationError("B12.1 capacity reservation path contains a symlink component")
+            reservation_effect = self._existing_effect(journal, "capacity-reservation")
+            if reservation_effect:
+                reservation_payload = reservation_effect.get("payload", {})
+                if reservation_payload.get("required_bytes") != capacity["required_bytes"] or reservation_payload.get("path") != str(capacity_lock_path):
+                    raise MigrationError("B12 capacity reservation conflicts with its durable receipt")
+                reservation_id = str(reservation_payload["reservation_id"])
+            else:
+                reservation_id = secrets.token_urlsafe(18)
+            reservation = _CapacityReservation.acquire(path=capacity_lock_path, reservation_id=reservation_id, required_bytes=int(capacity["required_bytes"]), minimum_free_bytes=int(capacity["required_bytes"]))
+            stack.callback(reservation.release)
+            immediate_free = reservation.recheck()
+            if reservation_effect:
+                if reservation_effect.get("payload", {}).get("recheck_available_bytes") is None:
+                    raise MigrationError("B12 capacity reservation receipt is incomplete")
+            else:
+                journal.effect("capacity-reservation", path=str(reservation.path), reservation_id=reservation_id, required_bytes=int(capacity["required_bytes"]), recheck_available_bytes=immediate_free)
             if current["state"] == "prepared":
                 freeze_path = evidence_root / "source-freeze-b12.json"
                 freeze_effect = self._existing_effect(journal, "source-freeze")
-                freeze = self._read_json(freeze_path) if freeze_effect else {"packet": "B12.1", "state": "frozen", "source_manifest_sha256": source_manifest_sha256, "source_tree_sha256": _tree_digest(self.config.source_root), "source_facts_sha256": inventory["source_facts_sha256"], "writer": writer_receipt, "created_at": time.time()}
+                if freeze_effect:
+                    freeze = self._read_json(freeze_path)
+                    if freeze.get("source_manifest_sha256") != source_manifest_sha256 or freeze.get("source_facts_sha256") != inventory["source_facts_sha256"] or freeze.get("writer", {}).get("stopped") is not True:
+                        raise MigrationError("B12 durable source freeze is not bound to the writer-stop receipt")
+                    byte_path = evidence_root / "source-byte-manifest-b12.json"
+                    byte_manifest = self._read_json(byte_path)
+                    if byte_manifest.get("source_manifest_sha256") != source_manifest_sha256 or byte_manifest.get("source_facts_sha256") != inventory["source_facts_sha256"] or byte_manifest.get("files_sha256") != inventory["files_sha256"] or byte_manifest.get("database_sha256") != inventory["database_sha256"]:
+                        raise MigrationError("B12 durable source byte manifest changed")
+                else:
+                    freeze = {"packet": "B12.1", "state": "frozen", "source_manifest_sha256": source_manifest_sha256, "source_tree_sha256": _tree_digest(self.config.source_root), "source_facts_sha256": inventory["source_facts_sha256"], "writer": writer_receipt, "created_at": time.time()}
                 if not freeze_effect:
                     _write_json(freeze_path, freeze)
                     byte_manifest = {"packet": "B12.1", "source_manifest_sha256": source_manifest_sha256, "source_facts_sha256": inventory["source_facts_sha256"], "database_sha256": inventory["database_sha256"], "files": inventory["files"], "files_sha256": inventory["files_sha256"], "created_at": time.time()}
                     _write_json(evidence_root / "source-byte-manifest-b12.json", byte_manifest)
                     journal.effect("source-freeze", path=str(freeze_path), source_manifest_sha256=source_manifest_sha256, source_byte_manifest_sha256=inventory["files_sha256"])
-                capacity_path = evidence_root / "capacity-receipt-b12.json"
-                capacity_effect = self._existing_effect(journal, "capacity-receipt")
-                capacity = self._read_json(capacity_path) if capacity_effect else self._capacity(inventory, evidence_root)
-                if not capacity_effect:
-                    _write_json(capacity_path, capacity)
-                    journal.effect("capacity-receipt", path=str(capacity_path), required_bytes=capacity["required_bytes"], available_bytes=capacity["available_bytes"])
                 writer_path = evidence_root / "writer-freeze-receipt-b12.json"
                 if not self._existing_effect(journal, "writer-freeze-receipt"):
                     _write_json(writer_path, freeze | {"authorization_id": "AUTH-WRITER-STOP-B12"})
@@ -377,33 +803,76 @@ class LiveMigration:
                     dry_run = Migrator(dry_config, None).migrate()
                     _write_json(dry_path, {"packet": "B12.1", "source_manifest_sha256": source_manifest_sha256, "report": dry_run})
                     journal.effect("dry-run-receipt", path=str(dry_path), source_manifest_sha256=source_manifest_sha256)
+                reservation.recheck()
                 active_binding = {"packet": "B12.1", "kind": "rollback-archive", "selected_realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256}
                 active_backup = self._backup_or_reuse(active, active_backup_root, binding=active_binding, journal=journal, effect_name="pre-migration-backup", seam="active_backup")
+                baseline_effect = self._existing_effect(journal, "active-baseline")
+                if not baseline_effect:
+                    baseline_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
+                    baseline_payload = {"semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(baseline_snapshot)), "database_sha256": _database_snapshot_sha256(active.store.db_path), "realm_id": realm_id}
+                    journal.effect("active-baseline", **baseline_payload)
                 self._consume_authorization("AUTH-LIVE-MIGRATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
 
+                if _has_symlink_component(self.config.destination_root):
+                    raise MigrationError("B12 destination must not contain a symlink component")
+                reservation.recheck()
                 destination = RuntimeService(self.config.destination_root, display_name=active.realm["display_name"], realm_id=realm_id)
                 destination_adapter = RuntimeServiceAdapter(destination)
                 try:
                     migration_effect = self._existing_effect(journal, "migration-receipt")
+                    migration_baseline_effect = self._existing_effect(journal, "migration-baseline")
+                    destination_baseline_effect = self._existing_effect(journal, "destination-baseline")
+                    # Validate every durable destination checkpoint before
+                    # replaying the migration kernel.  Otherwise a deleted or
+                    # edited destination row could be silently recreated by
+                    # idempotent import during resume.
+                    if migration_effect and not migration_baseline_effect:
+                        raise MigrationError("B12 migration baseline is missing before reconciliation")
+                    if migration_baseline_effect:
+                        self._assert_destination_baseline(destination, migration_baseline_effect.get("payload", {}))
+                    if destination_baseline_effect:
+                        self._assert_destination_baseline(destination, destination_baseline_effect.get("payload", {}))
                     if migration_effect:
                         migration = self._read_json(evidence_root / "migration-receipt-b12.json")["report"]
                     else:
                         live_config = replace(self.config, require_destination_verification=True, expected_source_manifest_sha256=source_manifest_sha256, expected_source_facts_sha256=inventory["source_facts_sha256"])
                         journal._inject("before_migration")
+                        reservation.recheck()
                         migration = Migrator(live_config, destination_adapter).migrate()
+                        migration_baseline = self._destination_truth(destination)
+                        journal.effect("migration-baseline", **migration_baseline)
                         journal._inject("after_migration")
+                        self._assert_destination_baseline(destination, migration_baseline)
+                        reservation.recheck()
                         _write_json(evidence_root / "migration-receipt-b12.json", {"packet": "B12.2", "migration_epoch": 1, "report": migration})
                         journal.effect("migration-receipt", path=str(evidence_root / "migration-receipt-b12.json"), source_manifest_sha256=source_manifest_sha256)
-                    reconciliation = migration["reconciliation"]
+                    live_config = replace(self.config, require_destination_verification=True, expected_source_manifest_sha256=source_manifest_sha256, expected_source_facts_sha256=inventory["source_facts_sha256"])
+                    reconciliation = self._revalidate_destination(live_config, inventory, destination, source_manifest_sha256=source_manifest_sha256)
                     if not reconciliation.get("ok"):
                         raise MigrationError("B12.2 reconciliation failed")
+                    destination_baseline = self._destination_truth(destination)
+                    baseline_effect = self._existing_effect(journal, "destination-baseline")
+                    if baseline_effect:
+                        if baseline_effect.get("payload") != destination_baseline:
+                            # A crash/resume may reopen the destination and
+                            # refresh only runtime control metadata; semantic
+                            # content must still match the original receipt.
+                            self._assert_destination_baseline(destination, baseline_effect.get("payload", {}))
+                        destination_baseline = baseline_effect.get("payload", {})
+                    else:
+                        journal.effect("destination-baseline", **destination_baseline)
                     destination_binding = {"packet": "B12.2", "kind": "destination", "selected_realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "reconciliation": reconciliation}
+                    reservation.recheck()
                     destination_backup = self._backup_or_reuse(destination, destination_backup_root, binding=destination_binding, journal=journal, effect_name="destination-backup", seam="destination_backup")
+                    self._assert_destination_baseline(destination, destination_baseline)
                 finally:
                     destination.close()
 
+                reservation.recheck()
                 candidate_result = self._restore_or_reuse(destination_backup_root, candidate_root, journal=journal, effect_name="candidate-restore", realm_id=realm_id, seam="candidate_restore")
                 destination_activation_manifest = self.config.destination_root / "activation-manifest.json"
+                if _has_symlink_component(destination_activation_manifest):
+                    raise MigrationError("B12 destination activation manifest contains a symlink component")
                 if destination_activation_manifest.is_file() and not (candidate_root / "activation-manifest.json").is_file():
                     shutil.copy2(destination_activation_manifest, candidate_root / "activation-manifest.json")
                 # The activation manifest is a control-plane handoff, not
@@ -413,16 +882,28 @@ class LiveMigration:
                 destination_binding = candidate_verification["manifest"].get("destination_binding") or {}
                 if (destination_binding.get("packet") != "B12.2" or destination_binding.get("selected_realm_id") != realm_id or destination_binding.get("source_manifest_sha256") != source_manifest_sha256):
                     raise MigrationError("B12.3 destination backup is not bound to the selected live migration")
+                # Candidate restore is another write boundary.  Recheck the
+                # original destination itself as well: a mutation after the
+                # reconciliation/backup must not be hidden by an unchanged
+                # candidate copy.
+                self._verify_root_against_backup(self.config.destination_root, destination_backup_root, realm_id=realm_id)
                 self._consume_authorization("AUTH-ACTIVATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
                 activation_effect = self._existing_effect(journal, "active-activation")
                 candidate_db = candidate_verification["database_sha256"]
                 if activation_effect:
+                    activation_payload = activation_effect.get("payload", {})
+                    if (activation_payload.get("candidate") != str(candidate_root) or _has_symlink_component(candidate_root) or not self._active_matches_candidate(candidate_root, realm_id)):
+                        raise MigrationError("B12 durable active activation is not reusable")
                     activated = activation_effect["payload"]["activation"]
-                elif _sha256_file(active.store.db_path) == candidate_db:
+                elif self._active_matches_candidate(candidate_root, realm_id):
                     activated = {"state": "active", "reused": True, "candidate": str(candidate_root)}
                     journal.effect("active-activation", candidate=str(candidate_root), state="active", activation=activated, database_sha256=candidate_db)
                 else:
+                    self._assert_active_baseline(journal, active)
                     journal._inject("before_active_activation")
+                    self._assert_active_baseline(journal, active)
+                    self._verify_root_against_backup(self.config.destination_root, destination_backup_root, realm_id=realm_id)
+                    reservation.recheck()
                     activated = RuntimeServiceAdapter(active).activate_destination(candidate_root, state="active")
                     journal._inject("after_active_activation")
                     journal.effect("active-activation", candidate=str(candidate_root), state="active", activation=activated, database_sha256=candidate_db)
@@ -438,16 +919,21 @@ class LiveMigration:
 
             if journal._read()["state"] == "active":
                 self._consume_authorization("AUTH-ROLLBACK-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
+                reservation.recheck()
                 rollback_result = self._restore_or_reuse(active_backup_root, rollback_root, journal=journal, effect_name="rollback-restore", realm_id=realm_id, seam="rollback_restore")
                 rollback_verification = rollback_result["verification"]
                 rollback_effect = self._existing_effect(journal, "rollback-activation")
                 if rollback_effect:
+                    rollback_payload = rollback_effect.get("payload", {})
+                    if (rollback_payload.get("candidate") != str(rollback_root) or _has_symlink_component(rollback_root) or not self._active_matches_candidate(rollback_root, realm_id)):
+                        raise MigrationError("B12 durable rollback activation is not reusable")
                     rolled_back = rollback_effect["payload"]["activation"]
-                elif _sha256_file(active.store.db_path) == rollback_verification["database_sha256"]:
+                elif self._active_matches_candidate(rollback_root, realm_id):
                     rolled_back = {"state": "rolled_back", "reused": True, "candidate": str(rollback_root)}
                     journal.effect("rollback-activation", candidate=str(rollback_root), state="rolled_back", activation=rolled_back, database_sha256=rollback_verification["database_sha256"])
                 else:
                     journal._inject("before_rollback_activation")
+                    reservation.recheck()
                     rolled_back = RuntimeServiceAdapter(active).activate_destination(rollback_root, state="rolled_back")
                     journal._inject("after_rollback_activation")
                     journal.effect("rollback-activation", candidate=str(rollback_root), state="rolled_back", activation=rolled_back, database_sha256=rollback_verification["database_sha256"])
@@ -459,23 +945,33 @@ class LiveMigration:
 
             if journal._read()["state"] == "rolled_back":
                 self._consume_authorization("AUTH-REACTIVATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
+                reservation.recheck()
                 reactivation_result = self._restore_or_reuse(destination_backup_root, reactivation_root, journal=journal, effect_name="reactivation-restore", realm_id=realm_id, seam="reactivation_restore")
                 reactivation_verification = reactivation_result["verification"]
                 reactivation_effect = self._existing_effect(journal, "reactivation-activation")
                 if reactivation_effect:
+                    reactivation_payload = reactivation_effect.get("payload", {})
+                    if (reactivation_payload.get("candidate") != str(reactivation_root) or _has_symlink_component(reactivation_root) or not self._active_matches_candidate(reactivation_root, realm_id)):
+                        raise MigrationError("B12 durable reactivation activation is not reusable")
                     reactivated = reactivation_effect["payload"]["activation"]
-                elif _sha256_file(active.store.db_path) == reactivation_verification["database_sha256"]:
+                elif self._active_matches_candidate(reactivation_root, realm_id):
                     reactivated = {"state": "reactivated", "reused": True, "candidate": str(reactivation_root)}
                     journal.effect("reactivation-activation", candidate=str(reactivation_root), state="reactivated", activation=reactivated, database_sha256=reactivation_verification["database_sha256"])
                 else:
                     journal._inject("before_reactivation_activation")
+                    reservation.recheck()
                     reactivated = RuntimeServiceAdapter(active).activate_destination(reactivation_root, state="reactivated")
                     journal._inject("after_reactivation_activation")
                     journal.effect("reactivation-activation", candidate=str(reactivation_root), state="reactivated", activation=reactivated, database_sha256=reactivation_verification["database_sha256"])
                 final_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
-                identity = {"packet": "B12.4", "realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "destination_root": str(active.store.root), "runtime_epoch": active.health()["runtime_epoch"], "activation_epoch": 3, "source_backup_manifest_sha256": _sha256_file(active_backup_root / "manifest.json"), "destination_backup_manifest_sha256": _sha256_file(destination_backup_root / "manifest.json"), "active_database_sha256": _database_snapshot_sha256(active.store.db_path), "active_snapshot_counts": {key: len(value) for key, value in final_snapshot.items() if isinstance(value, list)}}
+                if not active.doctor().get("ok"):
+                    raise MigrationError("B12.4 final runtime failed integrity verification")
+                artifacts = self._runtime_artifact_identity(active, source_manifest_sha256=source_manifest_sha256)
+                identity = {"packet": "B12.4", "realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "destination_root": str(active.store.root), "runtime_epoch": active.health()["runtime_epoch"], "runtime_session_id": active.runtime_session_id, "activation_epoch": 3, "source_backup_manifest_sha256": _sha256_file(active_backup_root / "manifest.json"), "destination_backup_manifest_sha256": _sha256_file(destination_backup_root / "manifest.json"), "active_database_sha256": _database_snapshot_sha256(active.store.db_path), "active_database_semantic_sha256": _database_semantic_sha256(active.store.db_path), "active_semantic_snapshot_sha256": _canonical_digest(_semantic_snapshot(final_snapshot)), "active_cas_manifest_sha256": self._cas_manifest_digest(final_snapshot), "activation_manifest_sha256": artifacts["activation_manifest_sha256"], "catalog_identity": artifacts["catalog"], "active_snapshot_counts": {key: len(value) for key, value in final_snapshot.items() if isinstance(value, list)}}
                 _write_json(evidence_root / "activated-destination-b12-reactivated.json", {"packet": "B12.3", "state": "reactivated", **{key: identity[key] for key in ("realm_id", "source_manifest_sha256", "activation_epoch", "runtime_epoch", "active_database_sha256")}})
                 journal.effect("final-identity", identity=identity)
+                journal.effect("capacity-release", reservation_id=reservation.reservation_id, reason="terminal")
+                reservation.release()
                 final = journal.transition("reactivated", predecessor=rollback_entry["entries"][-1], activation=reactivated, identity=identity, runtime_epoch=active.health()["runtime_epoch"], activation_epoch=3)
                 _write_json(evidence_root / "activated-destination-b12.json", identity)
                 return {"packet": "B12", "source_freeze": freeze, "capacity": capacity, "dry_run": dry_run, "migration": migration, "reconciliation": reconciliation, "active_backup": active_backup, "destination_backup": destination_backup, "journal": final, "activation": activated, "rollback": rolled_back, "reactivation": reactivated, "identity": identity, "active_snapshot": active_snapshot, "final_snapshot": final_snapshot}

@@ -800,7 +800,25 @@ class RealmStore:
         schema_ok = actual_schema == SCHEMA_VERSION and not missing_tables
         objects = self.conn.execute("SELECT digest FROM objects").fetchall()
         reachable = {str(row[0]) for row in objects}
-        missing = [digest for digest in sorted(reachable) if not (self.cas_root / digest[:2] / digest[2:]).is_file()]
+        missing = []
+        corrupt = []
+        for digest in sorted(reachable):
+            path = self.cas_root / digest[:2] / digest[2:]
+            # A reachable CAS entry is content-addressed, not merely a path.
+            # ``is_file`` follows links and therefore cannot be the integrity
+            # check on its own.  Hash every reachable object before reporting
+            # the realm healthy so terminal replay cannot bless replacement
+            # bytes at an unchanged CAS pathname.
+            if not path.is_file() or path.is_symlink():
+                missing.append(digest)
+                continue
+            try:
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                missing.append(digest)
+                continue
+            if actual != digest:
+                corrupt.append({"digest": digest, "actual_sha256": actual})
         orphaned = []
         if self.cas_root.exists():
             for path in self.cas_root.glob("*/*"):
@@ -808,7 +826,7 @@ class RealmStore:
                     digest = path.parent.name + path.name
                     if digest not in reachable:
                         orphaned.append(digest)
-        cas_ok = not missing
+        cas_ok = not missing and not corrupt
         event_errors = []
         for run in self.conn.execute("SELECT id FROM runs"):
             previous = ""
@@ -831,6 +849,7 @@ class RealmStore:
         if fk: issues.append("foreign_keys")
         if not schema_ok: issues.append("schema")
         if missing: issues.append("reachable_cas")
+        if corrupt: issues.append("corrupt_cas")
         if event_errors: issues.append("event_chain")
         issues.extend(catalog_check.get("issues", [])); issues.extend(activation_check.get("issues", []))
         recovery = "No recovery action required." if healthy else "Restore the realm from a verified backup, then re-run doctor."
@@ -847,7 +866,7 @@ class RealmStore:
                 "foreign_keys": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
                 "foreign_key": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
                 "schema": {"ok": schema_ok, "expected_version": SCHEMA_VERSION, "actual_version": actual_schema, "missing_tables": missing_tables},
-                "reachable_cas": {"ok": cas_ok, "missing": missing, "orphaned": sorted(orphaned)},
+                "reachable_cas": {"ok": cas_ok, "missing": missing, "corrupt": corrupt, "orphaned": sorted(orphaned)},
                 "cas_missing": missing,
                 "event_chain": {"ok": not bool(event_errors), "errors": event_errors},
                 "event_chain_errors": event_errors,
