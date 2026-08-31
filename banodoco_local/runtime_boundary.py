@@ -114,6 +114,7 @@ class LocalRuntimeBoundary:
         self._realm_id: str | None = None
         self._display_name = "Astrid Workspace"
         self._bootstrap_credential: str | None = None
+        self._detached_pid: int | None = None
 
     @staticmethod
     def _validate_checkout(source: SourceProfile) -> Path:
@@ -300,9 +301,40 @@ class LocalRuntimeBoundary:
             self._process = None
         self._bootstrap_credential = None
 
-    def restart(self, **_kwargs) -> Mapping[str, Any]:
+    def prepare_restart(self, *, source_profile: SourceProfile, realm_id: str, realm_root: Path, support_root: Path, pid: int) -> None:
+        """Adopt a detached daemon for an operator restart.
+
+        ``banodoco-local up`` intentionally leaves the daemon in its own
+        process group, so a later CLI invocation has no ``Popen`` handle.  The
+        support lock/discovery record is the only durable hand-off; adopting
+        it here lets restart terminate exactly that owner and relaunch the
+        same realm without opening its database in the launcher.
+        """
+        self._source = source_profile
+        self._realm_id = str(realm_id)
+        self._realm_root = Path(realm_root).expanduser().resolve()
+        self._support_root = Path(support_root).expanduser().resolve()
+        self._detached_pid = int(pid)
+
+    def restart(self, **kwargs) -> Mapping[str, Any]:
         if not self._source or not self._realm_root or not self._support_root or not self._realm_id:
             raise BootstrapError("No runtime process is available to restart.")
         source, root, support, realm_id = self._source, self._realm_root, self._support_root, self._realm_id
-        self.stop()
+        if not self._process and getattr(self, "_detached_pid", None):
+            detached = int(self._detached_pid)
+            try:
+                os.killpg(detached, signal.SIGTERM)
+            except OSError:
+                pass
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and self.is_pid_alive(detached):
+                time.sleep(0.05)
+            if self.is_pid_alive(detached):
+                try:
+                    os.killpg(detached, signal.SIGKILL)
+                except OSError:
+                    pass
+            self._detached_pid = None
+        else:
+            self.stop()
         return self.start(realm_id=realm_id, realm_root=root, owner_lock=support / "instance.lock", source_profile=source)

@@ -494,9 +494,27 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     config = config or BootstrapConfig()
     catalog = _read_catalog(paths)
     realm = _selected_realm(catalog)
-    if realm is None or not read_json(paths.discovery_path):
+    discovery = read_json(paths.discovery_path)
+    if realm is None or not discovery:
         raise BootstrapError("No healthy selected runtime. Next action: banodoco-local up --profile astrid")
-    return bootstrap(paths, boundary, config)
+    source = config.resolve_source_profile(paths)
+    _compatible(discovery, config, source)
+    try:
+        pid = int(discovery["pid"])
+        endpoint = str(discovery["endpoint"])
+        instance_id = str(discovery["runtime_instance_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BootstrapError("Runtime discovery is incomplete; run banodoco-local restart --profile astrid.") from exc
+    if not _pid_alive(boundary, pid) or not boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path):
+        raise BootstrapError("Runtime discovery is stale or owned by another process; run banodoco-local up --profile astrid.")
+    if not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id):
+        raise BootstrapError("The selected runtime is unhealthy; run banodoco-local restart --profile astrid.")
+    if str(realm.get("realm_id")) != str(discovery.get("active_realm")):
+        raise BootstrapError("Discovery does not match the selected catalog realm; run banodoco-local doctor.")
+    actor_id, token = _credential(paths)
+    connection = boundary.connect(endpoint=endpoint, credential=token)
+    _provision_connection(connection, actor_id, token, str(realm["realm_id"]))
+    return BootstrapResult("reconnected", str(realm["realm_id"]), str(realm.get("display_name", "Astrid Workspace")), endpoint, actor_id, source.profile, (), paths.discovery_path)
 
 
 def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
