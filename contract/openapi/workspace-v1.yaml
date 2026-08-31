@@ -92,6 +92,21 @@ paths:
       responses:
         '200': { description: Updated project, content: { application/json: { schema: { $ref: './schemas/project.json' } } } }
         '409': { $ref: '#/components/responses/Conflict' }
+  /v1/projects/selection:
+    get:
+      operationId: currentProject
+      responses:
+        '200': { description: Actor's effective project selection, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectSelection' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: selectProject
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/SelectProject' } } }
+      responses:
+        '200': { description: Persisted actor-scoped selection, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectSelection' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/projects/{project_id}/documents:
     get:
       operationId: listDocuments
@@ -550,6 +565,22 @@ components:
         expected_version: { type: integer, minimum: 1 }
         name: { type: string, minLength: 1, maxLength: 512 }
         metadata: { type: object, additionalProperties: true }
+    SelectProject:
+      type: object
+      additionalProperties: false
+      required: [project]
+      properties:
+        project: { type: string, minLength: 1 }
+        scope: { type: string, enum: [workspace, user], default: workspace }
+    ProjectSelection:
+      type: object
+      additionalProperties: false
+      required: [actor_id, scope, project, updated_at]
+      properties:
+        actor_id: { type: string }
+        scope: { type: string, enum: [workspace, user] }
+        project: { $ref: './schemas/project.json' }
+        updated_at: { type: string }
     RunAction:
       type: object
       additionalProperties: false
@@ -861,6 +892,9 @@ components:
       required: [from_reference_id, to_reference_id, kind]
       properties: { from_reference_id: { type: string }, to_reference_id: { type: string }, kind: { type: string }, metadata: { type: object } }
   responses:
+    NotFound:
+      description: Resource not found
+      content: { application/json: { schema: { $ref: './schemas/common.json#/$defs/Error' } } }
     Conflict:
       description: Conflict or idempotency mismatch
       content: { application/json: { schema: { $ref: './schemas/common.json#/$defs/Error' } } }

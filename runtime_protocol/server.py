@@ -123,6 +123,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if not body.get("backup") or not body.get("destination"):
                 raise ProtocolError("backup and destination are required")
             return self._send(201, self.runtime.restore(body["backup"], body["destination"]))
+        if path == ["v1", "projects", "selection"] and method in ("GET", "PUT", "POST"):
+            identity = self._identity("projects:read" if method == "GET" else "projects:write")
+            if method == "GET":
+                return self._send(200, self.runtime.current_project(identity["actor"]))
+            body = self._body()
+            if not isinstance(body, dict) or not body.get("project"):
+                raise ProtocolError("project is required")
+            return self._send(200, self.runtime.select_project(identity["actor"], body["project"], scope=body.get("scope", "workspace")))
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timelines":
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "POST": return self._send(201, self.runtime.create_timeline(path[2], self._body().get("timeline_id", "")))
@@ -315,7 +323,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("tasks:write")
             body = self._body()
             body["idempotency_key"] = self.headers.get("Idempotency-Key") or body.get("idempotency_key")
-            return self._send(201, self.runtime._task_resource(self.runtime.create_task(body)))
+            # Admission authority lives here, inside the owner process.  The
+            # readiness check and row creation share the store transaction;
+            # a client precheck can never race an unavailable registration.
+            return self._send(201, self.runtime._task_resource(self.runtime.create_task(body, enforce_readiness=True)))
         if path == ["v1", "tasks", "claim"] and method == "POST":
             self._identity("worker:execute")
             result = self.runtime.claim_next(self._body())

@@ -16,6 +16,52 @@ def _digest(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode()).hexdigest()
 
 
+def test_actor_project_selection_is_runtime_owned_and_persistent(tmp_path):
+    realm = tmp_path / "realm"
+    support = tmp_path / "support"
+    daemon = RuntimeDaemon(realm, support_root=support).start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        first = client.create_project("First", slug="first", idempotency_key="first")
+        second = client.create_project("Second", slug="second", idempotency_key="second")
+        selected = client.select_project(second.slug, scope="workspace", idempotency_key="select-second")
+        assert selected["scope"] == "workspace"
+        assert selected["project"]["project_id"] == second.project_id
+        assert client.current_project()["project"]["project_id"] == second.project_id
+        # A reconnecting client with the same actor credential sees the same
+        # selection, while a different actor has no local-file fallback.
+        reconnect = WorkspaceClient(daemon.endpoint, daemon.token)
+        assert reconnect.current_project()["project"]["project_id"] == second.project_id
+        assert first.project_id != second.project_id
+    finally:
+        daemon.stop()
+
+
+def test_unready_capability_rejected_before_any_ledger_rows(tmp_path):
+    daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project("Ready gate", slug="ready-gate", idempotency_key="ready-gate")
+        digest = _digest("gpu-capability")
+        client.register_capability("acceptance.gpu", digest, status="unavailable", unavailable_reason="gpu_not_configured")
+        before = daemon.service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        with pytest.raises(ApiError) as caught:
+            client.admit_task(capability_id="acceptance.gpu", capability_digest=digest, input_object_ids=[], project_id=project.project_id, idempotency_key="blocked")
+        assert caught.value.code == "unavailable"
+        assert caught.value.details == {
+            "capability_id": "acceptance.gpu",
+            "status": "unavailable",
+            "reason": "gpu_not_configured",
+            "next_action": "wait for capability readiness and retry",
+        }
+        after = daemon.service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        assert before == after == 0
+        assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+    finally:
+        daemon.stop()
+
+
 @pytest.mark.parametrize(
     ("method", "route"),
     [

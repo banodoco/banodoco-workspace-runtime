@@ -29,6 +29,14 @@ class ConflictError(RuntimeErrorBase):
     status = 409
 
 
+class CapabilityUnavailableError(ConflictError):
+    """Admission failed because the registered capability is not ready."""
+
+    # Keep Astrid's frozen SDK taxonomy.  The capability-specific reason and
+    # next action are carried in bounded details, not a new machine code.
+    code = "unavailable"
+
+
 class NotFoundError(RuntimeErrorBase):
     code = "not_found"
     status = 404

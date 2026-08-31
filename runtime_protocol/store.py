@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .errors import ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, ValidationError
+from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, ValidationError
 from .util import canonical_json, new_id, now
 
 try:
@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 LEASE_SECONDS = 30
 
 
@@ -157,6 +157,9 @@ class RealmStore:
             version = 13
         if version < 14:
             self._run_migration(14)
+            version = 14
+        if version < 15:
+            self._run_migration(15)
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
@@ -314,6 +317,42 @@ class RealmStore:
     def list_projects(self):
         return {"items": [self._project(row["id"]) for row in self.conn.execute("SELECT id FROM projects ORDER BY created_at")], "next_cursor": None}
 
+    def select_project(self, actor_id: str, selector: str, scope: str = "workspace"):
+        """Persist a project routing selection for one authenticated actor.
+
+        Selection is runtime state, not a product-local preference file.  The
+        actor and scope are part of the primary key, so two clients cannot
+        overwrite one another's selection and reconnects read the same value.
+        """
+        if not actor_id:
+            raise ValidationError("actor_id is required")
+        if scope not in {"workspace", "user"}:
+            raise ValidationError("selection scope must be 'workspace' or 'user'")
+        with self._mutex:
+            project = self._project(selector)
+            timestamp = now()
+            with self._transaction():
+                self.conn.execute(
+                    "INSERT INTO project_selections(actor_id, scope, project_id, updated_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(actor_id, scope) DO UPDATE SET project_id=excluded.project_id, updated_at=excluded.updated_at",
+                    (actor_id, scope, project["id"], timestamp),
+                )
+            return {"actor_id": actor_id, "scope": scope, "project": self._project(project["id"]), "updated_at": timestamp}
+
+    def current_project(self, actor_id: str):
+        """Return the actor's effective selection (workspace precedes user)."""
+        if not actor_id:
+            raise ValidationError("actor_id is required")
+        with self._mutex:
+            row = self.conn.execute(
+                "SELECT actor_id, scope, project_id, updated_at FROM project_selections "
+                "WHERE actor_id=? ORDER BY CASE scope WHEN 'workspace' THEN 0 ELSE 1 END LIMIT 1",
+                (actor_id,),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("no project is selected", details={"next_action": "astrid projects select <project>"})
+            return {"actor_id": row["actor_id"], "scope": row["scope"], "project": self._project(row["project_id"]), "updated_at": row["updated_at"]}
+
     def update_project(self, selector: str, *, name=None, metadata=None, expected_version=None, idempotency_key=None):
         with self._mutex:
             current = self._project(selector)
@@ -354,7 +393,7 @@ class RealmStore:
             self.conn.execute("INSERT OR IGNORE INTO objects VALUES (?, ?, ?, ?, ?)", (digest, size, media_type, original_name, now()))
             return dict(self.conn.execute("SELECT * FROM objects WHERE digest=?", (digest,)).fetchone())
 
-    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None):
+    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False):
         if not capability:
             raise ValidationError("capability is required")
         with self._mutex:
@@ -373,7 +412,21 @@ class RealmStore:
                     if capability_digest is not None and capability_digest != registered_digest:
                         raise ConflictError("capability definition digest does not match registered capability", details={"expected": registered_digest, "actual": capability_digest})
                     capability_digest = registered_digest
-                    waiting_reason = "capability_unavailable" if registered["status"] != "ready" else None
+                    if registered["status"] != "ready":
+                        if enforce_readiness:
+                            reason = registered["unavailable_reason"] or f"capability_status_{registered['status']}"
+                            raise CapabilityUnavailableError(
+                                "capability is not ready for admission",
+                                details={
+                                    "capability_id": capability,
+                                    "status": registered["status"],
+                                    "reason": reason,
+                                    "next_action": "wait for capability readiness and retry",
+                                },
+                            )
+                        waiting_reason = "capability_unavailable"
+                    else:
+                        waiting_reason = None
                 else:
                     if capability_digest is not None:
                         raise ConflictError("capability is not registered", details={"capability_id": capability})

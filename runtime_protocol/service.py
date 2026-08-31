@@ -140,6 +140,24 @@ class RuntimeService:
     def list_projects(self):
         return {"items": [self._project_resource(value) for value in self.store.list_projects()["items"]], "next_cursor": None}
 
+    def select_project(self, actor_id, selector, *, scope="workspace"):
+        value = self.store.select_project(actor_id, selector, scope)
+        return {
+            "actor_id": value["actor_id"],
+            "scope": value["scope"],
+            "project": self._project_resource(value["project"]),
+            "updated_at": value["updated_at"],
+        }
+
+    def current_project(self, actor_id):
+        value = self.store.current_project(actor_id)
+        return {
+            "actor_id": value["actor_id"],
+            "scope": value["scope"],
+            "project": self._project_resource(value["project"]),
+            "updated_at": value["updated_at"],
+        }
+
     def update_project(self, selector, body, *, idempotency_key=None):
         return self.store.update_project(selector, name=body.get("name"), metadata=body.get("metadata"), expected_version=body.get("expected_version"), idempotency_key=idempotency_key)
 
@@ -905,10 +923,10 @@ class RuntimeService:
         rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY created_at, from_digest, to_digest, kind, ordinal LIMIT ?", (project_id, limit)).fetchall()
         return {"items": [{"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]} for row in rows], "next_cursor": None}
 
-    def create_task(self, body):
+    def create_task(self, body, *, enforce_readiness=False):
         capability = body.get("capability_id") or body.get("capability")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
-        value = self.store.create_task(capability, {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect") or body.get("expected_effect"), digest)
+        value = self.store.create_task(capability, {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect") or body.get("expected_effect"), digest, enforce_readiness=enforce_readiness)
         return value
 
     def task(self, task_id):

@@ -716,6 +716,16 @@ class WorkspaceClient:
         value = self._json(body)
         return [Project.from_json(item) for item in value.get("items", [])], value.get("next_cursor")
 
+    def select_project(self, project: str, *, scope: str = "workspace", idempotency_key: str | None = None) -> Mapping[str, Any]:
+        payload = {"project": project, "scope": scope}
+        headers = {"Content-Type": "application/json"}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        return self._json(self._request("PUT", "/v1/projects/selection", body=json.dumps(payload, separators=(",", ":")).encode(), headers=headers)[2])
+
+    def current_project(self) -> Mapping[str, Any]:
+        return self._json(self._request("GET", "/v1/projects/selection")[2])
+
     def ingest_object(self, data: bytes, *, media_type: str, idempotency_key: str, filename: str | None = None) -> ManagedObject:
         headers = {"Content-Type": media_type, "Idempotency-Key": idempotency_key}
         if filename:
