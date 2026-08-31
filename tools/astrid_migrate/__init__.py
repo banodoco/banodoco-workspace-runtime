@@ -7,5 +7,6 @@ generated-client-shaped object.
 
 from .migrator import MigrationConfig, MigrationError, Migrator, migrate
 from .rehearsal import MigrationJournal, Rehearsal, RuntimeServiceAdapter, SyntheticFixture, build_synthetic_fixture, run_rehearsal
+from .live import LIVE_AUTHORIZATION_IDS, LiveMigration, issue_live_authorizations, run_live_migration
 
-__all__ = ["MigrationConfig", "MigrationError", "Migrator", "migrate", "MigrationJournal", "Rehearsal", "RuntimeServiceAdapter", "SyntheticFixture", "build_synthetic_fixture", "run_rehearsal"]
+__all__ = ["MigrationConfig", "MigrationError", "Migrator", "migrate", "MigrationJournal", "Rehearsal", "RuntimeServiceAdapter", "SyntheticFixture", "build_synthetic_fixture", "run_rehearsal", "LIVE_AUTHORIZATION_IDS", "LiveMigration", "issue_live_authorizations", "run_live_migration"]

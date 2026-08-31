@@ -512,12 +512,24 @@ class RuntimeServiceAdapter:
             # Rehearsal control state is not part of a realm backup.  Carry it
             # across the authority swap so a crash after the swap can resume
             # from the same journal/evidence rather than starting over.
-            for name in ("migration-journal.json", "migration-evidence", "activation-manifest.json"):
+            # The candidate's activation manifest is produced by the
+            # destination migration and must follow that candidate into the
+            # active authority.  If a legacy rehearsal has no candidate
+            # manifest, retain the old control-state copy as a compatibility
+            # fallback.
+            candidate_activation_manifest = candidate / "activation-manifest.json"
+            if candidate_activation_manifest.is_file():
+                shutil.copy2(candidate_activation_manifest, temporary / "activation-manifest.json")
+            for name in ("migration-journal.json", "migration-evidence"):
                 source = quarantine / name
                 if source.is_dir():
                     shutil.copytree(source, temporary / name)
                 elif source.is_file():
                     shutil.copy2(source, temporary / name)
+            if not (temporary / "activation-manifest.json").exists():
+                source = quarantine / "activation-manifest.json"
+                if source.is_file():
+                    shutil.copy2(source, temporary / "activation-manifest.json")
             temporary.rename(target)
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
