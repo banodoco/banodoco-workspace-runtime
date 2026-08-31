@@ -488,6 +488,12 @@ class RuntimeServiceAdapter:
         old_service = self.service
         display_name = old_service.realm["display_name"]
         realm_id = old_service.realm["id"]
+        # A candidate backup contains the epoch at the time it was captured,
+        # not the epoch of the authority being replaced.  Preserve the
+        # monotonic runtime epoch across an activation swap so stale clients
+        # cannot become valid again merely because a rollback restored an
+        # older SQLite image.
+        previous_runtime_epoch = int(old_service.health()["runtime_epoch"])
         support_root = old_service.support_root
         # When no separate support root is configured, the authenticated
         # backup key lives beside the active realm. Preserve that private key
@@ -537,6 +543,16 @@ class RuntimeServiceAdapter:
             raise
         from runtime_protocol.service import RuntimeService
         reopened = RuntimeService(target, display_name=display_name, realm_id=realm_id, support_root=support_root)
+        reopened_epoch = int(reopened.health()["runtime_epoch"])
+        expected_epoch = previous_runtime_epoch + 1
+        if reopened_epoch != expected_epoch:
+            with reopened.store._mutex:
+                with reopened.store._transaction():
+                    reopened.store.conn.execute(
+                        "UPDATE runtime_lifecycle SET runtime_epoch=? WHERE id=1",
+                        (expected_epoch,),
+                    )
+            reopened._runtime_state = reopened.store.runtime_lifecycle()
         old_service.__dict__.update(reopened.__dict__)
         self.service = old_service
         if support_root is not None:
