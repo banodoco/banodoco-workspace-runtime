@@ -165,6 +165,122 @@ def revalidate_write_path(path: str | Path, identity: Mapping[str, Any]) -> None
         raise MigrationError(f"capacity write parent identity changed before material write: {parent}")
 
 
+def capture_activation_path(path: str | Path) -> dict[str, Any]:
+    """Capture the lexical identity of an activation target and its parent.
+
+    Activation replaces an existing authority directory, unlike a restore
+    write which requires a fresh target.  The target is therefore recorded as
+    either absent or as an ordinary directory with its ``st_dev``, ``st_ino``
+    and ``st_mode``.  The nearest existing parent is captured through a
+    complete ``O_NOFOLLOW`` chain so an interrupted/replayed activation cannot
+    be redirected by replacing a parent with a symlink or another directory.
+    """
+    target = _absolute_path(path)
+    if _has_symlink_component(target):
+        raise MigrationError(f"activation path contains a symlink component: {target}")
+    target_parent = target.parent
+    parent = target_parent
+    while not os.path.lexists(str(parent)):
+        if parent == parent.parent:
+            raise MigrationError(f"activation path has no existing parent: {target}")
+        parent = parent.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise MigrationError(f"activation parent is not an ordinary directory: {parent}")
+    try:
+        parent_fd = _open_directory_chain(parent)
+        parent_identity = os.fstat(parent_fd)
+    except OSError as exc:
+        raise MigrationError(f"activation parent cannot be opened safely: {parent}") from exc
+    finally:
+        try:
+            os.close(parent_fd)
+        except (UnboundLocalError, OSError):
+            pass
+    if not stat.S_ISDIR(parent_identity.st_mode):
+        raise MigrationError(f"activation parent is not an ordinary directory: {parent}")
+    record: dict[str, Any] = {
+        "path": str(target),
+        "parent": str(parent),
+        "target_parent": str(target_parent),
+        "parent_was_missing": target_parent != parent,
+        "target_absent": not os.path.lexists(str(target)),
+        "parent_st_dev": int(parent_identity.st_dev),
+        "parent_st_ino": int(parent_identity.st_ino),
+        "parent_st_mode": int(parent_identity.st_mode),
+    }
+    if record["target_absent"]:
+        return record
+    try:
+        target_fd = _open_directory_chain(target)
+        target_identity = os.fstat(target_fd)
+    except OSError as exc:
+        raise MigrationError(f"activation target cannot be opened safely: {target}") from exc
+    finally:
+        try:
+            os.close(target_fd)
+        except (UnboundLocalError, OSError):
+            pass
+    if not stat.S_ISDIR(target_identity.st_mode):
+        raise MigrationError(f"activation target is not an ordinary directory: {target}")
+    record.update(
+        target_st_dev=int(target_identity.st_dev),
+        target_st_ino=int(target_identity.st_ino),
+        target_st_mode=int(target_identity.st_mode),
+    )
+    return record
+
+
+def revalidate_activation_path(path: str | Path, identity: Mapping[str, Any]) -> None:
+    """Revalidate a captured activation path immediately before material use."""
+    target = _absolute_path(path)
+    target_parent = target.parent
+    if identity.get("path") != str(target) or identity.get("target_parent") != str(target_parent):
+        raise MigrationError(f"activation path identity changed: {target}")
+    if _has_symlink_component(target):
+        raise MigrationError(f"activation path contains a symlink component: {target}")
+    if bool(identity.get("parent_was_missing")):
+        if os.path.lexists(str(target_parent)):
+            raise MigrationError(f"activation parent appeared before material write: {target_parent}")
+    elif not os.path.lexists(str(target_parent)):
+        raise MigrationError(f"activation parent disappeared before material write: {target_parent}")
+    parent = Path(str(identity["parent"]))
+    try:
+        parent_fd = _open_directory_chain(parent)
+        current_parent = os.fstat(parent_fd)
+    except OSError as exc:
+        raise MigrationError(f"activation parent changed before material write: {parent}") from exc
+    finally:
+        try:
+            os.close(parent_fd)
+        except (UnboundLocalError, OSError):
+            pass
+    if not stat.S_ISDIR(current_parent.st_mode) or any(
+        int(getattr(current_parent, key)) != int(identity[f"parent_{key}"])
+        for key in ("st_dev", "st_ino", "st_mode")
+    ):
+        raise MigrationError(f"activation parent identity changed before material write: {parent}")
+    target_absent = not os.path.lexists(str(target))
+    if target_absent != bool(identity.get("target_absent")):
+        raise MigrationError(f"activation target presence changed before material write: {target}")
+    if target_absent:
+        return
+    try:
+        target_fd = _open_directory_chain(target)
+        current_target = os.fstat(target_fd)
+    except OSError as exc:
+        raise MigrationError(f"activation target changed before material write: {target}") from exc
+    finally:
+        try:
+            os.close(target_fd)
+        except (UnboundLocalError, OSError):
+            pass
+    if not stat.S_ISDIR(current_target.st_mode) or any(
+        int(getattr(current_target, key)) != int(identity[f"target_{key}"])
+        for key in ("st_dev", "st_ino", "st_mode")
+    ):
+        raise MigrationError(f"activation target identity changed before material write: {target}")
+
+
 def _mount_identity(directory: Path, device: int) -> str:
     """Return a stable mount identity, including the mount boundary."""
     current = directory
@@ -373,4 +489,4 @@ class CapacityReservation:
             pass
 
 
-__all__ = ["CapacityPlan", "CapacityReservation", "StorageDomain", "capture_write_path", "revalidate_write_path"]
+__all__ = ["CapacityPlan", "CapacityReservation", "StorageDomain", "capture_write_path", "revalidate_write_path", "capture_activation_path", "revalidate_activation_path"]

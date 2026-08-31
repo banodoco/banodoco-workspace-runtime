@@ -280,6 +280,35 @@ def test_b13_disposable_restore_parent_swap_fails_closed_before_material_write(t
         active.close()
 
 
+@pytest.mark.parametrize("swap_mode", ["symlink", "replacement"])
+def test_b13_reactivation_target_swap_fails_closed_before_authority_write(tmp_path, swap_mode):
+    active, rollback_archive, auth = _setup(tmp_path)
+    active_root = tmp_path / "active"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=tmp_path / "disposable", authorizations=auth)
+    r2, _fake = _r2_kwargs(active)
+
+    def swap_target(seam):
+        if seam == "before_final_rollback_activation":
+            active_root.rename(tmp_path / "active-real")
+            if swap_mode == "symlink":
+                active_root.symlink_to(outside, target_is_directory=True)
+            else:
+                active_root.mkdir()
+
+    try:
+        with pytest.raises(MigrationError, match="symlink|identity|activation"):
+            run_b13_recovery(active, **kwargs, **r2, fault_injector=swap_target)
+        assert not any(outside.iterdir())
+        if swap_mode == "symlink":
+            assert active_root.is_symlink()
+        else:
+            assert list(active_root.iterdir()) == []
+    finally:
+        active.close()
+
+
 def test_b13_interrupted_purge_rejects_catalog_reclassification(tmp_path):
     support = tmp_path / "support"
     active = RuntimeService(tmp_path / "active", display_name="Selected", support_root=support)

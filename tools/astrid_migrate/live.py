@@ -29,7 +29,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.util import canonical_json
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _sha256_file, _tree_size
-from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_write_path, revalidate_write_path
+from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path
 from .rehearsal import MigrationJournal, RuntimeServiceAdapter, _tree_digest, _write_json
 
 
@@ -906,11 +906,19 @@ class LiveMigration:
                     journal.effect("active-activation", candidate=str(candidate_root), state="active", activation=activated, database_sha256=candidate_db)
                 else:
                     self._assert_active_baseline(journal, active)
+                    # Capture the configured authority before the crash seam;
+                    # the post-seam revalidation must run before any health or
+                    # verification read can follow a swapped root.
+                    reservation.recheck()
+                    target_identity = capture_activation_path(active.store.root)
                     journal._inject("before_active_activation")
+                    reservation.recheck()
+                    revalidate_activation_path(active.store.root, target_identity)
                     self._assert_active_baseline(journal, active)
                     self._verify_root_against_backup(self.config.destination_root, destination_backup_root, realm_id=realm_id)
                     reservation.recheck()
-                    activated = RuntimeServiceAdapter(active).activate_destination(candidate_root, state="active")
+                    revalidate_activation_path(active.store.root, target_identity)
+                    activated = RuntimeServiceAdapter(active).activate_destination(candidate_root, state="active", target_identity=target_identity)
                     journal._inject("after_active_activation")
                     journal.effect("active-activation", candidate=str(candidate_root), state="active", activation=activated, database_sha256=candidate_db)
                 active_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
@@ -938,9 +946,12 @@ class LiveMigration:
                     rolled_back = {"state": "rolled_back", "reused": True, "candidate": str(rollback_root)}
                     journal.effect("rollback-activation", candidate=str(rollback_root), state="rolled_back", activation=rolled_back, database_sha256=rollback_verification["database_sha256"])
                 else:
+                    reservation.recheck()
+                    target_identity = capture_activation_path(active.store.root)
                     journal._inject("before_rollback_activation")
                     reservation.recheck()
-                    rolled_back = RuntimeServiceAdapter(active).activate_destination(rollback_root, state="rolled_back")
+                    revalidate_activation_path(active.store.root, target_identity)
+                    rolled_back = RuntimeServiceAdapter(active).activate_destination(rollback_root, state="rolled_back", target_identity=target_identity)
                     journal._inject("after_rollback_activation")
                     journal.effect("rollback-activation", candidate=str(rollback_root), state="rolled_back", activation=rolled_back, database_sha256=rollback_verification["database_sha256"])
                 rollback_entry = journal.transition("rolled_back", predecessor=active_entry["entries"][-1], activation=rolled_back, runtime_epoch=active.health()["runtime_epoch"], activation_epoch=2)
@@ -964,9 +975,12 @@ class LiveMigration:
                     reactivated = {"state": "reactivated", "reused": True, "candidate": str(reactivation_root)}
                     journal.effect("reactivation-activation", candidate=str(reactivation_root), state="reactivated", activation=reactivated, database_sha256=reactivation_verification["database_sha256"])
                 else:
+                    reservation.recheck()
+                    target_identity = capture_activation_path(active.store.root)
                     journal._inject("before_reactivation_activation")
                     reservation.recheck()
-                    reactivated = RuntimeServiceAdapter(active).activate_destination(reactivation_root, state="reactivated")
+                    revalidate_activation_path(active.store.root, target_identity)
+                    reactivated = RuntimeServiceAdapter(active).activate_destination(reactivation_root, state="reactivated", target_identity=target_identity)
                     journal._inject("after_reactivation_activation")
                     journal.effect("reactivation-activation", candidate=str(reactivation_root), state="reactivated", activation=reactivated, database_sha256=reactivation_verification["database_sha256"])
                 final_snapshot = RuntimeServiceAdapter(active).destination_snapshot()

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.astrid_migrate.capacity import CapacityPlan, CapacityReservation, StorageDomain
+from tools.astrid_migrate.capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, revalidate_activation_path
 from tools.astrid_migrate.migrator import MigrationError
 
 
@@ -79,3 +79,27 @@ def test_failed_probe_acquisition_releases_lock_for_immediate_retry(monkeypatch,
         CapacityReservation.acquire(plan=plan, reservation_id="failed")
     retry = CapacityReservation.acquire(plan=plan, reservation_id="retry")
     retry.release()
+
+
+def test_activation_identity_fences_absent_and_replaced_targets(tmp_path: Path):
+    parent = tmp_path / "authority-parent"
+    parent.mkdir()
+    target = parent / "active"
+
+    absent = capture_activation_path(target)
+    target.mkdir()
+    with pytest.raises(MigrationError, match="presence"):
+        revalidate_activation_path(target, absent)
+
+    target.rename(parent / "active-original")
+    target.mkdir()
+    existing = capture_activation_path(target)
+    target.rename(parent / "active-replaced")
+    target.mkdir()
+    with pytest.raises(MigrationError, match="identity"):
+        revalidate_activation_path(target, existing)
+
+    parent.rename(tmp_path / "authority-parent-original")
+    parent.mkdir()
+    with pytest.raises(MigrationError, match="identity"):
+        revalidate_activation_path(target, existing)

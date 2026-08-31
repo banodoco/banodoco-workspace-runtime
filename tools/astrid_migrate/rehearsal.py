@@ -20,6 +20,7 @@ import time
 from typing import Any, Callable, Mapping
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _canonical, _sha256_file, _tree_size
+from .capacity import _has_symlink_component, capture_activation_path, revalidate_activation_path
 from runtime_protocol.util import now
 
 
@@ -462,15 +463,23 @@ class RuntimeServiceAdapter:
             if path.is_file() and path.name not in baseline_objects:
                 path.unlink(missing_ok=True)
 
-    def activate_destination(self, candidate_root: str | Path, *, state: str):
+    def activate_destination(self, candidate_root: str | Path, *, state: str, target_identity: Mapping[str, Any] | None = None):
         """Install a verified candidate into the configured realm root.
 
         A sibling restore is only a staging artifact.  The active authority is
         always ``service.store.root``; this method swaps the verified contents
         into that exact root and reopens the kernel before returning.
         """
-        candidate = Path(candidate_root).expanduser().resolve()
-        target = self.service.store.root.resolve()
+        # Keep both paths lexical until their symlink components have been
+        # rejected.  Resolving an attacker-swapped active root first would
+        # turn a symlink into an apparently legitimate outside authority.
+        candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(candidate_root))))
+        target = Path(os.path.abspath(os.path.expanduser(os.fspath(self.service.store.root))))
+        if target_identity is None:
+            target_identity = capture_activation_path(target)
+        revalidate_activation_path(target, target_identity)
+        if _has_symlink_component(candidate):
+            raise MigrationError("candidate realm path contains a symlink component")
         if candidate == target or not (candidate / "realm.sqlite3").is_file() or not (candidate / "cas").is_dir():
             raise MigrationError("candidate is not a complete inactive realm")
         from runtime_protocol.backup import verify_restore_candidate
@@ -485,6 +494,10 @@ class RuntimeServiceAdapter:
             candidate_verification = verify_restore_candidate(candidate)
         except Exception as exc:
             raise MigrationError(f"candidate failed verification before {state} activation") from exc
+        # Candidate verification can read a large CAS. Revalidate once more at
+        # the final authority seam so a parent/target swap during that read is
+        # fail-closed before closing the live service or writing any material.
+        revalidate_activation_path(target, target_identity)
         old_service = self.service
         display_name = old_service.realm["display_name"]
         realm_id = old_service.realm["id"]
@@ -505,8 +518,10 @@ class RuntimeServiceAdapter:
             candidate_key = old_service.store.root / ".operator-backup-key"
             if candidate_key.is_file() and not candidate_key.is_symlink():
                 operator_key = candidate_key
+        revalidate_activation_path(target, target_identity)
         old_service.close()
         quarantine = target.parent / f".{target.name}.inactive-{state}-{time.time_ns()}"
+        revalidate_activation_path(target, target_identity)
         target.rename(quarantine)
         temporary = Path(tempfile.mkdtemp(prefix=f".{target.name}.activate-", dir=target.parent))
         try:

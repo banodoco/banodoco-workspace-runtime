@@ -29,7 +29,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.util import atomic_json_write, canonical_json, new_id
 
 from .migrator import MigrationError, _sha256_file
-from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_write_path, revalidate_write_path
+from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path
 from .rehearsal import RuntimeServiceAdapter, _tree_digest
 
 
@@ -916,10 +916,14 @@ class B13Recovery:
         reservation = getattr(self, "_capacity_reservation", None)
         if reservation is not None:
             reservation.recheck()
+        target_identity = capture_activation_path(self.active_runtime.store.root)
+        if reservation is not None:
+            reservation.recheck()
         journal._inject(f"before_{seam}")
         if reservation is not None:
             reservation.recheck()
-        result = RuntimeServiceAdapter(self.active_runtime).activate_destination(candidate, state=state)
+        revalidate_activation_path(self.active_runtime.store.root, target_identity)
+        result = RuntimeServiceAdapter(self.active_runtime).activate_destination(candidate, state=state, target_identity=target_identity)
         journal._inject(f"after_{seam}")
         if self.active_runtime.realm["id"] != realm_id or not self.active_runtime.doctor()["ok"]:
             raise MigrationError(f"B13.2 {state} activation failed identity/integrity verification")

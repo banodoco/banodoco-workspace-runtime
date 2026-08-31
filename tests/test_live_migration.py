@@ -187,6 +187,36 @@ def test_b12_active_backup_parent_swap_fails_closed_before_material_write(tmp_pa
         active.close()
 
 
+@pytest.mark.parametrize("swap_mode", ["symlink", "replacement"])
+def test_b12_activation_target_swap_fails_closed_before_authority_write(tmp_path, swap_mode):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    config = _config(source, tmp_path)
+    active_root = tmp_path / "active"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    active = RuntimeService(active_root)
+
+    def swap_target(seam):
+        if seam == "before_active_activation":
+            active_root.rename(tmp_path / "active-real")
+            if swap_mode == "symlink":
+                active_root.symlink_to(outside, target_is_directory=True)
+            else:
+                active_root.mkdir()
+
+    try:
+        with pytest.raises(MigrationError, match="symlink|identity|activation"):
+            run_live_migration(config, active, _auth(config, active), writer_stop=lambda: {"stopped": True}, fault_injector=swap_target)
+        assert not any(outside.iterdir())
+        if swap_mode == "symlink":
+            assert active_root.is_symlink()
+        else:
+            assert list(active_root.iterdir()) == []
+    finally:
+        active.close()
+
+
 def test_b12_reconciliation_rechecks_destination_after_migration_callback(tmp_path):
     source = tmp_path / "source"
     build_synthetic_fixture(source)
