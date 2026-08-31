@@ -8,12 +8,19 @@ with the retained operator HMAC key, and consumed exactly once.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 import secrets
 from typing import Any, Mapping, Sequence
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the supported POSIX runtimes use fcntl
+    fcntl = None
 
 from runtime_protocol.errors import AuthorizationError, ConflictError, ValidationError
 from runtime_protocol.util import atomic_json_write, canonical_json, now
@@ -117,7 +124,14 @@ def verify_trusted_disposition(
     if not isinstance(value["owner_identity"], str) or value["owner_identity"] != expected_owner_identity:
         raise AuthorizationError("trusted disposition owner identity does not match SOURCE-OWNER-ID")
     binding = value["source_owner_binding"]
-    if not isinstance(binding, Mapping) or binding.get("source_owner_id") != value["owner_identity"] or binding.get("source_manifest_sha256") != value["source_manifest_sha256"]:
+    if (
+        not isinstance(binding, Mapping)
+        or set(binding) != {"source_owner_id", "source_manifest_sha256"}
+        or not isinstance(binding.get("source_owner_id"), str)
+        or not isinstance(binding.get("source_manifest_sha256"), str)
+        or binding.get("source_owner_id") != value["owner_identity"]
+        or binding.get("source_manifest_sha256") != value["source_manifest_sha256"]
+    ):
         raise AuthorizationError("trusted disposition SOURCE-OWNER-ID binding is invalid")
     if value["source_manifest_sha256"] != expected_source_manifest_sha256:
         raise ConflictError("trusted disposition source manifest does not match frozen source")
@@ -138,6 +152,10 @@ def verify_trusted_disposition(
         raise ConflictError("trusted disposition is not yet valid")
     if value["expires_at"] != "NONE" and datetime.fromisoformat(value["expires_at"].replace("Z", "+00:00")) <= clock:
         raise AuthorizationError("trusted disposition has expired")
+    for key in ("fact_scope", "field_scope", "source_pair_scope"):
+        scope = value[key]
+        if not isinstance(scope, list) or any(not isinstance(item, str) or not item for item in scope) or scope != sorted(set(scope)):
+            raise ValidationError(f"trusted disposition {key} must be a sorted unique string list")
     for key, expected in (("fact_scope", expected_fact_scope), ("field_scope", expected_field_scope), ("source_pair_scope", expected_source_pair_scope)):
         if expected is not None and value[key] != sorted(set(str(item) for item in expected)):
             raise ConflictError(f"trusted disposition {key} does not match requested scope")
@@ -161,17 +179,36 @@ class DispositionNonceLedger:
             raise ConflictError("trusted disposition nonce ledger schema is invalid")
         return value
 
+    @contextmanager
+    def _exclusive_lock(self):
+        """Serialize the read/check/write transaction across processes."""
+        if fcntl is None:
+            raise ConflictError("trusted disposition nonce ledger requires a file-locking runtime")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        with lock_path.open("a+") as stream:
+            try:
+                os.fchmod(stream.fileno(), 0o600)
+            except OSError:
+                pass
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     def consume(self, disposition: Mapping[str, Any]) -> None:
-        value = self._read()
-        nonce = str(disposition["nonce"])
-        prior = value["consumed"].get(nonce)
-        binding = {"disposition_id": disposition["disposition_id"], "signature": disposition["signature_or_attestation_sha256"]}
-        if prior is not None:
-            if prior != binding:
-                raise ConflictError("trusted disposition nonce replay conflicts with a different attestation")
-            raise ConflictError("trusted disposition nonce has already been consumed")
-        value["consumed"][nonce] = binding
-        atomic_json_write(self.path, value)
+        with self._exclusive_lock():
+            value = self._read()
+            nonce = str(disposition["nonce"])
+            prior = value["consumed"].get(nonce)
+            binding = {"disposition_id": disposition["disposition_id"], "signature": disposition["signature_or_attestation_sha256"]}
+            if prior is not None:
+                if prior != binding:
+                    raise ConflictError("trusted disposition nonce replay conflicts with a different attestation")
+                raise ConflictError("trusted disposition nonce has already been consumed")
+            value["consumed"][nonce] = binding
+            atomic_json_write(self.path, value)
 
 
 def resolve_trusted_dispositions(

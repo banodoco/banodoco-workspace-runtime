@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 
 import pytest
 
-from runtime_protocol.errors import AuthorizationError, ConflictError
+from runtime_protocol.errors import AuthorizationError, ConflictError, ValidationError
 from tools.astrid_migrate import (
     DispositionNonceLedger,
     MigrationConfig,
@@ -18,6 +19,7 @@ from tools.astrid_migrate import (
     seal_trusted_disposition,
     verify_trusted_disposition,
 )
+from tools.astrid_migrate.disposition import _signature
 from runtime_protocol.service import RuntimeService
 
 
@@ -65,6 +67,21 @@ def test_tamper_and_foreign_owner_fail_closed(tmp_path, mutation):
         verify_trusted_disposition(forged, verification_key=key, expected_owner_identity="owner-1", expected_source_manifest_sha256=inventory["source_manifest_sha256"])
 
 
+@pytest.mark.parametrize("mutation", ["binding_extra", "fact_scope_type", "field_scope_item_type"])
+def test_signed_disposition_rejects_closed_schema_drift(tmp_path, mutation):
+    _, inventory, key, value = _disposition(tmp_path)
+    forged = dict(value)
+    if mutation == "binding_extra":
+        forged["source_owner_binding"] = {**forged["source_owner_binding"], "unexpected": "field"}
+    elif mutation == "fact_scope_type":
+        forged["fact_scope"] = "owner-data"
+    else:
+        forged["field_scope"] = ["all", 7]
+    forged["signature_or_attestation_sha256"] = _signature(forged, key)
+    with pytest.raises((AuthorizationError, ValidationError)):
+        verify_trusted_disposition(forged, verification_key=key, expected_owner_identity="owner-1", expected_source_manifest_sha256=inventory["source_manifest_sha256"])
+
+
 def test_self_issue_and_replay_are_rejected(tmp_path):
     with pytest.raises(AuthorizationError):
         _ = issue_trusted_disposition(owner_identity="same", source_manifest_sha256="0" * 64, fact_scope=[], field_scope=[], source_pair_scope=[], decision="preserve", basis_artifact_sha256="0" * 64, epochs={}, signing_key=b"k" * 32, issuer_identity="same")
@@ -98,3 +115,29 @@ def test_authorized_migration_consumes_disposition_and_binds_frozen_source(tmp_p
     assert report["trusted_disposition"]["decision"] == "preserve"
     assert report["trusted_disposition"]["trusted_disposition_sha256"]
     assert report["source_freeze"]
+
+
+def _consume_nonce_worker(path, disposition, barrier, result_queue):
+    ledger = DispositionNonceLedger(path)
+    barrier.wait()
+    try:
+        ledger.consume(disposition)
+    except Exception as exc:  # communicate the typed result across processes
+        result_queue.put(type(exc).__name__)
+    else:
+        result_queue.put("ok")
+
+
+def test_nonce_consumption_is_one_shot_across_processes(tmp_path):
+    _, _, _, value = _disposition(tmp_path, nonce="cross-process")
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    result_queue = context.Queue()
+    path = str(tmp_path / "nonce-ledger.json")
+    processes = [context.Process(target=_consume_nonce_worker, args=(path, value, barrier, result_queue)) for _ in range(2)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+    assert sorted(result_queue.get() for _ in processes) == ["ConflictError", "ok"]
