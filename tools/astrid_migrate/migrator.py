@@ -20,6 +20,26 @@ class MigrationError(RuntimeError):
     pass
 
 
+# These tables are intentionally preserved as opaque, canonical source rows.
+# They are not promoted to product APIs until a second client proves a neutral
+# semantic contract, but they must never be silently discarded by B10.2.
+OWNER_DATA_TABLES = (
+    "media_references", "media_relations", "reference_links",
+    "generation_variants", "shot_items", "task_dependencies", "task_outputs",
+    "execution_attempts", "command_receipts", "evidence_items",
+    "runaway_transitions",
+)
+OWNER_PRIMARY_KEYS = {
+    "media_references": ("id",), "media_relations": ("from_media_id", "to_media_id", "kind"),
+    "reference_links": ("from_reference_id", "to_reference_id", "kind"),
+    "generation_variants": ("id",), "shot_items": ("id",),
+    "task_dependencies": ("task_id", "depends_on_task_id", "kind"),
+    "task_outputs": ("task_id", "ordinal"), "execution_attempts": ("id",),
+    "command_receipts": ("project_id", "idempotency_key"), "evidence_items": ("id",),
+    "runaway_transitions": ("id",),
+}
+
+
 @dataclass(frozen=True)
 class MigrationConfig:
     source_root: Path
@@ -120,6 +140,30 @@ def _rows(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
         return [dict(row) for row in conn.execute(f' SELECT * FROM "{table}"')]
     except sqlite3.OperationalError:
         return []
+
+
+def _owner_key(table: str, row: Mapping[str, Any]) -> str:
+    keys = OWNER_PRIMARY_KEYS[table]
+    values = {key: row.get(key) for key in keys}
+    if any(value is None or value == "" for value in values.values()):
+        raise MigrationError(f"{table} contains a missing owner-data identity")
+    return _canonical(values).decode("utf-8")
+
+
+def _owner_records(data: Mapping[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    records = []
+    for table in OWNER_DATA_TABLES:
+        for ordinal, row in enumerate(data.get(table, [])):
+            encoded = _canonical(dict(row)).decode("utf-8")
+            records.append({
+                "source_table": table,
+                "source_key": _owner_key(table, row),
+                "source_ordinal": ordinal,
+                "row_json": encoded,
+                "row_sha256": _sha256_bytes(encoded.encode("utf-8")),
+                "row": dict(row),
+            })
+    return records
 
 
 def _source_database(root: Path) -> Path:
@@ -279,7 +323,7 @@ class Migrator:
                 disposition.append({"realm": realm, "disposition": "readable_local" if path.is_file() and inside else "missing_or_outside_source", "relative_locator": str(path.resolve().relative_to(self.config.source_root)) if inside else "<outside-source>"})
             media_dispositions.append({"media_id": media.get("id"), "content_hash": media.get("content_hash"), "byte_size": media.get("byte_size"), "locations": disposition})
         known_columns = {"projects": {"id", "slug", "name", "settings_json", "event_head_seq", "created_at", "updated_at"}, "timelines": {"id", "project_id", "event_stream_id", "name", "document_json", "asset_registry_json", "created_at", "updated_at", "project_data_json"}, "shots": {"id", "project_id", "name", "sort_key", "metadata_json", "created_at", "updated_at"}, "project_references": {"id", "project_id", "kind", "name", "description", "metadata_json", "created_at", "updated_at", "archived_at"}, "media": {"id", "project_id", "media_kind", "mime_type", "byte_size", "content_hash", "metadata_json", "created_at"}, "media_locations": {"id", "media_id", "realm", "locator", "verified_at", "created_at"}, "media_references": {"id", "reference_id", "media_id", "role", "context_task_id", "ordinal", "is_primary", "metadata_json", "created_at"}, "media_relations": {"from_media_id", "to_media_id", "kind", "ordinal", "metadata_json", "created_at"}, "reference_links": {"from_reference_id", "to_reference_id", "kind", "metadata_json", "created_at"}, "generation_variants": {"id", "generation_id", "media_id", "variant_type", "name", "params_json", "is_primary", "starred", "viewed_at", "created_at"}, "generations": {"id", "project_id", "task_id", "type", "name", "based_on_generation_id", "parent_generation_id", "child_order", "params_json", "starred", "deleted_at", "created_at", "updated_at"}, "runs": {"id", "project_id", "event_stream_id", "kind", "status", "title", "input_json", "result_json", "started_at", "finished_at"}, "tasks": {"id", "project_id", "event_stream_id", "run_id", "run_ordinal", "capability", "spec_json", "spec_hash", "input_manifest_json", "status", "priority", "available_at", "max_attempts", "winning_attempt_id", "cancel_request_id", "cancel_requested_at", "created_at", "updated_at", "finished_at"}, "events": {"event_id", "project_id", "project_seq", "stream_id", "seq", "subject_type", "subject_id", "changes_json", "kind", "schema_version", "idempotency_key", "txn_id", "actor_kind", "payload_json", "created_at"}, "event_streams": {"id", "project_id", "stream_type", "aggregate_id", "head_seq", "created_at"}, "schema_migrations": {"pack", "version", "name", "checksum", "applied_at"}, "shot_items": {"id", "shot_id", "media_id", "sort_key", "source_frame", "metadata_json", "created_at"}, "task_dependencies": {"task_id", "depends_on_task_id", "kind", "ordinal"}, "task_outputs": {"task_id", "ordinal", "role", "media_id", "is_primary", "params_json", "created_at"}, "execution_attempts": {"id", "task_id", "attempt_no", "executor_id", "status", "status_version", "lease_id", "lease_expires_at", "heartbeat_counter", "last_heartbeat_at", "progress_json", "error_json", "created_at", "updated_at", "finished_at"}, "command_receipts": {"project_id", "idempotency_key", "request_hash", "command_kind", "txn_id", "primary_stream_id", "resulting_stream_seq", "first_project_seq", "last_project_seq", "event_ids_json", "result_json", "created_at"}, "evidence_items": {"id", "run_id", "task_id", "kind", "summary", "data_json", "media_id", "created_at"}, "runaway_transitions": {"id", "project_id", "run_id", "task_id", "ordinal", "start_ms", "duration_ms", "prompt", "metadata_json", "created_at"}}
-        supported_tables = {"projects", "timelines", "shots", "project_references", "media", "media_locations", "generations", "runs", "tasks", "event_streams", "events"}
+        supported_tables = {"projects", "timelines", "shots", "project_references", "media", "media_locations", "generations", "runs", "tasks", "event_streams", "events", *OWNER_DATA_TABLES}
         metadata_only_tables = {"schema_migrations"}
         unmapped = {}
         unsupported = {}
@@ -367,6 +411,7 @@ class Migrator:
             digest = str(row.get("content_hash") or "")
             if digest and len(digest.removeprefix("sha256:")) != 64:
                 raise MigrationError(f"media {row.get('id')} has an invalid content hash")
+        self._validate_owner_data(data)
         blockers = []
         inventory = self._report.get("inventory", {})
         for table, detail in inventory.get("unsupported_nonempty_tables", {}).items():
@@ -377,6 +422,42 @@ class Migrator:
                     blockers.append({"kind": "media_locator", "media_id": media.get("media_id"), "disposition": location.get("disposition")})
         inventory["blockers"] = blockers
         self._report["validation"] = {"ok": not blockers, "foreign_keys": "ok", "invariants": ["unique project IDs/slugs", "project-owned timelines/shots/references", "media-location foreign keys", "content hash shape"], "blockers": blockers}
+
+    @staticmethod
+    def _validate_owner_data(data: Mapping[str, list[dict[str, Any]]]) -> None:
+        """Validate the preserved source graph before any destination write.
+
+        Owner tables remain opaque in the neutral runtime, so these explicit
+        checks are the migration boundary's FK contract.  They cover nullable
+        links as well as composite identities and reject ambiguous duplicate
+        keys before rows can be archived/imported.
+        """
+        ids = {table: {str(row.get("id")) for row in data.get(table, []) if row.get("id") is not None} for table in ("projects", "project_references", "media", "shots", "generations", "runs", "tasks")}
+        for table in OWNER_DATA_TABLES:
+            keys = [_owner_key(table, row) for row in data.get(table, [])]
+            if len(keys) != len(set(keys)):
+                raise MigrationError(f"{table} contains duplicate owner-data identities")
+        checks = {
+            "media_references": (("reference_id", "project_references", False), ("media_id", "media", False), ("context_task_id", "tasks", True)),
+            "media_relations": (("from_media_id", "media", False), ("to_media_id", "media", False)),
+            "reference_links": (("from_reference_id", "project_references", False), ("to_reference_id", "project_references", False)),
+            "generation_variants": (("generation_id", "generations", False), ("media_id", "media", True)),
+            "shot_items": (("shot_id", "shots", False), ("media_id", "media", True)),
+            "task_dependencies": (("task_id", "tasks", False), ("depends_on_task_id", "tasks", False)),
+            "task_outputs": (("task_id", "tasks", False), ("media_id", "media", True)),
+            "execution_attempts": (("task_id", "tasks", False),),
+            "command_receipts": (("project_id", "projects", False),),
+            "evidence_items": (("run_id", "runs", False), ("task_id", "tasks", True), ("media_id", "media", True)),
+            "runaway_transitions": (("project_id", "projects", False), ("run_id", "runs", True), ("task_id", "tasks", True)),
+        }
+        for table, columns in checks.items():
+            for row in data.get(table, []):
+                for column, target, nullable in columns:
+                    value = row.get(column)
+                    if nullable and value in (None, ""):
+                        continue
+                    if str(value) not in ids[target]:
+                        raise MigrationError(f"{table} row {_owner_key(table, row)} references missing {target}.{column}={value!r}")
 
     def _invoke(self, name: str, *args, **kwargs):
         if self.client is None or not hasattr(self.client, name):
@@ -485,7 +566,11 @@ class Migrator:
             return self._report
 
     def _mapping_preview(self, data):
-        return {"projects": len(data.get("projects", [])), "timelines": len(data.get("timelines", [])), "shots": len(data.get("shots", [])), "references": len(data.get("project_references", [])), "generations": len(data.get("generations", [])), "media": len(data.get("media", [])), "runs": len(data.get("runs", [])), "tasks": len(data.get("tasks", []))}
+        result = {"projects": len(data.get("projects", [])), "timelines": len(data.get("timelines", [])), "shots": len(data.get("shots", [])), "references": len(data.get("project_references", [])), "generations": len(data.get("generations", [])), "media": len(data.get("media", [])), "runs": len(data.get("runs", [])), "tasks": len(data.get("tasks", []))}
+        owner_count = len(_owner_records(data))
+        if owner_count:
+            result["owner_data"] = owner_count
+        return result
 
     def _archive(self, inventory: Mapping[str, Any]) -> Path:
         escaping_source = [name for name, detail in inventory.get("files", {}).items() if detail.get("kind") == "symlink" and not detail.get("resolved_inside_root", False)]
@@ -587,10 +672,21 @@ class Migrator:
                     doc = self.client.create_document(project_id, body["document_id"], body["kind"], body["content"])
                 self._document_ids[str(row["id"])] = self._result_id(doc, "document_id", "id")
         for row in data.get("shots", []):
-            timeline_id = str(_json(row.get("metadata_json"), {}).get("timeline_id") or row.get("timeline_id") or "")
+            metadata = _json(row.get("metadata_json"), {}) or {}
+            timeline_id = str(metadata.get("timeline_id") or row.get("timeline_id") or "")
             if not timeline_id:
                 continue
-            shot = self._invoke("create_shot", timeline_id, {"shot_id": str(row["id"]), "start_ms": 0, "duration_ms": 1, "reference_ids": []}, idempotency_key=f"astrid-migrate-shot-{row['id']}")
+            try:
+                start_ms = int(row.get("start_ms", metadata.get("start_ms", metadata.get("start", 0))) or 0)
+                duration_ms = int(row.get("duration_ms", metadata.get("duration_ms", metadata.get("duration", 1))) or 1)
+            except (TypeError, ValueError) as exc:
+                raise MigrationError(f"shot {row.get('id')} has invalid timing") from exc
+            if start_ms < 0 or duration_ms <= 0:
+                raise MigrationError(f"shot {row.get('id')} has invalid timing")
+            reference_ids = row.get("reference_ids") or metadata.get("reference_ids") or metadata.get("references") or []
+            if not isinstance(reference_ids, list):
+                raise MigrationError(f"shot {row.get('id')} has invalid reference ordering")
+            shot = self._invoke("create_shot", timeline_id, {"shot_id": str(row["id"]), "start_ms": start_ms, "duration_ms": duration_ms, "reference_ids": [str(value) for value in reference_ids]}, idempotency_key=f"astrid-migrate-shot-{row['id']}")
             if self._result_id(shot, "shot_id", "id") is not None:
                 self._import_counts["shots"] = self._import_counts.get("shots", 0) + 1
             else:
@@ -598,8 +694,16 @@ class Migrator:
         for row in data.get("project_references", []):
             project_id = str(row["project_id"])
             timeline = next((x for x in data.get("timelines", []) if str(x.get("project_id")) == project_id), None)
+            metadata = _json(row.get("metadata_json"), {}) or {}
+            object_id = metadata.get("object_id") or metadata.get("digest")
+            if not object_id:
+                linked_media = next((x for x in data.get("media_references", []) if str(x.get("reference_id")) == str(row.get("id")) and x.get("media_id") is not None), None)
+                if linked_media:
+                    source_media = next((x for x in data.get("media", []) if str(x.get("id")) == str(linked_media.get("media_id"))), None)
+                    object_id = source_media.get("content_hash") if source_media else None
+            object_id = str(object_id or "").removeprefix("sha256:")
             if timeline and hasattr(self.client, "create_reference"):
-                reference = self._invoke("create_reference", str(timeline["id"]), {"reference_id": str(row["id"]), "object_id": "", "role": row.get("kind")}, idempotency_key=f"astrid-migrate-reference-{row['id']}")
+                reference = self._invoke("create_reference", str(timeline["id"]), {"reference_id": str(row["id"]), "object_id": object_id, "role": row.get("kind")}, idempotency_key=f"astrid-migrate-reference-{row['id']}")
                 if self._result_id(reference, "reference_id", "id") is not None:
                     self._reference_ids[str(row["id"])] = self._result_id(reference, "reference_id", "id")
                 else:
@@ -655,6 +759,14 @@ class Migrator:
             run_id = self._result_id(task, "run_id")
             if run_id is not None:
                 self._run_ids[str(row.get("run_id") or run_id)] = run_id
+        owner_records = _owner_records(data)
+        if owner_records:
+            if not hasattr(self.client, "import_owner_data"):
+                self._report.setdefault("unresolved", []).append({"kind": "owner_data", "rows": len(owner_records), "reason": "client_missing_owner_data_operation"})
+            else:
+                result = self._invoke("import_owner_data", owner_records)
+                imported = self._result_id(result, "count", "rows") if isinstance(result, Mapping) else None
+                self._import_counts["owner_data"] = int(imported if imported is not None else len(owner_records))
         if hasattr(self.client, "append_migration_event"):
             for ordinal, row in enumerate(data.get("events", [])):
                 payload = _json(row.get("payload_json"), row.get("payload", {}))
@@ -684,6 +796,8 @@ class Migrator:
         if not isinstance(truth, Mapping):
             return {"ok": False, "errors": [{"kind": "destination_verification", "reason": "destination snapshot must be a mapping"}]}
         required_sections = ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "event_streams", "media_locations", "project_objects", "foreign_key_errors")
+        if _owner_records(data):
+            required_sections += ("owner_data",)
         missing_sections = [section for section in required_sections if section not in truth]
         if self.config.require_destination_verification and missing_sections:
             errors.append({"kind": "destination_verification", "reason": "snapshot is not a complete authority snapshot", "missing": missing_sections})
@@ -722,6 +836,30 @@ class Migrator:
             expected_relationships = Counter((str(next((p.get("slug") for p in data.get("projects", []) if str(p.get("id")) == str(m.get("project_id"))), m.get("project_id"))), str(m.get("content_hash", "")).removeprefix("sha256:"), str(m.get("media_kind") or "managed")) for m in data.get("media", []))
             if expected_relationships != actual_relationships:
                 errors.append({"kind": "project_objects", "reason": "project-media relationships differ", "missing": [list(x) for x in (expected_relationships - actual_relationships).elements()], "unexpected": [list(x) for x in (actual_relationships - expected_relationships).elements()]})
+            expected_owner = _owner_records(data)
+            if expected_owner:
+                actual_owner = list(truth.get("owner_data", []))
+
+                def owner_shape(record):
+                    row = record.get("row")
+                    if row is None:
+                        raw = record.get("row_json", "")
+                        try:
+                            row = json.loads(raw)
+                        except (TypeError, json.JSONDecodeError):
+                            row = None
+                    encoded = _canonical(row) if isinstance(row, Mapping) else b""
+                    digest = record.get("row_sha256") or _sha256_bytes(encoded)
+                    try:
+                        ordinal = int(record.get("source_ordinal", -1))
+                    except (TypeError, ValueError):
+                        ordinal = -1
+                    return (str(record.get("source_table", "")), str(record.get("source_key", "")), ordinal, str(digest), encoded)
+
+                expected_shape = sorted((owner_shape(record) for record in expected_owner), key=lambda value: (value[0], value[2], value[1]))
+                actual_shape = sorted((owner_shape(record) for record in actual_owner), key=lambda value: (value[0], value[2], value[1]))
+                if expected_shape != actual_shape:
+                    errors.append({"kind": "owner_data", "reason": "destination owner-data rows differ in table, identity, order, digest, or content", "source_count": len(expected_shape), "destination_count": len(actual_shape)})
         for source in data.get("projects", []):
             actual = by_slug.get(str(source.get("slug")))
             if not actual or str(actual.get("name")) != str(source.get("name")):
@@ -962,6 +1100,8 @@ class Migrator:
     def _reconcile(self, data, *, preview: bool) -> dict[str, Any]:
         expected = self._mapping_preview(data)
         actual = {"projects": len(self._project_ids), "timelines": len(self._timeline_ids), "shots": self._import_counts.get("shots", 0), "references": len(self._reference_ids), "generations": self._import_counts.get("generations", 0), "media": len(self._media_ids), "runs": len(self._run_ids), "tasks": len(self._task_ids), "documents": len(self._document_ids)} if not preview else {}
+        if not preview and _owner_records(data):
+            actual["owner_data"] = self._import_counts.get("owner_data", 0)
         unresolved = self._report.get("unresolved", [])
         blockers = list(self._report.get("inventory", {}).get("blockers", [])) + unresolved
         source_facts_sha256 = self._report.get("inventory", {}).get("source_facts_sha256") or _sha256_bytes(_canonical({table: data.get(table, []) for table in sorted(data)}))

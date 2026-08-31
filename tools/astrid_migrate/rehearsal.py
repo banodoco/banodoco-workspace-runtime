@@ -83,6 +83,17 @@ def build_synthetic_fixture(root: str | Path) -> SyntheticFixture:
         CREATE TABLE media (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), media_kind TEXT, mime_type TEXT, byte_size INTEGER, content_hash TEXT, metadata_json TEXT, created_at TEXT);
         CREATE TABLE media_locations (id TEXT PRIMARY KEY, media_id TEXT REFERENCES media(id), realm TEXT, locator TEXT, verified_at TEXT, created_at TEXT);
         CREATE TABLE generations (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), task_id TEXT, type TEXT, name TEXT, based_on_generation_id TEXT, parent_generation_id TEXT, child_order INTEGER, params_json TEXT, starred INTEGER, deleted_at TEXT, created_at TEXT, updated_at TEXT);
+        CREATE TABLE media_references (id TEXT PRIMARY KEY, reference_id TEXT REFERENCES project_references(id), media_id TEXT REFERENCES media(id), role TEXT, context_task_id TEXT REFERENCES tasks(id), ordinal INTEGER, is_primary INTEGER, metadata_json TEXT, created_at TEXT);
+        CREATE TABLE media_relations (from_media_id TEXT REFERENCES media(id), to_media_id TEXT REFERENCES media(id), kind TEXT, ordinal INTEGER, metadata_json TEXT, created_at TEXT, PRIMARY KEY(from_media_id, to_media_id, kind));
+        CREATE TABLE reference_links (from_reference_id TEXT REFERENCES project_references(id), to_reference_id TEXT REFERENCES project_references(id), kind TEXT, metadata_json TEXT, created_at TEXT, PRIMARY KEY(from_reference_id, to_reference_id, kind));
+        CREATE TABLE generation_variants (id TEXT PRIMARY KEY, generation_id TEXT REFERENCES generations(id), media_id TEXT REFERENCES media(id), variant_type TEXT, name TEXT, params_json TEXT, is_primary INTEGER, starred INTEGER, viewed_at TEXT, created_at TEXT);
+        CREATE TABLE shot_items (id TEXT PRIMARY KEY, shot_id TEXT REFERENCES shots(id), media_id TEXT REFERENCES media(id), sort_key TEXT, source_frame INTEGER, metadata_json TEXT, created_at TEXT);
+        CREATE TABLE task_dependencies (task_id TEXT REFERENCES tasks(id), depends_on_task_id TEXT REFERENCES tasks(id), kind TEXT, ordinal INTEGER, PRIMARY KEY(task_id, depends_on_task_id, kind));
+        CREATE TABLE task_outputs (task_id TEXT REFERENCES tasks(id), ordinal INTEGER, role TEXT, media_id TEXT REFERENCES media(id), is_primary INTEGER, params_json TEXT, created_at TEXT, PRIMARY KEY(task_id, ordinal));
+        CREATE TABLE execution_attempts (id TEXT PRIMARY KEY, task_id TEXT REFERENCES tasks(id), attempt_no INTEGER, executor_id TEXT, status TEXT, status_version INTEGER, lease_id TEXT, lease_expires_at TEXT, heartbeat_counter INTEGER, last_heartbeat_at TEXT, progress_json TEXT, error_json TEXT, created_at TEXT, updated_at TEXT, finished_at TEXT);
+        CREATE TABLE command_receipts (project_id TEXT REFERENCES projects(id), idempotency_key TEXT, request_hash TEXT, command_kind TEXT, txn_id TEXT, primary_stream_id TEXT, resulting_stream_seq INTEGER, first_project_seq INTEGER, last_project_seq INTEGER, event_ids_json TEXT, result_json TEXT, created_at TEXT, PRIMARY KEY(project_id, idempotency_key));
+        CREATE TABLE evidence_items (id TEXT PRIMARY KEY, run_id TEXT REFERENCES runs(id), task_id TEXT REFERENCES tasks(id), kind TEXT, summary TEXT, data_json TEXT, media_id TEXT REFERENCES media(id), created_at TEXT);
+        CREATE TABLE runaway_transitions (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), run_id TEXT REFERENCES runs(id), task_id TEXT REFERENCES tasks(id), ordinal INTEGER, start_ms INTEGER, duration_ms INTEGER, prompt TEXT, metadata_json TEXT, created_at TEXT);
         CREATE TABLE runs (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), event_stream_id TEXT, kind TEXT, status TEXT, title TEXT, input_json TEXT, result_json TEXT, started_at TEXT, finished_at TEXT);
         CREATE TABLE tasks (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), event_stream_id TEXT, run_id TEXT, run_ordinal INTEGER, capability TEXT, spec_json TEXT, spec_hash TEXT, input_manifest_json TEXT, status TEXT, priority INTEGER, available_at TEXT, max_attempts INTEGER, winning_attempt_id TEXT, cancel_request_id TEXT, cancel_requested_at TEXT, created_at TEXT, updated_at TEXT, finished_at TEXT);
         CREATE TABLE event_streams (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), stream_type TEXT, aggregate_id TEXT, head_seq INTEGER, created_at TEXT);
@@ -106,6 +117,17 @@ def build_synthetic_fixture(root: str | Path) -> SyntheticFixture:
     db.execute("INSERT INTO event_streams VALUES ('stream-task','p-demo','task','task-1',1,'2026-01-01')")
     db.execute("INSERT INTO runs VALUES ('run-1','p-demo','stream-run','task','queued','Synthetic task','{}',NULL,NULL,NULL)")
     db.execute("INSERT INTO tasks VALUES ('task-1','p-demo','stream-task','run-1',0,'render.basic','{\"quality\":\"draft\"}',NULL,'{}','queued',0,'2026-01-01',1,NULL,NULL,NULL,'2026-01-01','2026-01-01',NULL)")
+    db.execute("INSERT INTO media_references VALUES ('media-ref-1','ref-1','media-1','plate','task-1',0,1,'{\"frame\":1}','2026-01-01')")
+    db.execute("INSERT INTO media_relations VALUES ('media-1','media-1','derived',0,'{\"stage\":\"source\"}','2026-01-01')")
+    db.execute("INSERT INTO reference_links VALUES ('ref-1','ref-1','related','{\"reason\":\"self\"}','2026-01-01')")
+    db.execute("INSERT INTO task_dependencies VALUES ('task-1','task-1','after',0)")
+    db.execute("INSERT INTO generation_variants VALUES ('variant-1','gen-1','media-1','preview','Opening preview','{\"seed\":7}',1,0,NULL,'2026-01-01')")
+    db.execute("INSERT INTO shot_items VALUES ('shot-item-1','shot-1','media-1','001',12,'{\"crop\":\"full\"}','2026-01-01')")
+    db.execute("INSERT INTO task_outputs VALUES ('task-1',0,'preview','media-1',1,'{\"codec\":\"raw\"}','2026-01-01')")
+    db.execute("INSERT INTO execution_attempts VALUES ('attempt-1','task-1',1,'generic-host','failed',2,'lease-1',NULL,3,'2026-01-01','{\"progress\":1}','{\"error\":\"timeout\"}','2026-01-01','2026-01-01','2026-01-01')")
+    db.execute("INSERT INTO command_receipts VALUES ('p-demo','receipt-1','request-hash','task.create','txn-1','stream-task',1,1,1,'[\"event-task\"]','{\"task_id\":\"task-1\"}','2026-01-01')")
+    db.execute("INSERT INTO evidence_items VALUES ('evidence-1','run-1','task-1','preview','Preview output','{\"quality\":\"draft\"}','media-1','2026-01-01')")
+    db.execute("INSERT INTO runaway_transitions VALUES ('transition-1','p-demo','run-1','task-1',0,0,1000,'Opening','{\"state\":\"queued\"}','2026-01-01')")
     db.execute("INSERT INTO events VALUES ('event-project','p-demo',1,'stream-project',1,'project','p-demo',NULL,'project.created','1','project-created','txn-project','migration','{\"slug\":\"demo\"}','2026-01-01')")
     db.execute("INSERT INTO events VALUES ('event-task','p-demo',2,'stream-task',1,'task','task-1',NULL,'task.admitted','1','task-created','txn-task','migration','{\"capability\":\"render.basic\"}','2026-01-01')")
     db.execute("INSERT INTO schema_migrations VALUES ('core',10,'legacy','fixture','2026-01-01')")
@@ -217,6 +239,32 @@ class RuntimeServiceAdapter:
         value["capability_digest"] = value.get("capability_digest") or "sha256:" + hashlib.sha256(str(value.get("capability_id") or value.get("capability")).encode()).hexdigest()
         return self.service.create_task(value)
 
+    def import_owner_data(self, records, *, idempotency_key=None):
+        """Persist complete B10.2 source rows in the neutral runtime ledger."""
+        imported = 0
+        with self.service.store._mutex:
+            with self.service.store._transaction():
+                for record in records:
+                    values = (
+                        str(record["source_table"]), str(record["source_key"]),
+                        int(record["source_ordinal"]), str(record["row_json"]),
+                        str(record["row_sha256"]), now(),
+                    )
+                    existing = self.service.store.conn.execute(
+                        "SELECT source_ordinal, row_json, row_sha256 FROM migration_owner_records WHERE source_table=? AND source_key=?",
+                        values[:2],
+                    ).fetchone()
+                    if existing:
+                        if tuple(existing) != values[2:5]:
+                            raise ValueError(f"owner-data mapping conflicts for {values[0]}:{values[1]}")
+                    else:
+                        self.service.store.conn.execute(
+                            "INSERT INTO migration_owner_records(source_table, source_key, source_ordinal, row_json, row_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            values,
+                        )
+                    imported += 1
+        return {"count": imported}
+
     def append_migration_event(self, kind, payload, *, source_event=None, idempotency_key=None):
         """Preserve a source event and its stream relationship durably.
 
@@ -289,6 +337,7 @@ class RuntimeServiceAdapter:
                 snapshot[table] = rows(table)
             except Exception:
                 snapshot[table] = []
+        snapshot["owner_data"] = [dict(row) for row in conn.execute("SELECT source_table, source_key, source_ordinal, row_json, row_sha256, created_at FROM migration_owner_records ORDER BY source_table, source_ordinal, source_key")]
         snapshot["documents"] = rows("project_documents")
         snapshot["media_locations"] = [{"digest": row["digest"], "realm": "cas", "locator": str(self.service.cas.root / row["digest"][:2] / row["digest"][2:])} for row in snapshot.get("objects", [])]
         cas_objects = []
@@ -356,6 +405,7 @@ class RuntimeServiceAdapter:
         """
         conn = self.service.store.conn
         keep = {table: {str(row.get("id", row.get("digest", ""))) for row in baseline.get(table, [])} for table in ("projects", "timelines", "timeline_shots", "timeline_references", "objects", "generations", "runs", "tasks", "events", "documents", "attempts", "reservations", "recovery_checkpoints", "generation_variants", "timeline_shot_state", "timeline_reference_state", "timeline_revisions", "project_objects", "media_relations")}
+        keep_owner_data = {(str(row.get("source_table")), str(row.get("source_key"))) for row in baseline.get("owner_data", [])}
         keep["migration_event_streams"] = {str(row.get("source_stream_id")) for row in baseline.get("event_stream_mappings", [])}
         keep["migration_events"] = {str(row.get("source_event_id")) for row in baseline.get("event_mappings", [])}
         keep_project_objects = {(str(row.get("project_id")), str(row.get("digest"))) for row in baseline.get("project_objects", [])}
@@ -379,6 +429,9 @@ class RuntimeServiceAdapter:
                 for row in rows:
                     if str(row[0]) not in baseline_key:
                         conn.execute(f'DELETE FROM "{table}" WHERE "{key}"=?', (row[0],))
+            for row in conn.execute("SELECT source_table, source_key FROM migration_owner_records").fetchall():
+                if (str(row[0]), str(row[1])) not in keep_owner_data:
+                    conn.execute("DELETE FROM migration_owner_records WHERE source_table=? AND source_key=?", (row[0], row[1]))
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_objects'").fetchone():
                 conn.execute("DELETE FROM project_objects WHERE project_id NOT IN (SELECT id FROM projects) OR digest NOT IN (SELECT digest FROM objects)")
         baseline_objects = keep.get("objects", set())

@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 LEASE_SECONDS = 30
 
 
@@ -137,6 +137,9 @@ class RealmStore:
             version = 9
         if version < 10:
             self._run_migration(10)
+            version = 10
+        if version < 11:
+            self._run_migration(11)
 
     def begin_runtime_session(self, boot_id):
         """Open a durable boot session and recover work owned by old boots.
@@ -785,6 +788,7 @@ class RealmStore:
             "recovery_checkpoints",
             "realm_lifecycle",
             "migration_event_streams", "migration_events",
+            "migration_owner_records",
         }
         actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing_tables = sorted(expected_tables - actual_tables)

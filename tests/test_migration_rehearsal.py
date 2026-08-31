@@ -67,6 +67,70 @@ def test_b10_rehearsal_preserves_all_source_streams_and_relationships(tmp_path):
         runtime.close()
 
 
+def test_b10_owner_data_preserves_every_row_identity_order_and_digest(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        report = run_rehearsal(
+            MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+            RuntimeServiceAdapter(runtime), runtime=runtime,
+        )
+        rows = report["reconciliation"]["destination_truth"]["truth"]["owner_data"]
+        assert len(rows) == 11
+        assert {row["source_table"] for row in rows} == {
+            "media_references", "media_relations", "reference_links", "generation_variants",
+            "shot_items", "task_dependencies", "task_outputs", "execution_attempts",
+            "command_receipts", "evidence_items", "runaway_transitions",
+        }
+        assert all(len(row["row_sha256"]) == 64 for row in rows)
+        assert rows == sorted(rows, key=lambda row: (row["source_table"], row["source_ordinal"], row["source_key"]))
+    finally:
+        runtime.close()
+
+
+def test_b10_owner_data_missing_fk_fails_before_destination_write(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+    db = sqlite3.connect(source / ".astrid" / "astrid.sqlite3")
+    db.execute("PRAGMA foreign_keys=OFF")
+    db.execute("UPDATE media_references SET media_id='missing-media' WHERE id='media-ref-1'")
+    db.commit()
+    db.close()
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="integrity/foreign-key preflight"):
+            run_rehearsal(
+                MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+                RuntimeServiceAdapter(runtime), runtime=runtime,
+            )
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM migration_owner_records").fetchone()[0] == 0
+    finally:
+        runtime.close()
+
+
+def test_b10_owner_data_truncation_fails_reconciliation(tmp_path):
+    source = tmp_path / "legacy-clone"
+    build_synthetic_fixture(source)
+
+    class TruncatingAdapter(RuntimeServiceAdapter):
+        def destination_snapshot(self):
+            snapshot = super().destination_snapshot()
+            snapshot["owner_data"] = snapshot["owner_data"][:-1]
+            return snapshot
+
+    runtime = RuntimeService(tmp_path / "destination")
+    try:
+        with pytest.raises(MigrationError, match="reconciliation failed"):
+            run_rehearsal(
+                MigrationConfig(source, tmp_path / "archive", tmp_path / "destination", capacity_margin_bytes=0),
+                TruncatingAdapter(runtime), runtime=runtime,
+            )
+        assert runtime.store.conn.execute("SELECT COUNT(*) FROM migration_owner_records").fetchone()[0] == 0
+    finally:
+        runtime.close()
+
+
 def test_b10_rehearsal_rejects_omitted_source_stream(tmp_path):
     source = tmp_path / "legacy-clone"
     build_synthetic_fixture(source)
