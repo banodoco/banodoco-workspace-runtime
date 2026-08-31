@@ -46,8 +46,8 @@ def git_identity(path:str|os.PathLike[str])->dict[str,Any]:
         m=re.match(r"^[ +-]?([0-9a-f]{40,64})\s+([^ (]+)",line)
         if m:
             subpath,subroot=m.group(2),root/m.group(2); initialized=subroot.is_dir() and (subroot/".git").exists(); subref=_gt(subroot,"symbolic-ref","-q","--short","HEAD",optional=True) if initialized else ""
-            subgit,subcommon=_gt(subroot,"rev-parse","--git-dir",optional=True),_gt(subroot,"rev-parse","--git-common-dir",optional=True);subs.append({"path":subpath,"oid":m.group(1),"head_ref":subref or NONE,"detached":not bool(subref),"git_dir_relative":os.path.relpath(subgit,subcommon) if subgit and subcommon else NONE,"common_dir_relative":".","dirty_paths":_dirty(subroot) if initialized else []})
-    return {"repository_identity":_repo(root),"head_oid":_gt(root,"rev-parse","HEAD"),"head_ref":ref or NONE,"detached":not bool(ref),"git_dir_kind":"worktree" if (root/".git").is_file() else "directory","git_dir_relative":os.path.relpath(gd,common) if gd and common else NONE,"common_dir_relative":".","submodules":sorted(subs,key=lambda x:x["path"])}
+            subgit,subcommon=_gt(subroot,"rev-parse","--git-dir",optional=True),_gt(subroot,"rev-parse","--git-common-dir",optional=True);subs.append({"path":subpath,"oid":m.group(1),"head_ref":subref or NONE,"detached":not bool(subref),"git_dir_relative":"WORKTREE" if (subroot/".git").is_file() else "MAIN","common_dir_relative":".","dirty_paths":_dirty(subroot) if initialized else []})
+    return {"repository_identity":_repo(root),"head_oid":_gt(root,"rev-parse","HEAD"),"head_ref":ref or NONE,"detached":not bool(ref),"git_dir_kind":"worktree" if (root/".git").is_file() else "directory","git_dir_relative":"WORKTREE" if (root/".git").is_file() else "MAIN","common_dir_relative":".","submodules":sorted(subs,key=lambda x:x["path"])}
 def _submodule_sources(root:Path,approved:Path)->list[dict[str,str]]:
     lines=_gt(root,"config","-f",".gitmodules","--get-regexp",r"^submodule\..*\.url$",optional=True).splitlines();out=[]
     for line in lines:
@@ -231,24 +231,28 @@ def _validate_git_identity_bytes(content:bytes,row:Mapping[str,Any])->None:
     if not isinstance(identity.get("submodules"),list):raise ReleaseIdentityError("Git submodule identity evidence is not a list")
     for sub in identity["submodules"]:
         if set(sub)!={"path","oid","head_ref","detached","git_dir_relative","common_dir_relative","dirty_paths"} or not isinstance(sub.get("dirty_paths"),list) or Path(str(sub.get("path"))).is_absolute() or ".." in Path(str(sub.get("path"))).parts:raise ReleaseIdentityError("Git submodule identity evidence schema mismatch")
-def create_pre_live_identity(components:Mapping[str,str|os.PathLike[str]],*,metadata:Mapping[str,Any]|None=None,output:Any=None,seed_outputs:Mapping[str,Any]|None=None,generator_definitions:Sequence[Mapping[str,Any]]|None=None,contract_bytes:bytes|None=None,schema_manifest_bytes:bytes|None=None)->dict[str,Any]:
+def create_pre_live_identity(components:Mapping[str,str|os.PathLike[str]],*,metadata:Mapping[str,Any]|None=None,output:Any=None,seed_outputs:Mapping[str,Any]|None=None,generator_definitions:Sequence[Mapping[str,Any]]|None=None,contract_bytes:bytes|None=None,schema_manifest_bytes:bytes|None=None,registry_rows:Sequence[Mapping[str,Any]]|None=None)->dict[str,Any]:
     _clean(components,output); rows=resolve_reviewed_components(components)
     if generator_definitions is not None:
         if contract_bytes is None or schema_manifest_bytes is None:raise ReleaseIdentityError("B11.1 requires complete contract and schema-manifest bytes")
         rows=run_b11_1(rows,generator_definitions,contract_bytes=contract_bytes,schema_manifest_bytes=schema_manifest_bytes)
     planned=set(components)=={"ASTRID-CLIENT","NEUTRAL-RUNTIME"}
     if seed_outputs is None:raise ReleaseIdentityError("PRELIVE-MANIFEST requires actual bytes for all 47 seeds")
-    meta=dict(metadata or {}); manifest=build_prelive_manifest(seed_outputs,metadata=meta); seed_wrappers=_seed_payload_wrappers(seed_outputs,metadata=meta); evidence=[]
+    meta=dict(metadata or {}); definitions=sorted((dict(d) for d in (generator_definitions or [])),key=lambda d:d.get("generator_id",""))
+    if len({d.get("generator_id") for d in definitions})!=len(definitions) or any(not isinstance(d.get("generator_id"),str) for d in definitions):raise ReleaseIdentityError("generator definitions must have unique IDs")
+    if definitions:
+        epochs=dict(meta.get("epochs",{}));epochs["generator_definition_digests"]=[hashlib.sha256(canonical_bytes(d)).hexdigest() for d in definitions];meta["epochs"]=epochs
+    manifest=build_prelive_manifest(seed_outputs,metadata=meta); seed_wrappers=_seed_payload_wrappers(seed_outputs,metadata=meta); evidence=[]
     for r in rows:
         b=canonical_bytes(r); d=hashlib.sha256(b).hexdigest(); evidence.append({"path":f"evidence/sha256/{d[:2]}/{d}","sha256":d,"producer_id":"CMD-IDENTITY:pre-live-root","token_ids":[r["component_id"]],"epochs":meta.get("epochs",{}),"media_type":"application/json"})
-    evidence.sort(key=lambda x:(x["path"],x["sha256"],x["producer_id"])); identity=framed_hash("banodoco.pre-live-evidence-root.v1",{"component_rows":rows,"evidence_rows":evidence,"manifest_sha256":manifest["manifest_sha256"]}); strict=set(r["component_id"] for r in rows)=={"ASTRID-CLIENT","NEUTRAL-RUNTIME"}; locators=join_plan_remote_targets(rows) if strict else []; identities=[]
+    evidence.sort(key=lambda x:(x["path"],x["sha256"],x["producer_id"])); identity=framed_hash("banodoco.pre-live-evidence-root.v1",{"component_rows":rows,"evidence_rows":evidence,"manifest_sha256":manifest["manifest_sha256"]}); strict=set(r["component_id"] for r in rows)=={"ASTRID-CLIENT","NEUTRAL-RUNTIME"}; locators=join_plan_remote_targets(rows,registry_rows=registry_rows) if strict else []; identities=[]
     for row in rows:
         bind=next((b for b in row["provenance_input_bindings"] if b.get("input_id")==f"GIT-IDENTITY:{row['component_id']}"),None)
         if bind is None:raise ReleaseIdentityError("candidate row lacks Git identity binding")
         raw=canonical_bytes(git_identity(Path(components[row["component_id"]]))); identities.append(_artifact_wrapper(bind["input_id"],"CMD-IDENTITY:pre-live-root",raw))
     defs=[]
-    for d in sorted((dict(x) for x in (generator_definitions or [])),key=lambda x:x.get("generator_id","")):
-        if isinstance(d.get("generator_id"),str):defs.append(_artifact_wrapper(f"GENERATOR-DEFINITION:{d['generator_id']}","CMD-IDENTITY:pre-live-root",canonical_bytes(d)))
+    for d in definitions:
+        if isinstance(d.get("generator_id"),str):defs.append(_artifact_wrapper(f"GENERATOR-DEFINITION:{d['generator_id']}","CMD-IDENTITY:pre-live-root",canonical_bytes(d),detail_schema_id="generator-definition-v1"))
     rec={"schema_version":SCHEMA_VERSION,"kind":"pre-live-root","operation_id":"CMD-IDENTITY:pre-live-root","identity":identity,"pre_live_manifest":manifest,"pre_live_seed_payloads":seed_wrappers,"component_identity_evidence":identities,"generator_definition_evidence":defs,"evidence_rows":evidence,"component_rows":rows,"plan_registry_enforced":bool(locators),"remote_target_locators":locators,"remote_target_registry_sha256":component_registry_sha256(plan_component_registry()) if locators else NONE,"metadata":_nfc(meta)}; rec["receipt_sha256"]=_rd(rec); _write(rec,output); return rec
 def _sets(rows:Sequence[Mapping[str,Any]])->dict[str,Mapping[str,Any]]:
     out={}
@@ -260,10 +264,13 @@ def _sets(rows:Sequence[Mapping[str,Any]])->dict[str,Mapping[str,Any]]:
 def create_candidate_core_identity(pre_live:Mapping[str,Any]|str|os.PathLike[str],components:Mapping[str,str|os.PathLike[str]],*,metadata:Mapping[str,Any]|None=None,output:Any=None)->dict[str,Any]:
     prior=load_receipt(pre_live) if isinstance(pre_live,(str,os.PathLike)) else dict(pre_live); verify_receipt(prior)
     if prior.get("kind")!="pre-live-root":raise ReleaseIdentityError("candidate core requires a pre-live-root receipt")
-    _clean(components,output); rows=resolve_reviewed_components(components); old,new=_sets(prior.get("component_rows",[])),_sets(rows)
+    _clean(components,output); recomputed_rows=resolve_reviewed_components(components); old,new=_sets(prior.get("component_rows",[])),_sets(recomputed_rows)
     if set(old)!=set(new):raise ReleaseIdentityError("candidate component set is not a total bijection")
     for c in old:
-        if canonical_bytes(old[c])!=canonical_bytes(new[c]):raise ReleaseIdentityError(f"candidate component field mismatch after pre-live capture: {c}")
+        for field in CANDIDATE_COMPONENT_FIELDS:
+            if field in {"generator_ids","generator_observation_rows"}:continue
+            if canonical_bytes(old[c][field])!=canonical_bytes(new[c][field]):raise ReleaseIdentityError(f"candidate component field mismatch after pre-live capture: {c}:{field}")
+    rows=[copy.deepcopy(old[c]) for c in sorted(old)]
     meta=dict(metadata or {}); core={"schema_version":1,"governance_binding":meta.get("governance_binding","LOCAL-STAGE1-RELEASE"),"component_manifest_sha256":framed_hash("banodoco.component-manifest.v1",rows),"contract_id":meta.get("contract_id",framed_hash("banodoco.contract.v1",[r["contract_sha256"] for r in rows])),"runtime_build_id":meta.get("runtime_build_id",framed_hash("banodoco.runtime-build.v1",[r["integrated_oid"] for r in rows])),"source_manifest_id":meta.get("source_manifest_id",framed_hash("banodoco.source-manifest.v1",[r["subtree_sha256"] for r in rows])),"migration_manifest_id":meta.get("migration_manifest_id",NONE),"selected_realm_id":meta.get("selected_realm_id",NONE),"trusted_disposition_sha256":meta.get("trusted_disposition_sha256",NONE),"pre_live_evidence_root":prior["identity"],"contract_epoch":meta.get("contract_epoch",NONE),"runtime_epoch":meta.get("runtime_epoch",NONE),"source_epoch":meta.get("source_epoch",NONE),"migration_epoch":meta.get("migration_epoch",NONE),"activation_epoch":meta.get("activation_epoch",NONE),"release_epoch":NONE,"component_rows":rows}; rec={"schema_version":SCHEMA_VERSION,"kind":"candidate-core","operation_id":"CMD-IDENTITY:candidate-core","identity":framed_hash("banodoco.candidate-core.v1",core),"candidate_core":core,"pre_live_root":prior["identity"],"pre_live_component_rows":copy.deepcopy(prior["component_rows"]),"pre_live_evidence_rows":copy.deepcopy(prior["evidence_rows"]),"pre_live_manifest":copy.deepcopy(prior["pre_live_manifest"]),"pre_live_manifest_sha256":prior["pre_live_manifest"]["manifest_sha256"],"metadata":_nfc(meta)}; rec["receipt_sha256"]=_rd(rec); _write(rec,output); return rec
 def _configured_root()->Path|None:
     for name in RECEIPT_ROOT_ENVIRONMENTS:
@@ -313,7 +320,18 @@ def verify_receipt(r:Mapping[str,Any])->str:
             _validate_git_identity_bytes(content,row)
         defs=r.get("generator_definition_evidence",[])
         if not isinstance(defs,list):raise ReleaseIdentityError("generator definition evidence is not a list")
-        for item in defs:_decode_artifact(item,producer_id="CMD-IDENTITY:pre-live-root")
+        observations=[o for row in component_rows for o in row.get("generator_observation_rows",[])]
+        ordered=sorted(observations,key=lambda x:x.get("generator_id",""))
+        if len(defs)!=len(ordered) or [x.get("artifact_id","").removeprefix("GENERATOR-DEFINITION:") for x in defs]!=[x.get("generator_id") for x in ordered]:raise ReleaseIdentityError("generator definition evidence cardinality or order mismatch")
+        digests=[]
+        for item,observation in zip(defs,ordered):
+            raw=_decode_artifact(item,artifact_id=f"GENERATOR-DEFINITION:{observation['generator_id']}",producer_id="CMD-IDENTITY:pre-live-root")
+            if item.get("detail_schema_id")!="generator-definition-v1" or hashlib.sha256(raw).hexdigest()!=observation.get("generator_definition_sha256"):raise ReleaseIdentityError("generator definition evidence digest mismatch")
+            try:definition=json.loads(raw.decode())
+            except (UnicodeDecodeError,json.JSONDecodeError):raise ReleaseIdentityError("generator definition evidence is not canonical JSON")
+            if canonical_bytes(definition)!=raw:raise ReleaseIdentityError("generator definition evidence bytes are not canonical")
+            digests.append(hashlib.sha256(raw).hexdigest())
+        if m.get("epochs",{}).get("generator_definition_digests",[])!=digests:raise ReleaseIdentityError("PRELIVE manifest is not bound to generator definitions")
         for row in component_rows:
             for observation in row.get("generator_observation_rows",[]):
                 if set(observation)!=set(GENERATOR_ROW_FIELDS):raise ReleaseIdentityError("generator observation schema mismatch")
@@ -405,10 +423,14 @@ def _load_seed_inputs(seed_dir:str|os.PathLike[str],manifest_path:str|os.PathLik
         if not isinstance(producer,str) or not isinstance(media,str) or not producer or not media:raise ReleaseIdentityError(f"seed media/producer definition is invalid: {seed}")
         defs[seed]={"producer_id":producer,"media_type":media}
     return outputs,{"seed_artifacts":defs}
+def _load_json_input(path:str|os.PathLike[str],label:str)->Any:
+    try:return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError,UnicodeDecodeError,json.JSONDecodeError) as e:raise ReleaseIdentityError(f"{label} must be readable JSON") from e
 def main(argv:Sequence[str]|None=None)->int:
-    p=argparse.ArgumentParser(prog="banodoco-runtime-identity");s=p.add_subparsers(dest="op",required=True);a=s.add_parser("pre-live");a.add_argument("--component",action="append",default=[]);a.add_argument("--output");a.add_argument("--seed-dir",required=True);a.add_argument("--seed-manifest",required=True);b=s.add_parser("candidate-core");b.add_argument("--pre-live",required=True);b.add_argument("--component",action="append",default=[]);b.add_argument("--output");c=s.add_parser("verify");c.add_argument("receipt");x=p.parse_args(argv)
+    p=argparse.ArgumentParser(prog="banodoco-runtime-identity");s=p.add_subparsers(dest="op",required=True);a=s.add_parser("pre-live");a.add_argument("--component",action="append",default=[]);a.add_argument("--output");a.add_argument("--seed-dir",required=True);a.add_argument("--seed-manifest",required=True);a.add_argument("--generator-manifest");a.add_argument("--registry");a.add_argument("--contract-file");a.add_argument("--schema-manifest-file");b=s.add_parser("candidate-core");b.add_argument("--pre-live",required=True);b.add_argument("--component",action="append",default=[]);b.add_argument("--output");c=s.add_parser("verify");c.add_argument("receipt");x=p.parse_args(argv)
     try:
-        if x.op=="pre-live":seed_outputs,seed_metadata=_load_seed_inputs(x.seed_dir,x.seed_manifest);r=create_pre_live_identity(_args(x.component),output=x.output,seed_outputs=seed_outputs,metadata=seed_metadata)
+        if x.op=="pre-live":
+            seed_outputs,seed_metadata=_load_seed_inputs(x.seed_dir,x.seed_manifest);definitions=_load_json_input(x.generator_manifest,"--generator-manifest") if x.generator_manifest else None;definitions=definitions.get("generators",definitions) if isinstance(definitions,Mapping) else definitions;registry=_load_json_input(x.registry,"--registry") if x.registry else None;contract=Path(x.contract_file).read_bytes() if x.contract_file else None;schema=Path(x.schema_manifest_file).read_bytes() if x.schema_manifest_file else None;r=create_pre_live_identity(_args(x.component),output=x.output,seed_outputs=seed_outputs,metadata=seed_metadata,generator_definitions=definitions,contract_bytes=contract,schema_manifest_bytes=schema,registry_rows=registry)
         elif x.op=="candidate-core":r=create_candidate_core_identity(x.pre_live,_args(x.component),output=x.output)
         else:r={"ok":True,"identity":load_receipt(x.receipt)["identity"]}
         print(json.dumps(r,sort_keys=True,indent=2));return 0
