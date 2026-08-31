@@ -3,8 +3,42 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 
 from .util import atomic_json_write, new_id, now
+
+
+def process_birth_identity(pid: int | None = None) -> str | None:
+    """Return an OS birth marker that changes when a PID is reused.
+
+    Linux exposes the process start tick in ``/proc/<pid>/stat``.  macOS and
+    other POSIX hosts do not, so use ``ps``'s start-time rendering there.  The
+    value is only an identity fence; it is never treated as an authorization
+    secret.
+    """
+    value = os.getpid() if pid is None else int(pid)
+    if value <= 0:
+        return None
+    stat_path = Path(f"/proc/{value}/stat")
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        # The comm field may contain ')' so split at the final closing paren.
+        fields = raw.rsplit(")", 1)[-1].split()
+        if len(fields) >= 20:
+            return f"proc-start-ticks:{fields[19]}"
+    except (OSError, ValueError):
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(value), "-o", "lstart="],
+            capture_output=True, text=True, check=False, timeout=1,
+        )
+        rendered = result.stdout.strip()
+        if result.returncode == 0 and rendered:
+            return f"ps-lstart:{rendered}"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
 
 
 class RealmCatalog:
@@ -46,7 +80,7 @@ class LiveDiscovery:
     def publish(self, **fields):
         # Canonical discovery is shared with banodoco-local. Legacy aliases
         # remain readable for older neutral clients during this beta.
-        allowed = {"version", "endpoint", "pid", "runtime_instance_id", "active_realm", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "instance_id", "realm_id"}
+        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "instance_id", "realm_id"}
         atomic_json_write(self.path, {k: fields[k] for k in allowed if k in fields})
 
     def clear(self, instance_id: str | None = None):

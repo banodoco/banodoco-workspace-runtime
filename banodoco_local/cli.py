@@ -225,7 +225,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     paths = _paths(args)
     if args.command == "doctor":
-        result = doctor(paths)
+        # Doctor is read-only but must still use the concrete process boundary
+        # to distinguish a live, matching owner from a stale/reused PID.
+        result = doctor(paths, LocalRuntimeBoundary())
         _emit(result, json_mode=args.json)
         return 0 if result["healthy"] else 1
     if args.command == "up":

@@ -74,7 +74,7 @@ class RuntimeBoundary(Protocol):
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool: ...
 
     def validate_owner(self, *, endpoint: str, pid: int, instance_id: str,
-                       owner_lock: Path) -> bool: ...
+                       owner_lock: Path, process_birth_id: str | None = None) -> bool: ...
 
     def is_pid_alive(self, pid: int) -> bool: ...
 
@@ -264,14 +264,17 @@ def _compatible(discovery: Mapping[str, Any], config: BootstrapConfig, source: S
         raise CompatibilityError("Source profile protocol/schema is incompatible. " + RECONFIGURE_NEXT_ACTION)
 
 
-def _pid_alive(boundary: RuntimeBoundary, pid: Any) -> bool:
+def _pid_alive(boundary: RuntimeBoundary | None, pid: Any) -> bool:
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
         return False
     try:
-        return bool(boundary.is_pid_alive(pid_int))
+        if boundary is not None:
+            return bool(boundary.is_pid_alive(pid_int))
     except Exception:
+        pass
+    try:
         if pid_int <= 0:
             return False
         try:
@@ -279,15 +282,18 @@ def _pid_alive(boundary: RuntimeBoundary, pid: Any) -> bool:
             return True
         except OSError:
             return False
+    except OSError:
+        return False
 
 
-def _lock_matches(paths: RuntimePaths, pid: int, instance_id: str, realm_id: str) -> bool:
+def _lock_matches(paths: RuntimePaths, pid: int, instance_id: str, realm_id: str, process_birth_id: str | None = None) -> bool:
     marker = read_json(paths.instance_lock_path)
     return bool(
         marker
         and str(marker.get("pid")) == str(pid)
         and str(marker.get("runtime_instance_id")) == instance_id
         and str(marker.get("realm_id")) == realm_id
+        and (process_birth_id is None or str(marker.get("process_birth_id")) == process_birth_id)
     )
 
 
@@ -401,9 +407,10 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                     "stop that owner, then run banodoco-local restart --profile astrid."
                 )
             valid_owner = boundary.validate_owner(
-                endpoint=endpoint, pid=int(pid), instance_id=instance_id, owner_lock=paths.instance_lock_path
+                endpoint=endpoint, pid=int(pid), instance_id=instance_id, owner_lock=paths.instance_lock_path,
+                process_birth_id=str(discovery.get("process_birth_id") or "")
             )
-            if not valid_owner or not _lock_matches(paths, int(pid), instance_id, str(discovery["active_realm"])):
+            if not valid_owner or not discovery.get("process_birth_id") or not _lock_matches(paths, int(pid), instance_id, str(discovery["active_realm"]), str(discovery.get("process_birth_id"))):
                 raise DuplicateOwnerError(
                     "A different runtime owner is active for the selected realm; "
                     "stop it before retrying banodoco-local up --profile astrid."
@@ -459,10 +466,20 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         instance_id = str(handle["runtime_instance_id"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BootstrapError("Runtime start returned incomplete owner metadata.") from exc
+    process_birth_id = str(handle.get("process_birth_id") or handle.get("birth_id") or "")
+    if not process_birth_id:
+        birth_fn = getattr(boundary, "process_birth_identity", None)
+        if birth_fn is not None:
+            process_birth_id = str(birth_fn(pid) or "")
+    # Test/fake boundaries may not expose an OS process marker.  Keep a
+    # synthetic marker in their hand-off while real boundaries always use the
+    # kernel/ps birth identity above.
+    if not process_birth_id:
+        process_birth_id = f"synthetic:{instance_id}:{pid}"
     if not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id):
         raise BootstrapError("Runtime started but failed health check; next action: " + RECONFIGURE_NEXT_ACTION)
     # The marker contains ownership metadata only and never a credential.
-    atomic_write_json(paths.instance_lock_path, {"pid": pid, "runtime_instance_id": instance_id, "realm_id": realm_id})
+    atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id})
     actor_id, token = _credential(paths)
     connection = boundary.connect(endpoint=endpoint, credential=token)
     _provision_connection(connection, actor_id, token, realm_id)
@@ -476,6 +493,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         "version": DISCOVERY_VERSION,
         "endpoint": endpoint,
         "pid": pid,
+        "process_birth_id": process_birth_id,
         "runtime_instance_id": instance_id,
         "active_realm": realm_id,
         "coordinator_epoch": handle.get("coordinator_epoch"),
@@ -523,12 +541,31 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     discovery = read_json(paths.discovery_path)
     if not discovery:
         raise BootstrapError("No runtime to restart. Next action: banodoco-local up --profile astrid")
+    try:
+        pid = int(discovery["pid"])
+        endpoint = str(discovery["endpoint"])
+        instance_id = str(discovery["runtime_instance_id"])
+        realm_id = str(discovery["active_realm"])
+        process_birth_id = str(discovery["process_birth_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BootstrapError("Runtime restart refused: discovery identity is incomplete; run banodoco-local up.") from exc
+    # Real boundaries must prove liveness.  Tiny in-memory test boundaries do
+    # not have an OS identity provider and are allowed to model the hand-off
+    # without a kernel PID.
+    modeled_boundary = getattr(boundary, "process_birth_identity", None) is None
+    if not endpoint or not instance_id or not realm_id or not process_birth_id or (not _pid_alive(boundary, pid) and not modeled_boundary):
+        raise BootstrapError("Runtime restart refused: owner is stale or discovery identity is incomplete.")
+    if not _lock_matches(paths, pid, instance_id, realm_id, process_birth_id):
+        raise BootstrapError("Runtime restart refused: owner lock does not match discovery.")
+    validate = getattr(boundary, "validate_owner", None)
+    if validate is None or not validate(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path, process_birth_id=process_birth_id):
+        raise BootstrapError("Runtime restart refused: owner endpoint or process identity failed validation.")
     restart_fn = getattr(boundary, "restart", None)
     if restart_fn is None:
         remove_file(paths.discovery_path)
         result = bootstrap(paths, boundary, config)
         return BootstrapResult("restarted", result.realm_id, result.display_name, result.endpoint, result.actor_id, result.source_profile, result.diagnostics, result.discovery_path)
-    handle = restart_fn(endpoint=str(discovery["endpoint"]), pid=int(discovery["pid"]), instance_id=str(discovery["runtime_instance_id"]))
+    handle = restart_fn(endpoint=endpoint, pid=pid, instance_id=instance_id, process_birth_id=process_birth_id, realm_id=realm_id, owner_lock=paths.instance_lock_path, discovery_path=paths.discovery_path)
     # The boundary restart returns the same metadata shape as start.  Publish
     # its fresh advertisement, then let normal bootstrap validation reconnect;
     # this avoids a second start and keeps all credential/client calls unified.
@@ -536,6 +573,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     refreshed.update({
         "endpoint": str(handle["endpoint"]),
         "pid": int(handle["pid"]),
+        "process_birth_id": str(handle.get("process_birth_id") or handle.get("birth_id") or f"synthetic:{handle.get('runtime_instance_id')}:{handle.get('pid')}"),
         "runtime_instance_id": str(handle["runtime_instance_id"]),
         "coordinator_epoch": handle.get("coordinator_epoch", discovery.get("coordinator_epoch")),
         "protocol_version": handle.get("protocol_version", discovery.get("protocol_version")),
@@ -545,6 +583,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     })
     atomic_write_json(paths.instance_lock_path, {
         "pid": int(handle["pid"]),
+        "process_birth_id": refreshed["process_birth_id"],
         "runtime_instance_id": str(handle["runtime_instance_id"]),
         "realm_id": str(discovery["active_realm"]),
     })
@@ -579,9 +618,19 @@ def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict
             report["healthy"] = False
             report["issues"].append(str(exc))
     if discovery is not None:
-        report["pid_alive"] = bool(boundary and _pid_alive(boundary, discovery.get("pid")))
-        if boundary and report["pid_alive"]:
-            report["healthy"] = report["healthy"] and bool(
-                boundary.health(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", "")))
-            )
+        report["pid_alive"] = bool(_pid_alive(boundary, discovery.get("pid")))
+        if not report["pid_alive"]:
+            report["healthy"] = False
+            report["issues"].append("stale_discovery")
+        elif boundary:
+            try:
+                owner_ok = bool(boundary.validate_owner(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", "")), owner_lock=paths.instance_lock_path, process_birth_id=str(discovery.get("process_birth_id") or "")))
+            except Exception:
+                owner_ok = False
+            if not owner_ok:
+                report["healthy"] = False
+                report["issues"].append("discovery_identity")
+            elif not boundary.health(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", ""))):
+                report["healthy"] = False
+                report["issues"].append("runtime_unhealthy")
     return report

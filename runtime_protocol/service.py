@@ -41,7 +41,8 @@ class RuntimeService:
         self.store.close()
 
     def backup(self, destination, *, binding=None):
-        return create_backup(self.store, destination, binding=binding)
+        key_path = (self.support_root / "backup-auth.key") if self.support_root else (self.store.root / ".operator-backup-key")
+        return create_backup(self.store, destination, binding=binding, key_path=key_path)
 
     def restore(self, backup_dir, destination):
         return restore_backup(backup_dir, destination)

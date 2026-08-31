@@ -17,6 +17,7 @@ import shutil
 import sqlite3
 import tempfile
 from pathlib import Path
+import stat
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import atomic_json_write, canonical_json, now
@@ -35,16 +36,89 @@ def _authenticated_digest(payload: dict) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def _auth_payload(value: dict) -> dict:
+    return {key: item for key, item in value.items() if key not in {"manifest_sha256", "manifest_hmac", "handoff_sha256", "handoff_hmac"}}
+
+
+def _key_id(key: bytes) -> str:
+    return hashlib.sha256(key).hexdigest()[:32]
+
+
+def _provision_key(path: Path, *, rotate: bool = False) -> bytes:
+    """Provision a private operator key outside the backup directory."""
+    path = path.expanduser().resolve()
+    if path.exists() and not rotate:
+        if path.is_symlink() or not path.is_file():
+            raise ConflictError("backup authentication key is not a regular file")
+        key = path.read_bytes()
+        if len(key) < 32:
+            raise ConflictError("backup authentication key is too short")
+        return key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = os.urandom(32)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(key)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return key
+
+
+def provision_backup_key(path: str | Path, *, rotate: bool = False) -> dict:
+    """Provision/rotate a backup key without placing it in any backup.
+
+    Rotation intentionally leaves existing backups bound to their old key;
+    operators can verify those backups by supplying the retained old key via
+    ``verify_backup(..., key=...)``.
+    """
+    key = _provision_key(Path(path), rotate=rotate)
+    return {"path": str(Path(path).expanduser().resolve()), "key_id": _key_id(key), "algorithm": "hmac-sha256"}
+
+
+def _resolve_key(manifest: dict, *, key: bytes | None = None, key_path: str | Path | None = None) -> bytes:
+    if key is not None:
+        value = bytes(key)
+    else:
+        auth = manifest.get("authentication")
+        if not isinstance(auth, dict):
+            raise ConflictError("backup authentication metadata is missing")
+        candidate = key_path or auth.get("key_path")
+        if not candidate:
+            raise ConflictError("backup authentication key is not provisioned")
+        path = Path(str(candidate)).expanduser().resolve()
+        if path.is_symlink() or not path.is_file():
+            raise ConflictError("backup authentication key is unavailable")
+        value = path.read_bytes()
+    if len(value) < 32:
+        raise ConflictError("backup authentication key is too short")
+    auth = manifest.get("authentication")
+    if not isinstance(auth, dict) or auth.get("algorithm") != "hmac-sha256" or auth.get("key_id") != _key_id(value):
+        raise ConflictError("backup authentication key does not match manifest realm")
+    return value
+
+
+def _manifest_mac(manifest: dict, key: bytes) -> str:
+    return hmac.new(key, canonical_json(_auth_payload(manifest)).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def _file_record(path: Path) -> dict:
     return {"sha256": _sha256(path), "size": path.stat().st_size}
 
 
 def _manifest_digest_payload(manifest: dict) -> dict:
-    return {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    return {key: value for key, value in manifest.items() if key not in {"manifest_sha256", "manifest_hmac"}}
 
 
 def _handoff_digest_payload(handoff: dict) -> dict:
-    return {key: value for key, value in handoff.items() if key != "handoff_sha256"}
+    return {key: value for key, value in handoff.items() if key not in {"handoff_sha256", "handoff_hmac"}}
 
 
 def _object_path(cas_root: Path, digest: str) -> Path:
@@ -84,7 +158,7 @@ def _verify_cas_manifest(root: Path, manifest: dict) -> None:
             raise ConflictError("backup CAS object failed verification", details={"digest": obj.get("digest")})
 
 
-def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False) -> dict:
+def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False, key: bytes | None = None, key_path: str | Path | None = None) -> dict:
     root = Path(backup_dir).expanduser().resolve()
     manifest_path = root / "manifest.json"
     cas_manifest_path = root / "cas-manifest.json"
@@ -107,7 +181,11 @@ def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False) -> dict
             raise ConflictError("backup SQLite hash mismatch")
     elif format_version == 2:
         digest = manifest.get("manifest_sha256")
+        mac = manifest.get("manifest_hmac")
         if not isinstance(digest, str) or not hmac.compare_digest(digest, _authenticated_digest(_manifest_digest_payload(manifest))):
+            raise ConflictError("backup manifest authentication failed (public digest mismatch)")
+        auth_key = _resolve_key(manifest, key=key, key_path=key_path)
+        if not isinstance(mac, str) or not hmac.compare_digest(mac, _manifest_mac(manifest, auth_key)):
             raise ConflictError("backup manifest authentication failed")
         realm_meta = manifest.get("realm")
         schema_meta = manifest.get("schema")
@@ -142,6 +220,8 @@ def verify_backup(backup_dir: str | Path, *, allow_legacy: bool = False) -> dict
             raise ConflictError("backup realm identity mismatch")
     finally:
         connection.close()
+    # Never expose the operator key through an API response: this result is
+    # serialized by the HTTP server for backup callers.
     return {"manifest": manifest, "cas_manifest": cas}
 
 
@@ -168,7 +248,11 @@ def verify_restore_candidate(candidate_dir: str | Path) -> dict:
     if handoff.get("format_version") != 2:
         raise ConflictError("legacy restore handoff requires explicit migration")
     handoff_digest = handoff.get("handoff_sha256")
+    handoff_mac = handoff.get("handoff_hmac")
+    auth_key = _resolve_key(source_manifest)
     if not isinstance(handoff_digest, str) or not hmac.compare_digest(handoff_digest, _authenticated_digest(_handoff_digest_payload(handoff))):
+        raise ConflictError("restore handoff authentication failed")
+    if not isinstance(handoff_mac, str) or not auth_key or not hmac.compare_digest(handoff_mac, hmac.new(auth_key, canonical_json(_auth_payload(handoff)).encode("utf-8"), hashlib.sha256).hexdigest()):
         raise ConflictError("restore handoff authentication failed")
     if handoff.get("source_manifest_sha256") != _sha256(source_backup / "manifest.json"):
         raise ConflictError("restore handoff source manifest mismatch")
@@ -203,7 +287,7 @@ def verify_restore_candidate(candidate_dir: str | Path) -> dict:
     return {"handoff": handoff, "manifest": source_manifest, "doctor": report, "database_sha256": candidate_db_hash, "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
 
 
-def create_backup(store, destination: str | Path, *, binding: dict | None = None) -> dict:
+def create_backup(store, destination: str | Path, *, binding: dict | None = None, key: bytes | None = None, key_path: str | Path | None = None) -> dict:
     destination = Path(destination).expanduser().resolve()
     if destination.exists():
         raise ConflictError("backup destination already exists", details={"destination": str(destination)})
@@ -230,6 +314,10 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
             atomic_json_write(temporary / "cas-manifest.json", cas)
             realm = store.realm
             schema_version = store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            auth_path = Path(key_path or (store.root / ".operator-backup-key")).expanduser().resolve()
+            auth_key = bytes(key) if key is not None else _provision_key(auth_path)
+            if len(auth_key) < 32:
+                raise ConflictError("backup authentication key is too short")
             manifest = {
                 "format_version": 2,
                 "created_at": now(),
@@ -243,13 +331,15 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                 "display_name": realm["display_name"],
                 "database_sha256": _sha256(target_db),
                 "cas_manifest_sha256": cas["manifest_sha256"],
+                "authentication": {"algorithm": "hmac-sha256", "key_id": _key_id(auth_key), "key_path": str(auth_path)},
             }
             if binding is not None:
                 manifest["destination_binding"] = dict(binding)
             manifest["manifest_sha256"] = _authenticated_digest(manifest)
+            manifest["manifest_hmac"] = _manifest_mac(manifest, auth_key)
             atomic_json_write(temporary / "manifest.json", manifest)
         temporary.rename(destination)
-        return verify_backup(destination)
+        return verify_backup(destination, key=auth_key)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
@@ -277,6 +367,8 @@ def restore_backup(backup_dir: str | Path, destination: str | Path) -> dict:
             restored.close()
         handoff = {"format_version": 2, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": _sha256(source / "manifest.json"), "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _sha256(temporary / "realm.sqlite3"), "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
         handoff["handoff_sha256"] = _authenticated_digest(handoff)
+        auth_key = _resolve_key(verified["manifest"])
+        handoff["handoff_hmac"] = hmac.new(auth_key, canonical_json(_auth_payload(handoff)).encode("utf-8"), hashlib.sha256).hexdigest()
         atomic_json_write(temporary / "activation-handoff.json", handoff)
         temporary.rename(destination)
         return {"destination": str(destination), "realm_id": realm["id"], "activation_handoff": str(destination / "activation-handoff.json"), "source_manifest_sha256": handoff["source_manifest_sha256"], "verification": verified["manifest"]}

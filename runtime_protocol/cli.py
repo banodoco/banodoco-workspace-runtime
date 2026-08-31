@@ -128,7 +128,15 @@ def main(argv=None):
         shutil.rmtree(root)
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
-    daemon = RuntimeDaemon(args.root, support_root=args.support_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file).start()
+    try:
+        daemon = RuntimeDaemon(args.root, support_root=args.support_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file).start()
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        # Installed operator entrypoints must fail as a stable JSON boundary;
+        # never leak a traceback for a missing migration or bad root.
+        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+        return 1
     print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path)}, sort_keys=True), flush=True)
     stop = False
     def handle(*_):

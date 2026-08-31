@@ -19,3 +19,10 @@ addopts = "-ra"
 
 [tool.setuptools.packages.find]
 include = ["runtime_protocol*", "banodoco_local*", "tools*"]
+
+# Migrations are runtime data, not optional source files.  Keep them in every
+# wheel/sdist so an installed ``banodoco-runtime start`` has the same schema
+# bootstrap as a checkout launch.
+[tool.setuptools.package-data]
+runtime_protocol = ["migrations/*.sql"]
+"tools.astrid_migrate" = ["evidence/*.json"]

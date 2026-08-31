@@ -200,11 +200,13 @@ class LocalRuntimeBoundary:
         self._source, self._realm_root, self._support_root, self._realm_id = source_profile, realm_root, support_root, realm_id
         self._bootstrap_credential = bootstrap_token
         endpoint = self._wait_endpoint(support_root, self._process)
+        discovery = self._read_discovery(support_root)
         return {
             "endpoint": endpoint,
             "pid": self._process.pid,
-            "runtime_instance_id": self._read_discovery(support_root).get("runtime_instance_id", ""),
-            "coordinator_epoch": self._read_discovery(support_root).get("coordinator_epoch"),
+            "process_birth_id": discovery.get("process_birth_id") or self.process_birth_identity(self._process.pid),
+            "runtime_instance_id": discovery.get("runtime_instance_id", ""),
+            "coordinator_epoch": discovery.get("coordinator_epoch"),
             "protocol_version": PROTOCOL_VERSION,
             "schema_version": SCHEMA_VERSION,
             "capability_digest": source_profile.capability_digest,
@@ -216,6 +218,27 @@ class LocalRuntimeBoundary:
             return value if isinstance(value, dict) else {}
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
+
+    @staticmethod
+    def process_birth_identity(pid: int) -> str | None:
+        """Return a PID-reuse-resistant process start marker."""
+        if int(pid) <= 0:
+            return None
+        stat_path = Path(f"/proc/{int(pid)}/stat")
+        try:
+            fields = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[-1].split()
+            if len(fields) >= 20:
+                return f"proc-start-ticks:{fields[19]}"
+        except (OSError, ValueError):
+            pass
+        try:
+            result = subprocess.run(["ps", "-p", str(int(pid)), "-o", "lstart="], capture_output=True, text=True, check=False, timeout=1)
+            rendered = result.stdout.strip()
+            if result.returncode == 0 and rendered:
+                return f"ps-lstart:{rendered}"
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
 
     def _wait_endpoint(self, support_root: Path, process: subprocess.Popen[str]) -> str:
         deadline = time.monotonic() + self.wait_seconds
@@ -257,7 +280,7 @@ class LocalRuntimeBoundary:
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool:
         return self.is_pid_alive(pid) and self._http_health(endpoint)
 
-    def validate_owner(self, *, endpoint: str, pid: int, instance_id: str, owner_lock: Path) -> bool:
+    def validate_owner(self, *, endpoint: str, pid: int, instance_id: str, owner_lock: Path, process_birth_id: str | None = None) -> bool:
         if not self.is_pid_alive(pid):
             return False
         try:
@@ -265,6 +288,9 @@ class LocalRuntimeBoundary:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return False
         if str(marker.get("pid")) != str(pid) or str(marker.get("runtime_instance_id")) != instance_id:
+            return False
+        expected_birth = process_birth_id or marker.get("process_birth_id")
+        if not expected_birth or expected_birth != self.process_birth_identity(pid):
             return False
         return self._http_health(endpoint)
 
@@ -320,21 +346,69 @@ class LocalRuntimeBoundary:
         if not self._source or not self._realm_root or not self._support_root or not self._realm_id:
             raise BootstrapError("No runtime process is available to restart.")
         source, root, support, realm_id = self._source, self._realm_root, self._support_root, self._realm_id
+        endpoint = str(kwargs.get("endpoint", ""))
+        expected_pid = int(kwargs.get("pid", 0))
+        expected_instance = str(kwargs.get("instance_id", ""))
+        expected_birth = str(kwargs.get("process_birth_id", ""))
+        expected_realm = str(kwargs.get("realm_id", realm_id))
+        owner_lock = Path(kwargs.get("owner_lock", support / "instance.lock")).expanduser().resolve()
+        discovery_path = Path(kwargs.get("discovery_path", support / "discovery.json")).expanduser().resolve()
+
+        def validate_before_signal(*, require_health: bool = True) -> None:
+            """Re-read every fence immediately before the first signal."""
+            if expected_pid <= 0 or not endpoint or not expected_instance or not expected_birth:
+                raise BootstrapError("Runtime restart refused: discovery identity is incomplete.")
+            if expected_pid == os.getpid():
+                raise BootstrapError("Runtime restart refused: owner PID is the current operator process.")
+            try:
+                discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+                marker = json.loads(owner_lock.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise BootstrapError("Runtime restart refused: owner discovery or lock is unavailable.") from exc
+            checks = (
+                str(discovery.get("pid")) == str(expected_pid),
+                str(discovery.get("endpoint")) == endpoint,
+                str(discovery.get("runtime_instance_id")) == expected_instance,
+                str(discovery.get("process_birth_id")) == expected_birth,
+                str(discovery.get("active_realm")) == expected_realm,
+                str(marker.get("pid")) == str(expected_pid),
+                str(marker.get("runtime_instance_id")) == expected_instance,
+                str(marker.get("process_birth_id")) == expected_birth,
+                str(marker.get("realm_id")) == expected_realm,
+                self.is_pid_alive(expected_pid),
+                self.process_birth_identity(expected_pid) == expected_birth,
+                (self._http_health(endpoint) if require_health else True),
+            )
+            if not all(checks):
+                raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")
+            # A group kill is only safe for the daemon's own session leader.
+            try:
+                if os.getpgid(expected_pid) != expected_pid:
+                    raise BootstrapError("Runtime restart refused: owner is not its own process-group leader.")
+            except OSError as exc:
+                raise BootstrapError("Runtime restart refused: owner process disappeared.") from exc
+
+        validate_before_signal()
         if not self._process and getattr(self, "_detached_pid", None):
             detached = int(self._detached_pid)
-            try:
-                os.killpg(detached, signal.SIGTERM)
-            except OSError:
-                pass
+            if detached != expected_pid:
+                raise BootstrapError("Runtime restart refused: adopted owner PID changed.")
+            validate_before_signal()
+            os.killpg(detached, signal.SIGTERM)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and self.is_pid_alive(detached):
                 time.sleep(0.05)
             if self.is_pid_alive(detached):
-                try:
-                    os.killpg(detached, signal.SIGKILL)
-                except OSError:
-                    pass
+                # Revalidate again before escalation; PID reuse or a changed
+                # group must never receive a signal from this boundary.
+                validate_before_signal(require_health=False)
+                os.killpg(detached, signal.SIGKILL)
             self._detached_pid = None
         else:
-            self.stop()
+            process = self._process
+            if process is None or process.pid != expected_pid:
+                raise BootstrapError("Runtime restart refused: owned process handle changed.")
+            validate_before_signal()
+            self._terminate(process)
+            self._process = None
         return self.start(realm_id=realm_id, realm_root=root, owner_lock=support / "instance.lock", source_profile=source)
