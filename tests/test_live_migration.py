@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -92,5 +93,87 @@ def test_b12_requires_explicit_writer_stop_boundary(tmp_path):
                 authorizations,
                 writer_stop=lambda: {"stopped": False},
             )
+    finally:
+        active.close()
+
+
+@pytest.mark.parametrize(
+    "crash_at",
+    [
+        "after_active_backup",
+        "after_migration",
+        "after_destination_backup",
+        "after_candidate_restore",
+        "after_active_activation",
+        "after_rollback_restore",
+        "after_rollback_activation",
+        "after_reactivation_restore",
+        "after_reactivation_activation",
+    ],
+)
+def test_b12_live_migration_resumes_after_each_durable_crash_seam(tmp_path, crash_at):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    config = _config(source, tmp_path)
+    active = RuntimeService(tmp_path / "active")
+    try:
+        authorizations = issue_live_authorizations(selected_realm_id=active.realm["id"])
+        with pytest.raises(MigrationError, match="injected rehearsal crash"):
+            run_live_migration(
+                config,
+                active,
+                authorizations,
+                writer_stop=lambda: {"stopped": True},
+                crash_at=crash_at,
+            )
+        resumed = run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
+        assert resumed["journal"]["state"] == "reactivated"
+        assert [entry["to"] for entry in resumed["journal"]["entries"]] == ["active", "rolled_back", "reactivated"]
+    finally:
+        active.close()
+
+
+def test_b12_terminal_replay_is_bound_to_exact_request_and_final_identity(tmp_path):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    config = _config(source, tmp_path)
+    active = RuntimeService(tmp_path / "active")
+    try:
+        authorizations = issue_live_authorizations(selected_realm_id=active.realm["id"])
+        first = run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
+        assert run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})["idempotent"] is True
+
+        conflicting_auth = {key: dict(value) for key, value in authorizations.items()}
+        conflicting_auth["AUTH-LIVE-INPUT-B12"]["nonce"] = "different-request"
+        with pytest.raises(MigrationError, match="durable authorization"):
+            run_live_migration(config, active, conflicting_auth, writer_stop=lambda: {"stopped": True})
+
+        conflicting_config = replace(config, destination_root=tmp_path / "another-destination")
+        with pytest.raises(MigrationError, match="realm or destination binding"):
+            run_live_migration(conflicting_config, active, authorizations, writer_stop=lambda: {"stopped": True})
+
+        (source / "late-write.txt").write_text("changed after completion\n", encoding="utf-8")
+        with pytest.raises(MigrationError, match="frozen source manifest"):
+            run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
+        assert first["identity"]["realm_id"] == active.realm["id"]
+    finally:
+        active.close()
+
+
+def test_b12_destination_must_not_preexist_even_empty_or_be_symlink(tmp_path):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    active = RuntimeService(tmp_path / "active")
+    try:
+        empty_destination = config_destination = tmp_path / "destination"
+        empty_destination.mkdir()
+        with pytest.raises(MigrationError, match="fresh"):
+            run_live_migration(_config(source, tmp_path), active, issue_live_authorizations(selected_realm_id=active.realm["id"]), writer_stop=lambda: {"stopped": True})
+
+        symlink_destination = tmp_path / "symlink-destination"
+        symlink_destination.symlink_to(tmp_path / "not-created")
+        symlink_config = replace(_config(source, tmp_path), destination_root=symlink_destination)
+        with pytest.raises(MigrationError, match="fresh"):
+            run_live_migration(symlink_config, active, issue_live_authorizations(selected_realm_id=active.realm["id"]), writer_stop=lambda: {"stopped": True})
     finally:
         active.close()

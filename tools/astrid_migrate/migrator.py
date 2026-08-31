@@ -67,7 +67,11 @@ class MigrationConfig:
     def __post_init__(self):
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
         object.__setattr__(self, "archive_root", Path(self.archive_root).expanduser().resolve())
-        object.__setattr__(self, "destination_root", Path(self.destination_root).expanduser().resolve())
+        # Keep the final destination component unresolved so the live runner
+        # can reject both existing directories and dangling symlinks before
+        # any operation follows the link. Source/archive roots remain
+        # canonicalized because they are read-only inputs/artifact roots.
+        object.__setattr__(self, "destination_root", Path(os.path.abspath(os.path.expanduser(str(self.destination_root)))))
         if self.evidence_root is not None:
             object.__setattr__(self, "evidence_root", Path(self.evidence_root).expanduser().resolve())
 

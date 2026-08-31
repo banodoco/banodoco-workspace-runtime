@@ -589,6 +589,22 @@ class MigrationJournal:
     def effects(self) -> dict[str, Any]:
         return {str(item["name"]): item for item in self._read().get("effects", []) if isinstance(item, dict) and item.get("name")}
 
+    def bind(self, **payload: Any) -> dict[str, Any]:
+        """Durably bind a journal to one exact migration request."""
+        current = self._read()
+        recorded = current.get("binding")
+        if recorded is not None:
+            if recorded != payload:
+                raise MigrationError("migration journal request binding conflict")
+            return current
+        if current["state"] != "prepared":
+            raise MigrationError("migration request binding must be established while prepared")
+        self._inject("before_bind")
+        result = current | {"binding": dict(payload)}
+        _write_json(self.path, result)
+        self._inject("after_bind")
+        return result
+
     def _inject(self, seam: str) -> None:
         if self.crash_at == seam:
             raise MigrationError(f"injected rehearsal crash at {seam}")
@@ -598,6 +614,14 @@ class MigrationJournal:
     def transition(self, state: str, **payload: Any) -> dict[str, Any]:
         current = self._read()
         if current["state"] == state:
+            # A repeated terminal command is only idempotent when it is the
+            # same command.  Historically this returned the journal blindly,
+            # allowing a caller to present a different destination/identity
+            # and have it accepted as a successful replay.
+            if payload:
+                for key, value in payload.items():
+                    if current.get("entries", [])[-1].get(key) != value:
+                        raise MigrationError(f"migration journal replay conflicts with terminal state: {key}")
             return current
         allowed = {"prepared": {"active"}, "active": {"rolled_back"}, "rolled_back": {"reactivated"}, "reactivated": set()}
         if state not in allowed.get(current["state"], set()):
@@ -605,6 +629,8 @@ class MigrationJournal:
         entry = {"from": current["state"], "to": state, "generation": int(current["generation"]) + 1, **payload}
         entry["entry_sha256"] = self._entry_hash(entry)
         result = {"format_version": 1, "generation": entry["generation"], "state": state, "entries": [*current["entries"], entry], "effects": list(current.get("effects", []))}
+        if "binding" in current:
+            result["binding"] = current["binding"]
         self._inject(f"before_{current['state']}_to_{state}")
         _write_json(self.path, result)
         self._inject(f"after_{current['state']}_to_{state}")
