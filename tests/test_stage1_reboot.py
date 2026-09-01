@@ -175,6 +175,27 @@ def test_stage1_reboot_requires_terminal_b12_and_changed_os_boot(tmp_path: Path,
         resume_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
 
 
+def test_stage1_postboot_rejects_same_boot_before_start_or_cleanup(tmp_path: Path, stage1_runtime_environment: Path) -> None:
+    evidence, active, support, realm_id = _completed_b12(tmp_path, stage1_runtime_environment)
+    armed = _arm(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
+    stable_plist = Path(armed["launch_agent_path"])
+
+    with pytest.raises(MigrationError, match="changed host boot identity"):
+        postboot_stage1_reboot(
+            evidence,
+            active,
+            support,
+            realm_id,
+            neutral_home=tmp_path / "home",
+            source_manifest=tmp_path / "home" / "Library" / "Application Support" / "Banodoco" / "runtime" / "source-profiles" / "astrid.json",
+            boot_identity_provider=lambda: "boot-before",
+        )
+
+    assert stable_plist.is_file()
+    assert not (evidence / R2_NAME).exists()
+    assert not (tmp_path / "home" / "Library" / "Application Support" / "Banodoco" / "runtime" / "discovery.json").exists()
+
+
 def test_stage1_reboot_rejects_changed_pinned_evidence_and_realm_binding(tmp_path: Path, stage1_runtime_environment: Path) -> None:
     evidence, active, support, realm_id = _completed_b12(tmp_path, stage1_runtime_environment)
     original_journal = (evidence / "migration-journal-b12.json").read_bytes()

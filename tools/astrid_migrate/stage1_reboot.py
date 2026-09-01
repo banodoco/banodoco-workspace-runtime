@@ -572,7 +572,7 @@ def _remove_launch_agent(marker: Mapping[str, Any], launch_agent: Path) -> dict[
     }
 
 
-def postboot_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, neutral_home: str | Path | None = None, source_manifest: str | Path | None = None, terminal_support_root: str | Path | None = None, wait_seconds: int = 120, poll_seconds: int = 1) -> dict[str, Any]:
+def postboot_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, neutral_home: str | Path | None = None, source_manifest: str | Path | None = None, terminal_support_root: str | Path | None = None, wait_seconds: int = 120, poll_seconds: int = 1, boot_identity_provider: Callable[[], str] | None = None) -> dict[str, Any]:
     evidence = _absolute(evidence_root, "evidence root")
     active = _absolute(active_root, "active root")
     support = _absolute(support_root, "support root")
@@ -587,6 +587,8 @@ def postboot_stage1_reboot(evidence_root: str | Path, active_root: str | Path, s
         raise MigrationError("Stage 1 postboot neutral home does not match R1")
     if manifest != Path(str(marker.get("source_manifest", ""))):
         raise MigrationError("Stage 1 postboot source manifest does not match R1")
+    if _provider(boot_identity_provider) == marker.get("boot_identity_before"):
+        raise MigrationError("Stage 1 R2 requires a changed host boot identity")
     if marker.get("state") == "completed":
         return resume_stage1_reboot(evidence, active, support, realm_id, terminal_support_root=terminal_support)
     try:
