@@ -320,6 +320,44 @@ def _source_database(root: Path) -> Path:
     raise MigrationError("Astrid source database was not found")
 
 
+def _relocated_managed_local_path(source_root: Path, locator: str) -> Path | None:
+    """Resolve a moved managed-local CAS locator inside this source root.
+
+    Astrid snapshots can preserve a historical absolute locator while copying
+    the addressed bytes into the snapshot's ``.astrid/media`` tree.  Only the
+    exact content-addressed layout is portable: this does not make arbitrary
+    outside-root paths valid, and callers still verify the resulting bytes
+    against the authored media hash.
+    """
+    path = Path(locator).expanduser()
+    if not path.is_absolute():
+        return None
+    parts = path.parts
+    try:
+        marker = parts.index(".astrid")
+    except ValueError:
+        return None
+    suffix = parts[marker:]
+    if len(suffix) != 6 or suffix[:3] != (".astrid", "media", "sha256"):
+        return None
+    first, second, digest = suffix[3:]
+    if (
+        len(first) != 2
+        or len(second) != 2
+        or len(digest) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in first + second + digest)
+        or digest[:2].lower() != first.lower()
+        or digest[2:4].lower() != second.lower()
+    ):
+        return None
+    candidate = source_root / Path(*suffix)
+    try:
+        candidate.resolve().relative_to(source_root)
+    except ValueError:
+        return None
+    return candidate
+
+
 def _assert_writer_free(
     source_root: Path,
     database: Path,
@@ -485,6 +523,9 @@ class Migrator:
                 path = Path(locator).expanduser()
                 if not path.is_absolute():
                     path = self.config.source_root / path
+                relocated = _relocated_managed_local_path(self.config.source_root, locator)
+                if relocated is not None:
+                    path = relocated
                 try:
                     path.resolve().relative_to(self.config.source_root)
                     inside = True
@@ -687,6 +728,9 @@ class Migrator:
             path = Path(locator).expanduser()
             if not path.is_absolute():
                 path = self.config.source_root / path
+            relocated = _relocated_managed_local_path(self.config.source_root, locator)
+            if relocated is not None:
+                path = relocated
             try:
                 path = path.resolve()
                 path.relative_to(self.config.source_root)

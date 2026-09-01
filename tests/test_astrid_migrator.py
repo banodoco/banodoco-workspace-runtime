@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -131,6 +132,28 @@ def test_source_freeze_does_not_report_its_own_writer_lock_as_active(tmp_path):
             tmp_path.parent / "archive-self-lock",
             tmp_path.parent / "destination-self-lock",
         ),
+        FakeClient(),
+    )
+
+    assert report["reconciliation"]["ok"] is True
+
+
+def test_managed_local_cas_locator_can_follow_an_explicitly_moved_snapshot(tmp_path):
+    _fixture(tmp_path)
+    digest = hashlib.sha256(b"fixture-media").hexdigest()
+    cas_path = tmp_path / ".astrid" / "media" / "sha256" / digest[:2] / digest[2:4] / digest
+    cas_path.parent.mkdir(parents=True)
+    shutil.copy2(tmp_path / "media" / "clip.mp4", cas_path)
+    connection = sqlite3.connect(tmp_path / ".astrid" / "astrid.sqlite3")
+    connection.execute(
+        "UPDATE media_locations SET realm='managed_local', locator=?",
+        (f"/old/authority/.astrid/media/sha256/{digest[:2]}/{digest[2:4]}/{digest}",),
+    )
+    connection.commit()
+    connection.close()
+
+    report = migrate(
+        MigrationConfig(tmp_path, tmp_path.parent / "archive-relocated", tmp_path.parent / "destination-relocated"),
         FakeClient(),
     )
 
