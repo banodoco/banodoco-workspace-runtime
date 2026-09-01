@@ -44,7 +44,7 @@ export async function runSecondProduct(control: WorkspaceClient, execution: Work
   steps.push("timeline-shot-reference-create-read-update");
 
   const capability: Capability = await execution.registerCapability({ capability_id: "render.neutral", definition_digest: `sha256:${"c".repeat(64)}`, status: "ready", required_resource_keys: ["cpu"], estimated_scratch_bytes: 0, estimated_output_bytes: 1 }, "second-product-capability-1");
-  const executor: Executor = { executor_id: "astrid-pack-host", max_concurrency: 1, resource_keys: ["cpu"], capabilities: [capability], protocol: "workspace.v1" };
+  const executor: Executor = { executor_id: "astrid-pack-host", max_concurrency: 1, resource_keys: ["cpu"], capabilities: [capability], protocol: "workspace.v1", runtime_epoch: health.runtime_epoch };
   await execution.registerExecutor(executor, "second-product-executor-1");
   const capabilities = await control.listCapabilities();
   if (!capabilities.items.some((item) => item.capability_id === capability.capability_id && item.status === "ready")) throw new Error("capability registration contract failed");
