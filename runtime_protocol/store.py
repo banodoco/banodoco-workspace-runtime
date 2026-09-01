@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import sqlite3
 import shutil
 import threading
@@ -23,6 +24,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
 SCHEMA_VERSION = 19
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
+OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 
 
 class RealmStore:
@@ -620,11 +622,52 @@ class RealmStore:
             self.conn.execute("INSERT OR IGNORE INTO objects VALUES (?, ?, ?, ?, ?)", (digest, size, media_type, original_name, now()))
             return dict(self.conn.execute("SELECT * FROM objects WHERE digest=?", (digest,)).fetchone())
 
+    def _validate_task_inputs(self, project_id, spec):
+        """Validate and authorize immutable task input object references.
+
+        Task inputs are content-addressed runtime objects, not arbitrary
+        product-local identifiers.  A project task may consume only objects
+        that are both present in the CAS index and associated with that
+        project.  Keeping this check beside task creation makes admission
+        atomic with the project lookup and prevents a client-side precheck
+        from becoming an authorization gap.
+        """
+        if not isinstance(spec, dict):
+            raise ValidationError("task spec must be an object")
+        input_object_ids = spec.get("input_object_ids", [])
+        if not isinstance(input_object_ids, list):
+            raise ValidationError("input_object_ids must be a list")
+        normalized = []
+        for index, object_id in enumerate(input_object_ids):
+            if not isinstance(object_id, str):
+                raise ValidationError("input_object_ids must contain strings", details={"index": index})
+            match = OBJECT_ID_RE.fullmatch(object_id)
+            if not match:
+                raise ValidationError("input_object_ids must contain sha256 object IDs", details={"index": index})
+            digest = match.group(1)
+            if digest in normalized:
+                raise ValidationError("input_object_ids must be unique", details={"index": index, "object_id": object_id})
+            normalized.append(digest)
+        if normalized and project_id is None:
+            raise ValidationError("project is required when input_object_ids are supplied")
+        for object_id, digest in zip(input_object_ids, normalized):
+            associated = self.conn.execute(
+                "SELECT 1 FROM objects o JOIN project_objects po ON po.digest=o.digest "
+                "WHERE po.project_id=? AND o.digest=?",
+                (project_id, digest),
+            ).fetchone()
+            if not associated:
+                raise ConflictError(
+                    "task input object is not associated with the task project",
+                    details={"project_id": project_id, "object_id": object_id},
+                )
+
     def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False):
         if not capability:
             raise ValidationError("capability is required")
         with self._mutex:
             project_id = self._project(project)["id"] if project else None
+            self._validate_task_inputs(project_id, spec)
             with self._transaction():
                 request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": spec, "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
                 aggregate_id = project_id or "unscoped"

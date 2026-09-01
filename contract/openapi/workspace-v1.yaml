@@ -134,6 +134,7 @@ paths:
       responses: { '200': { description: Project-scoped managed objects, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedObjectPage' } } } } }
     post:
       operationId: ingestProjectObject
+      description: Ingest bytes into runtime CAS and associate the resulting managed object with this project before task settlement.
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
       responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
@@ -617,8 +618,8 @@ components:
         capability_id: { type: string, minLength: 1 }
         capability_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
         schema_version: { type: string, minLength: 1 }
-        input_object_ids: { type: array, items: { type: string }, uniqueItems: true }
-        project: { type: string }
+        input_object_ids: { type: array, items: { type: string, description: Canonical sha256 object ID already associated with the task project. }, uniqueItems: true }
+        project: { type: string, description: Project selector whose managed-object associations authorize input_object_ids and output settlement. }
         spec: { type: object, additionalProperties: true }
         settlement_effect: { type: object, additionalProperties: true }
     EventPage:

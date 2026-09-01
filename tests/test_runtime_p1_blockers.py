@@ -8,7 +8,7 @@ import pytest
 
 from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
-from runtime_protocol.errors import ConflictError, InvalidRequestError, LeaseError
+from runtime_protocol.errors import ConflictError, InvalidRequestError, LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
 
 
@@ -53,6 +53,84 @@ def test_task_transitions_and_attempt_settlement_replay_exactly(tmp_path: Path) 
         cancelled = service.create_task({"capability_id": "render.test", "capability_digest": _digest("render.test"), "project": project["id"], "idempotency_key": "task-cancel"})
         cancel_first = service.cancel_task_canonical(cancelled["task"]["id"], {}, idempotency_key="cancel")
         assert service.cancel_task_canonical(cancelled["task"]["id"], {}, idempotency_key="cancel") == cancel_first
+    finally:
+        service.close()
+
+
+def test_project_task_contract_scopes_inputs_and_outputs(tmp_path: Path) -> None:
+    """A project task carries its scope through claim/get and output ingest.
+
+    This is the runtime-side contract that a generic host needs: input
+    digests cannot cross project boundaries, while bytes uploaded to the
+    project's managed-object endpoint are associated before fenced settlement.
+    """
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        capability_digest = _digest("render.project")
+        service.register_capability({"capability_id": "render.project", "definition_digest": capability_digest})
+        service.register_executor({"executor_id": "worker", "capabilities": ["render.project"]})
+        source_project = service.create_project({"slug": "source", "name": "Source"}, idempotency_key="project-source")
+        other_project = service.create_project({"slug": "other", "name": "Other"}, idempotency_key="project-other")
+        source = service.ingest(source_project["id"], b"project input", idempotency_key="input")
+        input_id = source["data"]["digest"]
+
+        with pytest.raises(ConflictError, match="not associated with the task project"):
+            service.create_task(
+                {
+                    "capability_id": "render.project",
+                    "capability_digest": capability_digest,
+                    "project": other_project["id"],
+                    "input_object_ids": [input_id],
+                    "idempotency_key": "foreign-input",
+                }
+            )
+        with pytest.raises(ValidationError, match="sha256 object IDs"):
+            service.create_task(
+                {
+                    "capability_id": "render.project",
+                    "capability_digest": capability_digest,
+                    "project": source_project["id"],
+                    "input_object_ids": ["not-an-object-id"],
+                    "idempotency_key": "malformed-input",
+                }
+            )
+
+        admitted = service.create_task(
+            {
+                "capability_id": "render.project",
+                "capability_digest": capability_digest,
+                "project": source_project["id"],
+                "input_object_ids": [input_id],
+                "idempotency_key": "scoped-task",
+            }
+        )
+        task = service._task_resource(admitted)
+        assert task["project_id"] == source_project["id"]
+        epoch = service.health()["runtime_epoch"]
+        claim = service.claim_next(
+            {"executor_id": "worker", "capability_ids": ["render.project"], "runtime_epoch": epoch},
+            idempotency_key="scoped-claim",
+        )
+        assert claim["project_id"] == source_project["id"]
+        assert service._task_resource(service.store.get_task(task["task_id"]))["project_id"] == source_project["id"]
+
+        output = service.ingest(source_project["id"], b"new project output", idempotency_key="output")
+        output_id = output["data"]["digest"]
+        settled = service.settle_attempt(
+            claim["attempt_id"],
+            {
+                "lease_id": claim["lease_id"],
+                "fence": claim["fence"],
+                "runtime_epoch": epoch,
+                "outputs": [{"name": "render", "kind": "object", "digest": output_id, "media_type": "application/octet-stream", "size": len(b"new project output")}],
+            },
+            idempotency_key="scoped-settle",
+        )
+        assert settled["data"]["project_id"] == source_project["id"]
+        assert service.store.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+            (source_project["id"], output_id.removeprefix("sha256:")),
+        ).fetchone()
     finally:
         service.close()
 

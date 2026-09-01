@@ -30,10 +30,11 @@
     },
     "AttemptFence": {
       "type": "object", "additionalProperties": false,
-      "required": ["attempt_id", "task_id", "lease_id", "fence", "lease_expires_at", "runtime_epoch"],
+      "required": ["attempt_id", "task_id", "project_id", "lease_id", "fence", "lease_expires_at", "runtime_epoch"],
       "properties": {
         "attempt_id": { "type": "string", "minLength": 1 },
         "task_id": { "type": "string", "minLength": 1 },
+        "project_id": { "type": ["string", "null"], "minLength": 1 },
         "lease_id": { "type": "string", "minLength": 1 },
         "fence": { "type": "integer", "minimum": 1 },
         "lease_expires_at": { "type": "string", "format": "date-time" },

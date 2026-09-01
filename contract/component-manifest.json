@@ -112,6 +112,7 @@
         "input_object_ids": [
           "object-neutral-1"
         ],
+        "project_id": null,
         "protocol": "workspace.v1",
         "run_id": "run-neutral-1",
         "runtime_epoch": 1,

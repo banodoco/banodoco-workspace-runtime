@@ -21,7 +21,7 @@ export async function runSecondProduct(client: WorkspaceClient): Promise<Record<
   steps.push("project-create-read-list");
 
   const source = text.encode("neutral managed bytes");
-  const object = await client.ingestObject(source, "application/octet-stream", "second-product-object-1", "neutral.bin");
+  const object = await client.ingestProjectObject(project.project_id, source, "application/octet-stream", "second-product-object-1", "neutral.bin");
   const full = await client.getObject(object.object_id);
   const head = await client.headObject(object.object_id);
   const ranged = await client.getObject(object.object_id, [0, 3]);
@@ -47,14 +47,14 @@ export async function runSecondProduct(client: WorkspaceClient): Promise<Record<
   if (!capabilities.items.some((item) => item.capability_id === capability.capability_id && item.status === "ready")) throw new Error("capability registration contract failed");
   steps.push("register-capability-executor");
 
-  const cancelled = await client.admitTask({ capability_id: capability.capability_id, capability_digest: capability.definition_digest, input_object_ids: [object.object_id] }, "second-product-cancel-1");
+  const cancelled = await client.admitTask({ capability_id: capability.capability_id, capability_digest: capability.definition_digest, input_object_ids: [object.object_id], project: project.project_id }, "second-product-cancel-1");
   const cancelResult = await client.cancelTask(cancelled.task_id, "second-product-cancel-action-1", cancelled.version);
   if (cancelResult.state !== "cancelled") throw new Error("cancel transition failed");
   const retried = await client.retryTask(cancelled.task_id, "second-product-retry-1", cancelResult.version);
   if (retried.state !== "queued") throw new Error("retry transition failed");
   steps.push("task-cancel-retry");
 
-  const task = await client.admitTask({ capability_id: capability.capability_id, capability_digest: capability.definition_digest, input_object_ids: [object.object_id] }, "second-product-render-1");
+  const task = await client.admitTask({ capability_id: capability.capability_id, capability_digest: capability.definition_digest, input_object_ids: [object.object_id], project: project.project_id }, "second-product-render-1");
   const run = await client.getRun(task.run_id);
   const observed = await client.getTask(task.task_id);
   const events = await client.listEvents(undefined, 100, task.task_id);
@@ -65,8 +65,8 @@ export async function runSecondProduct(client: WorkspaceClient): Promise<Record<
   if (!attempt || "waiting_reason" in attempt || typeof attempt.attempt_id !== "string") throw new Error("executor claim failed");
   const heartbeat = await client.heartbeatAttempt(attempt.attempt_id, String(attempt.lease_id), Number(attempt.fence), "second-product-heartbeat-1", health.runtime_epoch);
   if (heartbeat.fence !== attempt.fence) throw new Error("attempt heartbeat fence failed");
-  const output = await client.ingestObject(text.encode("neutral render output"), "application/octet-stream", "second-product-output-1", "render.bin");
-  const settled = await client.settleAttempt(attempt.attempt_id, { attempt_id: attempt.attempt_id, lease_id: attempt.lease_id, fence: attempt.fence, runtime_epoch: health.runtime_epoch, outputs: [{ digest: output.digest, media_type: output.media_type, name: output.filename }] }, "second-product-settle-1");
+  const output = await client.ingestProjectObject(project.project_id, text.encode("neutral render output"), "application/octet-stream", "second-product-output-1", "render.bin");
+  const settled = await client.settleAttempt(attempt.attempt_id, { attempt_id: attempt.attempt_id, lease_id: attempt.lease_id, fence: attempt.fence, runtime_epoch: health.runtime_epoch, outputs: [{ digest: output.digest, media_type: output.media_type, name: output.filename, kind: "object", size: output.size }] }, "second-product-settle-1");
   if (settled.state !== "succeeded") throw new Error("fenced settlement failed");
   const settledOutput = await client.getObject(output.object_id);
   if (bytes(settledOutput.data) !== "neutral render output") throw new Error("settled output was not readable from CAS");
