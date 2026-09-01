@@ -6,6 +6,22 @@ trees, or delete source data.
 
 ## Preflight and dry run
 
+For routine Stage 1 proof, use the tiny live acceptance fixture. It creates a
+small SQLite-backed Astrid source, one managed media blob, a disposable neutral
+realm, fresh B12 authorizations, the writer-stop receipt, and the complete
+production compact journey under one fresh output root. It also cold-opens the
+reactivated realm before returning. The fixture is only kilobytes, so it does
+not require capacity for the historical corpus:
+
+```bash
+astrid-live-migrate tiny-acceptance --output-root /absolute/stage1-tiny-b12
+```
+
+This command is the routine default and always uses compact redundancy. A
+historical/full-corpus migration is a separate, explicit operator action; use
+the `live-migrate` command below only with an explicitly selected real source.
+`--redundancy extreme` is likewise opt-in and is not part of routine acceptance.
+
 Use a fresh archive/destination parent on a volume with enough capacity for
 source, archive, active backup, destination, signed destination backup,
 rollback copy, activation temporary, CAS, evidence, and the safety margin.

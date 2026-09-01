@@ -382,6 +382,8 @@ def _parser() -> argparse.ArgumentParser:
     normalize.add_argument("--source-root", required=True)
     normalize.add_argument("--database", required=True, help="exact .astrid/source-projects-root-kernel/astrid.sqlite3 path")
     normalize.add_argument("--destination-root", required=True)
+    tiny = sub.add_parser("tiny-acceptance", help="run the small routine Stage 1 B12 live acceptance journey")
+    tiny.add_argument("--output-root", required=True, help="fresh absolute root for fixture, realm, receipts, and evidence")
     return parser
 
 
@@ -392,6 +394,9 @@ def main(argv: list[str] | None = None) -> int:
             result = issue_authorizations(args)
         elif args.command == "live-migrate":
             result = live_migrate(args)
+        elif args.command == "tiny-acceptance":
+            from .tiny_acceptance import run_tiny_acceptance
+            result = run_tiny_acceptance(args.output_root)
         else:
             result = normalize_nested_source(args)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
