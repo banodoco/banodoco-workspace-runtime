@@ -22,9 +22,7 @@ import sqlite3
 import time
 from typing import Any, Callable, Mapping
 
-from runtime_protocol.backup import verify_restore_candidate
-
-from .boundary import verify_backup, _open_relative, _sha256_at, _connection_from_fd, canonical_json, new_id, atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_parent as _validate_parent, pin_directory as _pin_directory
+from .boundary import verify_backup, verify_restore_candidate, _open_relative, _sha256_at, _connection_from_fd, canonical_json, new_id, atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_parent as _validate_parent, pin_directory as _pin_directory
 
 from .migrator import MigrationError, _sha256_file
 from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path

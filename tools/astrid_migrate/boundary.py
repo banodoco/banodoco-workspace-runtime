@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import sqlite3
 import shutil
 import stat
 import time
@@ -86,6 +87,11 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def durable_json_bytes(value: Any) -> bytes:
+    """Encode the exact owner-only JSON representation used by this boundary."""
+    return json.dumps(value, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -147,7 +153,11 @@ def validate_parent(path: str | Path, identity: Mapping[str, Any], *, allow_pare
     if identity.get("path") != str(target) or _has_symlink(target):
         raise ConflictError(f"filesystem path identity changed: {target}")
     fd = int(identity.get("_parent_fd", -1))
-    if fd < 0 or _identity(Path(str(identity["parent"]))) != tuple(int(identity[f"parent_{k}"]) for k in ("st_dev", "st_ino", "st_mode")):
+    expected = tuple(
+        int(identity[f"parent_{key}"] if f"parent_{key}" in identity else identity[key])
+        for key in ("st_dev", "st_ino", "st_mode")
+    )
+    if fd < 0 or _identity(Path(str(identity["parent"]))) != expected:
         raise ConflictError(f"filesystem parent identity changed: {target.parent}")
     if identity.get("parent_was_missing") and os.path.lexists(str(target.parent)) and not allow_parent_appeared:
         raise ConflictError(f"filesystem target parent appeared: {target.parent}")
@@ -279,39 +289,292 @@ def remove_tree_at(parent_fd: int, name: str):
     os.rmdir(name, dir_fd=parent_fd)
 
 
-def _sha256(path: Path) -> str:
+def _sha256_fd(fd: int) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""): digest.update(chunk)
-    return digest.hexdigest()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
 
 
-def _key(manifest: Mapping[str, Any]) -> bytes:
-    auth = manifest.get("authentication") or {}; candidate = auth.get("key_path")
-    if not candidate: raise ConflictError("backup authentication key is missing")
-    value = Path(str(candidate)).read_bytes()
-    if auth.get("key_id") != hashlib.sha256(value).hexdigest()[:32]: raise ConflictError("backup authentication key does not match manifest")
+def _json_at(root_fd: int, name: str) -> dict[str, Any]:
+    fd = _open_relative(root_fd, name)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConflictError(f"backup entry is not an ordinary file: {name}")
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+        value = json.loads(bytes(data).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ConflictError(f"backup artifact is invalid: {name}") from exc
+    finally:
+        os.close(fd)
+    if not isinstance(value, dict):
+        raise ConflictError(f"backup artifact must be an object: {name}")
     return value
 
 
-def verify_backup(backup_dir: str | Path, **kwargs):
-    root = absolute_path(backup_dir); manifest = json.loads((root / "manifest.json").read_text())
-    if manifest.get("database_sha256") != _sha256(root / "realm.sqlite3"): raise ConflictError("backup SQLite hash mismatch")
-    cas = json.loads((root / "cas-manifest.json").read_text())
-    if manifest.get("cas_manifest_sha256") != cas.get("manifest_sha256"): raise ConflictError("backup CAS manifest hash mismatch")
-    key = kwargs.get("key") or _key(manifest)
-    payload = {k: v for k, v in manifest.items() if k not in {"manifest_sha256", "manifest_hmac"}}
-    if manifest.get("manifest_sha256") != hashlib.sha256(canonical_json(payload).encode()).hexdigest(): raise ConflictError("backup manifest authentication failed")
-    if not hmac.compare_digest(str(manifest.get("manifest_hmac")), hmac.new(key, canonical_json(payload).encode(), hashlib.sha256).hexdigest()): raise ConflictError("backup manifest authentication failed")
-    return {"manifest": manifest, "cas_manifest": cas}
+def _sha256_at(root_fd: int, relative: str | Path) -> tuple[str, int]:
+    fd = _open_relative(root_fd, relative)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConflictError(f"backup entry is not an ordinary file: {relative}")
+        return _sha256_fd(fd), int(metadata.st_size)
+    finally:
+        os.close(fd)
 
 
-def verify_restore_candidate(candidate_dir: str | Path, **kwargs):
-    root = absolute_path(candidate_dir); handoff = json.loads((root / "activation-handoff.json").read_text())
-    source = absolute_path(handoff["source_backup"]); verified = verify_backup(source)
-    if handoff.get("candidate_database_sha256") != _sha256(root / "realm.sqlite3"): raise ConflictError("restore candidate SQLite bytes differ from backup")
-    if handoff.get("source_manifest_sha256") != _sha256(source / "manifest.json"): raise ConflictError("restore handoff source manifest mismatch")
-    return {"handoff": handoff, "manifest": verified["manifest"], "doctor": {"ok": True}, "database_sha256": _sha256(root / "realm.sqlite3"), "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
+def _connection_from_fd(root_fd: int, name: str) -> sqlite3.Connection:
+    fd = _open_relative(root_fd, name)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConflictError(f"backup SQLite entry is not an ordinary file: {name}")
+        duplicate = os.dup(fd)
+        try:
+            return sqlite3.connect(f"file:/dev/fd/{duplicate}?immutable=1", uri=True)
+        except Exception:
+            os.close(duplicate)
+            raise
+    finally:
+        os.close(fd)
+
+
+def _key_id(key: bytes) -> str:
+    return hashlib.sha256(key).hexdigest()[:32]
+
+
+def _auth_payload(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if key not in {"manifest_sha256", "manifest_hmac", "handoff_sha256", "handoff_hmac"}}
+
+
+def _manifest_digest_payload(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in manifest.items() if key not in {"manifest_sha256", "manifest_hmac"}}
+
+
+def _handoff_digest_payload(handoff: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in handoff.items() if key not in {"handoff_sha256", "handoff_hmac"}}
+
+
+def _resolve_key(manifest: Mapping[str, Any], *, key: bytes | None = None, key_path: str | Path | None = None) -> bytes:
+    if key is not None:
+        value = bytes(key)
+    else:
+        auth = manifest.get("authentication")
+        if not isinstance(auth, Mapping):
+            raise ConflictError("backup authentication metadata is missing")
+        candidate = key_path or auth.get("key_path")
+        if not candidate:
+            raise ConflictError("backup authentication key is not provisioned")
+        path = absolute_path(str(candidate))
+        identity = capture_parent(path)
+        fd = -1
+        try:
+            validate_parent(path, identity, allow_parent_appeared=True)
+            parent = Path(str(identity["parent"]))
+            fd = _open_relative(int(identity["_parent_fd"]), path.relative_to(parent))
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ConflictError("backup authentication key is unavailable")
+            value = bytearray()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                value.extend(chunk)
+            validate_parent(path, identity, allow_parent_appeared=True)
+            value = bytes(value)
+        except FileNotFoundError as exc:
+            raise ConflictError("backup authentication key is unavailable") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            close_pinned(identity)
+    if len(value) < 32:
+        raise ConflictError("backup authentication key is too short")
+    auth = manifest.get("authentication")
+    if not isinstance(auth, Mapping) or auth.get("algorithm") != "hmac-sha256" or auth.get("key_id") != _key_id(value):
+        raise ConflictError("backup authentication key does not match manifest realm")
+    return value
+
+
+def _verify_cas_manifest(root_fd: int, manifest: Mapping[str, Any]) -> None:
+    objects = manifest.get("objects")
+    payload = {"format_version": manifest.get("format_version"), "objects": objects}
+    if not isinstance(objects, list) or manifest.get("manifest_sha256") != hashlib.sha256(canonical_json(payload).encode()).hexdigest():
+        raise ConflictError("CAS manifest hash mismatch")
+    cas_root_fd = _open_relative(root_fd, "cas/sha256", directory=True)
+    try:
+        for item in objects:
+            if not isinstance(item, Mapping):
+                raise ConflictError("backup CAS manifest contains an invalid object")
+            digest = str(item.get("digest", ""))
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ConflictError("backup CAS manifest contains an invalid digest")
+            actual_hash, actual_size = _sha256_at(cas_root_fd, f"{digest[:2]}/{digest[2:]}")
+            if actual_size != int(item.get("size", -1)) or actual_hash != item.get("sha256") or item.get("sha256") != digest:
+                raise ConflictError("backup CAS object failed verification", details={"digest": digest})
+    finally:
+        os.close(cas_root_fd)
+
+
+def verify_backup(backup_dir: str | Path, *, key: bytes | None = None, key_path: str | Path | None = None, directory_identity: Mapping[str, Any] | None = None):
+    """Verify an authenticated backup through one retained parent identity."""
+    root = absolute_path(backup_dir)
+    own_identity = directory_identity is None
+    identity = directory_identity or capture_parent(root)
+    backup_fd = -1
+    try:
+        validate_parent(root, identity, allow_parent_appeared=bool(identity.get("parent_was_missing")))
+        parent = Path(str(identity["parent"]))
+        backup_fd = _open_relative(int(identity["_parent_fd"]), root.relative_to(parent), directory=True)
+        manifest = _json_at(backup_fd, "manifest.json")
+        if manifest.get("format_version") != 2:
+            raise ConflictError("legacy or unsupported backup format")
+        digest = manifest.get("manifest_sha256")
+        if not isinstance(digest, str) or not hmac.compare_digest(digest, hashlib.sha256(canonical_json(_manifest_digest_payload(manifest)).encode()).hexdigest()):
+            raise ConflictError("backup manifest authentication failed (public digest mismatch)")
+        auth_key = _resolve_key(manifest, key=key, key_path=key_path)
+        mac = manifest.get("manifest_hmac")
+        if not isinstance(mac, str) or not hmac.compare_digest(mac, hmac.new(auth_key, canonical_json(_auth_payload(manifest)).encode(), hashlib.sha256).hexdigest()):
+            raise ConflictError("backup manifest authentication failed")
+        realm_meta = manifest.get("realm")
+        schema_meta = manifest.get("schema")
+        files = manifest.get("files")
+        if not isinstance(realm_meta, Mapping) or not realm_meta.get("id") or not isinstance(schema_meta, Mapping) or not isinstance(schema_meta.get("version"), int) or not isinstance(files, Mapping):
+            raise ConflictError("backup manifest metadata is incomplete")
+        if manifest.get("realm_id") != realm_meta["id"] or manifest.get("schema_version") != schema_meta["version"]:
+            raise ConflictError("backup manifest metadata aliases mismatch")
+        for name in ("realm.sqlite3", "cas-manifest.json"):
+            record = files.get(name)
+            actual_hash, actual_size = _sha256_at(backup_fd, name)
+            if not isinstance(record, Mapping) or record.get("sha256") != actual_hash or int(record.get("size", -1)) != actual_size:
+                raise ConflictError("backup file digest mismatch", details={"file": name})
+        database_hash, _ = _sha256_at(backup_fd, "realm.sqlite3")
+        if manifest.get("database_sha256") != database_hash:
+            raise ConflictError("backup SQLite hash mismatch")
+        cas = _json_at(backup_fd, "cas-manifest.json")
+        if manifest.get("cas_manifest_sha256") != cas.get("manifest_sha256"):
+            raise ConflictError("backup CAS manifest hash mismatch")
+        _verify_cas_manifest(backup_fd, cas)
+        connection = _connection_from_fd(backup_fd, "realm.sqlite3")
+        try:
+            if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ConflictError("backup SQLite quick check failed")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise ConflictError("backup SQLite foreign-key check failed")
+            realm = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()
+            if not realm or realm[0] != manifest.get("realm_id"):
+                raise ConflictError("backup realm identity mismatch")
+        finally:
+            connection.close()
+        validate_parent(root, identity, allow_parent_appeared=bool(identity.get("parent_was_missing")))
+        return {"manifest": manifest, "cas_manifest": cas}
+    except FileNotFoundError as exc:
+        raise ConflictError("backup is incomplete") from exc
+    finally:
+        if backup_fd >= 0:
+            os.close(backup_fd)
+        if own_identity:
+            close_pinned(identity)
+
+
+def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: Mapping[str, Any] | None = None):
+    """Verify a restored realm using descriptor-pinned candidate and backup reads."""
+    root = absolute_path(candidate_dir)
+    own_identity = directory_identity is None
+    identity = directory_identity or capture_parent(root)
+    candidate_fd = source_fd = -1
+    source_identity = None
+    try:
+        validate_parent(root, identity, allow_parent_appeared=bool(identity.get("parent_was_missing")))
+        parent = Path(str(identity["parent"]))
+        candidate_fd = _open_relative(int(identity["_parent_fd"]), root.relative_to(parent), directory=True)
+        if not stat.S_ISDIR(os.fstat(candidate_fd).st_mode):
+            raise ConflictError("restore candidate is not an ordinary directory")
+        handoff = _json_at(candidate_fd, "activation-handoff.json")
+        candidate_hash, _ = _sha256_at(candidate_fd, "realm.sqlite3")
+        source = absolute_path(str(handoff.get("source_backup", "")))
+        source_identity, source_fd, _ = pin_directory(source)
+        verified = verify_backup(source, directory_identity=source_identity)
+        manifest = verified["manifest"]
+        if handoff.get("format_version") != 2:
+            raise ConflictError("legacy restore handoff requires explicit migration")
+        if not isinstance(handoff.get("handoff_sha256"), str) or not hmac.compare_digest(handoff["handoff_sha256"], hashlib.sha256(canonical_json(_handoff_digest_payload(handoff)).encode()).hexdigest()):
+            raise ConflictError("restore handoff authentication failed")
+        auth_key = _resolve_key(manifest)
+        if not isinstance(handoff.get("handoff_hmac"), str) or not hmac.compare_digest(handoff["handoff_hmac"], hmac.new(auth_key, canonical_json(_auth_payload(handoff)).encode(), hashlib.sha256).hexdigest()):
+            raise ConflictError("restore handoff authentication failed")
+        source_manifest_hash, _ = _sha256_at(source_fd, "manifest.json")
+        if handoff.get("source_manifest_sha256") != source_manifest_hash:
+            raise ConflictError("restore handoff source manifest mismatch")
+        if handoff.get("realm_id") != manifest.get("realm_id"):
+            raise ConflictError("restore candidate realm does not match its backup")
+        if handoff.get("candidate_database_sha256") != candidate_hash or candidate_hash != manifest.get("database_sha256"):
+            raise ConflictError("restore candidate SQLite bytes differ from its verified backup")
+        expected = {str(item["digest"]): item for item in verified["cas_manifest"].get("objects", []) if isinstance(item, Mapping)}
+        actual: dict[str, tuple[str, str]] = {}
+        cas_fd = _open_relative(candidate_fd, "cas/sha256", directory=True)
+        try:
+            for prefix_entry in os.scandir(cas_fd):
+                if not prefix_entry.is_dir(follow_symlinks=False):
+                    continue
+                prefix_fd = os.open(prefix_entry.name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=cas_fd)
+                try:
+                    for object_entry in os.scandir(prefix_fd):
+                        if object_entry.is_file(follow_symlinks=False):
+                            actual[prefix_entry.name + object_entry.name] = (prefix_entry.name, object_entry.name)
+                finally:
+                    os.close(prefix_fd)
+        finally:
+            os.close(cas_fd)
+        if set(actual) != set(expected):
+            raise ConflictError("restore candidate CAS object set differs from its verified backup")
+        cas_fd = _open_relative(candidate_fd, "cas/sha256", directory=True)
+        try:
+            for digest, item in expected.items():
+                prefix, name = actual[digest]
+                prefix_fd = os.open(prefix, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0), dir_fd=cas_fd)
+                try:
+                    actual_hash, actual_size = _sha256_at(prefix_fd, name)
+                finally:
+                    os.close(prefix_fd)
+                if actual_size != int(item.get("size", -1)) or actual_hash != item.get("sha256"):
+                    raise ConflictError("restore candidate CAS bytes differ from its verified backup", details={"digest": digest})
+        finally:
+            os.close(cas_fd)
+        connection = _connection_from_fd(candidate_fd, "realm.sqlite3")
+        try:
+            if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise ConflictError("restore candidate SQLite quick check failed")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise ConflictError("restore candidate SQLite foreign-key check failed")
+            realm = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()
+            if not realm or realm[0] != manifest.get("realm_id"):
+                raise ConflictError("restore candidate realm identity mismatch")
+        finally:
+            connection.close()
+        validate_parent(root, identity, allow_parent_appeared=bool(identity.get("parent_was_missing")))
+        return {"handoff": handoff, "manifest": manifest, "doctor": {"ok": True}, "database_sha256": candidate_hash, "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
+    except FileNotFoundError as exc:
+        raise ConflictError("restore candidate is incomplete") from exc
+    finally:
+        if candidate_fd >= 0:
+            os.close(candidate_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+        if source_identity is not None:
+            close_pinned(source_identity)
+        if own_identity:
+            close_pinned(identity)
 
 
 def restore_backup(backup_dir: str | Path, destination: str | Path, **kwargs):
