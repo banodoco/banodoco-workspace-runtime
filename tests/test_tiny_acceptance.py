@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import os
+import subprocess
+import sys
 
 from tools.astrid_migrate.tiny_acceptance import run_tiny_acceptance
 
@@ -45,3 +48,25 @@ def test_tiny_acceptance_requires_a_fresh_output_root(tmp_path: Path) -> None:
         assert "not empty" in str(exc)
     else:  # pragma: no cover - defensive assertion
         raise AssertionError("tiny acceptance replaced an existing output root")
+
+
+def test_tiny_acceptance_cli_has_no_runpy_warning(tmp_path: Path) -> None:
+    output = tmp_path / "tiny-b12-cli"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tools.astrid_migrate.operator",
+            "tiny-acceptance",
+            "--output-root",
+            str(output),
+        ],
+        cwd=Path(__file__).parents[1],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "RuntimeWarning" not in result.stderr
+    assert json.loads(result.stdout)["redundancy"] == "compact"
