@@ -158,3 +158,17 @@ def test_managed_local_cas_locator_can_follow_an_explicitly_moved_snapshot(tmp_p
     )
 
     assert report["reconciliation"]["ok"] is True
+
+
+def test_archive_file_map_ignores_only_appledouble_metadata(tmp_path):
+    _fixture(tmp_path)
+    (tmp_path / "._finder-metadata").write_bytes(b"\x00\x05\x16\x07metadata")
+    (tmp_path / "._authored-file").write_bytes(b"ordinary authored bytes")
+
+    archive = tmp_path.parent / "archive-appledouble"
+    report = migrate(MigrationConfig(tmp_path, archive, tmp_path.parent / "destination-appledouble"), FakeClient())
+
+    assert report["reconciliation"]["ok"] is True
+    files = json.loads((archive / "manifest.json").read_text())["files"]
+    assert "._finder-metadata" not in files
+    assert files["._authored-file"]["sha256"] == hashlib.sha256(b"ordinary authored bytes").hexdigest()

@@ -137,6 +137,17 @@ def _tree_size(root: Path) -> int:
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file() and not path.is_symlink())
 
 
+def _is_appledouble(path: Path) -> bool:
+    """Identify macOS ExFAT metadata companions without hiding user files."""
+    if not path.name.startswith("._") or not path.is_file() or path.is_symlink():
+        return False
+    try:
+        with path.open("rb") as stream:
+            return stream.read(4) == b"\x00\x05\x16\x07"
+    except OSError:
+        return False
+
+
 def _file_map(root: Path) -> dict[str, dict[str, Any]]:
     """Return a root-complete description, including symlink identity.
 
@@ -148,6 +159,11 @@ def _file_map(root: Path) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     root = root.resolve()
     for path in sorted(root.rglob("*")):
+        if _is_appledouble(path):
+            # Finder/resource-fork metadata is synthesized by macOS on
+            # filesystems such as ExFAT during an otherwise byte-identical
+            # copy. It is not part of the source authority's content map.
+            continue
         relative = str(path.relative_to(root))
         if path.is_symlink():
             target = os.readlink(path)
