@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 
-from tools.astrid_migrate.tiny_acceptance import run_tiny_acceptance
+from banodoco_local.tiny_acceptance import run_tiny_acceptance
 
 
 def test_tiny_acceptance_runs_real_compact_b12_and_cold_opens(tmp_path: Path) -> None:

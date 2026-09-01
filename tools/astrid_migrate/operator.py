@@ -395,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "live-migrate":
             result = live_migrate(args)
         elif args.command == "tiny-acceptance":
-            from .tiny_acceptance import run_tiny_acceptance
+            from banodoco_local.tiny_acceptance import run_tiny_acceptance
             result = run_tiny_acceptance(args.output_root)
         else:
             result = normalize_nested_source(args)

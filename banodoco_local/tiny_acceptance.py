@@ -22,9 +22,9 @@ from banodoco_local.io import atomic_write_json
 from runtime_protocol.catalog import RealmCatalog
 from runtime_protocol.service import RuntimeService
 
-from .migrator import MigrationError
-from .operator import CONFIRMATION, _write_new_json, issue_authorizations, live_migrate
-from .rehearsal import build_synthetic_fixture
+from tools.astrid_migrate.migrator import MigrationError
+from tools.astrid_migrate.operator import CONFIRMATION, _write_new_json, issue_authorizations, live_migrate
+from tools.astrid_migrate.rehearsal import build_synthetic_fixture
 
 
 REALM_ID = "stage1-tiny-acceptance"
