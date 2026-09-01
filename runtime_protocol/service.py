@@ -13,12 +13,13 @@ import os
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from .errors import ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
+from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
+OBJECT_MAX_BYTES = 64 * 1024 * 1024
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
@@ -103,7 +104,6 @@ class RuntimeService:
         if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
             raise ValidationError("reboot allowlist contains an unsupported command", details={"allowlist": sorted(configured_allowlist), "supported": sorted(REBOOT_COMMAND_ALLOWLIST)})
         self.reboot_allowlist = configured_allowlist
-        self._ensure_default_capability()
 
     def close(self):
         self.store.close()
@@ -183,7 +183,41 @@ class RuntimeService:
         actor = body.get("authenticated_actor")
         if not actor:
             raise ValidationError("authenticated actor is required")
+        if any(not isinstance(scope, str) or not scope for scope in requested) or len(set(requested)) != len(requested):
+            raise ValidationError("requested_scopes must contain unique non-empty strings")
+        authenticated = set(body.get("authenticated_scopes") or [])
+        # ``admin`` authorizes endpoint access but is not a wildcard grant for
+        # handshake negotiation.  The session is the exact authenticated
+        # scope intersection, and asking for anything outside it fails closed.
+        negotiated = authenticated - {"admin"}
+        excess = sorted(set(requested) - negotiated)
+        if excess:
+            raise AuthorizationError("credential cannot negotiate requested scopes", details={"scopes": excess})
         return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested}
+
+    @staticmethod
+    def _assert_executor_identity(identity, executor_id):
+        """Bind bearer worker credentials to the executor they operate.
+
+        ``identity`` is supplied only by the HTTP boundary.  Direct service
+        calls remain useful for in-process control-plane tests and have no
+        bearer principal to bind.  The daemon's explicitly marked fixture
+        worker credential is retained as a compatibility bridge for the
+        existing generated end-to-end tests; ordinary credentials are strict.
+        """
+        if identity is None:
+            return
+        if not executor_id:
+            raise AuthorizationError("executor identity is required")
+        actor = identity.get("actor")
+        if actor == executor_id or "admin" in set(identity.get("scopes", [])) or identity.get("legacy_worker") is True:
+            return
+        raise AuthorizationError("worker credential is not bound to executor", details={"executor_id": executor_id, "actor_id": actor})
+
+    def _assert_attempt_identity(self, row, identity):
+        if not row:
+            return
+        self._assert_executor_identity(identity, row["executor_id"])
 
     def create_project(self, body, *, idempotency_key=None):
         name = str(body.get("name") or "")
@@ -1058,12 +1092,22 @@ class RuntimeService:
     def recover_reference(self, reference_id, body, *, idempotency_key=None): return self._update_reference_state(reference_id, body, archived=False, idempotency_key=idempotency_key)
 
     def ingest(self, project, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None):
-        obj = self.cas.put(data, expected_digest=expected_digest)
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise InvalidRequestError("object body must be bytes")
+        if len(data) > OBJECT_MAX_BYTES:
+            raise ValidationError("object exceeds 64 MiB limit")
+        data = bytes(data)
+        obj = self.cas.put(data, expected_digest=(expected_digest or "").removeprefix("sha256:") or None)
         row = self.store.record_object(obj["digest"], obj["size"], media_type, original_name)
         self.store.add_object_ref(project, obj["digest"])
         return row | {"project": self.store.get_project(project)["id"], "deduplicated": obj["deduplicated"]}
 
     def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None):
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise InvalidRequestError("object body must be bytes")
+        if len(data) > OBJECT_MAX_BYTES:
+            raise ValidationError("object exceeds 64 MiB limit")
+        data = bytes(data)
         obj = self.cas.put(data, expected_digest=(expected_digest or "").removeprefix("sha256:") or None)
         return self._object_resource(self.store.record_object(obj["digest"], obj["size"], media_type, original_name))
 
@@ -1198,24 +1242,36 @@ class RuntimeService:
         return result
 
     def _ensure_default_capability(self):
-        digest = "sha256:" + hashlib.sha256(b"render.basic").hexdigest()
-        self.store.register_capability("render.basic", digest, required_resource_keys=[], estimated_output_bytes=1)
+        # Kept as a compatibility hook for older embedders.  Capability
+        # registration is executor-owned now; startup must never manufacture a
+        # ready render.basic entry without a live matching host.
+        return None
 
     def list_capabilities(self, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
         return _page_rows(rows, scope="capabilities", cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["id"]),),
-                          resource_fn=lambda r: {"capability_id": r["id"], "definition_digest": r["definition_digest"], "status": r["status"], "required_resource_keys": json.loads(r["required_resource_keys_json"]), "estimated_scratch_bytes": r["estimated_scratch_bytes"], "estimated_output_bytes": r["estimated_output_bytes"], "unavailable_reason": r["unavailable_reason"]})
+                          resource_fn=lambda r: self._capability_resource(r))
+
+    def _capability_resource(self, row):
+        status = row["status"]
+        reason = row["unavailable_reason"]
+        if status == "ready" and not self.store.matching_live_executor(row["id"], row["definition_digest"]):
+            status, reason = "unavailable", "no_live_matching_executor"
+        return {"capability_id": row["id"], "definition_digest": row["definition_digest"], "status": status, "required_resource_keys": json.loads(row["required_resource_keys_json"]), "estimated_scratch_bytes": row["estimated_scratch_bytes"], "estimated_output_bytes": row["estimated_output_bytes"], "unavailable_reason": reason}
 
     def register_capability(self, body):
         value = self.store.register_capability(body.get("capability_id", ""), body.get("definition_digest", ""), required_resource_keys=body.get("required_resource_keys", []), status=body.get("status", "ready"), unavailable_reason=body.get("unavailable_reason"), estimated_scratch_bytes=body.get("estimated_scratch_bytes", 0), estimated_output_bytes=body.get("estimated_output_bytes", 0))
+        # Registration acknowledges the executor's declared state. Discovery
+        # computes liveness-aware availability via ``_capability_resource``.
         return {"capability_id": value["id"], "definition_digest": value["definition_digest"], "status": value["status"], "required_resource_keys": value["required_resource_keys"], "estimated_scratch_bytes": value["estimated_scratch_bytes"], "estimated_output_bytes": value["estimated_output_bytes"], "unavailable_reason": value.get("unavailable_reason")}
 
     @_durable_mutation
-    def register_executor(self, body, *, idempotency_key=None):
+    def register_executor(self, body, *, idempotency_key=None, identity=None):
         self._require_object_body(body)
         if not body.get("executor_id"):
             raise ValidationError("executor_id is required")
+        self._assert_executor_identity(identity, body.get("executor_id"))
         max_concurrency = int(body.get("max_concurrency", 1))
         if max_concurrency < 1:
             raise ValidationError("max_concurrency must be positive")
@@ -1240,7 +1296,7 @@ class RuntimeService:
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result)
 
     @_durable_mutation
-    def claim_next(self, body, *, idempotency_key=None):
+    def claim_next(self, body, *, idempotency_key=None, identity=None):
         """Atomically select, claim, fence, and record a canonical claim.
 
         A claim has no task path, so its command aggregate is the endpoint's
@@ -1254,6 +1310,7 @@ class RuntimeService:
         runtime_epoch = body.get("runtime_epoch")
         if not isinstance(executor_id, str) or not executor_id:
             raise ValidationError("executor_id is required")
+        self._assert_executor_identity(identity, executor_id)
         if not isinstance(capability_ids, list) or any(not isinstance(value, str) or not value for value in capability_ids) or len(set(capability_ids)) != len(capability_ids):
             raise ValidationError("capability_ids must be a list of unique non-empty strings")
         if runtime_epoch is not None and (isinstance(runtime_epoch, bool) or not isinstance(runtime_epoch, int) or runtime_epoch < 1):
@@ -1309,13 +1366,14 @@ class RuntimeService:
             )
         return result
 
-    def settle_attempt(self, attempt_id, body):
+    def settle_attempt(self, attempt_id, body, *, identity=None):
         # The identity/fence and effect preconditions must precede CAS writes.
         # Keep this entire sequence under the owner mutex so a concurrent
         # recovery cannot invalidate an attempt between validation and
         # publication.
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            self._assert_attempt_identity(row, identity)
             current_epoch = self.store._current_runtime_epoch()
             self._validate_attempt_lease(row, body, current_epoch)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
@@ -1331,36 +1389,159 @@ class RuntimeService:
                 raise ValidationError("declared settlement effect is required")
             if effect is not None:
                 self.store._validate_settlement_effect(effect)
-            outputs = self._publish_outputs(body.get("outputs", []))
-            result = {"outputs": outputs}
-            value = self.store._settle_attempt(row["task_id"], row["lease_id"], result, effect=effect, fence=body.get("fence"), attempt_id=attempt_id)
-            return self._task_resource(value)
+            project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0]
+            staged = self._stage_outputs(attempt_id, body.get("outputs", []), project_id=project_id)
+            try:
+                result = {"outputs": staged["outputs"]}
+                value = self.store._settle_attempt(
+                    row["task_id"], row["lease_id"], result,
+                    effect=effect, fence=body.get("fence"), attempt_id=attempt_id,
+                    publish=lambda: self._publish_staged_outputs(staged, project_id=project_id),
+                )
+                return self._task_resource(value)
+            finally:
+                self._discard_staged_outputs(staged)
 
-    def _publish_outputs(self, outputs):
+    def _stage_outputs(self, attempt_id, outputs, *, project_id=None):
+        """Validate and stage every output without making it globally reachable."""
         if not isinstance(outputs, list):
             raise ValidationError("outputs must be a list")
-        published = []
-        for output in outputs:
-            if not isinstance(output, dict) or not output.get("digest"):
-                raise ValidationError("each output requires a digest")
-            digest = str(output["digest"]).removeprefix("sha256:")
-            data_field = output.get("data_base64")
-            if data_field is not None:
+        stage_dir = self.store.staging_root / "settlements" / attempt_id
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        stage_dir.chmod(0o700)
+        staged = []
+        seen = set()
+        try:
+            for index, output in enumerate(outputs):
+                if not isinstance(output, dict):
+                    raise ValidationError("each output must be an object")
+                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64"}
+                unknown = sorted(set(output) - allowed)
+                if unknown:
+                    raise ValidationError("output contains unsupported fields", details={"fields": unknown})
+                digest_value = output.get("digest")
+                if not isinstance(digest_value, str) or not digest_value.startswith("sha256:"):
+                    raise ValidationError("each output requires a sha256 digest")
+                digest = digest_value.removeprefix("sha256:")
+                if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                    raise ValidationError("each output requires a valid SHA-256 digest")
+                if digest in seen:
+                    raise ValidationError("outputs must not contain duplicate digests")
+                seen.add(digest)
+                kind = output.get("kind", "object")
+                if not isinstance(kind, str) or kind not in {"object", "document", "value"}:
+                    raise ValidationError("output kind is invalid")
+                name = output.get("name", "output")
+                if not isinstance(name, str) or not name or len(name) > 512:
+                    raise ValidationError("output name must be a non-empty string")
+                media_type = output.get("media_type", "application/octet-stream")
+                if not isinstance(media_type, str) or not media_type or len(media_type) > 255 or any(ord(char) < 32 for char in media_type):
+                    raise ValidationError("output media_type is invalid")
+                declared_size = output.get("size")
+                if declared_size is not None and (isinstance(declared_size, bool) or not isinstance(declared_size, int) or declared_size < 0 or declared_size > OBJECT_MAX_BYTES):
+                    raise ValidationError("output size must be an integer between 0 and 64 MiB")
+                data_field = output.get("data_base64")
+                stage_path = None
+                if data_field is not None:
+                    if not isinstance(data_field, str):
+                        raise ValidationError("output data_base64 is invalid")
+                    try:
+                        data = base64.b64decode(data_field, validate=True)
+                    except (ValueError, TypeError) as exc:
+                        raise ValidationError("output data_base64 is invalid") from exc
+                    if len(data) > OBJECT_MAX_BYTES:
+                        raise ValidationError("output exceeds 64 MiB object limit")
+                    actual_digest = sha256_bytes(data)
+                    if actual_digest != digest:
+                        raise ConflictError("output content hash does not match declared digest", details={"expected": digest_value, "actual": "sha256:" + actual_digest})
+                    if declared_size is not None and declared_size != len(data):
+                        raise ValidationError("output size does not match staged bytes")
+                    stage_path = stage_dir / f"{index:08d}.stage"
+                    with open(stage_path, "xb") as stream:
+                        stream.write(data)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    size = len(data)
+                else:
+                    path = self.cas.path_for(digest)
+                    if not path.is_file() or path.is_symlink():
+                        raise ConflictError("output must be staged or published to runtime CAS before settlement", details={"digest": digest_value})
+                    size = path.stat().st_size
+                    if size > OBJECT_MAX_BYTES:
+                        raise ValidationError("output exceeds 64 MiB object limit")
+                    self.cas.verify(digest)
+                    if declared_size is not None and declared_size != size:
+                        raise ValidationError("output size does not match CAS bytes")
+                existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+                if existing:
+                    if int(existing["size"]) != size or existing["media_type"] != media_type:
+                        raise ConflictError("output metadata does not match existing object", details={"digest": digest_value})
+                    if project_id and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
+                        raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
+                elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
+                    raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
+                normalized = {"name": name, "kind": kind, "digest": digest_value, "media_type": media_type, "size": size}
+                staged.append({"digest": digest, "path": stage_path, "size": size, "media_type": media_type, "name": name, "output": normalized})
+            return {"stage_dir": stage_dir, "items": staged, "outputs": [item["output"] for item in staged]}
+        except Exception:
+            self._discard_staged_outputs({"stage_dir": stage_dir, "items": staged})
+            raise
+
+    def _publish_staged_outputs(self, staged, *, project_id=None):
+        """Publish already validated bytes as part of the settlement transaction."""
+        for item in staged["items"]:
+            digest = item["digest"]
+            destination = self.cas.path_for(digest)
+            if item["path"] is not None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    if destination.is_symlink() or self.cas.read(digest) != item["path"].read_bytes():
+                        raise ConflictError("CAS collision or corrupt existing object")
+                    item["path"].unlink(missing_ok=True)
+                else:
+                    os.replace(item["path"], destination)
+            self.store.conn.execute(
+                "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                (digest, item["size"], item["media_type"], item["name"], now()),
+            )
+            if project_id:
+                self.store.conn.execute(
+                    "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)",
+                    (project_id, digest, now()),
+                )
+
+    @staticmethod
+    def _discard_staged_outputs(staged):
+        stage_dir = staged.get("stage_dir") if isinstance(staged, dict) else None
+        for item in (staged.get("items", []) if isinstance(staged, dict) else []):
+            path = item.get("path")
+            if path is not None:
                 try:
-                    data = base64.b64decode(data_field, validate=True)
-                except (ValueError, TypeError) as exc:
-                    raise ValidationError("output data_base64 is invalid") from exc
-                stored = self.cas.put(data, expected_digest=digest)
-                size = stored["size"]
-            else:
-                path = self.cas.path_for(digest)
-                if not path.is_file():
-                    raise ConflictError("output must be published to runtime CAS before settlement", details={"digest": output["digest"]})
-                size = path.stat().st_size
-                self.cas.verify(digest)
-            self.store.record_object(digest, size, output.get("media_type", "application/octet-stream"), output.get("name"))
-            published.append({key: value for key, value in output.items() if key != "data_base64"})
-        return published
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+        if stage_dir is not None:
+            # Include a file whose validation failed immediately after its
+            # fsync, before it could be appended to ``items``.
+            try:
+                for path in stage_dir.iterdir():
+                    if path.is_file() or path.is_symlink():
+                        path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
+            try:
+                stage_dir.rmdir()
+            except OSError:
+                pass
+
+    def _publish_outputs(self, outputs):
+        """Compatibility helper for in-process callers; settlement uses staging."""
+        staged = self._stage_outputs("compatibility", outputs)
+        try:
+            self._publish_staged_outputs(staged)
+            return staged["outputs"]
+        finally:
+            self._discard_staged_outputs(staged)
 
     def _checkpoint_row(self, checkpoint_id=None, attempt_id=None):
         if checkpoint_id:
@@ -1423,11 +1604,12 @@ class RuntimeService:
             except ValueError as exc:
                 raise LeaseError("attempt lease deadline is invalid") from exc
 
-    def prepare_reboot(self, body=None):
+    def prepare_reboot(self, body=None, *, identity=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
         body = body or {}
         attempt_id = body.get("attempt_id")
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        self._assert_attempt_identity(row, identity)
         if not row or row["settled"]:
             raise LeaseError("attempt lease is stale or already settled")
         current = self.store._current_runtime_epoch()
@@ -1445,10 +1627,11 @@ class RuntimeService:
         expires_in = max(0, int((datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)).total_seconds()))
         return {"attempt_id": attempt_id, "task_id": row["task_id"], "executor_id": row["executor_id"], "runtime_epoch": current, "nonce": nonce, "expires_in_seconds": expires_in}
 
-    def checkpoint_attempt(self, attempt_id, body):
+    def checkpoint_attempt(self, attempt_id, body, *, identity=None):
         """Persist a bounded, fsync'd R1 checkpoint before a reboot request."""
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            self._assert_attempt_identity(row, identity)
             current = self.store._current_runtime_epoch()
             self._validate_attempt_lease(row, body, current)
             nonce = self._reboot_authorized(body, attempt_id)
@@ -1492,7 +1675,7 @@ class RuntimeService:
 
     create_checkpoint = checkpoint_attempt
 
-    def request_reboot(self, body):
+    def request_reboot(self, body, *, identity=None):
         """Execute only an allowlisted reboot command after durable checkpointing."""
         # Claim and consume the one-shot authorization in the same SQLite
         # transaction as the durable-state transition.  The executor is
@@ -1501,6 +1684,7 @@ class RuntimeService:
         with self.store._mutex:
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
+            self._assert_attempt_identity(row, identity)
             if row["state"] in {"executed", "resumed"} and row["recovery_receipt_json"]:
                 # A completed request is safely replayable, but still require
                 # the exact original nonce and authorization.
@@ -1561,10 +1745,11 @@ class RuntimeService:
                 self.store.conn.execute("UPDATE recovery_checkpoints SET state='executed', recovery_receipt_json=?, updated_at=? WHERE id=? AND state='reboot_requested'", (canonical_json(receipt), now(), row["id"]))
         return receipt
 
-    def resume_attempt(self, body):
+    def resume_attempt(self, body, *, identity=None):
         with self.store._mutex:
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
+            self._assert_attempt_identity(row, identity)
             # request_reboot consumes the one-shot authorization.  The exact
             # consumed token remains the authorization for this checkpoint's
             # one successful resume; it is not a newly reusable nonce.
@@ -1599,8 +1784,9 @@ class RuntimeService:
 
     resume = resume_attempt
 
-    def heartbeat_attempt(self, attempt_id, body):
+    def heartbeat_attempt(self, attempt_id, body, *, identity=None):
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        self._assert_attempt_identity(row, identity)
         current = self.store._current_runtime_epoch()
         self._validate_attempt_lease(row, body, current)
         value = self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30))
@@ -1608,8 +1794,9 @@ class RuntimeService:
         self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
         return {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires, "runtime_epoch": self.store._current_runtime_epoch()}
 
-    def fail_attempt(self, attempt_id, body):
+    def fail_attempt(self, attempt_id, body, *, identity=None):
         row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        self._assert_attempt_identity(row, identity)
         current = self.store._current_runtime_epoch()
         self._validate_attempt_lease(row, body, current)
         if "reason" in body:

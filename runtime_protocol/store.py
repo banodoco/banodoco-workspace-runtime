@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
 
 SCHEMA_VERSION = 19
 LEASE_SECONDS = 30
+EXECUTOR_LIVENESS_SECONDS = 90
 
 
 class RealmStore:
@@ -653,9 +654,16 @@ class RealmStore:
                     else:
                         waiting_reason = None
                 else:
-                    if capability_digest is not None:
-                        raise ConflictError("capability is not registered", details={"capability_id": capability})
-                    waiting_reason = None
+                    # Keep task admission durable for clients that submit work
+                    # before a worker host comes online, but mark it blocked.
+                    # The task cannot be claimed until a matching capability
+                    # and live executor registration is present.
+                    waiting_reason = "capability_unavailable" if capability_digest is not None else None
+                if enforce_readiness and waiting_reason is None and not self.matching_live_executor(capability, capability_digest):
+                    # Queue the durable task while making the unavailable
+                    # readiness explicit. Claiming remains impossible until a
+                    # matching live executor appears.
+                    waiting_reason = "capability_unavailable"
                 if waiting_reason is None and not self.storage_preflight(capability)["ok"]:
                     waiting_reason = "insufficient_storage"
                 timestamp, run_id, task_id = now(), new_id(), new_id()
@@ -890,6 +898,48 @@ class RealmStore:
         values = json.loads(row["capabilities_json"])
         return {item if isinstance(item, str) else item.get("capability_id", item.get("id")) for item in values}
 
+    def _executor_capability(self, row, capability_id):
+        """Return the exact descriptor advertised by an executor."""
+        for value in json.loads(row["capabilities_json"]):
+            if isinstance(value, str) and value == capability_id:
+                return {"capability_id": value}
+            if isinstance(value, dict) and (value.get("capability_id") or value.get("id")) == capability_id:
+                return value
+        return None
+
+    @staticmethod
+    def _executor_live(row):
+        if not row or not row["last_seen_at"]:
+            return False
+        try:
+            seen = datetime.fromisoformat(row["last_seen_at"])
+        except (TypeError, ValueError):
+            return False
+        return seen > datetime.now(timezone.utc) - timedelta(seconds=EXECUTOR_LIVENESS_SECONDS)
+
+    def _executor_can_run(self, executor, capability_id, capability_digest=None):
+        if not executor or executor["readiness"] != "ready" or not self._executor_live(executor):
+            return False
+        descriptor = self._executor_capability(executor, capability_id)
+        if not descriptor or descriptor.get("status", "ready") != "ready":
+            return False
+        capability = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (capability_id,)).fetchone()
+        if not capability or capability["status"] != "ready":
+            return False
+        if capability_digest is not None and capability["definition_digest"] != capability_digest:
+            return False
+        advertised_digest = descriptor.get("definition_digest")
+        if advertised_digest and advertised_digest != capability["definition_digest"]:
+            return False
+        available = set(json.loads(executor["resource_keys_json"]))
+        for key in self._required_resource_keys(capability_id):
+            if key not in available:
+                return False
+        return self.storage_preflight(capability_id)["ok"]
+
+    def matching_live_executor(self, capability_id, capability_digest=None):
+        return any(self._executor_can_run(row, capability_id, capability_digest) for row in self.conn.execute("SELECT * FROM executors"))
+
     def _required_resource_keys(self, capability):
         row = self.conn.execute("SELECT required_resource_keys_json FROM capabilities WHERE id=?", (capability,)).fetchone()
         return json.loads(row[0]) if row else []
@@ -921,19 +971,28 @@ class RealmStore:
                 if task["status"] != "queued":
                     raise ConflictError("task is not claimable", details={"status": task["status"]})
                 executor = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
-                capability = self.conn.execute("SELECT status FROM capabilities WHERE id=?", (task["capability"],)).fetchone()
+                capability = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (task["capability"],)).fetchone()
                 waiting_reason = None
                 if not executor:
                     waiting_reason = "waiting_for_worker"
                 elif executor["readiness"] != "ready":
                     waiting_reason = "waiting_for_worker"
                 elif not capability and task["capability_digest"] is not None:
-                    raise ConflictError("capability is not registered", details={"capability_id": task["capability"]})
+                    # A task admitted before its executor advertises the
+                    # capability remains queued, never claimable, until a
+                    # matching registration arrives.
+                    waiting_reason = "capability_unavailable"
                 elif capability and capability["status"] != "ready":
                     waiting_reason = "capability_unavailable"
                 elif not self.storage_preflight(task["capability"])["ok"]:
                     waiting_reason = "insufficient_storage"
                 elif task["capability"] not in self._executor_capability_ids(executor):
+                    waiting_reason = "waiting_for_worker"
+                elif not self._executor_live(executor):
+                    waiting_reason = "waiting_for_worker"
+                elif task["capability_digest"] is not None and (not capability or capability["definition_digest"] != task["capability_digest"]):
+                    waiting_reason = "capability_unavailable"
+                elif (self._executor_capability(executor, task["capability"]) or {}).get("status", "ready") != "ready":
                     waiting_reason = "waiting_for_worker"
                 else:
                     active = self.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
@@ -993,7 +1052,18 @@ class RealmStore:
             # registration only happens after the complete request shape is
             # known to be valid.
             for capability_id, value in descriptors:
-                self.register_capability(capability_id, value["definition_digest"], required_resource_keys=value.get("required_resource_keys"), status=value.get("status", "ready"), unavailable_reason=value.get("unavailable_reason"), estimated_scratch_bytes=value.get("estimated_scratch_bytes", 0), estimated_output_bytes=value.get("estimated_output_bytes", 0))
+                existing = self.conn.execute("SELECT definition_digest FROM capabilities WHERE id=?", (capability_id,)).fetchone()
+                if existing and existing["definition_digest"] != value["definition_digest"]:
+                    raise ConflictError("executor capability digest does not match registered capability", details={"capability_id": capability_id, "expected": existing["definition_digest"], "actual": value["definition_digest"]})
+                if not existing:
+                    self.register_capability(capability_id, value["definition_digest"], required_resource_keys=value.get("required_resource_keys"), status=value.get("status", "ready"), unavailable_reason=value.get("unavailable_reason"), estimated_scratch_bytes=value.get("estimated_scratch_bytes", 0), estimated_output_bytes=value.get("estimated_output_bytes", 0))
+            # Preserve the historical convenience of string capability ids,
+            # but make the registration explicit and digest-pinned.  This is
+            # no longer a boot-time default: a fresh runtime has no ready
+            # capability until an executor actually advertises one.
+            for capability_id in capability_ids:
+                if not self.conn.execute("SELECT 1 FROM capabilities WHERE id=?", (capability_id,)).fetchone():
+                    self.register_capability(capability_id, "sha256:" + hashlib.sha256(str(capability_id).encode()).hexdigest(), required_resource_keys=[])
             timestamp = now()
             self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp))
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
@@ -1035,7 +1105,7 @@ class RealmStore:
         if changed.rowcount != 1:
             raise ConflictError("stale settlement effect target version")
 
-    def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id):
+    def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id, publish=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
@@ -1061,6 +1131,11 @@ class RealmStore:
                 timestamp = now()
                 if effect is not None:
                     self._apply_settlement_effect(effect)
+                # The service stages output bytes before entering this fenced
+                # transaction.  Publication and object/project metadata are
+                # performed only after all lease/effect checks succeeded.
+                if publish is not None:
+                    publish()
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))

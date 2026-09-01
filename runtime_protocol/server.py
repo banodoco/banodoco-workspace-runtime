@@ -21,6 +21,7 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
 
 class RuntimeHandler(BaseHTTPRequestHandler):
     server_version = "BanodocoRuntime/0.1"
+    MAX_BODY_BYTES = 64 * 1024 * 1024
 
     def log_message(self, *_):
         return
@@ -37,11 +38,26 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             raise AuthorizationError("bearer credential required")
         return self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
 
-    def _body(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > 64 * 1024 * 1024:
+    def _content_length(self):
+        """Return a strict, bounded request length before touching the body."""
+        raw = self.headers.get("Content-Length")
+        value = raw.strip() if raw is not None else ""
+        if not value or any(char < "0" or char > "9" for char in value):
+            raise ProtocolError("Content-Length header is required and must be a non-negative decimal integer")
+        length = int(value, 10)
+        if length > self.MAX_BODY_BYTES:
             raise ProtocolError("request body exceeds 64 MiB limit")
+        return length
+
+    def _raw_body(self):
+        length = self._content_length()
         raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ProtocolError("request body is shorter than Content-Length")
+        return raw
+
+    def _body(self):
+        raw = self._raw_body()
         try:
             return json.loads(raw.decode("utf-8")) if raw else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -94,11 +110,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             identity = self._identity("handshake")
             body = self._body()
             body["authenticated_actor"] = identity["actor"]
+            body["authenticated_scopes"] = identity.get("scopes", [])
             value = self.runtime.handshake(body)
             return self._send(200, value)
         if path == ["v1", "handshake"] and method == "GET":
             identity = self._identity("handshake")
-            return self._send(200, self.runtime.handshake({"authenticated_actor": identity["actor"], "requested_scopes": []}))
+            return self._send(200, self.runtime.handshake({"authenticated_actor": identity["actor"], "authenticated_scopes": identity.get("scopes", []), "requested_scopes": []}))
         if path == ["v1", "realm"] and method == "GET":
             self._identity("projects:read")
             return self._send(200, self.runtime.realm_resource())
@@ -252,8 +269,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     query = parse_qs(urlsplit(self.path).query)
                     return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST":
-                    length = int(self.headers.get("Content-Length", "0"))
-                    data = self.rfile.read(length)
+                    data = self._raw_body()
                     result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"))
                     return self._send(201, self.runtime._object_resource(result))
             if len(path) == 4 and path[3] in ("tasks", "runs") and method == "GET":
@@ -324,7 +340,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body()))
         if path == ["v1", "objects"] and method == "POST":
             self._identity("objects:write")
-            length = int(self.headers.get("Content-Length", "0")); data = self.rfile.read(length)
+            data = self._raw_body()
             return self._send(201, self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest")))
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")
@@ -366,11 +382,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             project_id = value["run"].get("project_id") or "unscoped"
             return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, body.get("idempotency_key"), project_id=project_id)})
         if path == ["v1", "tasks", "claim"] and method == "POST":
-            self._identity("worker:execute")
+            identity = self._identity("worker:execute")
             key = self.headers.get("Idempotency-Key")
             if not key:
                 raise ProtocolError("Idempotency-Key header is required")
-            result = self.runtime.claim_next(self._body(), idempotency_key=key)
+            result = self.runtime.claim_next(self._body(), idempotency_key=key, identity=identity)
             if result is None:
                 return self._send(204, body=b"")
             return self._send(200, result)
@@ -392,7 +408,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 query = parse_qs(urlsplit(self.path).query)
                 return self._send(200, self.runtime.events_page(task["run"]["id"], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
-            self._identity("worker:execute")
+            identity = self._identity("worker:execute")
             action = path[3]
             if action == "prepare-reboot":
                 body = self._body()
@@ -401,17 +417,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 # JSON body, so bind it at the HTTP boundary before invoking
                 # the service.
                 body["attempt_id"] = path[2]
-                return self._send(200, self.runtime.prepare_reboot(body))
-            if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body()))
-            if action == "settle": return self._send(200, self.runtime.settle_attempt(path[2], self._body()))
-            if action == "heartbeat": return self._send(200, self.runtime.heartbeat_attempt(path[2], self._body()))
-            if action == "fail": return self._send(200, self.runtime.fail_attempt(path[2], self._body()))
+                return self._send(200, self.runtime.prepare_reboot(body, identity=identity))
+            if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body(), identity=identity))
+            if action == "settle": return self._send(200, self.runtime.settle_attempt(path[2], self._body(), identity=identity))
+            if action == "heartbeat": return self._send(200, self.runtime.heartbeat_attempt(path[2], self._body(), identity=identity))
+            if action == "fail": return self._send(200, self.runtime.fail_attempt(path[2], self._body(), identity=identity))
         if path == ["v1", "recovery", "reboot"] and method == "POST":
-            self._identity("worker:execute")
-            return self._send(200, self.runtime.request_reboot(self._body()))
+            identity = self._identity("worker:execute")
+            return self._send(200, self.runtime.request_reboot(self._body(), identity=identity))
         if path == ["v1", "recovery", "resume"] and method == "POST":
-            self._identity("worker:execute")
-            return self._send(200, self.runtime.resume_attempt(self._body()))
+            identity = self._identity("worker:execute")
+            return self._send(200, self.runtime.resume_attempt(self._body(), identity=identity))
         if len(path) == 3 and path[:2] == ["v1", "generations"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_generation(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "generations"] and path[3] == "variants":
@@ -451,11 +467,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("worker:register")
             return self._send(201, self.runtime.register_capability(self._body()))
         if path == ["v1", "executors"] and method == "POST":
-            self._identity("worker:register")
+            identity = self._identity("worker:register")
             key = self.headers.get("Idempotency-Key")
             if not key:
                 raise ProtocolError("Idempotency-Key header is required")
-            return self._send(201, self.runtime.register_executor(self._body(), idempotency_key=key))
+            return self._send(201, self.runtime.register_executor(self._body(), idempotency_key=key, identity=identity))
         if len(path) == 3 and path[:2] == ["v1", "runs"] and method == "GET":
             self._identity("tasks:read")
             return self._send(200, self.runtime.run(path[2]))

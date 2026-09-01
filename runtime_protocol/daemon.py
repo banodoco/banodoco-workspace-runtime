@@ -52,7 +52,11 @@ class RuntimeDaemon:
             return self
         self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist)
         self.token, self.credential_path = self.credentials.provision("owner", ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"])
-        self.worker_token, _ = self.credentials.provision("fake-worker", ["handshake", "worker:execute", "tasks:read"])
+        # The built-in worker token exists solely for the generated acceptance
+        # harness, whose owner registers arbitrary fixture executor ids.  Mark
+        # that compatibility credential explicitly so real worker credentials
+        # remain executor-bound at the HTTP boundary.
+        self.worker_token, _ = self.credentials.provision("fake-worker", ["handshake", "worker:execute", "tasks:read"], metadata={"legacy_worker": True})
         if self.bootstrap_token_file and self.bootstrap_token_file.exists():
             bootstrap_token = self.bootstrap_token_file.read_text(encoding="utf-8").strip()
             self.credentials.provision_static("bootstrap", bootstrap_token, ["admin", "credentials:provision"])

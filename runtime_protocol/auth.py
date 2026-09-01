@@ -14,14 +14,17 @@ class CredentialStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.root.chmod(0o700)
 
-    def provision(self, actor: str, scopes: list[str]) -> tuple[str, Path]:
+    def provision(self, actor: str, scopes: list[str], *, metadata: dict | None = None) -> tuple[str, Path]:
         if not actor or "/" in actor or ".." in actor:
             raise ValidationError("invalid actor")
         token = secrets.token_urlsafe(32)
         path = self.root / f"{actor}.token"
         path.write_text(token, encoding="utf-8")
         path.chmod(0o600)
-        (self.root / f"{actor}.json").write_text(__import__("json").dumps({"actor": actor, "scopes": sorted(set(scopes))}), encoding="utf-8")
+        value = {"actor": actor, "scopes": sorted(set(scopes))}
+        if metadata:
+            value.update(metadata)
+        (self.root / f"{actor}.json").write_text(__import__("json").dumps(value), encoding="utf-8")
         (self.root / f"{actor}.json").chmod(0o600)
         return token, path
 
