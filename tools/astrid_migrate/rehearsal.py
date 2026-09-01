@@ -14,7 +14,6 @@ import hmac
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import stat
 import tempfile
@@ -31,7 +30,7 @@ from .capacity import (
     revalidate_activation_path,
 )
 from . import boundary as _boundary
-from .boundary import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, validate_parent as _validate_parent, _open_relative, _connection_from_fd, _sha256_at, pin_directory as _pin_directory, RealmCatalog, now, verify_backup as _verify_backup
+from .boundary import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, validate_parent as _validate_parent, _open_relative, _connection_from_fd, _sha256_at, pin_directory as _pin_directory, RealmCatalog, now, verify_backup as _verify_backup, write_bytes_at as _write_bytes_at
 
 
 def _write_json(path: Path, value: Mapping[str, Any], *, identity: Mapping[str, Any] | None = None) -> None:
@@ -260,6 +259,12 @@ def _assert_pinned_candidate(candidate: Path, parent_fd: int, root_fd: int, pare
         raise MigrationError(f"candidate lexical parent identity changed: {candidate.parent}")
     if (current_root.st_dev, current_root.st_ino, current_root.st_mode) != (root_stat.st_dev, root_stat.st_ino, root_stat.st_mode):
         raise MigrationError(f"candidate identity changed: {candidate}")
+    try:
+        named_root = os.stat(candidate.name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise MigrationError(f"candidate identity changed: {candidate}") from exc
+    if (named_root.st_dev, named_root.st_ino, named_root.st_mode) != (root_stat.st_dev, root_stat.st_ino, root_stat.st_mode):
+        raise MigrationError(f"candidate lexical identity changed: {candidate}")
 
 
 def _retarget_runtime_paths(runtime: Any, target: Path) -> None:
@@ -717,43 +722,19 @@ class RuntimeServiceAdapter:
         # rejected.  Resolving an attacker-swapped active root first would
         # turn a symlink into an apparently legitimate outside authority.
         candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(candidate_root))))
-        candidate_cleanup = None
-        # A compact migration hands the signed destination backup directly to
-        # this boundary. Materialize only an activation-local candidate so the
-        # authenticated handoff is created in the temporary activation source,
-        # never in the durable backup artifact.
-        if (candidate / "manifest.json").is_file() and not (candidate / "activation-handoff.json").exists():
-            try:
-                _verify_backup(candidate)
-                candidate_cleanup = Path(tempfile.mkdtemp(prefix=".activation-source-", dir=str(candidate.parent)))
-                candidate_cleanup.rmdir()
-                verified = _verify_backup(candidate)
-                candidate_cleanup.mkdir(mode=0o700)
-                shutil.copy2(candidate / "realm.sqlite3", candidate_cleanup / "realm.sqlite3")
-                shutil.copytree(candidate / "cas", candidate_cleanup / "cas", symlinks=False)
-                manifest = verified["manifest"]
-                key = _boundary._resolve_key(manifest)
-                handoff = {
-                    "format_version": 2,
-                    "source_backup": str(candidate),
-                    "source_manifest_sha256": _sha256_file(candidate / "manifest.json"),
-                    "realm_id": manifest.get("realm_id"),
-                    "candidate_database_sha256": _sha256_file(candidate_cleanup / "realm.sqlite3"),
-                }
-                handoff["handoff_sha256"] = hashlib.sha256(_canonical(handoff)).hexdigest()
-                handoff["handoff_hmac"] = hmac.new(key, _canonical({key: value for key, value in handoff.items() if key not in {"handoff_sha256", "handoff_hmac"}}), hashlib.sha256).hexdigest()
-                (candidate_cleanup / "activation-handoff.json").write_bytes(_canonical(handoff) + b"\n")
-                candidate = candidate_cleanup
-            except Exception as exc:
-                if candidate_cleanup is not None:
-                    shutil.rmtree(candidate_cleanup, ignore_errors=True)
-                raise MigrationError("signed backup could not be materialized for activation") from exc
         target = Path(os.path.abspath(os.path.expanduser(os.fspath(self.service.store.root))))
         if target_identity is None:
             target_identity = capture_activation_path(target)
         parent_fd = int(target_identity.get("_parent_fd", -1))
         if parent_fd < 0:
             raise MigrationError("activation boundary has no retained parent descriptor")
+        backup_source = (candidate / "manifest.json").is_file() and not (candidate / "activation-handoff.json").exists()
+        backup_verification = None
+        if backup_source:
+            try:
+                backup_verification = _verify_backup(candidate)
+            except Exception as exc:
+                raise MigrationError("signed backup could not be verified for activation") from exc
 
         candidate_parent_fd = candidate_fd = quarantine_fd = temporary_fd = -1
         temporary_name = quarantine_name = None
@@ -776,7 +757,7 @@ class RuntimeServiceAdapter:
                 raise MigrationError(f"candidate realm cannot be opened safely: {candidate}") from exc
             if not _exists_at(candidate_fd, "realm.sqlite3") or not _exists_at(candidate_fd, "cas"):
                 raise MigrationError("candidate is not a complete inactive realm")
-            if activation_manifest_source is not None and not _exists_at(candidate_fd, "activation-manifest.json"):
+            if not backup_source and activation_manifest_source is not None and not _exists_at(candidate_fd, "activation-manifest.json"):
                 manifest_source = Path(os.path.abspath(os.path.expanduser(os.fspath(activation_manifest_source))))
                 if _has_symlink_component(manifest_source) or not manifest_source.is_file():
                     raise MigrationError("activation manifest source is missing or contains a symlink")
@@ -788,14 +769,19 @@ class RuntimeServiceAdapter:
                     os.close(source_fd)
                     _close_pinned(source_identity)
             from .boundary import verify_restore_candidate
-            # Candidate restore directories carry a handoff, while backups carry
-            # a manifest.  Both must be checked before touching the authority.
-            if not _exists_at(candidate_fd, "activation-handoff.json"):
-                raise MigrationError("candidate realm has no activation handoff")
-            try:
-                candidate_verification = verify_restore_candidate(candidate)
-            except Exception as exc:
-                raise MigrationError(f"candidate failed verification before {state} activation") from exc
+            if backup_source:
+                # The backup remains the pinned immutable source. Its handoff
+                # is created only after copying into the activation temporary.
+                backup_identity = {"path": str(candidate), "parent": str(candidate.parent), "target_parent": str(candidate.parent), "parent_st_dev": int(candidate_parent_stat.st_dev), "parent_st_ino": int(candidate_parent_stat.st_ino), "parent_st_mode": int(candidate_parent_stat.st_mode), "_parent_fd": candidate_parent_fd}
+                backup_verification = _verify_backup(candidate, directory_identity=backup_identity)
+                candidate_verification = None
+            else:
+                if not _exists_at(candidate_fd, "activation-handoff.json"):
+                    raise MigrationError("candidate realm has no activation handoff")
+                try:
+                    candidate_verification = verify_restore_candidate(candidate)
+                except Exception as exc:
+                    raise MigrationError(f"candidate failed verification before {state} activation") from exc
             _assert_pinned_candidate(candidate, candidate_parent_fd, candidate_fd, candidate_parent_stat, candidate_stat)
             # Verification can read a large CAS. Revalidate once more at the
             # final authority seam so swaps are rejected before closing live.
@@ -814,7 +800,20 @@ class RuntimeServiceAdapter:
             temporary_name, temporary_fd = _mkdir_at(parent_fd, f".{target.name}.activate-")
             _copy_file_at(candidate_fd, "realm.sqlite3", temporary_fd, "realm.sqlite3")
             _copy_tree_at(candidate_fd, "cas", temporary_fd, "cas")
-            _copy_file_at(candidate_fd, "activation-handoff.json", temporary_fd, "activation-handoff.json")
+            if backup_source:
+                manifest = backup_verification["manifest"]
+                handoff = {
+                    "format_version": 2,
+                    "source_backup": str(candidate),
+                    "source_manifest_sha256": _sha256_file(candidate / "manifest.json"),
+                    "realm_id": manifest.get("realm_id"),
+                    "candidate_database_sha256": manifest.get("database_sha256"),
+                }
+                handoff["handoff_sha256"] = hashlib.sha256(_canonical(handoff)).hexdigest()
+                handoff["handoff_hmac"] = hmac.new(_boundary._resolve_key(manifest), _boundary.canonical_json({key: value for key, value in handoff.items() if key not in {"handoff_sha256", "handoff_hmac"}}).encode(), hashlib.sha256).hexdigest()
+                _write_bytes_at(temporary_fd, "activation-handoff.json", _canonical(handoff) + b"\n")
+            else:
+                _copy_file_at(candidate_fd, "activation-handoff.json", temporary_fd, "activation-handoff.json")
             if _exists_at(quarantine_fd, ".operator-backup-key"):
                 _copy_file_at(quarantine_fd, ".operator-backup-key", temporary_fd, ".operator-backup-key")
             # Rehearsal control state is not part of a realm backup. Carry it
@@ -830,9 +829,21 @@ class RuntimeServiceAdapter:
                         _copy_file_at(quarantine_fd, name, temporary_fd, name)
                     else:
                         raise MigrationError(f"activation control state is not ordinary: {name}")
+            if activation_manifest_source is not None and not _exists_at(temporary_fd, "activation-manifest.json"):
+                manifest_source = Path(os.path.abspath(os.path.expanduser(os.fspath(activation_manifest_source))))
+                if _has_symlink_component(manifest_source) or not manifest_source.is_file():
+                    raise MigrationError("activation manifest source is missing or contains a symlink")
+                source_identity, source_fd, _ = _pin_directory(manifest_source.parent)
+                try:
+                    _copy_file_at(source_fd, manifest_source.name, temporary_fd, "activation-manifest.json")
+                finally:
+                    os.close(source_fd)
+                    _close_pinned(source_identity)
             if not _exists_at(temporary_fd, "activation-manifest.json") and _exists_at(quarantine_fd, "activation-manifest.json"):
                 _copy_file_at(quarantine_fd, "activation-manifest.json", temporary_fd, "activation-manifest.json")
             os.fsync(temporary_fd)
+            if backup_source:
+                candidate_verification = verify_restore_candidate(target.parent / temporary_name)
             os.close(temporary_fd)
             temporary_fd = -1
 
@@ -923,8 +934,6 @@ class RuntimeServiceAdapter:
                     except OSError:
                         pass
             close_activation_path(target_identity)
-            if candidate_cleanup is not None:
-                shutil.rmtree(candidate_cleanup, ignore_errors=True)
 
 
 class MigrationJournal:

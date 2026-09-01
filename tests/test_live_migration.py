@@ -291,23 +291,23 @@ def test_b12_rejects_scope_mismatch_for_each_operation(tmp_path, authorization_i
 
 
 @pytest.mark.parametrize(
-    "crash_at",
+    "redundancy, crash_at",
     [
-        "after_active_backup",
-        "after_migration",
-        "after_destination_backup",
-        "after_candidate_restore",
-        "after_active_activation",
-        "after_rollback_restore",
-        "after_rollback_activation",
-        "after_reactivation_restore",
-        "after_reactivation_activation",
+        ("compact", "after_active_backup"),
+        ("compact", "after_migration"),
+        ("compact", "after_destination_backup"),
+        ("compact", "after_active_activation"),
+        ("compact", "after_rollback_restore"),
+        ("compact", "after_rollback_activation"),
+        ("compact", "after_reactivation_activation"),
+        ("extreme", "after_candidate_restore"),
+        ("extreme", "after_reactivation_restore"),
     ],
 )
-def test_b12_live_migration_resumes_after_each_durable_crash_seam(tmp_path, crash_at):
+def test_b12_live_migration_resumes_after_each_durable_crash_seam(tmp_path, redundancy, crash_at):
     source = tmp_path / "source"
     build_synthetic_fixture(source)
-    config = _config(source, tmp_path)
+    config = replace(_config(source, tmp_path), redundancy=redundancy)
     active = RuntimeService(tmp_path / "active")
     try:
         authorizations = _auth(config, active)
