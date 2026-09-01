@@ -2132,6 +2132,21 @@ class RuntimeService:
         return receipt
 
     def resume_attempt(self, body, *, identity=None):
+        def attempt_resource(attempt):
+            task_value = self.store.get_task(attempt["task_id"])
+            admitted_spec = dict(task_value["task"].get("spec") or {})
+            return {
+                "attempt_id": attempt["id"],
+                "task_id": attempt["task_id"],
+                "project_id": task_value["run"].get("project_id"),
+                "lease_id": attempt["lease_id"],
+                "fence": attempt["fence"],
+                "lease_expires_at": attempt["lease_expires_at"],
+                "runtime_epoch": attempt["runtime_epoch"],
+                "input_object_ids": list(admitted_spec.get("input_object_ids") or []),
+                "spec": admitted_spec,
+            }
+
         with self.store._mutex:
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
@@ -2144,7 +2159,7 @@ class RuntimeService:
                 receipt = json.loads(row["recovery_receipt_json"])
                 attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (receipt["attempt_id"],)).fetchone()
                 if attempt:
-                    return {"receipt": receipt, "attempt": {"attempt_id": attempt["id"], "task_id": attempt["task_id"], "lease_id": attempt["lease_id"], "fence": attempt["fence"], "lease_expires_at": attempt["lease_expires_at"], "runtime_epoch": attempt["runtime_epoch"]}}
+                    return {"receipt": receipt, "attempt": attempt_resource(attempt)}
             if row["state"] not in {"recovered", "reboot_requested", "executed"}:
                 raise ConflictError("checkpoint is not ready for resume", details={"state": row["state"]})
             checkpoint_bytes = Path(row["checkpoint_path"]).read_bytes()
@@ -2166,7 +2181,7 @@ class RuntimeService:
             receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": resumed_attempt["id"], "task_id": row["task_id"], "runtime_epoch": current, "command": "resume", "status": "resumed", "checkpoint_digest": "sha256:" + row["checkpoint_digest"], "checkpoint": checkpoint}
             with self.store._transaction():
                 self.store.conn.execute("UPDATE recovery_checkpoints SET state='resumed', recovery_receipt_json=?, updated_at=? WHERE id=? AND state IN ('recovered', 'reboot_requested', 'executed')", (canonical_json(receipt), now(), row["id"]))
-            return {"receipt": receipt, "attempt": {"attempt_id": resumed_attempt["id"], "task_id": row["task_id"], "lease_id": resumed_attempt["lease_id"], "fence": resumed_attempt["fence"], "lease_expires_at": resumed_attempt["lease_expires_at"], "runtime_epoch": current}}
+            return {"receipt": receipt, "attempt": attempt_resource(resumed_attempt)}
 
     resume = resume_attempt
 
