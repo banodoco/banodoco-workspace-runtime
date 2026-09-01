@@ -419,7 +419,13 @@ class RuntimeServiceAdapter:
         return {"source_stream_id": source_id, "destination_stream_id": destination_id, "head_seq": head_seq}
 
     def ingest_object(self, data, *, media_type, idempotency_key=None, filename=None):
-        return self.service.ingest_object(data, media_type=media_type, original_name=filename)
+        result = self.service.ingest_object(
+            data,
+            media_type=media_type,
+            original_name=filename,
+            idempotency_key=idempotency_key,
+        )
+        return result.get("data", result) if isinstance(result, Mapping) else result
 
     def add_project_object(self, project_id, digest, *, relation="managed"):
         self.service.store.add_object_ref(str(project_id), str(digest).removeprefix("sha256:"), relation=relation)

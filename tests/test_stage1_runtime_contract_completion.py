@@ -31,8 +31,8 @@ def test_targeted_mutations_replay_the_same_committed_receipt(tmp_path: Path) ->
         variant = service.create_variant("generation", {"variant_id": "variant", "metadata": {}}, idempotency_key="variant-create")
         assert variant["receipt"]["command_kind"] == "variant.create"
 
-        left = service.ingest(project["id"], b"left")["digest"]
-        right = service.ingest(project["id"], b"right")["digest"]
+        left = service.ingest(project["id"], b"left", idempotency_key="left-object")["data"]["digest"]
+        right = service.ingest(project["id"], b"right", idempotency_key="right-object")["data"]["digest"]
         relation_body = {"from_object_id": left, "to_object_id": right, "kind": "derived_from", "ordinal": 1}
         relation = service.create_media_relation(project["id"], relation_body, idempotency_key="relation-create")
         assert relation["receipt"]["command_kind"] == "media_relation.create"

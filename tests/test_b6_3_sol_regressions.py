@@ -12,10 +12,16 @@ from runtime_protocol.util import durable_json_bytes
 
 def _setup(tmp_path, *, reboot_executor=None):
     service = RuntimeService(tmp_path / "realm", reboot_executor=reboot_executor)
-    service.register_executor({"executor_id": "worker", "capabilities": ["render.basic"]})
+    service.register_executor(
+        {"executor_id": "worker", "capabilities": ["render.basic"]},
+        idempotency_key="b63-worker",
+    )
     service.create_task({"capability_id": "render.basic", "spec": {}, "idempotency_key": "sol-b63"})
     epoch = service.health()["runtime_epoch"]
-    attempt = service.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": epoch})
+    attempt = service.claim_next(
+        {"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": epoch},
+        idempotency_key="b63-claim",
+    )
     return service, attempt, epoch
 
 
@@ -47,7 +53,11 @@ def test_expired_settlement_has_zero_cas_or_object_mutation(tmp_path):
     service.store.conn.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (expired, attempt["task_id"]))
     try:
         with pytest.raises(LeaseError, match="expired"):
-            service.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": epoch, "outputs": [{"digest": "sha256:" + digest, "data_base64": "ZXhwaXJlZC1vdXRwdXQ"}]})
+            service.settle_attempt(
+                attempt["attempt_id"],
+                {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": epoch, "outputs": [{"digest": "sha256:" + digest, "data_base64": "ZXhwaXJlZC1vdXRwdXQ"}]},
+                idempotency_key="b63-expired-settle",
+            )
         assert not service.cas.path_for(digest).exists()
         assert service.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone() is None
         assert service.store.conn.execute("SELECT status FROM tasks WHERE id=?", (attempt["task_id"],)).fetchone()[0] == "running"
@@ -95,9 +105,17 @@ def test_recovery_epoch_is_required_before_mutation(tmp_path):
         with pytest.raises(LeaseError, match="runtime epoch is required"):
             service.prepare_reboot({"attempt_id": attempt["attempt_id"], "lease_id": attempt["lease_id"], "fence": attempt["fence"]})
         with pytest.raises(LeaseError, match="runtime epoch is required"):
-            service.heartbeat_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"]})
+            service.heartbeat_attempt(
+                attempt["attempt_id"],
+                {"lease_id": attempt["lease_id"], "fence": attempt["fence"]},
+                idempotency_key="b63-missing-epoch-heartbeat",
+            )
         with pytest.raises(LeaseError, match="runtime epoch is required"):
-            service.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "outputs": []})
+            service.settle_attempt(
+                attempt["attempt_id"],
+                {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "outputs": []},
+                idempotency_key="b63-missing-epoch-settle",
+            )
         assert service.store.conn.execute("SELECT recovery_nonce FROM attempts WHERE id=?", (attempt["attempt_id"],)).fetchone()[0] is None
     finally:
         service.close()

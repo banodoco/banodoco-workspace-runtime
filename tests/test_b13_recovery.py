@@ -380,7 +380,11 @@ def test_b13_terminal_replay_survives_a_runtime_process_reopen(tmp_path):
 
 def test_b13_terminal_replay_rejects_corrupt_reachable_cas_bytes(tmp_path):
     active, rollback_archive, auth = _setup(tmp_path)
-    active.ingest_object(b"b13-cas-content", media_type="application/octet-stream")
+    active.ingest_object(
+        b"b13-cas-content",
+        media_type="application/octet-stream",
+        idempotency_key="b13-cas-content",
+    )
     r2, _fake = _r2_kwargs(active)
     kwargs = dict(recovery_base_backup=tmp_path / "base", rollback_archive=rollback_archive, evidence_root=tmp_path / "evidence", disposable_root=tmp_path / "disposable", authorizations=auth, **r2)
     try:

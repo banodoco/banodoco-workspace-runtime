@@ -42,13 +42,13 @@ def test_reboot_requeues_durable_task_and_fences_old_process(tmp_path):
         assert recovered["task"]["id"] == task_id
 
         with pytest.raises(LeaseError):
-            second.settle_attempt(old_lease["attempt_id"], {"lease_id": old_lease["lease_id"], "fence": old_lease["fence"], "outputs": []})
+            second.settle_attempt(old_lease["attempt_id"], {"lease_id": old_lease["lease_id"], "fence": old_lease["fence"], "outputs": []}, idempotency_key="reboot-old-settle")
 
         resumed = second.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": second.health()["runtime_epoch"]})
         assert resumed["task_id"] == task_id
         assert resumed["fence"] == old_lease["fence"] + 1
-        settled = second.settle_attempt(resumed["attempt_id"], {"lease_id": resumed["lease_id"], "fence": resumed["fence"], "runtime_epoch": second.health()["runtime_epoch"], "outputs": [{"digest": _digest("reboot-output"), "data_base64": "cmVib290LW91dHB1dA=="}]})
-        assert settled["state"] == "succeeded"
+        settled = second.settle_attempt(resumed["attempt_id"], {"lease_id": resumed["lease_id"], "fence": resumed["fence"], "runtime_epoch": second.health()["runtime_epoch"], "outputs": [{"digest": _digest("reboot-output"), "data_base64": "cmVib290LW91dHB1dA=="}]}, idempotency_key="reboot-new-settle")
+        assert settled["data"]["state"] == "succeeded"
         assert second.task(task_id)["task"]["status"] == "completed"
         events = second.events(admitted["run"]["id"])
         assert [event["kind"] for event in events][-3:] == ["task.runtime_recovered", "task.claimed", "task.completed"]
@@ -71,10 +71,10 @@ def test_reboot_recovery_is_atomic_with_settlement_effects(tmp_path):
         resumed = second.claim_next({"executor_id": "worker", "capability_ids": ["render.basic"], "runtime_epoch": second.health()["runtime_epoch"]})
         assert resumed["task_id"] == admitted["task"]["id"]
         body = {"lease_id": resumed["lease_id"], "fence": resumed["fence"], "runtime_epoch": second.health()["runtime_epoch"], "outputs": [], "effect": effect}
-        second.settle_attempt(resumed["attempt_id"], body)
+        second.settle_attempt(resumed["attempt_id"], body, idempotency_key="effect-reboot-settle")
         assert second.get_project(project["id"])["name"] == "After"
         with pytest.raises(LeaseError):
-            second.settle_attempt(resumed["attempt_id"], body)
+            second.settle_attempt(resumed["attempt_id"], body, idempotency_key="effect-reboot-settle-retry")
         assert second.get_project(project["id"])["version"] == 2
         assert attempt["fence"] < resumed["fence"]
     finally:
@@ -91,7 +91,7 @@ def test_stale_settlement_rejects_before_cas_or_object_mutation(tmp_path):
     digest = _digest("stale-output").removeprefix("sha256:")
     service.store.conn.execute("UPDATE runtime_lifecycle SET runtime_epoch=runtime_epoch+1 WHERE id=1")
     with pytest.raises(LeaseError):
-        service.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": stale_epoch, "outputs": [{"digest": "sha256:" + digest, "data_base64": "c3RhbGUtb3V0cHV0"}]})
+        service.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": stale_epoch, "outputs": [{"digest": "sha256:" + digest, "data_base64": "c3RhbGUtb3V0cHV0"}]}, idempotency_key="stale-settlement")
     assert not service.cas.path_for(digest).exists()
     assert service.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone() is None
     assert service.task(admitted["task"]["id"])["task"]["status"] == "running"

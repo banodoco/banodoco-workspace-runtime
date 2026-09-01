@@ -95,7 +95,12 @@ def test_http_digest_mismatch_fails_before_project_media_publication(tmp_path):
         project = client.create_project("Digest", "Digest", idempotency_key="digest-project")
         expected = _digest("different-bytes")
         with pytest.raises(RuntimeError) as mismatch:
-            client.ingest(project["project_id"], b"actual-bytes", expected_digest=expected)
+            client.ingest(
+                project["project_id"],
+                b"actual-bytes",
+                expected_digest=expected,
+                idempotency_key="digest-mismatch",
+            )
         assert "digest" in str(mismatch.value).lower()
         assert client.request("GET", f"/v1/projects/{project['project_id']}/objects")["items"] == []
     finally:

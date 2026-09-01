@@ -58,18 +58,32 @@ def test_settlement_stages_all_outputs_before_fenced_publication(tmp_path: Path)
     try:
         definition = _digest(b"render-settlement-v1")
         service.register_capability({"capability_id": "render.settlement", "definition_digest": definition})
-        service.register_executor({"executor_id": "worker", "capabilities": ["render.settlement"]})
+        service.register_executor(
+            {"executor_id": "worker", "capabilities": ["render.settlement"]},
+            idempotency_key="settlement-worker-register",
+        )
         project = service.create_project({"slug": "settlement", "name": "Settlement"})
         task = service.create_task({"capability_id": "render.settlement", "capability_digest": definition, "project": project["id"], "idempotency_key": "settlement-task"})
-        attempt = service.claim_next({"executor_id": "worker", "capability_ids": ["render.settlement"], "runtime_epoch": service.health()["runtime_epoch"]})
+        attempt = service.claim_next(
+            {"executor_id": "worker", "capability_ids": ["render.settlement"], "runtime_epoch": service.health()["runtime_epoch"]},
+            idempotency_key="settlement-worker-claim",
+        )
         payload = b"first-output"
         valid = {"digest": _digest(payload), "data_base64": base64.b64encode(payload).decode("ascii"), "size": len(payload), "media_type": "application/octet-stream", "kind": "object", "name": "first"}
         with pytest.raises(ValidationError):
-            service.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"], "outputs": [valid, {"digest": "malformed"}]})
+            service.settle_attempt(
+                attempt["attempt_id"],
+                {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"], "outputs": [valid, {"digest": "malformed"}]},
+                idempotency_key="settlement-invalid",
+            )
         assert service.store.conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 0
         assert list((service.store.cas_root).glob("*/*")) == []
 
-        service.settle_attempt(attempt["attempt_id"], {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"], "outputs": [valid]})
+        service.settle_attempt(
+            attempt["attempt_id"],
+            {"lease_id": attempt["lease_id"], "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"], "outputs": [valid]},
+            idempotency_key="settlement-valid",
+        )
         assert service.store.conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 1
         assert service.store.conn.execute("SELECT COUNT(*) FROM project_objects WHERE project_id=?", (project["id"],)).fetchone()[0] == 1
         assert service.task(task["task"]["id"])["task"]["status"] == "completed"

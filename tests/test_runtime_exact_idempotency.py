@@ -7,7 +7,7 @@ from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
 
 
-def test_executor_registration_requires_key_and_replays_exactly_after_restart(tmp_path):
+def test_executor_registration_requires_key_and_fences_stale_replay_after_restart(tmp_path):
     root = tmp_path / "realm"
     support = tmp_path / "support"
     daemon = RuntimeDaemon(root, support_root=support).start()
@@ -31,7 +31,9 @@ def test_executor_registration_requires_key_and_replays_exactly_after_restart(tm
     restarted = RuntimeDaemon(root, support_root=support).start()
     try:
         api = Api(restarted.endpoint, restarted.token)
-        assert api.request("POST", "/v1/executors", executor, headers={"Idempotency-Key": "executor-exact"}) == first
+        with pytest.raises(RuntimeError) as stale:
+            api.request("POST", "/v1/executors", executor, headers={"Idempotency-Key": "executor-exact"})
+        assert stale.value.status == 409
         with pytest.raises(RuntimeError) as changed:
             api.request("POST", "/v1/executors", {**executor, "max_concurrency": 3}, headers={"Idempotency-Key": "executor-exact"})
         assert changed.value.status == 409

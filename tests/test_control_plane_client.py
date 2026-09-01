@@ -11,6 +11,11 @@ from banodoco_workspace_client import WorkspaceClient
 TASK = {"task_id": "t", "run_id": "r", "state": "queued", "version": 1, "capability_id": "render.basic", "capability_digest": "sha256:" + "b" * 64, "idempotency_key": "i", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z", "attempt_id": None, "runtime_epoch": 1}
 
 
+def mutation_response(data, command_kind: str, idempotency_key: str) -> bytes:
+    receipt = {"receipt_id": f"{command_kind}-receipt", "command_kind": command_kind, "idempotency_key": idempotency_key, "request_hash": "sha256:" + "a" * 64, "project_id": "runtime-realm", "project_seq": [1, 1], "event_ids": [], "result": {}, "created_at": "2026-01-01T00:00:00Z"}
+    return json.dumps({"data": data, "receipt": receipt}).encode()
+
+
 def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None:
     calls = []
 
@@ -24,7 +29,7 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
         if path.endswith("/cancel"):
             assert headers["Idempotency-Key"] == "cancel-1"
             assert json.loads(body) == {"expected_version": 1}
-            return 200, {}, json.dumps({**TASK, "state": "cancel_requested", "version": 2}).encode()
+            return 200, {}, mutation_response({**TASK, "state": "cancel_requested", "version": 2}, "task.cancel", headers["Idempotency-Key"])
         if path == "/v1/events?limit=10&cursor=c0&aggregate_id=t":
             event = {"event_id": "e", "sequence": 3, "cursor": "c1", "event_type": "task.cancel_requested", "aggregate_type": "task", "aggregate_id": "t", "payload": {}, "occurred_at": "2026-01-01T00:00:00Z"}
             return 200, {}, json.dumps({"items": [event], "next_cursor": "c1"}).encode()
@@ -39,11 +44,11 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
         if path.endswith("/settle"):
             value = json.loads(body)
             assert value["lease_id"] == "l" and value["fence"] == 4
-            return 200, {}, json.dumps({**TASK, "state": "succeeded", "version": 2}).encode()
+            return 200, {}, mutation_response({**TASK, "state": "succeeded", "version": 2}, "attempt.settle", headers["Idempotency-Key"])
         if path.endswith("/fail"):
             value = json.loads(body)
             assert value["lease_id"] == "l" and value["fence"] == 4
-            return 200, {}, json.dumps({**TASK, "state": "failed", "version": 2}).encode()
+            return 200, {}, mutation_response({**TASK, "state": "failed", "version": 2}, "attempt.fail", headers["Idempotency-Key"])
         raise AssertionError((method, path))
 
     client = WorkspaceClient("http://runtime", transport=transport)

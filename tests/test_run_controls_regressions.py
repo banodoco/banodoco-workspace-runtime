@@ -101,6 +101,7 @@ def test_cancelled_attempt_cannot_publish_late_outputs(tmp_path):
                 "runtime_epoch": attempt["runtime_epoch"],
                 "outputs": [{"digest": digest, "data_base64": "bGF0ZS1vdXRwdXQ="}],
             },
+            idempotency_key="late-settlement",
         )
     assert service.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest.removeprefix("sha256:"),)).fetchone() is None
     assert not service.cas.path_for(digest.removeprefix("sha256:")).exists()

@@ -38,9 +38,9 @@ def test_project_managed_object_and_fake_executor_end_to_end(daemon):
     same = client.create_project("demo", "Demo", {"theme": "neutral"}, idempotency_key="project-1")
     assert same["project_id"] == project["project_id"]
     source = b"managed bytes\x00"
-    obj = client.ingest("demo", source, media_type="application/octet-stream", original_name="source.bin")
+    obj = client.ingest("demo", source, media_type="application/octet-stream", original_name="source.bin", idempotency_key="source-object")
     digest = "sha256:" + hashlib.sha256(source).hexdigest()
-    assert obj["digest"] == digest
+    assert obj["data"]["digest"] == digest
     received, headers = client.read_object(digest)
     assert received == source
     assert headers["ETag"] == f'"{digest}"'

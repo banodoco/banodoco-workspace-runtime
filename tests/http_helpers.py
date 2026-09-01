@@ -40,10 +40,11 @@ class Api:
     def handshake(self): return self.request("GET", "/v1/handshake")
     def create_project(self, slug, name, metadata=None, idempotency_key=None): return self.request("POST", "/v1/projects", {"slug": slug, "name": name, "metadata": metadata or {}}, headers={"Idempotency-Key": idempotency_key or "test-project"})["data"]
     def get_project(self, selector): return self.request("GET", f"/v1/projects/{selector}")
-    def ingest(self, project, data, *, media_type="application/octet-stream", original_name=None, expected_digest=None):
+    def ingest(self, project, data, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None):
         headers = {"Content-Type": media_type}
         if original_name: headers["X-Original-Name"] = original_name
         if expected_digest: headers["X-Expected-Digest"] = expected_digest
+        headers["Idempotency-Key"] = idempotency_key or "test-ingest"
         return self.request("POST", f"/v1/projects/{project}/objects", raw=data, headers=headers)
     def read_object(self, digest, *, range_header=None): return self.request("GET", f"/v1/objects/{digest}", headers={"Range": range_header} if range_header else None)
     def create_task(self, capability, spec, *, project=None, idempotency_key=None, expected_effect=None): return self.request("POST", "/v1/tasks", {"capability_id": capability, "capability_digest": "sha256:" + __import__("hashlib").sha256(capability.encode()).hexdigest(), "input_object_ids": [], "spec": spec, "project": project, "settlement_effect": expected_effect}, headers={"Idempotency-Key": idempotency_key or "test-task"})["data"]
