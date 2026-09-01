@@ -8,7 +8,7 @@ import pytest
 
 from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
-from runtime_protocol.errors import ConflictError, LeaseError
+from runtime_protocol.errors import ConflictError, InvalidRequestError, LeaseError
 from runtime_protocol.service import RuntimeService
 
 
@@ -106,6 +106,72 @@ def test_startup_reconciles_journaled_publication_after_crash_seam(tmp_path: Pat
     recovered = RuntimeService(root)
     try:
         assert not recovered.cas.path_for(digest).exists()
+        assert list((root / "staging" / "publications").glob("*.json")) == []
+    finally:
+        recovered.close()
+
+
+def test_project_updates_require_idempotency_keys_at_service_boundary(tmp_path: Path) -> None:
+    service = RuntimeService(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "p1", "name": "P1"}, idempotency_key="project")
+        shot = service.create_project_shot(project["id"], {"name": "Shot", "metadata": {}}, idempotency_key="shot")
+        media = service.ingest(project["id"], b"reference-media", idempotency_key="media")
+        reference = service.create_project_reference(
+            project["id"],
+            {"kind": "object", "name": "Reference", "media_id": media["data"]["digest"], "metadata": {}},
+            idempotency_key="reference",
+        )
+        with pytest.raises(InvalidRequestError, match="Idempotency-Key is required"):
+            service.update_project_shot(project["id"], shot["data"]["shot_id"], {"expected_version": 1, "name": "Updated"})
+        with pytest.raises(InvalidRequestError, match="Idempotency-Key is required"):
+            service.update_project_reference(
+                project["id"], reference["data"]["reference_id"], {"expected_version": 1, "name": "Updated"}
+            )
+        with pytest.raises(InvalidRequestError, match="at most 256"):
+            service.update_project_shot(
+                project["id"], shot["data"]["shot_id"], {"expected_version": 1, "name": "Updated"}, idempotency_key="x" * 257
+            )
+    finally:
+        service.close()
+
+
+def test_publication_journal_is_retained_when_cleanup_fails_then_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "realm"
+    payload = b"retryable-cleanup-output"
+    digest = _digest(payload).removeprefix("sha256:")
+    service = RuntimeService(root)
+    service._begin_cas_publication_journal("ingest", [{"digest": digest}], project_id="unscoped")
+    service.cas.put(payload)
+    destination = service.cas.path_for(digest)
+    service.close()
+
+    original_unlink = Path.unlink
+    failed = False
+
+    def fail_destination_once(path, *args, **kwargs):
+        nonlocal failed
+        if path == destination and not failed:
+            failed = True
+            raise OSError("simulated cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_destination_once)
+    interrupted = RuntimeService(root)
+    try:
+        journal_paths = list((root / "staging" / "publications").glob("*.json"))
+        assert failed
+        assert destination.exists()
+        assert len(journal_paths) == 1
+    finally:
+        interrupted.close()
+
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    recovered = RuntimeService(root)
+    try:
+        assert not destination.exists()
         assert list((root / "staging" / "publications").glob("*.json")) == []
     finally:
         recovered.close()

@@ -674,6 +674,7 @@ class RuntimeService:
             except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
                 continue
             if not committed:
+                cleanup_failed = False
                 for entry in journal.get("entries", []):
                     digest = entry.get("digest") if isinstance(entry, dict) else None
                     if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
@@ -688,6 +689,9 @@ class RuntimeService:
                     except FileNotFoundError:
                         continue
                     except OSError:
+                        # Keep the durable evidence when cleanup fails so a
+                        # later startup can retry the exact destination.
+                        cleanup_failed = True
                         continue
                     try:
                         directory_fd = os.open(destination.parent, os.O_RDONLY)
@@ -697,6 +701,8 @@ class RuntimeService:
                             os.close(directory_fd)
                     except OSError:
                         pass
+                if cleanup_failed:
+                    continue
             self._remove_publication_journal(path)
 
     def _project_shot_resource(self, row):
@@ -780,6 +786,7 @@ class RuntimeService:
 
     @_durable_mutation
     def update_project_shot(self, project_id, shot_id, body, *, idempotency_key=None, archived=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
         self._require_object_body(body)
         project = self.store.get_project(project_id)
         expected = self._expected_version(body)
@@ -883,6 +890,7 @@ class RuntimeService:
 
     @_durable_mutation
     def update_project_reference(self, project_id, reference_id, body, *, idempotency_key=None, archived=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
         self._require_object_body(body)
         project = self.store.get_project(project_id); expected = self._expected_version(body); action = "update" if archived is None else "archive" if archived else "recover"; request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         with self.store._mutex:
