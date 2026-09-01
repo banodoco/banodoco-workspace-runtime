@@ -674,6 +674,12 @@ class WorkspaceClient:
     def add_shot_item(self, project_id: str, shot_id: str, item: Mapping[str, Any], *, idempotency_key: str) -> MutationResult:
         return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items", body=json.dumps(dict(item), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
+    def promote_project_shot_candidate(self, project_id: str, shot_id: str, candidate_item_id: str, *, expected_head_seq: int, timeline_assets: list[Mapping[str, Any]] | Mapping[str, Mapping[str, Any]] = (), idempotency_key: str) -> MutationResult:
+        payload: dict[str, Any] = {"candidate_item_id": candidate_item_id, "expected_head_seq": expected_head_seq}
+        if timeline_assets:
+            payload["timeline_assets"] = timeline_assets
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/promote-candidate", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
     def remove_shot_item(self, project_id: str, shot_id: str, item_id: str, *, expected_version: int, idempotency_key: str) -> MutationResult:
         return self._mutation_json(self._request("DELETE", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/items/{_path_part(item_id)}", body=json.dumps({"expected_version": expected_version}).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 

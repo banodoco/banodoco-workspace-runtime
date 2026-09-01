@@ -277,6 +277,12 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { name: item_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
       responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shots/{shot_id}/promote-candidate:
+    post:
+      operationId: promoteProjectShotCandidate
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotCandidatePromotion' } } } }
+      responses: { '200': { description: Atomically promoted shot candidate and stored invalidation report, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/shots/{shot_id}/reorder:
     post:
       operationId: reorderShotItems
@@ -898,6 +904,14 @@ components:
       additionalProperties: false
       required: [media_id]
       properties: { item_id: { type: string }, media_id: { type: string }, position: { type: integer, minimum: 0 }, source_frame: { type: integer, minimum: 0 }, metadata: { type: object } }
+    ShotCandidatePromotion:
+      type: object
+      additionalProperties: false
+      required: [candidate_item_id, expected_head_seq]
+      properties:
+        candidate_item_id: { type: string, minLength: 1 }
+        expected_head_seq: { type: integer, minimum: 1 }
+        timeline_assets: { type: array, items: { type: object } }
     ShotReorder:
       type: object
       additionalProperties: false

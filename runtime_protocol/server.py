@@ -337,6 +337,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     body = self._project_mutation_body()
                     if not key: raise ProtocolError("Idempotency-Key header is required")
                     return self._send(200, self.runtime.add_shot_item(selector, resource_id, body, idempotency_key=key))
+                if kind == "shots" and path[5:] == ["promote-candidate"] and method == "POST":
+                    body = self._project_mutation_body()
+                    if not key: raise ProtocolError("Idempotency-Key header is required")
+                    return self._send(200, self.runtime.promote_project_shot_candidate(selector, resource_id, body, idempotency_key=key))
                 if kind == "shots" and len(path) == 7 and path[5] == "items" and method == "DELETE":
                     body = self._project_mutation_body()
                     if not key: raise ProtocolError("Idempotency-Key header is required")

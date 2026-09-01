@@ -12,12 +12,14 @@ import base64
 import os
 import re
 import uuid
+from collections.abc import Mapping
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
+from .shot_dependencies import analyze_invalidation
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
@@ -880,6 +882,118 @@ class RuntimeService:
             for index, item_id in enumerate(item_ids): self.store.conn.execute("UPDATE shot_items SET sort_key=? WHERE id=?", (f"tmp-{index:08d}-{shot_id}", item_id))
             for index, item_id in enumerate(item_ids): self.store.conn.execute("UPDATE shot_items SET sort_key=? WHERE id=?", (f"{index:08d}", item_id))
             self.store.conn.execute("UPDATE project_shots SET version=version+1, updated_at=? WHERE id=?", (now(), shot_id)); result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone()); return self._command_record("shot.item.reorder", shot_id, idempotency_key, request_hash, result, project_id=project["id"])
+
+    @_durable_mutation
+    def promote_project_shot_candidate(self, project_id, shot_id, body, *, idempotency_key=None):
+        """Atomically promote a shot candidate and persist its invalidation report.
+
+        The receipt lookup is deliberately the first database read.  A retry
+        therefore returns the exact stored result without inspecting the
+        mutable shot, candidate, or media projections.
+        """
+        self._require_object_body(body)
+        key = require_idempotency_key(idempotency_key)
+        candidate_id = body.get("candidate_item_id")
+        expected = body.get("expected_head_seq")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ValidationError("candidate_item_id is required")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
+            raise ValidationError("expected_head_seq must be a positive integer")
+        timeline_assets = body.get("timeline_assets", [])
+        if isinstance(timeline_assets, Mapping):
+            timeline_assets = list(timeline_assets.values())
+        if not isinstance(timeline_assets, list) or any(not isinstance(item, Mapping) for item in timeline_assets):
+            raise ValidationError("timeline_assets must be a list of objects")
+        request = {"project_id": str(project_id), "shot_id": str(shot_id), "candidate_item_id": candidate_id, "expected_head_seq": expected, "timeline_assets": timeline_assets}
+        request_hash = hashlib.sha256(canonical_json(request).encode()).hexdigest()
+        # Receipt-first is important: do not resolve the project or read the
+        # shot before proving this is not an idempotent replay.
+        replay = self._command_replay("shot.promote_candidate", str(shot_id), key, request_hash, project_id=str(project_id))
+        if replay is not None:
+            return replay
+        project = self.store.get_project(project_id)
+        shot_row = self.store.conn.execute("SELECT * FROM project_shots WHERE id=? AND project_id=?", (str(shot_id), project["id"])).fetchone()
+        if shot_row is None:
+            raise NotFoundError("shot not found")
+        actual = int(shot_row["version"])
+        if actual != expected:
+            raise ConflictError("shot head conflict", details={"expected": expected, "actual": actual})
+        item_rows = self.store.conn.execute("SELECT * FROM shot_items WHERE shot_id=? ORDER BY sort_key, id", (str(shot_id),)).fetchall()
+        candidate_row = next((row for row in item_rows if str(row["id"]) == candidate_id), None)
+        if candidate_row is None:
+            raise NotFoundError("shot candidate not found")
+        try:
+            candidate_metadata = json.loads(candidate_row["metadata_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValidationError("candidate metadata is invalid") from exc
+        if not isinstance(candidate_metadata, dict) or candidate_metadata.get("role") != "primary_visual" or candidate_metadata.get("status") != "candidate":
+            raise ValidationError("candidate item must have role='primary_visual' and status='candidate'")
+        # Product provenance is carried in metadata, but the authority check
+        # is neutral: only verify fields that a producer supplied.
+        provenance = candidate_metadata.get("provenance")
+        recipe = candidate_metadata.get("recipe")
+        for label, value in (("candidate metadata", candidate_metadata), ("candidate provenance", provenance), ("candidate recipe", recipe)):
+            if not isinstance(value, Mapping):
+                continue
+            if value.get("project_id") is not None and str(value["project_id"]) != str(project["id"]):
+                raise ValidationError(f"{label} project_id does not match target project")
+            if value.get("shot_id") is not None and str(value["shot_id"]) != str(shot_id):
+                raise ValidationError(f"{label} shot_id does not match target shot")
+            if value.get("target_role") is not None and value["target_role"] != "primary_visual":
+                raise ValidationError(f"{label} target_role must be primary_visual")
+            supplied_media = value.get("media_id") or value.get("output_media_id")
+            if supplied_media is not None and str(supplied_media).removeprefix("sha256:") != str(candidate_row["media_id"]).removeprefix("sha256:"):
+                raise ValidationError(f"{label} media_id does not match candidate media")
+        media_digest = str(candidate_row["media_id"]).removeprefix("sha256:")
+        owned = self.store.conn.execute("SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest WHERE po.project_id=? AND o.digest=?", (project["id"], media_digest)).fetchone()
+        if owned is None:
+            raise NotFoundError("candidate media is not owned by project")
+        # Verify both the durable object identity and the bytes behind it.  A
+        # database row alone is not provenance evidence after a damaged CAS.
+        try:
+            actual_digest = sha256_bytes(self.cas.read(media_digest))
+        except Exception as exc:  # pragma: no cover - CAS backend-specific
+            raise ValidationError("candidate media is unavailable") from exc
+        if actual_digest != media_digest:
+            raise ValidationError("candidate media digest does not match stored bytes")
+        primaries = []
+        for row in item_rows:
+            metadata = json.loads(row["metadata_json"])
+            if isinstance(metadata, dict) and metadata.get("role") == "primary_visual" and metadata.get("status") == "primary":
+                primaries.append((row, metadata))
+        if len(primaries) > 1:
+            raise ValidationError("shot must contain at most one primary_visual item")
+        if primaries and str(primaries[0][0]["id"]) == candidate_id:
+            raise ValidationError("candidate item is already the primary")
+        updates = []
+        superseded_id = None
+        if primaries:
+            old_row, old_metadata = primaries[0]
+            superseded_id = str(old_row["id"])
+            old_metadata = dict(old_metadata); old_metadata["status"] = "superseded"
+            updates.append((superseded_id, old_metadata))
+        candidate_metadata = dict(candidate_metadata); candidate_metadata["status"] = "primary"
+        updates.append((candidate_id, candidate_metadata))
+        stamp = now()
+        resulting_head = self.store.promote_shot_items(shot_id, expected, updates, timestamp=stamp)
+        promoted = {"shot_id": str(shot_id), "project_id": str(project["id"]), "candidate_item_id": candidate_id, "primary_item_id": candidate_id, "superseded_item_id": superseded_id, "item_ids": [str(row["id"]) for row in item_rows], "event_head_seq": resulting_head}
+        item_resources = []
+        for row in self.store.conn.execute("SELECT * FROM shot_items WHERE shot_id=? ORDER BY sort_key, id", (shot_id,)).fetchall():
+            value = self._shot_item_resource(row)
+            value["media_id"] = "sha256:" + str(value["media_id"]).removeprefix("sha256:")
+            item_resources.append(value)
+        media_records = []
+        for row in self.store.conn.execute("SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest WHERE po.project_id=? ORDER BY o.digest", (project["id"],)).fetchall():
+            media_records.append({"id": "sha256:" + str(row["digest"]), "media_id": "sha256:" + str(row["digest"]), "content_hash": "sha256:" + str(row["digest"]), "digest": "sha256:" + str(row["digest"])})
+        relation_rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY from_digest, to_digest, kind, ordinal", (project["id"],)).fetchall()
+        relations = [{"from_media_id": "sha256:" + str(row["from_digest"]), "to_media_id": "sha256:" + str(row["to_digest"]), "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"])} for row in relation_rows]
+        invalidation = analyze_invalidation(item_resources, media_records, timeline_assets, media_relations=relations)
+        result = {"promotion": promoted, "invalidation": invalidation}
+        return self._command_record("shot.promote_candidate", str(shot_id), key, request_hash, result, project_id=project["id"])
+
+    # Short neutral service alias used by adapters that do not expose the
+    # project-qualified generated method name.
+    promote_candidate = promote_project_shot_candidate
 
     # -- immutable shot text bindings -----------------------------------
 

@@ -620,6 +620,21 @@ class RealmStore:
         rows = self.conn.execute("SELECT o.*, po.relation FROM objects o JOIN project_objects po ON po.digest=o.digest WHERE po.project_id=? ORDER BY o.created_at, o.digest", (p["id"],)).fetchall()
         return [dict(row) for row in rows]
 
+    def promote_shot_items(self, shot_id, expected_version, updates, *, timestamp):
+        """Apply candidate metadata and advance the shot head atomically."""
+        for item_id, metadata in updates:
+            self.conn.execute(
+                "UPDATE shot_items SET metadata_json=? WHERE id=? AND shot_id=?",
+                (canonical_json(metadata), str(item_id), str(shot_id)),
+            )
+        changed = self.conn.execute(
+            "UPDATE project_shots SET version=?, updated_at=? WHERE id=? AND version=?",
+            (int(expected_version) + 1, timestamp, str(shot_id), int(expected_version)),
+        ).rowcount
+        if changed != 1:
+            raise ConflictError("shot head conflict", details={"expected": int(expected_version)})
+        return int(expected_version) + 1
+
     def record_object(self, digest, size, media_type, original_name=None):
         with self._mutex:
             self.conn.execute("INSERT OR IGNORE INTO objects VALUES (?, ?, ?, ?, ?)", (digest, size, media_type, original_name, now()))
