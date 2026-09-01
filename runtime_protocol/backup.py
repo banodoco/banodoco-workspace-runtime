@@ -759,7 +759,11 @@ def structured_export(store) -> dict:
     documents = rows("SELECT * FROM project_documents ORDER BY project_id, created_at, id", lambda value: value | {"content": json.loads(value.pop("content_json"))})
     generations = rows("SELECT * FROM generations ORDER BY project_id, created_at, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
     variants = rows("SELECT * FROM generation_variants ORDER BY generation_id, created_at, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
+    shots = rows("SELECT * FROM project_shots ORDER BY project_id, created_at, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
+    shot_items = rows("SELECT * FROM shot_items ORDER BY shot_id, sort_key, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
+    text_bindings = rows("SELECT * FROM shot_text_bindings ORDER BY project_id, id")
+    text_binding_events = rows("SELECT * FROM shot_text_binding_events ORDER BY project_id, binding_id, seq", lambda value: value | {"payload": json.loads(value.pop("payload_json"))})
     owner_records = rows("SELECT source_table, source_key, source_ordinal, row_json, row_sha256, created_at FROM migration_owner_records ORDER BY source_table, source_ordinal, source_key")
     for record in owner_records:
         record["row"] = json.loads(record.pop("row_json"))
-    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "migration_owner_records": owner_records}
+    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events, "migration_owner_records": owner_records}

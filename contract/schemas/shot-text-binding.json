@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "workspace.v1/shot-text-binding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["binding_id", "project_id", "shot_id", "kind", "media_id", "head", "content_hash", "mime_type", "byte_size"],
+  "properties": {
+    "binding_id": {"type": "string", "minLength": 1},
+    "project_id": {"type": "string", "minLength": 1},
+    "shot_id": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["prompt", "voiceover_script", "transcript"]},
+    "slot": {"type": ["string", "null"]},
+    "media_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "event_stream_id": {"type": "string", "minLength": 1},
+    "head": {"type": "integer", "minimum": 1},
+    "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "mime_type": {"type": "string"},
+    "byte_size": {"type": "integer", "minimum": 0, "maximum": 1048576},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"}
+  }
+}

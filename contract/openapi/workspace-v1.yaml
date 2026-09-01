@@ -283,6 +283,32 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ShotId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotReorder' } } } }
       responses: { '200': { description: Updated shot mutation, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shot-text-bindings:
+    get:
+      operationId: listProjectShotTextBindings
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { name: shot_id, in: query, required: false, schema: { type: string } }, { name: kind, in: query, required: false, schema: { type: string, enum: [prompt, voiceover_script, transcript] } }, { name: slot, in: query, required: false, schema: { type: string } } ]
+      responses: { '200': { description: Project-scoped shot text bindings, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingPage' } } } } }
+    post:
+      operationId: setProjectShotTextBinding
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingSet' } } } }
+      responses: { '200': { description: Set text binding, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shot-text-bindings/{binding_id}:
+    get:
+      operationId: getProjectShotTextBinding
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/BindingId' } ]
+      responses: { '200': { description: Shot text binding, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBinding' } } } } }
+    post:
+      operationId: setProjectShotTextBindingById
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/BindingId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingSetById' } } } }
+      responses: { '200': { description: Set text binding, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/projects/{project_id}/shot-text-bindings/{binding_id}/rebind:
+    post:
+      operationId: rebindProjectShotTextBinding
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/BindingId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ShotTextBindingRebind' } } } }
+      responses: { '200': { description: Rebound text binding, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/projects/{project_id}/references:
     post:
       operationId: createProjectReference
@@ -545,6 +571,7 @@ components:
     AttemptId: { name: attempt_id, in: path, required: true, schema: { type: string } }
     TimelineId: { name: timeline_id, in: path, required: true, schema: { type: string } }
     ShotId: { name: shot_id, in: path, required: true, schema: { type: string } }
+    BindingId: { name: binding_id, in: path, required: true, schema: { type: string, minLength: 1 } }
     ReferenceId: { name: reference_id, in: path, required: true, schema: { type: string } }
     DocumentId: { name: document_id, in: path, required: true, schema: { type: string } }
     GenerationId: { name: generation_id, in: path, required: true, schema: { type: string } }
@@ -880,6 +907,30 @@ components:
       type: object
       required: [items, next_cursor]
       properties: { items: { type: array, items: { $ref: '#/components/schemas/ProjectShot' } }, next_cursor: { type: [string, 'null'] } }
+    ShotTextBinding:
+      type: object
+      additionalProperties: false
+      required: [binding_id, project_id, shot_id, kind, media_id, event_stream_id, head, content_hash, mime_type, byte_size, created_at, updated_at]
+      properties: { binding_id: { type: string }, project_id: { type: string }, shot_id: { type: string }, kind: { type: string, enum: [prompt, voiceover_script, transcript] }, slot: { type: [string, 'null'] }, media_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, event_stream_id: { type: string }, head: { type: integer, minimum: 1 }, content_hash: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, mime_type: { type: string }, byte_size: { type: integer, minimum: 0, maximum: 1048576 }, created_at: { type: string }, updated_at: { type: string } }
+    ShotTextBindingPage:
+      type: object
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: '#/components/schemas/ShotTextBinding' } }, next_cursor: { type: [string, 'null'] } }
+    ShotTextBindingSet:
+      type: object
+      additionalProperties: false
+      required: [shot_id, kind, expected_head, text]
+      properties: { binding_id: { type: string }, shot_id: { type: string }, kind: { type: string, enum: [prompt, voiceover_script, transcript] }, slot: { type: [string, 'null'] }, expected_head: { type: integer, minimum: 0 }, text: { type: string, maxLength: 1048576 } }
+    ShotTextBindingSetById:
+      type: object
+      additionalProperties: false
+      required: [expected_head, text]
+      properties: { binding_id: { type: string }, expected_head: { type: integer, minimum: 1 }, text: { type: string, maxLength: 1048576 } }
+    ShotTextBindingRebind:
+      type: object
+      additionalProperties: false
+      required: [media_id, expected_head]
+      properties: { binding_id: { type: string }, shot_id: { type: string }, kind: { type: string }, slot: { type: [string, 'null'] }, media_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, expected_head: { type: integer, minimum: 1 } }
     ReferenceAssociation:
       type: object
       additionalProperties: false

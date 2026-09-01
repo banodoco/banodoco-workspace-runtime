@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
@@ -194,6 +194,9 @@ class RealmStore:
         if version < 19:
             self._run_migration(19)
             version = 19
+        if version < 20:
+            self._run_migration(20)
+            version = 20
 
     def _run_receipt_backfill_migration(self):
         """Backfill pre-016 rows inside one retryable migration transaction."""
@@ -1390,6 +1393,7 @@ class RealmStore:
             "command_idempotency", "project_sequences",
             "canonical_receipt_backfills",
             "timeline_events",
+            "shot_text_bindings", "shot_text_binding_events",
             "runtime_lifecycle",
             "recovery_checkpoints",
             "realm_lifecycle",

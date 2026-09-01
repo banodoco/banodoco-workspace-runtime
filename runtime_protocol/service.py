@@ -11,6 +11,7 @@ import sqlite3
 import base64
 import os
 import re
+import uuid
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,10 @@ REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
+TEXT_BINDING_KINDS = ("prompt", "voiceover_script", "transcript")
+TEXT_BINDING_MAX_BYTES = 1_048_576
+TEXT_BINDING_SLOT_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+TEXT_BINDING_IDENTITY_SCHEMA = "workspace.shot.text_binding.identity/v1"
 
 
 def validate_idempotency_key(value):
@@ -875,6 +880,264 @@ class RuntimeService:
             for index, item_id in enumerate(item_ids): self.store.conn.execute("UPDATE shot_items SET sort_key=? WHERE id=?", (f"tmp-{index:08d}-{shot_id}", item_id))
             for index, item_id in enumerate(item_ids): self.store.conn.execute("UPDATE shot_items SET sort_key=? WHERE id=?", (f"{index:08d}", item_id))
             self.store.conn.execute("UPDATE project_shots SET version=version+1, updated_at=? WHERE id=?", (now(), shot_id)); result = self._project_shot_resource(self.store.conn.execute("SELECT * FROM project_shots WHERE id=?", (shot_id,)).fetchone()); return self._command_record("shot.item.reorder", shot_id, idempotency_key, request_hash, result, project_id=project["id"])
+
+    # -- immutable shot text bindings -----------------------------------
+
+    @staticmethod
+    def _text_binding_id(project_id, shot_id, kind, slot):
+        if not isinstance(kind, str) or kind not in TEXT_BINDING_KINDS:
+            raise ValidationError("kind must be prompt, voiceover_script, or transcript", details={"reason": "kind"})
+        if slot is not None and (kind != "prompt" or not isinstance(slot, str) or not TEXT_BINDING_SLOT_RE.fullmatch(slot)):
+            raise ValidationError("slot is allowed only for prompt bindings and must be a lowercase slug", details={"reason": "slot"})
+        identity = {"schema": TEXT_BINDING_IDENTITY_SCHEMA, "project_id": str(project_id), "shot_id": str(shot_id), "kind": kind, "slot": slot}
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, canonical_json(identity)))
+
+    @staticmethod
+    def _freeze_text(value):
+        if isinstance(value, str):
+            value = value.encode("utf-8")
+        if not isinstance(value, (bytes, bytearray, memoryview)):
+            raise ValidationError("text must be UTF-8 text or bytes", details={"reason": "text"})
+        data = bytes(value)
+        if len(data) > TEXT_BINDING_MAX_BYTES:
+            raise ValidationError("text exceeds 1 MiB", details={"reason": "too_large"})
+        try:
+            data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValidationError("text is not valid UTF-8", details={"reason": "invalid_utf8"}) from exc
+        return data, sha256_bytes(data)
+
+    def _verify_text_object(self, project_id, digest, *, candidate=False):
+        digest = str(digest).removeprefix("sha256:")
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            details = {"reason": "malformed_hash", "media_id": "sha256:" + digest}
+            if candidate:
+                raise ValidationError("text media candidate failed integrity", details=details)
+            raise ConflictError("bound text media failed integrity", details=details)
+        row = self.store.conn.execute(
+            "SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest "
+            "WHERE o.digest=? AND po.project_id=? AND po.relation='managed'", (digest, project_id)
+        ).fetchone()
+        reason = None
+        if row is None:
+            reason = "media_not_owned"
+        elif not str(row["media_type"]).startswith("text/"):
+            reason = "media_type_not_text"
+        elif int(row["size"]) > TEXT_BINDING_MAX_BYTES:
+            reason = "text_too_large"
+        else:
+            path = self.cas.path_for(digest)
+            try:
+                if path.is_symlink() or not path.is_file():
+                    reason = "managed_file_not_regular"
+                else:
+                    data = path.read_bytes()
+                    if len(data) != int(row["size"]): reason = "managed_size_mismatch"
+                    elif sha256_bytes(data) != digest: reason = "managed_hash_mismatch"
+                    else:
+                        data.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                reason = "managed_bytes_invalid_utf8"
+            except (OSError, ValidationError):
+                reason = "managed_file_missing"
+        if reason:
+            details = {"reason": reason, "media_id": "sha256:" + digest}
+            if candidate:
+                raise ValidationError("text media candidate failed integrity", details=details)
+            raise ConflictError("bound text media failed integrity", details=details)
+        return row
+
+    def _text_binding_resource(self, row, *, verify=True):
+        project_id = str(row["project_id"])
+        shot = self.store.conn.execute("SELECT project_id FROM project_shots WHERE id=?", (row["shot_id"],)).fetchone()
+        if shot is None or str(shot["project_id"]) != project_id:
+            raise ConflictError("text binding shot is outside its project", details={"reason": "binding_shot_project_mismatch"})
+        expected_id = self._text_binding_id(project_id, row["shot_id"], row["kind"], row["slot"])
+        if str(row["id"]) != expected_id:
+            raise ConflictError("text binding identity is corrupt", details={"reason": "binding_natural_tuple_mismatch"})
+        expected_stream = expected_id + ":shot.text_binding"
+        if str(row["event_stream_id"]) != expected_stream:
+            raise ConflictError("text binding stream identity is corrupt", details={"reason": "binding_stream_id_mismatch"})
+        events = self.store.conn.execute(
+            "SELECT event_id, project_id, seq, kind, payload_json, previous_hash, event_hash "
+            "FROM shot_text_binding_events WHERE binding_id=? ORDER BY seq", (row["id"],)
+        ).fetchall()
+        if int(row["head_seq"]) != len(events) or any(int(event["seq"]) != index for index, event in enumerate(events, 1)):
+            raise ConflictError("text binding replay ordering is corrupt", details={"reason": "binding_event_order"})
+        previous_hash = ""
+        for event in events:
+            try:
+                payload = json.loads(event["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                raise ConflictError("text binding event payload is corrupt", details={"reason": "binding_event_payload"})
+            if str(event["project_id"]) != project_id or str(event["previous_hash"]) != previous_hash:
+                raise ConflictError("text binding event chain is corrupt", details={"reason": "binding_event_chain"})
+            expected_hash = hashlib.sha256(canonical_json({
+                "event_id": event["event_id"], "binding_id": row["id"], "seq": int(event["seq"]),
+                "kind": event["kind"], "payload": payload, "previous_hash": previous_hash,
+            }).encode()).hexdigest()
+            if str(event["event_hash"]) != expected_hash:
+                raise ConflictError("text binding event hash is corrupt", details={"reason": "binding_event_hash"})
+            previous_hash = expected_hash
+        if verify:
+            media = self._verify_text_object(project_id, row["media_digest"])
+        else:
+            media = self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (row["media_digest"],)).fetchone()
+        if media is None:
+            raise ConflictError("bound text media is missing", details={"reason": "bound_media_missing"})
+        return {
+            "binding_id": str(row["id"]), "project_id": project_id, "shot_id": str(row["shot_id"]),
+            "kind": str(row["kind"]), "slot": row["slot"], "media_id": "sha256:" + str(media["digest"]),
+            "event_stream_id": str(row["event_stream_id"]), "head": int(row["head_seq"]),
+            "content_hash": "sha256:" + str(media["digest"]), "mime_type": str(media["media_type"]),
+            "byte_size": int(media["size"]), "created_at": str(row["created_at"]), "updated_at": str(row["updated_at"]),
+        }
+
+    def _resolve_text_binding(self, project_id, body):
+        binding_id = body.get("binding_id")
+        if binding_id is not None:
+            if any(body.get(key) is not None for key in ("shot_id", "shot_ref", "kind", "slot")):
+                raise ValidationError("binding_id cannot be combined with friendly selectors")
+            row = self.store.conn.execute("SELECT * FROM shot_text_bindings WHERE id=? AND project_id=?", (str(binding_id), project_id)).fetchone()
+            if row is None: raise NotFoundError("text binding not found")
+            return row
+        shot_id = body.get("shot_id") or body.get("shot_ref")
+        kind = body.get("kind")
+        if not shot_id or not kind: raise ValidationError("shot_id and kind are required")
+        self.store.get_project(project_id)
+        shot = self.store.conn.execute("SELECT id FROM project_shots WHERE id=? AND project_id=?", (shot_id, project_id)).fetchone()
+        if shot is None: raise NotFoundError("shot not found")
+        slot = body.get("slot")
+        self._text_binding_id(project_id, shot["id"], kind, slot)
+        params = [project_id, shot["id"], kind]
+        query = "SELECT * FROM shot_text_bindings WHERE project_id=? AND shot_id=? AND kind=?"
+        if "slot" in body:
+            query += " AND slot IS ?"; params.append(slot)
+        rows = self.store.conn.execute(query + " ORDER BY slot IS NOT NULL ASC, slot ASC, id ASC", tuple(params)).fetchall()
+        if not rows: raise NotFoundError("text binding not found")
+        if len(rows) > 1: raise ConflictError("text binding selector is ambiguous", details={"reason": "ambiguous_selector", "candidates": [str(value["id"]) for value in rows]})
+        return rows[0]
+
+    def _record_text_binding_event(self, row, event_kind, payload, *, timestamp):
+        prior = self.store.conn.execute("SELECT event_hash FROM shot_text_binding_events WHERE binding_id=? ORDER BY seq DESC LIMIT 1", (row["id"],)).fetchone()
+        previous_hash = str(prior[0]) if prior else ""
+        seq = int(row["head_seq"]) + 1
+        event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{row['id']}:shot.text_binding:{seq}"))
+        event_hash = hashlib.sha256(canonical_json({"event_id": event_id, "binding_id": row["id"], "seq": seq, "kind": event_kind, "payload": payload, "previous_hash": previous_hash}).encode()).hexdigest()
+        self.store.conn.execute("INSERT INTO shot_text_binding_events(event_id,binding_id,project_id,seq,kind,payload_json,previous_hash,event_hash,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (event_id, row["id"], row["project_id"], seq, event_kind, canonical_json(payload), previous_hash, event_hash, timestamp))
+        return event_id, seq
+
+    def _materialize_text_object(self, project_id, data, digest):
+        existing = self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (digest,)).fetchone()
+        if existing is not None:
+            # CAS objects are workspace-global, while ownership is project
+            # scoped.  A byte-identical object imported by another path may be
+            # reused, but only after independently checking its immutable
+            # bytes; then attach the project managed-local relation.
+            if not str(existing["media_type"]).startswith("text/") or int(existing["size"]) > TEXT_BINDING_MAX_BYTES:
+                raise ValidationError("text media candidate failed integrity", details={"reason": "media_type_not_text", "media_id": "sha256:" + digest})
+            try:
+                path = self.cas.path_for(digest)
+                if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+                    raise ValidationError("text media candidate failed integrity", details={"reason": "managed_hash_mismatch", "media_id": "sha256:" + digest})
+            except OSError as exc:
+                raise ValidationError("text media candidate failed integrity", details={"reason": "managed_file_missing", "media_id": "sha256:" + digest}) from exc
+            relation = self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=? AND relation='managed'", (project_id, digest)).fetchone()
+            if relation is None:
+                self.store.conn.execute("INSERT INTO project_objects(project_id,digest,relation,created_at) VALUES (?,?, 'managed', ?)", (project_id, digest, now()))
+            return existing
+        path = self.cas.path_for(digest)
+        if not path.exists():
+            self._begin_cas_publication_journal("shot-text-binding", [{"digest": digest}], project_id=project_id)
+            self.cas.put(data, expected_digest=digest)
+        stamp = now()
+        self.store.conn.execute("INSERT INTO objects(digest,size,media_type,original_name,created_at) VALUES (?,?,?,?,?)", (digest, len(data), "text/plain", digest + ".txt", stamp))
+        self.store.conn.execute("INSERT INTO project_objects(project_id,digest,relation,created_at) VALUES (?,?, 'managed', ?)", (project_id, digest, stamp))
+        return self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (digest,)).fetchone()
+
+    @_durable_mutation
+    def set_project_shot_text_binding(self, project_id, body, *, idempotency_key=None):
+        require_idempotency_key(idempotency_key)
+        self._require_object_body(body)
+        project = self.store.get_project(project_id); project_id = str(project["id"])
+        expected = body.get("expected_head")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0: raise ValidationError("expected_head must be a non-negative integer", details={"reason": "expected_head"})
+        data, digest = self._freeze_text(body.get("text"))
+        if expected == 0:
+            if body.get("binding_id") is not None: raise ValidationError("head 0 requires a friendly shot selector", details={"reason": "expected_head"})
+            shot_id = body.get("shot_id") or body.get("shot_ref"); kind = body.get("kind"); slot = body.get("slot")
+            if not shot_id: raise ValidationError("shot_id is required")
+            self._text_binding_id(project_id, shot_id, kind, slot)
+            shot = self.store.conn.execute("SELECT id FROM project_shots WHERE id=? AND project_id=?", (shot_id, project_id)).fetchone()
+            if shot is None: raise NotFoundError("shot not found")
+            binding_id = self._text_binding_id(project_id, shot["id"], kind, slot)
+            stream_id = binding_id + ":shot.text_binding"
+            row = self.store.conn.execute("SELECT * FROM shot_text_bindings WHERE id=?", (binding_id,)).fetchone()
+        else:
+            row = self._resolve_text_binding(project_id, body); binding_id = str(row["id"]); stream_id = str(row["event_stream_id"])
+            if int(row["head_seq"]) != expected: raise ConflictError("text binding head is stale", details={"expected_head": expected, "actual_head": int(row["head_seq"]), "binding_id": binding_id})
+        facts = {"project_id": project_id, "binding_id": binding_id, "event_stream_id": stream_id, "expected_head": expected, "desired_content_hash": "sha256:" + digest}
+        req_hash = hashlib.sha256(canonical_json({"command_kind": "shot.text_binding.set", **facts}).encode()).hexdigest()
+        replay = self._command_replay("shot.text_binding.set", binding_id, idempotency_key, req_hash, project_id=project_id)
+        if replay is not None: return replay
+        if expected == 0 and row is not None:
+            raise ConflictError("text binding head is stale", details={"expected_head": 0, "actual_head": int(row["head_seq"]), "binding_id": binding_id})
+        if expected != 0:
+            self._text_binding_resource(row)
+        if expected == 0:
+            desired = self._materialize_text_object(project_id, data, digest)
+            stamp = now(); self.store.conn.execute("INSERT INTO shot_text_bindings(id,project_id,shot_id,kind,slot,media_digest,event_stream_id,head_seq,created_at,updated_at) VALUES (?,?,?,?,?,?,?,0,?,?)", (binding_id, project_id, shot_id, kind, slot, digest, stream_id, stamp, stamp))
+            row = self.store.conn.execute("SELECT * FROM shot_text_bindings WHERE id=?", (binding_id,)).fetchone()
+            event_id, seq = self._record_text_binding_event(row, "shot.text_binding.created", {"binding_id": binding_id, "media_id": "sha256:" + digest, "content_hash": "sha256:" + digest}, timestamp=stamp)
+            self.store.conn.execute("UPDATE shot_text_bindings SET head_seq=1 WHERE id=?", (binding_id,))
+        else:
+            desired = self._materialize_text_object(project_id, data, digest) if self.store.conn.execute("SELECT 1 FROM objects WHERE digest=? AND EXISTS (SELECT 1 FROM project_objects WHERE project_id=? AND digest=? AND relation='managed')", (digest, project_id, digest)).fetchone() is None else self._verify_text_object(project_id, digest, candidate=True)
+            if str(row["media_digest"]) == digest:
+                return {"data": self._text_binding_resource(row), "receipt": None}
+            stamp = now(); event_id, seq = self._record_text_binding_event(row, "shot.text_binding.rebound", {"binding_id": binding_id, "previous_media_id": "sha256:" + str(row["media_digest"]), "media_id": "sha256:" + digest, "content_hash": "sha256:" + digest}, timestamp=stamp)
+            self.store.conn.execute("UPDATE shot_text_bindings SET media_digest=?, head_seq=?, updated_at=? WHERE id=?", (digest, seq, stamp, binding_id))
+        result = self._text_binding_resource(self.store.conn.execute("SELECT * FROM shot_text_bindings WHERE id=?", (binding_id,)).fetchone())
+        recorded = self._command_record("shot.text_binding.set", binding_id, idempotency_key, req_hash, result, project_id=project_id, event_ids=(event_id,), primary_stream_id=stream_id, resulting_stream_seq=seq)
+        return recorded
+
+    @_durable_mutation
+    def rebind_project_shot_text_binding(self, project_id, body, *, idempotency_key=None):
+        require_idempotency_key(idempotency_key); self._require_object_body(body)
+        project = self.store.get_project(project_id); project_id = str(project["id"])
+        expected = body.get("expected_head")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1: raise ValidationError("rebind requires a positive expected_head", details={"reason": "expected_head"})
+        row = self._resolve_text_binding(project_id, body)
+        if int(row["head_seq"]) != expected: raise ConflictError("text binding head is stale", details={"expected_head": expected, "actual_head": int(row["head_seq"]), "binding_id": str(row["id"])})
+        desired_digest = str(body.get("media_id") or body.get("content_hash") or "").removeprefix("sha256:")
+        if not re.fullmatch(r"[0-9a-f]{64}", desired_digest): raise ValidationError("media_id must be a SHA-256 object id", details={"reason": "media_id"})
+        facts = {"project_id": project_id, "binding_id": str(row["id"]), "event_stream_id": str(row["event_stream_id"]), "expected_head": expected, "desired_media_id": "sha256:" + desired_digest, "desired_content_hash": "sha256:" + desired_digest}
+        req_hash = hashlib.sha256(canonical_json({"command_kind": "shot.text_binding.rebind", **facts}).encode()).hexdigest()
+        replay = self._command_replay("shot.text_binding.rebind", str(row["id"]), idempotency_key, req_hash, project_id=project_id)
+        if replay is not None: return replay
+        current = self._text_binding_resource(row)
+        self._verify_text_object(project_id, desired_digest, candidate=True)
+        if str(row["media_digest"]) == desired_digest: return {"data": current, "receipt": None}
+        stamp = now(); event_id, seq = self._record_text_binding_event(row, "shot.text_binding.rebound", {"binding_id": str(row["id"]), "previous_media_id": current["media_id"], "media_id": "sha256:" + desired_digest, "content_hash": "sha256:" + desired_digest}, timestamp=stamp)
+        self.store.conn.execute("UPDATE shot_text_bindings SET media_digest=?, head_seq=?, updated_at=? WHERE id=?", (desired_digest, seq, stamp, row["id"]))
+        result = self._text_binding_resource(self.store.conn.execute("SELECT * FROM shot_text_bindings WHERE id=?", (row["id"],)).fetchone())
+        return self._command_record("shot.text_binding.rebind", str(row["id"]), idempotency_key, req_hash, result, project_id=project_id, event_ids=(event_id,), primary_stream_id=str(row["event_stream_id"]), resulting_stream_seq=seq)
+
+    def get_project_shot_text_binding(self, project_id, binding_id):
+        project = self.store.get_project(project_id)
+        row = self.store.conn.execute("SELECT * FROM shot_text_bindings WHERE id=? AND project_id=?", (binding_id, project["id"])).fetchone()
+        if row is None: raise NotFoundError("text binding not found")
+        return self._text_binding_resource(row)
+
+    def list_project_shot_text_bindings(self, project_id, *, shot_id=None, kind=None, slot=None):
+        project = self.store.get_project(project_id); project_id = str(project["id"])
+        params = [project_id]; query = "SELECT * FROM shot_text_bindings WHERE project_id=?"
+        if shot_id is not None: query += " AND shot_id=?"; params.append(shot_id)
+        if kind is not None:
+            if kind not in TEXT_BINDING_KINDS: raise ValidationError("invalid text binding kind")
+            query += " AND kind=?"; params.append(kind)
+        if slot is not None: query += " AND slot=?"; params.append(slot)
+        rows = self.store.conn.execute(query + " ORDER BY id", tuple(params)).fetchall()
+        return {"items": [self._text_binding_resource(row) for row in rows], "next_cursor": None}
 
     def _project_reference_resource(self, row):
         value = dict(row); value["reference_id"] = value.pop("id"); value["metadata"] = json.loads(value.pop("metadata_json")); value["archived"] = bool(value.pop("archived_at")); value["media_references"] = []

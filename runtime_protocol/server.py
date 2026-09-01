@@ -297,6 +297,24 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 include_archived = query.get("include_archived", ["false"])[0].lower() == "true"
                 value = self.runtime.list_project_shots(selector, cursor=query.get("cursor", [None])[0], include_archived=include_archived, limit=query.get("limit", [50])[0]) if path[3] == "shots" else self.runtime.list_project_references(selector, cursor=query.get("cursor", [None])[0], include_archived=include_archived, limit=query.get("limit", [50])[0])
                 return self._send(200, value)
+            if len(path) == 4 and path[3] == "shot-text-bindings":
+                self._identity("projects:read" if method == "GET" else "projects:write")
+                query = parse_qs(urlsplit(self.path).query)
+                if method == "GET":
+                    return self._send(200, self.runtime.list_project_shot_text_bindings(selector, shot_id=query.get("shot_id", [None])[0], kind=query.get("kind", [None])[0], slot=query.get("slot", [None])[0]))
+                if method == "POST":
+                    return self._send(200, self.runtime.set_project_shot_text_binding(selector, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+            if len(path) == 5 and path[3] == "shot-text-bindings":
+                self._identity("projects:read" if method == "GET" else "projects:write")
+                if method == "GET":
+                    return self._send(200, self.runtime.get_project_shot_text_binding(selector, path[4]))
+                if method == "POST":
+                    body = self._project_mutation_body(); body["binding_id"] = path[4]
+                    return self._send(200, self.runtime.set_project_shot_text_binding(selector, body, idempotency_key=self._idempotency_key()))
+            if len(path) == 6 and path[3] == "shot-text-bindings" and path[5] == "rebind" and method == "POST":
+                self._identity("projects:write")
+                body = self._project_mutation_body(); body["binding_id"] = path[4]
+                return self._send(200, self.runtime.rebind_project_shot_text_binding(selector, body, idempotency_key=self._idempotency_key()))
             if len(path) >= 5 and path[3] in ("shots", "references"):
                 kind, resource_id = path[3], path[4]
                 self._identity("projects:read" if method == "GET" else "projects:write")
