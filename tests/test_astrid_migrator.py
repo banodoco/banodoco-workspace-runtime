@@ -112,3 +112,26 @@ def test_active_writer_refuses_before_archive_or_client_calls(tmp_path):
     with pytest.raises(MigrationError, match="writer"):
         migrate(MigrationConfig(tmp_path, tmp_path.parent / "archive-freeze", tmp_path.parent / "destination-freeze", freeze_probe=lambda: False), FakeClient())
     assert not (tmp_path.parent / "archive-freeze").exists()
+
+
+def test_source_freeze_does_not_report_its_own_writer_lock_as_active(tmp_path):
+    """The freeze's held descriptor must not fail its second flock probe.
+
+    macOS treats a second descriptor opened by the same process as a
+    conflicting non-blocking flock.  This lock file therefore reproduces the
+    self-lock failure while asserting that external writer protection still
+    allows a normal migration once this process owns the lock.
+    """
+    _fixture(tmp_path)
+    (tmp_path / ".astrid" / "writer.lock").touch()
+
+    report = migrate(
+        MigrationConfig(
+            tmp_path,
+            tmp_path.parent / "archive-self-lock",
+            tmp_path.parent / "destination-self-lock",
+        ),
+        FakeClient(),
+    )
+
+    assert report["reconciliation"]["ok"] is True

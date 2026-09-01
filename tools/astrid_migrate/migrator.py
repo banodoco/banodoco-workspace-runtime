@@ -320,7 +320,24 @@ def _source_database(root: Path) -> Path:
     raise MigrationError("Astrid source database was not found")
 
 
-def _assert_writer_free(source_root: Path, database: Path, probe: Callable[[], bool] | None) -> None:
+def _assert_writer_free(
+    source_root: Path,
+    database: Path,
+    probe: Callable[[], bool] | None,
+    *,
+    held_lock_paths: set[Path] | None = None,
+) -> None:
+    """Fail closed unless no writer owns any legacy lock.
+
+    ``source_freeze`` already owns the lock descriptors for the duration of
+    the critical section.  Reopening one of those paths for a second flock
+    probe is self-conflicting on macOS (and on some other flock
+    implementations), so those exact paths are excluded from the probe.  The
+    acquisition itself remains non-blocking and therefore still protects the
+    migration from an external writer; every lock path not held by this
+    freeze scope is still probed here.
+    """
+    held_lock_paths = held_lock_paths or set()
     if probe is not None and not probe():
         raise MigrationError("Astrid writer freeze preflight failed; stop Astrid and retry")
     # The legacy app's lock is advisory but is enough to refuse an active
@@ -331,6 +348,8 @@ def _assert_writer_free(source_root: Path, database: Path, probe: Callable[[], b
     except ImportError:  # pragma: no cover
         fcntl = None
     for lock_path in lock_paths:
+        if lock_path in held_lock_paths:
+            continue
         if not lock_path.exists() or fcntl is None:
             continue
         handle = lock_path.open("rb")
@@ -392,7 +411,12 @@ class Migrator:
         self._freeze_handles = handles
         started = time.time()
         try:
-            _assert_writer_free(self.config.source_root, self.database, self.config.freeze_probe)
+            _assert_writer_free(
+                self.config.source_root,
+                self.database,
+                self.config.freeze_probe,
+                held_lock_paths={Path(handle.name) for handle, _ in handles},
+            )
             yield {"started_at": started, "lock_count": len(handles)}
         finally:
             for handle, module in reversed(handles):
