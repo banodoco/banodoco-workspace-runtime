@@ -28,6 +28,7 @@ HTTP boundary, project CRUD, managed object ingest and authenticated byte
 reads (`ETag`/`Range`), deterministic worker claim/settlement, restart
 reconnect, hash verification, path safety, and sole-owner refusal.
 
-The HTTP binding in this slice is intentionally a small runtime transport
-shim used by tests; canonical OpenAPI and generated product bindings belong to
-the protocol/conformance lane. No runtime module imports a product checkout.
+The HTTP binding in this slice is the canonical Stage 1 runtime transport
+boundary used by the daemon and product integrations. OpenAPI and generated
+product bindings consume this same protocol contract in the
+protocol/conformance lane. No runtime module imports a product checkout.
