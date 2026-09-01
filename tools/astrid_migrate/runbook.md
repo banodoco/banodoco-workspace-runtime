@@ -102,6 +102,69 @@ it does not create `-live-candidate` or `-live-reactivated`. The explicit
 trees. The terminal receipt is `activated-destination-b12.json` with journal
 state `reactivated`.
 
+## Actual reboot continuity (Stage 1 only)
+
+Run this only after B12 is terminal and the runtime is not performing a
+migration. The arm command is read-only with respect to the realm and writes
+two owner-only artifacts below the existing evidence root: `stage1-b12-reboot.json`
+(R1) and a one-shot user LaunchAgent plist. It never invokes `reboot` or
+`launchctl`:
+
+```bash
+astrid-live-migrate stage1-reboot-arm \
+  --evidence-root /absolute/migration/migration-evidence-b12 \
+  --active-root /absolute/Banodoco/runtime/realms/REALM_ID \
+  --support-root /absolute/Banodoco/runtime \
+  --realm-id REALM_ID
+```
+
+Review the JSON output and R1 at
+`/absolute/migration/migration-evidence-b12/stage1-b12-reboot.json`. It must
+show the terminal B12.4 receipt, `journal_state=reactivated`, and the
+pre-reboot OS boot identity. Explicitly load the generated LaunchAgent; this
+changes the user's launchd state and is the first machine-level action:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" \
+  /absolute/migration/migration-evidence-b12/stage1-b12-reboot-resume.plist
+```
+
+Confirm that the job is loaded, then perform the one actual machine reboot:
+
+```bash
+launchctl print "gui/$(id -u)/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID"
+sudo /sbin/reboot
+```
+
+The existing runtime launch must bring the selected realm back. The
+LaunchAgent has a bounded 120-second wait for that existing cold launch, then
+calls `stage1-reboot-resume`; it refuses to proceed unless the OS boot identity
+and runtime epoch both changed, and writes
+`stage1-b12-reboot-r2.json`. If launchd ran before the runtime came up, rerun
+the same resume command manually after the runtime launch; it is durable and
+idempotent:
+
+Keep this checkout and its verified interpreter in place until R2 is captured;
+the generated plist binds this checkout in `WorkingDirectory`.
+
+```bash
+astrid-live-migrate stage1-reboot-resume \
+  --evidence-root /absolute/migration/migration-evidence-b12 \
+  --active-root /absolute/Banodoco/runtime/realms/REALM_ID \
+  --support-root /absolute/Banodoco/runtime \
+  --realm-id REALM_ID
+```
+
+R2 is complete only when `stage1-b12-reboot-r2.json` exists with
+`state=completed`, changed `boot_identity_after`, increased
+`runtime_epoch_after`, and zero SQLite integrity errors. Repeating the resume
+command returns the same receipt and does not rerun migration or reboot.
+Remove the loaded one-shot job after retaining the evidence:
+
+```bash
+launchctl bootout "gui/$(id -u)/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID"
+```
+
 ## Nested intro source
 
 Only use this with the exact identified nested database. It clones and rewrites

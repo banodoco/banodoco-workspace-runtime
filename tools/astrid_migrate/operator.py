@@ -384,6 +384,19 @@ def _parser() -> argparse.ArgumentParser:
     normalize.add_argument("--destination-root", required=True)
     tiny = sub.add_parser("tiny-acceptance", help="run the small routine Stage 1 B12 live acceptance journey")
     tiny.add_argument("--output-root", required=True, help="fresh absolute root for fixture, realm, receipts, and evidence")
+    reboot_arm = sub.add_parser("stage1-reboot-arm", help="arm one postboot R2 receipt for a completed B12 journey")
+    reboot_arm.add_argument("--evidence-root", required=True)
+    reboot_arm.add_argument("--active-root", required=True)
+    reboot_arm.add_argument("--support-root", required=True)
+    reboot_arm.add_argument("--realm-id", required=True)
+    reboot_arm.add_argument("--python-executable", help="interpreter used by the generated user LaunchAgent")
+    reboot_resume = sub.add_parser("stage1-reboot-resume", help="capture the one-shot postboot R2 receipt")
+    reboot_resume.add_argument("--evidence-root", required=True)
+    reboot_resume.add_argument("--active-root", required=True)
+    reboot_resume.add_argument("--support-root", required=True)
+    reboot_resume.add_argument("--realm-id", required=True)
+    reboot_resume.add_argument("--wait-seconds", type=int, default=0, help="bounded wait for the existing runtime cold launch")
+    reboot_resume.add_argument("--poll-seconds", type=int, default=5, help="poll interval during the bounded runtime wait")
     return parser
 
 
@@ -397,6 +410,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "tiny-acceptance":
             from banodoco_local.tiny_acceptance import run_tiny_acceptance
             result = run_tiny_acceptance(args.output_root)
+        elif args.command == "stage1-reboot-arm":
+            from .stage1_reboot import arm_stage1_reboot
+            result = arm_stage1_reboot(args.evidence_root, args.active_root, args.support_root, args.realm_id, python_executable=args.python_executable)
+        elif args.command == "stage1-reboot-resume":
+            from .stage1_reboot import resume_stage1_reboot
+            result = resume_stage1_reboot(args.evidence_root, args.active_root, args.support_root, args.realm_id, wait_seconds=args.wait_seconds, poll_seconds=args.poll_seconds)
         else:
             result = normalize_nested_source(args)
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
