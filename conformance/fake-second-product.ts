@@ -7,7 +7,7 @@ const bytes = (value: Uint8Array) => new TextDecoder().decode(value);
 const CONTROL_SCOPES = ["projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write"];
 const WORKER_SCOPES = ["worker:register", "worker:execute", "tasks:read", "objects:read", "objects:write"];
 
-export async function runSecondProduct(control: WorkspaceClient, execution: WorkspaceClient): Promise<Record<string, unknown>> {
+export async function runSecondProduct(control: WorkspaceClient, execution: WorkspaceClient, executorId: string): Promise<Record<string, unknown>> {
   const steps: string[] = [];
   const health = await control.health();
   if (health.status !== "ok" || health.protocol !== "workspace.v1") throw new Error("health contract failed");
@@ -44,7 +44,7 @@ export async function runSecondProduct(control: WorkspaceClient, execution: Work
   steps.push("timeline-shot-reference-create-read-update");
 
   const capability: Capability = await execution.registerCapability({ capability_id: "render.neutral", definition_digest: `sha256:${"c".repeat(64)}`, status: "ready", required_resource_keys: ["cpu"], estimated_scratch_bytes: 0, estimated_output_bytes: 1 }, "second-product-capability-1");
-  const executor: Executor = { executor_id: "astrid-pack-host", max_concurrency: 1, resource_keys: ["cpu"], capabilities: [capability], protocol: "workspace.v1", runtime_epoch: health.runtime_epoch };
+  const executor: Executor = { executor_id: executorId, max_concurrency: 1, resource_keys: ["cpu"], capabilities: [capability], protocol: "workspace.v1", runtime_epoch: health.runtime_epoch };
   await execution.registerExecutor(executor, "second-product-executor-1");
   const capabilities = await control.listCapabilities();
   if (!capabilities.items.some((item) => item.capability_id === capability.capability_id && item.status === "ready")) throw new Error("capability registration contract failed");
@@ -86,6 +86,7 @@ if (processLike.process?.argv[1]?.endsWith("fake-second-product.js")) {
   const endpoint = argv[argv.indexOf("--endpoint") + 1];
   const token = argv[argv.indexOf("--token") + 1];
   const workerToken = argv[argv.indexOf("--worker-token") + 1];
-  if (!endpoint || !token || !workerToken) throw new Error("usage: fake-second-product --endpoint URL --token TOKEN --worker-token TOKEN");
-  runSecondProduct(new WorkspaceClient(endpoint, token), new WorkspaceClient(endpoint, workerToken)).then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(error); (globalThis as any).process.exitCode = 1; });
+  const executorId = argv[argv.indexOf("--executor-id") + 1];
+  if (!endpoint || !token || !workerToken || !executorId) throw new Error("usage: fake-second-product --endpoint URL --token TOKEN --worker-token TOKEN --executor-id ID");
+  runSecondProduct(new WorkspaceClient(endpoint, token), new WorkspaceClient(endpoint, workerToken), executorId).then((result) => console.log(JSON.stringify(result))).catch((error) => { console.error(error); (globalThis as any).process.exitCode = 1; });
 }

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR
 
 
 ROOT = Path(__file__).parents[1]
@@ -68,7 +68,7 @@ def test_second_client_core_journey_is_executable(daemon: RuntimeDaemon) -> None
     env.pop("BANODOCO_RUNTIME_OWNER_TOKEN", None)
     env.pop("BANODOCO_LOCAL_OWNER_TOKEN", None)
     completed = subprocess.run(
-        ["node", str(ACTOR), "--endpoint", daemon.endpoint, "--token", daemon.token, "--worker-token", daemon.worker_token],
+        ["node", str(ACTOR), "--endpoint", daemon.endpoint, "--token", daemon.token, "--worker-token", daemon.worker_token, "--executor-id", WORKER_ACTOR],
         cwd=ROOT,
         env=env,
         check=True,
