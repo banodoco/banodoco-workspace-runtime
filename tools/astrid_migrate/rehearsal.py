@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import stat
 import tempfile
@@ -28,7 +30,8 @@ from .capacity import (
     revalidate_activation_parent,
     revalidate_activation_path,
 )
-from .boundary import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, validate_parent as _validate_parent, _open_relative, _connection_from_fd, _sha256_at, pin_directory as _pin_directory, RealmCatalog, now
+from . import boundary as _boundary
+from .boundary import atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, validate_parent as _validate_parent, _open_relative, _connection_from_fd, _sha256_at, pin_directory as _pin_directory, RealmCatalog, now, verify_backup as _verify_backup
 
 
 def _write_json(path: Path, value: Mapping[str, Any], *, identity: Mapping[str, Any] | None = None) -> None:
@@ -703,7 +706,7 @@ class RuntimeServiceAdapter:
             if path.is_file() and path.name not in baseline_objects:
                 path.unlink(missing_ok=True)
 
-    def activate_destination(self, candidate_root: str | Path, *, state: str, target_identity: Mapping[str, Any] | None = None):
+    def activate_destination(self, candidate_root: str | Path, *, state: str, target_identity: Mapping[str, Any] | None = None, activation_manifest_source: str | Path | None = None):
         """Install a verified candidate into the configured realm root.
 
         A sibling restore is only a staging artifact.  The active authority is
@@ -714,6 +717,37 @@ class RuntimeServiceAdapter:
         # rejected.  Resolving an attacker-swapped active root first would
         # turn a symlink into an apparently legitimate outside authority.
         candidate = Path(os.path.abspath(os.path.expanduser(os.fspath(candidate_root))))
+        candidate_cleanup = None
+        # A compact migration hands the signed destination backup directly to
+        # this boundary. Materialize only an activation-local candidate so the
+        # authenticated handoff is created in the temporary activation source,
+        # never in the durable backup artifact.
+        if (candidate / "manifest.json").is_file() and not (candidate / "activation-handoff.json").exists():
+            try:
+                _verify_backup(candidate)
+                candidate_cleanup = Path(tempfile.mkdtemp(prefix=".activation-source-", dir=str(candidate.parent)))
+                candidate_cleanup.rmdir()
+                verified = _verify_backup(candidate)
+                candidate_cleanup.mkdir(mode=0o700)
+                shutil.copy2(candidate / "realm.sqlite3", candidate_cleanup / "realm.sqlite3")
+                shutil.copytree(candidate / "cas", candidate_cleanup / "cas", symlinks=False)
+                manifest = verified["manifest"]
+                key = _boundary._resolve_key(manifest)
+                handoff = {
+                    "format_version": 2,
+                    "source_backup": str(candidate),
+                    "source_manifest_sha256": _sha256_file(candidate / "manifest.json"),
+                    "realm_id": manifest.get("realm_id"),
+                    "candidate_database_sha256": _sha256_file(candidate_cleanup / "realm.sqlite3"),
+                }
+                handoff["handoff_sha256"] = hashlib.sha256(_canonical(handoff)).hexdigest()
+                handoff["handoff_hmac"] = hmac.new(key, _canonical({key: value for key, value in handoff.items() if key not in {"handoff_sha256", "handoff_hmac"}}), hashlib.sha256).hexdigest()
+                (candidate_cleanup / "activation-handoff.json").write_bytes(_canonical(handoff) + b"\n")
+                candidate = candidate_cleanup
+            except Exception as exc:
+                if candidate_cleanup is not None:
+                    shutil.rmtree(candidate_cleanup, ignore_errors=True)
+                raise MigrationError("signed backup could not be materialized for activation") from exc
         target = Path(os.path.abspath(os.path.expanduser(os.fspath(self.service.store.root))))
         if target_identity is None:
             target_identity = capture_activation_path(target)
@@ -742,6 +776,17 @@ class RuntimeServiceAdapter:
                 raise MigrationError(f"candidate realm cannot be opened safely: {candidate}") from exc
             if not _exists_at(candidate_fd, "realm.sqlite3") or not _exists_at(candidate_fd, "cas"):
                 raise MigrationError("candidate is not a complete inactive realm")
+            if activation_manifest_source is not None and not _exists_at(candidate_fd, "activation-manifest.json"):
+                manifest_source = Path(os.path.abspath(os.path.expanduser(os.fspath(activation_manifest_source))))
+                if _has_symlink_component(manifest_source) or not manifest_source.is_file():
+                    raise MigrationError("activation manifest source is missing or contains a symlink")
+                source_identity, source_fd, _ = _pin_directory(manifest_source.parent)
+                try:
+                    _copy_file_at(source_fd, manifest_source.name, candidate_fd, "activation-manifest.json")
+                    os.fsync(candidate_fd)
+                finally:
+                    os.close(source_fd)
+                    _close_pinned(source_identity)
             from .boundary import verify_restore_candidate
             # Candidate restore directories carry a handoff, while backups carry
             # a manifest.  Both must be checked before touching the authority.
@@ -878,6 +923,8 @@ class RuntimeServiceAdapter:
                     except OSError:
                         pass
             close_activation_path(target_identity)
+            if candidate_cleanup is not None:
+                shutil.rmtree(candidate_cleanup, ignore_errors=True)
 
 
 class MigrationJournal:
@@ -1129,8 +1176,10 @@ class Rehearsal:
                 require_destination_verification=True,
                 expected_source_manifest_sha256=self.config.expected_source_manifest_sha256,
                 expected_source_facts_sha256=self.config.expected_source_facts_sha256,
+                include_owner_data=self.config.include_owner_data,
                 activation_registry_root=self.config.activation_registry_root,
                 activation_trust_key=self.config.activation_trust_key,
+                redundancy=self.config.redundancy,
             )
         migrator = Migrator(rehearsal_config, self.client)
         inventory = migrator.inventory()
@@ -1147,12 +1196,19 @@ class Rehearsal:
             require_destination_verification=True,
             expected_source_manifest_sha256=freeze["source_manifest_sha256"],
             expected_source_facts_sha256=freeze["source_facts_sha256"],
+            include_owner_data=self.config.include_owner_data,
             activation_registry_root=self.config.activation_registry_root,
             activation_trust_key=self.config.activation_trust_key,
+            redundancy=self.config.redundancy,
         )
         migrator = Migrator(rehearsal_config, self.client)
         preceding = _tree_size(self.config.source_root)
-        margin = self.config.capacity_margin_bytes if self.config.capacity_margin_bytes is not None else max(int(preceding * 0.2), 10 * 1024**3)
+        if self.config.capacity_margin_bytes is not None:
+            margin = self.config.capacity_margin_bytes
+        elif self.config.redundancy == "compact":
+            margin = int(preceding * 0.2)
+        else:
+            margin = max(int(preceding * 0.2), 10 * 1024**3)
         free = int(inventory["destination_free_bytes"])
         destination_bytes = _tree_size(self.config.destination_root)
         # Reserve the whole peak set before migration starts.  The estimate is

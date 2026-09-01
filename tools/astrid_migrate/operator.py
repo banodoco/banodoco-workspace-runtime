@@ -256,14 +256,15 @@ def live_migrate(args: argparse.Namespace, *, runtime_factory: Callable[..., Any
     _reject_collisions(source, active, archive, destination, evidence, support)
     _require_catalog(support, active, realm_id)
     trust_key = _load_trust_key(support)
-    config = MigrationConfig(source, archive, destination, evidence_root=evidence, capacity_margin_bytes=args.capacity_margin_bytes, expected_source_manifest_sha256=None, activation_registry_root=support / "activations", activation_trust_key=trust_key)
+    redundancy = getattr(args, "redundancy", "compact")
+    config = MigrationConfig(source, archive, destination, evidence_root=evidence, capacity_margin_bytes=args.capacity_margin_bytes, expected_source_manifest_sha256=None, activation_registry_root=support / "activations", activation_trust_key=trust_key, redundancy=redundancy)
     # Compute the exact source binding before opening the active service.
     inventory = Migrator(config, None).inventory()
     source_manifest = inventory["source_manifest_sha256"]
     authorizations = _load_authorizations(_absolute(args.authorization_file, label="authorization file"), source=source, realm_id=realm_id, source_manifest=source_manifest)
     receipt_path = _absolute(args.writer_stop_receipt, label="writer-stop receipt")
     receipt, receipt_digest = _load_writer_receipt(receipt_path, source=source)
-    config = MigrationConfig(source, archive, destination, evidence_root=evidence, capacity_margin_bytes=args.capacity_margin_bytes, expected_source_manifest_sha256=source_manifest, activation_registry_root=support / "activations", activation_trust_key=trust_key)
+    config = MigrationConfig(source, archive, destination, evidence_root=evidence, capacity_margin_bytes=args.capacity_margin_bytes, expected_source_manifest_sha256=source_manifest, activation_registry_root=support / "activations", activation_trust_key=trust_key, redundancy=redundancy)
     runtime = None
     try:
         runtime = runtime_factory(active, display_name=args.display_name, realm_id=realm_id, support_root=support)
@@ -375,6 +376,7 @@ def _parser() -> argparse.ArgumentParser:
     live.add_argument("--writer-stop-receipt", required=True)
     live.add_argument("--display-name", default="Astrid Workspace")
     live.add_argument("--capacity-margin-bytes", type=int)
+    live.add_argument("--redundancy", choices=("compact", "extreme"), default="compact")
     live.add_argument("--confirm", required=True)
     normalize = sub.add_parser("normalize-nested-source", help="explicitly clone the nested Astrid intro source layout")
     normalize.add_argument("--source-root", required=True)

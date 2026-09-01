@@ -277,22 +277,31 @@ class LiveMigration:
         estimated_cas = int(inventory.get("estimated_cas_bytes", 0))
         # Peak accounting is intentionally conservative.  The source remains
         # live while the archive, active rollback backup, destination, its
-        # backup, restore candidate, rollback/reactivation candidates, CAS,
-        # evidence, and safety margin coexist.
+        # backup, rollback candidate, activation temporary, CAS, evidence,
+        # and safety margin coexist.  Compact mode deliberately does not
+        # reserve the two separately materialized live candidate trees: the
+        # signed destination backup is copied into the activation temporary by
+        # the activation boundary itself.
         archive_bytes = max(source_bytes, _tree_size(self.config.archive_root) if self.config.archive_root.exists() else 0)
         active_backup_bytes = _tree_size(self.active_runtime.store.root)
         destination_bytes = max(_tree_size(self.config.destination_root) if self.config.destination_root.exists() else 0, source_bytes + estimated_cas)
         destination_backup_bytes = destination_bytes
-        candidate_bytes = destination_bytes
+        candidate_bytes = destination_bytes if self.config.redundancy == "extreme" else 0
         rollback_bytes = active_backup_bytes
-        reactivation_bytes = destination_bytes
+        reactivation_bytes = destination_bytes if self.config.redundancy == "extreme" else 0
+        activation_temp_bytes = max(destination_bytes, active_backup_bytes)
         # The evidence directory is empty on a fresh run, but the journey
         # necessarily writes multiple fsynced receipts and journals before it
         # reaches the terminal state. Reserve a concrete export allowance so
         # an empty preflight cannot claim that evidence costs zero bytes.
         evidence_bytes = max(_tree_size(evidence_root), 1024 * 1024)
-        margin = self.config.capacity_margin_bytes if self.config.capacity_margin_bytes is not None else max(int(source_bytes * 0.2), 10 * 1024**3)
-        components = {"source_bytes": source_bytes, "archive_bytes": archive_bytes, "active_backup_bytes": active_backup_bytes, "destination_bytes": destination_bytes, "destination_backup_bytes": destination_backup_bytes, "candidate_bytes": candidate_bytes, "rollback_bytes": rollback_bytes, "reactivation_bytes": reactivation_bytes, "cas_bytes": estimated_cas, "evidence_bytes": evidence_bytes, "margin_bytes": margin}
+        if self.config.capacity_margin_bytes is not None:
+            margin = self.config.capacity_margin_bytes
+        elif self.config.redundancy == "compact":
+            margin = int(source_bytes * 0.2)
+        else:
+            margin = max(int(source_bytes * 0.2), 10 * 1024**3)
+        components = {"redundancy": self.config.redundancy, "source_bytes": source_bytes, "archive_bytes": archive_bytes, "active_backup_bytes": active_backup_bytes, "destination_bytes": destination_bytes, "destination_backup_bytes": destination_backup_bytes, "candidate_bytes": candidate_bytes, "rollback_bytes": rollback_bytes, "reactivation_bytes": reactivation_bytes, "activation_temp_bytes": activation_temp_bytes, "cas_bytes": estimated_cas, "evidence_bytes": evidence_bytes, "margin_bytes": margin}
         # Every output is charged to the filesystem where that output is
         # written.  A shared filesystem therefore gets one aggregate pool;
         # split filesystems are independently fail-closed.
@@ -306,6 +315,7 @@ class LiveMigration:
             ("candidate", archive_parent / f"{self.config.archive_root.name}-live-candidate", candidate_bytes),
             ("rollback", archive_parent / f"{self.config.archive_root.name}-live-rollback", rollback_bytes),
             ("reactivation", archive_parent / f"{self.config.archive_root.name}-live-reactivated", reactivation_bytes),
+            ("activation_temp", self.active_runtime.store.root.parent / ".b12-activation-temp", activation_temp_bytes),
             ("evidence", evidence_root, evidence_bytes),
             ("active_runtime", self.active_runtime.store.root, 0),
         )
@@ -356,6 +366,7 @@ class LiveMigration:
             "archive_root": str(self.config.archive_root.resolve()),
             "destination_root": str(self.config.destination_root.resolve()),
             "evidence_root": str(evidence_root.resolve()),
+            "redundancy": self.config.redundancy,
             "authorization_nonce_sha256": {
                 authorization_id: self._nonce_digest(self.authorizations[authorization_id])
                 for authorization_id in LIVE_AUTHORIZATION_IDS
@@ -363,8 +374,22 @@ class LiveMigration:
         }
         current = journal._read()
         recorded = current.get("binding")
-        if recorded is not None and recorded != binding:
-            raise MigrationError("B12 replay conflicts with the durable request binding")
+        if recorded is not None:
+            # Journals written before the redundancy field are immutable
+            # legacy/extreme requests.  They may be replayed explicitly as
+            # extreme, but compact must use a new evidence root rather than
+            # silently rebinding the prepared journal.
+            if "redundancy" not in recorded:
+                if self.config.redundancy == "compact":
+                    raise MigrationError("legacy B12 journal requires --redundancy extreme or a new evidence root")
+                legacy_binding = dict(binding)
+                legacy_binding.pop("redundancy")
+                if recorded != legacy_binding:
+                    raise MigrationError("B12 replay conflicts with the durable legacy request binding")
+                return dict(recorded)
+            if recorded != binding:
+                raise MigrationError("B12 replay conflicts with the durable request binding")
+            return dict(recorded)
         if recorded is None:
             journal.bind(**binding)
         return binding
@@ -374,6 +399,9 @@ class LiveMigration:
         binding = current.get("binding")
         if not isinstance(binding, Mapping):
             raise MigrationError("B12 terminal journal has no durable request binding")
+        recorded_redundancy = binding.get("redundancy", "extreme")
+        if recorded_redundancy != self.config.redundancy:
+            raise MigrationError("B12 terminal replay redundancy conflicts with its durable journal")
         if binding.get("realm_id") != realm_id or binding.get("destination_root") != str(self.config.destination_root.resolve()):
             raise MigrationError("B12 terminal replay conflicts with realm or destination binding")
         if binding.get("source_root") != str(self.config.source_root.resolve()) or binding.get("archive_root") != str(self.config.archive_root.resolve()):
@@ -642,6 +670,22 @@ class LiveMigration:
         except Exception:
             return False
 
+    def _active_matches_backup(self, backup: Path, realm_id: str) -> bool:
+        """Recognize an activation completed directly from a signed backup."""
+        try:
+            if _has_symlink_component(backup):
+                return False
+            verified = verify_backup(backup)
+            manifest = verified["manifest"]
+            if manifest.get("realm_id") != realm_id or self.active_runtime.realm["id"] != realm_id or not self.active_runtime.doctor().get("ok"):
+                return False
+            if _database_semantic_sha256(self.active_runtime.store.db_path) != _database_semantic_sha256(backup / "realm.sqlite3"):
+                return False
+            expected = {str(item["digest"]): str(item["sha256"]) for item in verified["cas_manifest"].get("objects", [])}
+            return self._cas_content_map(_absolute_path(self.active_runtime.store.root)) == expected
+        except Exception:
+            return False
+
     def _runtime_artifact_identity(self, runtime: Any, *, source_manifest_sha256: str, expected_activation_manifest_sha256: str | None = None) -> dict[str, Any]:
         """Verify the control-plane artifacts that a terminal replay relies on."""
         root = _absolute_path(runtime.store.root)
@@ -762,9 +806,9 @@ class LiveMigration:
         archive_root = self.config.archive_root
         active_backup_root = archive_root.parent / f"{archive_root.name}-live-pre-migration-backup"
         destination_backup_root = archive_root.parent / f"{archive_root.name}-live-destination-backup"
-        candidate_root = archive_root.parent / f"{archive_root.name}-live-candidate"
         rollback_root = archive_root.parent / f"{archive_root.name}-live-rollback"
-        reactivation_root = archive_root.parent / f"{archive_root.name}-live-reactivated"
+        candidate_root = (archive_root.parent / f"{archive_root.name}-live-candidate" if self.config.redundancy == "extreme" else None)
+        reactivation_root = (archive_root.parent / f"{archive_root.name}-live-reactivated" if self.config.redundancy == "extreme" else None)
         with ExitStack() as stack:
             requested_source_manifest = self._requested_source_manifest()
             # Bind the operator inputs before invoking the external writer-stop
@@ -976,44 +1020,61 @@ class LiveMigration:
                     destination.close()
 
                 reservation.recheck()
-                candidate_result = self._restore_or_reuse(destination_backup_root, candidate_root, journal=journal, effect_name="candidate-restore", realm_id=realm_id, seam="candidate_restore", source_manifest_sha256=source_manifest_sha256)
-                destination_activation_manifest = self.config.destination_root / "activation-manifest.json"
-                if _has_symlink_component(destination_activation_manifest):
-                    raise MigrationError("B12 destination activation manifest contains a symlink component")
-                if destination_activation_manifest.is_file() and not (candidate_root / "activation-manifest.json").is_file():
-                    source_pin, source_fd, _ = _pin_directory(self.config.destination_root)
-                    candidate_pin, candidate_fd, _ = _pin_directory(candidate_root)
-                    try:
-                        _copy_file_at(source_fd, "activation-manifest.json", candidate_fd, "activation-manifest.json")
-                        os.fsync(candidate_fd)
-                    finally:
-                        os.close(source_fd)
-                        os.close(candidate_fd)
-                        _close_pinned(source_pin)
-                        _close_pinned(candidate_pin)
-                # The activation manifest is a control-plane handoff, not
-                # part of the realm backup. Re-verify after attaching it.
-                candidate_verification = verify_restore_candidate(candidate_root)
-                candidate_result = candidate_result | {"verification": candidate_verification}
-                destination_binding = candidate_verification["manifest"].get("destination_binding") or {}
-                if (destination_binding.get("packet") != "B12.2" or destination_binding.get("selected_realm_id") != realm_id or destination_binding.get("source_manifest_sha256") != source_manifest_sha256):
-                    raise MigrationError("B12.3 destination backup is not bound to the selected live migration")
-                # Candidate restore is another write boundary.  Recheck the
-                # original destination itself as well: a mutation after the
+                # The extreme path retains the historical standalone restore
+                # candidate. Compact verifies the signed destination backup
+                # and lets activate_destination copy it into its own
+                # descriptor-pinned activation temporary, where the handoff
+                # is written and verified.
+                if self.config.redundancy == "extreme":
+                    assert candidate_root is not None
+                    candidate_result = self._restore_or_reuse(destination_backup_root, candidate_root, journal=journal, effect_name="candidate-restore", realm_id=realm_id, seam="candidate_restore", source_manifest_sha256=source_manifest_sha256)
+                    destination_activation_manifest = self.config.destination_root / "activation-manifest.json"
+                    if _has_symlink_component(destination_activation_manifest):
+                        raise MigrationError("B12 destination activation manifest contains a symlink component")
+                    if destination_activation_manifest.is_file() and not (candidate_root / "activation-manifest.json").is_file():
+                        source_pin, source_fd, _ = _pin_directory(self.config.destination_root)
+                        candidate_pin, candidate_fd, _ = _pin_directory(candidate_root)
+                        try:
+                            _copy_file_at(source_fd, "activation-manifest.json", candidate_fd, "activation-manifest.json")
+                            os.fsync(candidate_fd)
+                        finally:
+                            os.close(source_fd)
+                            os.close(candidate_fd)
+                            _close_pinned(source_pin)
+                            _close_pinned(candidate_pin)
+                    candidate_verification = verify_restore_candidate(candidate_root)
+                    candidate_result = candidate_result | {"verification": candidate_verification}
+                    destination_binding = candidate_verification["manifest"].get("destination_binding") or {}
+                    if (destination_binding.get("packet") != "B12.2" or destination_binding.get("selected_realm_id") != realm_id or destination_binding.get("source_manifest_sha256") != source_manifest_sha256):
+                        raise MigrationError("B12.3 destination backup is not bound to the selected live migration")
+                    candidate_db = candidate_verification["database_sha256"]
+                else:
+                    destination_verification = verify_backup(destination_backup_root)
+                    destination_binding = destination_verification["manifest"].get("destination_binding") or {}
+                    if (destination_binding.get("packet") != "B12.2" or destination_binding.get("selected_realm_id") != realm_id or destination_binding.get("source_manifest_sha256") != source_manifest_sha256):
+                        raise MigrationError("B12.3 destination backup is not bound to the selected live migration")
+                    candidate_result = {"destination": str(destination_backup_root), "source": "signed-destination-backup", "verification": destination_verification}
+                    candidate_verification = destination_verification
+                    candidate_db = destination_verification["manifest"]["database_sha256"]
+                # Recheck the original destination itself: a mutation after
                 # reconciliation/backup must not be hidden by an unchanged
-                # candidate copy.
+                # activation source.
                 self._verify_root_against_backup(self.config.destination_root, destination_backup_root, realm_id=realm_id)
                 self._consume_authorization("AUTH-ACTIVATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
                 activation_effect = self._existing_effect(journal, "active-activation")
-                candidate_db = candidate_verification["database_sha256"]
                 if activation_effect:
                     activation_payload = activation_effect.get("payload", {})
-                    if (activation_payload.get("candidate") != str(candidate_root) or _has_symlink_component(candidate_root) or not self._active_matches_candidate(candidate_root, realm_id)):
+                    if self.config.redundancy == "extreme":
+                        reusable = activation_payload.get("candidate") == str(candidate_root) and candidate_root is not None and not _has_symlink_component(candidate_root) and self._active_matches_candidate(candidate_root, realm_id)
+                    else:
+                        reusable = activation_payload.get("candidate") == str(destination_backup_root) and self._active_matches_backup(destination_backup_root, realm_id)
+                    if not reusable:
                         raise MigrationError("B12 durable active activation is not reusable")
                     activated = activation_effect["payload"]["activation"]
-                elif self._active_matches_candidate(candidate_root, realm_id):
-                    activated = {"state": "active", "reused": True, "candidate": str(candidate_root)}
-                    journal.effect("active-activation", candidate=str(candidate_root), state="active", activation=activated, database_sha256=candidate_db)
+                elif ((self.config.redundancy == "extreme" and candidate_root is not None and self._active_matches_candidate(candidate_root, realm_id)) or (self.config.redundancy == "compact" and self._active_matches_backup(destination_backup_root, realm_id))):
+                    activation_source = candidate_root if self.config.redundancy == "extreme" else destination_backup_root
+                    activated = {"state": "active", "reused": True, "candidate": str(activation_source)}
+                    journal.effect("active-activation", candidate=str(activation_source), state="active", activation=activated, database_sha256=candidate_db)
                 else:
                     self._assert_active_baseline(journal, active)
                     # Capture the configured authority before the crash seam;
@@ -1028,9 +1089,10 @@ class LiveMigration:
                     self._verify_root_against_backup(self.config.destination_root, destination_backup_root, realm_id=realm_id)
                     reservation.recheck()
                     revalidate_activation_path(active.store.root, target_identity)
-                    activated = RuntimeServiceAdapter(active).activate_destination(candidate_root, state="active", target_identity=target_identity)
+                    activation_source = candidate_root if self.config.redundancy == "extreme" else destination_backup_root
+                    activated = RuntimeServiceAdapter(active).activate_destination(activation_source, state="active", target_identity=target_identity, activation_manifest_source=(self.config.destination_root / "activation-manifest.json" if self.config.redundancy == "compact" else None))
                     journal._inject("after_active_activation")
-                    journal.effect("active-activation", candidate=str(candidate_root), state="active", activation=activated, database_sha256=candidate_db)
+                    journal.effect("active-activation", candidate=str(activation_source), state="active", activation=activated, database_sha256=candidate_db)
                 active_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
                 active_entry = journal.transition("active", source_manifest_sha256=source_manifest_sha256, destination=str(self.config.destination_root), destination_backup=str(destination_backup_root), activation=activated, runtime_epoch=active.health()["runtime_epoch"], activation_epoch=1)
                 _write_json(evidence_root / "activated-destination-b12-active.json", {"packet": "B12.3", "state": "active", "realm_id": realm_id, "source_manifest_sha256": source_manifest_sha256, "activation_epoch": 1, "runtime_epoch": active.health()["runtime_epoch"], "database_sha256": _sha256_file(active.store.db_path)})
@@ -1073,26 +1135,39 @@ class LiveMigration:
             if journal._read()["state"] == "rolled_back":
                 self._consume_authorization("AUTH-REACTIVATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
                 reservation.recheck()
-                reactivation_result = self._restore_or_reuse(destination_backup_root, reactivation_root, journal=journal, effect_name="reactivation-restore", realm_id=realm_id, seam="reactivation_restore", source_manifest_sha256=source_manifest_sha256)
-                reactivation_verification = reactivation_result["verification"]
+                if self.config.redundancy == "extreme":
+                    assert reactivation_root is not None
+                    reactivation_result = self._restore_or_reuse(destination_backup_root, reactivation_root, journal=journal, effect_name="reactivation-restore", realm_id=realm_id, seam="reactivation_restore", source_manifest_sha256=source_manifest_sha256)
+                    reactivation_verification = reactivation_result["verification"]
+                else:
+                    reactivation_verification = verify_backup(destination_backup_root)
+                    reactivation_result = {"destination": str(destination_backup_root), "source": "signed-destination-backup", "verification": reactivation_verification}
                 reactivation_effect = self._existing_effect(journal, "reactivation-activation")
                 if reactivation_effect:
                     reactivation_payload = reactivation_effect.get("payload", {})
-                    if (reactivation_payload.get("candidate") != str(reactivation_root) or _has_symlink_component(reactivation_root) or not self._active_matches_candidate(reactivation_root, realm_id)):
+                    if self.config.redundancy == "extreme":
+                        reusable = reactivation_payload.get("candidate") == str(reactivation_root) and reactivation_root is not None and not _has_symlink_component(reactivation_root) and self._active_matches_candidate(reactivation_root, realm_id)
+                    else:
+                        reusable = reactivation_payload.get("candidate") == str(destination_backup_root) and self._active_matches_backup(destination_backup_root, realm_id)
+                    if not reusable:
                         raise MigrationError("B12 durable reactivation activation is not reusable")
                     reactivated = reactivation_effect["payload"]["activation"]
-                elif self._active_matches_candidate(reactivation_root, realm_id):
-                    reactivated = {"state": "reactivated", "reused": True, "candidate": str(reactivation_root)}
-                    journal.effect("reactivation-activation", candidate=str(reactivation_root), state="reactivated", activation=reactivated, database_sha256=reactivation_verification["database_sha256"])
+                elif ((self.config.redundancy == "extreme" and reactivation_root is not None and self._active_matches_candidate(reactivation_root, realm_id)) or (self.config.redundancy == "compact" and self._active_matches_backup(destination_backup_root, realm_id))):
+                    activation_source = reactivation_root if self.config.redundancy == "extreme" else destination_backup_root
+                    reactivated = {"state": "reactivated", "reused": True, "candidate": str(activation_source)}
+                    database_sha256 = reactivation_verification.get("database_sha256") or reactivation_verification["manifest"].get("database_sha256")
+                    journal.effect("reactivation-activation", candidate=str(activation_source), state="reactivated", activation=reactivated, database_sha256=database_sha256)
                 else:
                     reservation.recheck()
                     target_identity = capture_activation_path(active.store.root)
                     journal._inject("before_reactivation_activation")
                     reservation.recheck()
                     revalidate_activation_path(active.store.root, target_identity)
-                    reactivated = RuntimeServiceAdapter(active).activate_destination(reactivation_root, state="reactivated", target_identity=target_identity)
+                    activation_source = reactivation_root if self.config.redundancy == "extreme" else destination_backup_root
+                    reactivated = RuntimeServiceAdapter(active).activate_destination(activation_source, state="reactivated", target_identity=target_identity, activation_manifest_source=(self.config.destination_root / "activation-manifest.json" if self.config.redundancy == "compact" else None))
                     journal._inject("after_reactivation_activation")
-                    journal.effect("reactivation-activation", candidate=str(reactivation_root), state="reactivated", activation=reactivated, database_sha256=reactivation_verification["database_sha256"])
+                    database_sha256 = reactivation_verification.get("database_sha256") or reactivation_verification["manifest"].get("database_sha256")
+                    journal.effect("reactivation-activation", candidate=str(activation_source), state="reactivated", activation=reactivated, database_sha256=database_sha256)
                 final_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
                 if not active.doctor().get("ok"):
                     raise MigrationError("B12.4 final runtime failed integrity verification")

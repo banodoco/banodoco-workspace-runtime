@@ -89,8 +89,14 @@ class MigrationConfig:
     schema_version: str = "workspace-schema-v1"
     importer_version: str = "t5"
     activation_trust_key: bytes | None = None
+    # ``compact`` is the current safe default.  ``extreme`` preserves the
+    # original full-copy rehearsal allocation for an explicitly requested
+    # legacy run.
+    redundancy: str = "compact"
 
     def __post_init__(self):
+        if not isinstance(self.redundancy, str) or self.redundancy not in {"compact", "extreme"}:
+            raise MigrationError("redundancy must be compact or extreme")
         object.__setattr__(self, "source_root", Path(self.source_root).expanduser().resolve())
         object.__setattr__(self, "archive_root", Path(self.archive_root).expanduser().resolve())
         # Keep the final destination component unresolved so the live runner

@@ -7,8 +7,11 @@ trees, or delete source data.
 ## Preflight and dry run
 
 Use a fresh archive/destination parent on a volume with enough capacity for
-source, archive, active backup, destination, candidate, rollback/reactivation
-copies, CAS, evidence, and the safety margin. Run the offline dry run first:
+source, archive, active backup, destination, signed destination backup,
+rollback copy, activation temporary, CAS, evidence, and the safety margin.
+Compact redundancy is the default; use `--redundancy extreme` only when the
+historical full-copy allocation is explicitly required. Run the offline dry
+run first:
 
 ```bash
 PYTHONPATH=/path/to/runtime python -m tools.astrid_migrate \
@@ -69,14 +72,19 @@ astrid-live-migrate live-migrate --confirm 'MIGRATE LIVE ASTRID' \
   --evidence-root /absolute/migration/migration-evidence-b12 \
   --realm-id REALM_ID \
   --authorization-file /absolute/operator/b12-authorizations.json \
-  --writer-stop-receipt /absolute/operator/writer-stop.json
+  --writer-stop-receipt /absolute/operator/writer-stop.json \
+  --redundancy compact
 ```
 
 This invokes serialized B12: verified backups, import, reconciliation,
 activation, rollback, reactivation, and JSON evidence. Derived siblings are
-`<archive>-live-pre-migration-backup`, `-live-destination-backup`,
-`-live-candidate`, `-live-rollback`, and `-live-reactivated`. The terminal
-receipt is `activated-destination-b12.json` with journal state `reactivated`.
+`<archive>-live-pre-migration-backup`, `-live-destination-backup`, and
+`-live-rollback` in compact mode. Compact activates and reactivates directly
+from the verified signed destination backup through an activation temporary;
+it does not create `-live-candidate` or `-live-reactivated`. The explicit
+`--redundancy extreme` mode additionally creates those two historical restore
+trees. The terminal receipt is `activated-destination-b12.json` with journal
+state `reactivated`.
 
 ## Nested intro source
 
