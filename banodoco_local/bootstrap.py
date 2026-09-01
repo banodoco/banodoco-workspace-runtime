@@ -16,10 +16,12 @@ import os
 from pathlib import Path
 import sqlite3
 import secrets
+import shutil
 import stat
 import time
 from contextlib import contextmanager
 from typing import Any, Mapping, Protocol, Sequence
+from urllib.parse import urlsplit
 import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
@@ -100,10 +102,30 @@ class SourceProfile:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], *, expected_profile: str = "astrid") -> "SourceProfile":
+        if not isinstance(value, Mapping):
+            raise BootstrapError("Source profile manifest must contain an object.")
+        allowed = {
+            "profile", "runtime_checkout", "source_checkout", "runtime_environment",
+            "runtime_command", "protocol_version", "schema_version", "capability_digest",
+            "source_digest", "lock_digest",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise BootstrapError(
+                "Source profile cannot override runtime authority: "
+                + ", ".join(unknown)
+            )
         profile = str(value.get("profile", ""))
         if profile != expected_profile:
             raise BootstrapError(f"Source profile must be {expected_profile!r}, got {profile!r}.")
+        if "runtime_checkout" not in value:
+            raise BootstrapError(
+                "Source profile is incomplete; configure the pinned runtime_checkout "
+                "in the editable source manifest."
+            )
         runtime_checkout = str(value.get("runtime_checkout", ""))
+        if not runtime_checkout or not Path(runtime_checkout).expanduser().is_absolute():
+            raise BootstrapError("Source profile runtime_checkout must be an explicit absolute pinned checkout path.")
         source_checkout = str(value.get("source_checkout", ""))
         if not source_checkout:
             raise BootstrapError(
@@ -115,6 +137,10 @@ class SourceProfile:
             command = (command,)
         if not isinstance(command, Sequence):
             raise BootstrapError("Source profile runtime_command must be an argv array.")
+        if tuple(command):
+            raise BootstrapError(
+                "Source profile runtime_command is not an authority; configure only the pinned runtime_checkout."
+            )
         return cls(
             profile=profile,
             runtime_checkout=runtime_checkout,
@@ -130,9 +156,15 @@ class SourceProfile:
 
     @classmethod
     def load(cls, path: Path | str, *, expected_profile: str = "astrid") -> "SourceProfile":
-        raw = read_json(Path(path))
+        target = Path(path).expanduser()
+        if not target.is_absolute() or _has_symlink_component(target):
+            raise BootstrapError(f"Source profile manifest must be absolute and symlink-free: {target}")
+        try:
+            raw = _read_json_regular(target)
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BootstrapError(f"Source profile manifest is missing or invalid: {target}") from exc
         if raw is None:
-            raise BootstrapError(f"Source profile manifest is missing or invalid: {path}")
+            raise BootstrapError(f"Source profile manifest is missing or invalid: {target}")
         return cls.from_mapping(raw, expected_profile=expected_profile)
 
     def as_dict(self) -> dict[str, Any]:
@@ -317,9 +349,101 @@ def _has_symlink_component(path: Path) -> bool:
     current = Path(path.anchor)
     for component in path.parts[1:]:
         current /= component
-        if current.is_symlink():
+        # macOS exposes the temporary directory through the protected
+        # ``/var`` (and sometimes ``/tmp``) compatibility symlink.  Those
+        # fixed system aliases are not operator-controlled support paths;
+        # continue checking every component below them.
+        if current.is_symlink() and current not in {Path("/var"), Path("/tmp")}:
             return True
     return False
+
+
+def _validate_source_profile(source: SourceProfile, *, expected_profile: str = "astrid") -> None:
+    """Reject source metadata that attempts to become runtime authority."""
+    if not isinstance(source, SourceProfile) or source.profile != expected_profile:
+        raise BootstrapError(f"Source profile must be {expected_profile!r}.")
+    checkout = str(source.runtime_checkout or "")
+    checkout_path = Path(checkout).expanduser()
+    source_path = Path(str(source.source_checkout or "")).expanduser()
+    if not checkout or not checkout_path.is_absolute() or _has_symlink_component(checkout_path):
+        raise BootstrapError("Source profile runtime_checkout must be an explicit absolute pinned checkout path.")
+    if not source_path.is_absolute() or _has_symlink_component(source_path):
+        raise BootstrapError("Source profile source_checkout must be an absolute symlink-free provenance path.")
+    if source.runtime_command:
+        raise BootstrapError("Source profile runtime_command is not permitted; runtime launch is fixed by the installed runtime.")
+    if source.protocol_version != PROTOCOL_VERSION or source.schema_version != SCHEMA_VERSION:
+        raise CompatibilityError("Source profile protocol/schema is incompatible. " + RECONFIGURE_NEXT_ACTION)
+
+
+def _validate_loopback_endpoint(endpoint: str) -> str:
+    """Accept only the runtime's local HTTP authority."""
+    try:
+        parsed = urlsplit(str(endpoint))
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise BootstrapError("Runtime discovery endpoint is invalid or not loopback-only.") from exc
+    if (parsed.scheme != "http" or parsed.username or parsed.password
+            or host not in {"127.0.0.1", "localhost", "::1"}
+            or port is None or not (1 <= int(port) <= 65535)
+            or parsed.path not in ("", "/")
+            or parsed.query or parsed.fragment):
+        raise BootstrapError("Runtime discovery endpoint must be an HTTP loopback authority.")
+    return str(endpoint).rstrip("/")
+
+
+def _validate_support_paths(paths: RuntimePaths) -> None:
+    """Validate the fixed support composition before reading or writing it."""
+    directories = (
+        paths.home, paths.app_support, paths.runtime_support, paths.activations_dir,
+        paths.credentials_dir, paths.runtime_support / "credentials", paths.realms_dir,
+        paths.source_profiles_dir,
+    )
+    files = (
+        paths.catalog_path, paths.discovery_path, paths.activation_trust_path,
+        paths.instance_lock_path, paths.bootstrap_lock_path,
+        paths.runtime_support / "credentials" / "owner.token",
+        paths.runtime_support / "credentials" / "owner.json",
+    )
+    for item in (*directories, *files):
+        target = Path(item).expanduser()
+        # The fixed home path may itself be reached through a platform alias
+        # (for example /var -> /private/var).  Validate all support-relative
+        # components, including the leaf, while preserving that OS alias.
+        try:
+            relative = target.relative_to(Path(paths.home).expanduser())
+        except ValueError:
+            relative = target
+        support_symlink = False
+        cursor = Path(paths.home).expanduser() if target.is_relative_to(Path(paths.home).expanduser()) else Path(target.anchor)
+        for component in relative.parts:
+            if component in (".", ""):
+                continue
+            cursor /= component
+            if cursor.is_symlink():
+                support_symlink = True
+                break
+        if not target.is_absolute() or support_symlink:
+            raise BootstrapError(f"Neutral support path must be absolute and symlink-free: {target}")
+    for directory in directories:
+        if os.path.lexists(str(directory)) and (directory.is_symlink() or not directory.is_dir()):
+            raise BootstrapError(f"Neutral support directory is not a regular directory: {directory}")
+    for path in files:
+        if os.path.lexists(str(path)) and (path.is_symlink() or not path.is_file()):
+            raise BootstrapError(f"Neutral support file is not a regular file: {path}")
+
+
+def _read_support_json(path: Path) -> dict[str, Any] | None:
+    """Read a support JSON file without following a symlink."""
+    try:
+        value = _read_json_regular(path)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BootstrapError(f"Neutral support file is missing, malformed, or unsafe: {path}") from exc
+    if not isinstance(value, Mapping):
+        raise BootstrapError(f"Neutral support file must contain an object: {path}")
+    return dict(value)
 
 
 def _cas_inventory(root: Path) -> list[dict[str, Any]]:
@@ -473,14 +597,42 @@ def _new_realm_id() -> str:
 
 
 def _read_catalog(paths: RuntimePaths) -> dict[str, Any]:
-    catalog = read_json(paths.catalog_path)
+    catalog = _read_support_json(paths.catalog_path)
     if catalog is None:
         return {"version": CATALOG_VERSION, "selected_realm_id": None, "realms": [], "source_profiles": {}}
-    catalog.setdefault("version", CATALOG_VERSION)
-    catalog.setdefault("realms", [])
-    catalog.setdefault("source_profiles", {})
-    if not isinstance(catalog["realms"], list):
+    if catalog.get("version") != CATALOG_VERSION:
+        raise BootstrapError("Neutral realm catalog version is unsupported; run banodoco-local doctor.")
+    if not isinstance(catalog.get("realms", []), list):
         raise BootstrapError("Neutral realm catalog is invalid; recover or remove catalog.json.")
+    if not isinstance(catalog.get("source_profiles", {}), Mapping):
+        raise BootstrapError("Neutral realm catalog source profiles are invalid; run banodoco-local doctor.")
+    for profile_name, manifest in catalog.get("source_profiles", {}).items():
+        try:
+            if str(profile_name) != "astrid":
+                raise BootstrapError("Neutral realm catalog contains an unsupported source profile.")
+            SourceProfile.from_mapping(manifest, expected_profile=str(profile_name))
+        except BootstrapError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise BootstrapError("Neutral realm catalog source profile is invalid; run banodoco-local doctor.") from exc
+    if len(catalog["realms"]) > 1:
+        raise UnsupportedRealmError(MULTI_REALM_NEXT_ACTION)
+    seen: set[str] = set()
+    for realm in catalog["realms"]:
+        if not isinstance(realm, Mapping):
+            raise BootstrapError("Neutral realm catalog contains an invalid realm entry; run banodoco-local doctor.")
+        realm_id = str(realm.get("realm_id") or "")
+        data_root = Path(str(realm.get("data_root") or "")).expanduser()
+        if (not realm_id or realm_id in seen or any(char in realm_id for char in "/\\")
+                or not data_root.is_absolute() or _has_symlink_component(data_root)
+                or data_root.is_symlink() or (data_root.exists() and not data_root.is_dir())):
+            raise BootstrapError("Neutral realm catalog contains an unsafe realm root; run banodoco-local doctor.")
+        if not str(realm.get("display_name") or ""):
+            raise BootstrapError("Neutral realm catalog contains an unnamed realm; run banodoco-local doctor.")
+        seen.add(realm_id)
+    selected = catalog.get("selected_realm_id")
+    if selected is not None and str(selected) not in seen:
+        raise BootstrapError("Catalog selected realm is inconsistent; run banodoco-local doctor.")
     return catalog
 
 
@@ -492,7 +644,7 @@ def _selected_realm(catalog: dict[str, Any]) -> dict[str, Any] | None:
         return None
     selected = catalog.get("selected_realm_id")
     realm = realms[0]
-    if selected and selected != realm.get("realm_id"):
+    if selected and str(selected) != str(realm.get("realm_id")):
         raise BootstrapError("Catalog selected realm is inconsistent; run banodoco-local doctor.")
     return realm
 
@@ -501,7 +653,7 @@ def _credential(paths: RuntimePaths) -> tuple[str, str]:
     paths.credentials_dir.mkdir(parents=True, exist_ok=True)
     owner_only(paths.credentials_dir, directory=True)
     path = paths.credentials_dir / "astrid.json"
-    current = read_json(path)
+    current = _read_support_json(path)
     if current and current.get("scope") == "astrid" and isinstance(current.get("token"), str):
         token = current["token"]
         if len(token) == 64:
@@ -550,7 +702,7 @@ def _pid_alive(boundary: RuntimeBoundary | None, pid: Any) -> bool:
 
 
 def _lock_matches(paths: RuntimePaths, pid: int, instance_id: str, realm_id: str, process_birth_id: str | None = None) -> bool:
-    marker = read_json(paths.instance_lock_path)
+    marker = _read_support_json(paths.instance_lock_path)
     return bool(
         marker
         and str(marker.get("pid")) == str(pid)
@@ -600,6 +752,60 @@ def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: 
         handshake(protocol_version=PROTOCOL_VERSION, schema_version=SCHEMA_VERSION)
 
 
+def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid") -> None:
+    """Return neutral support state to its pre-launch shape after a failed handoff."""
+    stop = getattr(boundary, "stop", None)
+    if callable(stop):
+        try:
+            stop()
+        except Exception:
+            pass
+    for path in (paths.discovery_path, paths.instance_lock_path):
+        try:
+            remove_file(path)
+        except Exception:
+            pass
+    credential = paths.credentials_dir / "astrid.json"
+    try:
+        if credential_before is None:
+            remove_file(credential)
+        else:
+            credential.write_bytes(credential_before)
+            owner_only(credential)
+    except OSError:
+        pass
+    catalog = paths.catalog_path
+    try:
+        if catalog_before is None:
+            remove_file(catalog)
+        else:
+            catalog.write_bytes(catalog_before)
+            owner_only(catalog)
+    except OSError:
+        pass
+    source_manifest = paths.source_profiles_dir / f"{source_profile}.json"
+    try:
+        if source_before is None:
+            remove_file(source_manifest)
+        else:
+            source_manifest.write_bytes(source_before)
+            owner_only(source_manifest)
+    except OSError:
+        pass
+    # A failed first launch owns this newly allocated root.  Constrain the
+    # cleanup to the exact lexical child selected by the neutral realm path;
+    # never follow a symlink or remove an existing realm on reconnect.
+    if new_realm and realm_root.is_dir() and not realm_root.is_symlink():
+        try:
+            realm_root.relative_to(paths.realms_dir)
+        except ValueError:
+            return
+        try:
+            shutil.rmtree(realm_root)
+        except OSError:
+            pass
+
+
 def bootstrap(
     paths: RuntimePaths,
     boundary: RuntimeBoundary,
@@ -607,6 +813,7 @@ def bootstrap(
 ) -> BootstrapResult:
     """Perform ``banodoco-local up`` for the one current-Mac realm."""
     config = config or BootstrapConfig()
+    _validate_support_paths(paths)
     # Collision detection is deliberately before the mutex/support directory:
     # a legacy checkout must never cause even neutral launch state to be
     # created, and the user must be directed to the offline migrator first.
@@ -620,10 +827,18 @@ def bootstrap(
         return _bootstrap_locked(paths, boundary, config)
 
 
+def _commit_bootstrap_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any], discovery: Mapping[str, Any]) -> None:
+    """Commit catalog, source provenance, and ephemeral discovery in order."""
+    atomic_write_json(paths.catalog_path, dict(catalog))
+    atomic_write_json(paths.source_profiles_dir / f"{source.profile}.json", source.as_dict())
+    atomic_write_json(paths.discovery_path, dict(discovery))
+
+
 def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig) -> BootstrapResult:
     if config.profile != "astrid":
         raise BootstrapError("Stage 1 supports only the astrid profile.")
     source = config.resolve_source_profile(paths)
+    _validate_source_profile(source, expected_profile=config.profile)
     configure = getattr(boundary, "configure_source", None)
     if configure is not None:
         configure(source)
@@ -632,12 +847,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         raise LegacyRootCollisionError(LEGACY_NEXT_ACTION.format(legacy_root=collision))
 
     paths.ensure_support_dirs()
-    _durable_activation_trust_key(paths, provision=True)
     catalog = _read_catalog(paths)
+    catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     realm = _selected_realm(catalog)
+    new_realm = realm is None
     diagnostics: list[str] = []
 
-    discovery = read_json(paths.discovery_path)
+    discovery = _read_support_json(paths.discovery_path)
     if discovery is not None and discovery.get("active_realm"):
         _compatible(discovery, config, source)
         pid = discovery.get("pid")
@@ -649,6 +865,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                     "A runtime owner is active but its discovery record is incomplete; "
                     "stop that owner, then run banodoco-local restart --profile astrid."
                 )
+            endpoint = _validate_loopback_endpoint(endpoint)
             valid_owner = boundary.validate_owner(
                 endpoint=endpoint, pid=int(pid), instance_id=instance_id, owner_lock=paths.instance_lock_path,
                 process_birth_id=str(discovery.get("process_birth_id") or "")
@@ -676,7 +893,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     # ephemeral discovery write (or discovery may have been manually removed).
     # Never start a second owner while the durable instance lock still points
     # at a live process.
-    marker = read_json(paths.instance_lock_path)
+    marker = _read_support_json(paths.instance_lock_path)
     if marker and _pid_alive(boundary, marker.get("pid")):
         raise DuplicateOwnerError(
             "A different runtime owner is active for the selected realm; "
@@ -697,17 +914,29 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         catalog["selected_realm_id"] = realm["realm_id"]
 
     realm_id = str(realm["realm_id"])
-    handle = boundary.start(
-        realm_id=realm_id,
-        realm_root=Path(str(realm["data_root"])),
-        owner_lock=paths.instance_lock_path,
-        source_profile=source,
-    )
+    realm_root = Path(str(realm["data_root"])).expanduser()
+    # ``realm`` was synthesized above only when the catalog was empty. Keep
+    # this explicit ownership bit so rollback can remove only a fresh root.
+    credential_path = paths.credentials_dir / "astrid.json"
+    credential_before = credential_path.read_bytes() if credential_path.is_file() and not credential_path.is_symlink() else None
+    source_manifest_path = paths.source_profiles_dir / f"{source.profile}.json"
+    source_before = source_manifest_path.read_bytes() if source_manifest_path.is_file() and not source_manifest_path.is_symlink() else None
+    try:
+        handle = boundary.start(
+            realm_id=realm_id,
+            realm_root=realm_root,
+            owner_lock=paths.instance_lock_path,
+            source_profile=source,
+        )
+    except Exception:
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        raise
     try:
         endpoint = str(handle["endpoint"])
         pid = int(handle["pid"])
         instance_id = str(handle["runtime_instance_id"])
     except (KeyError, TypeError, ValueError) as exc:
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
         raise BootstrapError("Runtime start returned incomplete owner metadata.") from exc
     process_birth_id = str(handle.get("process_birth_id") or handle.get("birth_id") or "")
     if not process_birth_id:
@@ -719,27 +948,37 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     # kernel/ps birth identity above.
     if not process_birth_id:
         process_birth_id = f"synthetic:{instance_id}:{pid}"
-    if not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id):
+    try:
+        endpoint = _validate_loopback_endpoint(endpoint)
+    except Exception:
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        raise
+    try:
+        healthy = bool(boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id))
+    except Exception:
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        raise
+    if not healthy:
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
         raise BootstrapError("Runtime started but failed health check; next action: " + RECONFIGURE_NEXT_ACTION)
     # The marker contains ownership metadata only and never a credential.
-    atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id})
-    actor_id, token = _credential(paths)
-    connection = boundary.connect(endpoint=endpoint, credential=token)
-    _provision_connection(connection, actor_id, token, realm_id)
+    try:
+        atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id})
+        actor_id, token = _credential(paths)
+        connection = boundary.connect(endpoint=endpoint, credential=token)
+        _provision_connection(connection, actor_id, token, realm_id)
+    except Exception:
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        raise
     realm["source_profile"] = source.profile
     catalog["source_profiles"][source.profile] = source.as_dict()
-    atomic_write_json(paths.catalog_path, catalog)
     # Keep the editable source profile at the neutral support boundary after a
-    # successful launch.  ``up`` may have received a one-shot manifest from a
+    # successful launch. ``up`` may have received a one-shot manifest from a
     # product launcher, and later operator reconnect/restart commands must be
     # able to resolve the same composition without requiring that temporary
-    # path or a second manual setup step.  This is composition metadata only;
+    # path or a second manual setup step. This is composition metadata only;
     # it is not a runtime/database authority and is written only after the
     # daemon, credential handoff, activation, and catalog commit succeeded.
-    atomic_write_json(
-        paths.source_profiles_dir / f"{source.profile}.json",
-        source.as_dict(),
-    )
     discovery_value = {
         "version": DISCOVERY_VERSION,
         "endpoint": endpoint,
@@ -754,23 +993,28 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         "credential_file": str(paths.credentials_dir / "astrid.json"),
         "advertised_at": time.time(),
     }
-    atomic_write_json(paths.discovery_path, discovery_value)
+    try:
+        _commit_bootstrap_metadata(paths, source, catalog, discovery_value)
+    except Exception:
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        raise
     return BootstrapResult("started", realm_id, str(realm["display_name"]), endpoint, actor_id, source.profile, tuple(diagnostics), paths.discovery_path, paths.credentials_dir / "astrid.json")
 
 
 def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
     """Connect without creating a realm or starting authority."""
     config = config or BootstrapConfig()
+    _validate_support_paths(paths)
     catalog = _read_catalog(paths)
     realm = _selected_realm(catalog)
-    discovery = read_json(paths.discovery_path)
+    discovery = _read_support_json(paths.discovery_path)
     if realm is None or not discovery:
         raise BootstrapError("No healthy selected runtime. Next action: banodoco-local up --profile astrid")
     source = config.resolve_source_profile(paths)
     _compatible(discovery, config, source)
     try:
         pid = int(discovery["pid"])
-        endpoint = str(discovery["endpoint"])
+        endpoint = _validate_loopback_endpoint(str(discovery["endpoint"]))
         instance_id = str(discovery["runtime_instance_id"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BootstrapError("Runtime discovery is incomplete; run banodoco-local restart --profile astrid.") from exc
@@ -789,12 +1033,13 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
 def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
     """Restart the selected owner through the client/boundary seam."""
     config = config or BootstrapConfig()
-    discovery = read_json(paths.discovery_path)
+    _validate_support_paths(paths)
+    discovery = _read_support_json(paths.discovery_path)
     if not discovery:
         raise BootstrapError("No runtime to restart. Next action: banodoco-local up --profile astrid")
     try:
         pid = int(discovery["pid"])
-        endpoint = str(discovery["endpoint"])
+        endpoint = _validate_loopback_endpoint(str(discovery["endpoint"]))
         instance_id = str(discovery["runtime_instance_id"])
         realm_id = str(discovery["active_realm"])
         process_birth_id = str(discovery["process_birth_id"])
@@ -845,8 +1090,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
 
 def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict[str, Any]:
     """Read-only support-state diagnostics.  This function creates no files."""
-    catalog = read_json(paths.catalog_path)
-    discovery = read_json(paths.discovery_path)
+    catalog = discovery = None
     report: dict[str, Any] = {
         "healthy": True,
         "catalog_path": str(paths.catalog_path),
@@ -855,6 +1099,16 @@ def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict
         "discovery_present": discovery is not None,
         "issues": [],
     }
+    try:
+        _validate_support_paths(paths)
+        catalog = _read_support_json(paths.catalog_path)
+        discovery = _read_support_json(paths.discovery_path)
+    except BootstrapError as exc:
+        catalog = discovery = None
+        report["healthy"] = False
+        report["issues"].append(str(exc))
+    report["catalog_present"] = catalog is not None
+    report["discovery_present"] = discovery is not None
     if catalog is None:
         report["healthy"] = False
         report["issues"].append("catalog_missing")

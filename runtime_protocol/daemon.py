@@ -12,18 +12,30 @@ from .service import RuntimeService
 from .util import atomic_json_write
 
 
+def _authority_path(value, label):
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        if current.is_symlink() and current not in {Path("/var"), Path("/tmp")}:
+            raise ValueError(f"{label} must not traverse a symlink")
+    return path
+
+
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
     def __init__(self, root, *, support_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None):
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("runtime daemon only binds to loopback")
-        self.root = Path(root).expanduser().resolve()
-        self.support_root = Path(support_root).expanduser().resolve() if support_root else self.root / "support"
+        self.root = _authority_path(root, "realm root").resolve()
+        self.support_root = (_authority_path(support_root, "support root").resolve() if support_root else self.root / "support")
         self.host, self.port, self.display_name = host, port, display_name
         self.realm_id = realm_id
-        self.owner_lock = Path(owner_lock).expanduser().resolve() if owner_lock else None
-        self.bootstrap_token_file = Path(bootstrap_token_file).expanduser().resolve() if bootstrap_token_file else None
+        self.owner_lock = _authority_path(owner_lock, "owner lock").resolve() if owner_lock else None
+        self.bootstrap_token_file = _authority_path(bootstrap_token_file, "bootstrap token file").resolve() if bootstrap_token_file else None
         # Reboot is deliberately disabled unless a host supplies an executor.
         # The service additionally validates that any configured command is in
         # its small, explicit allowlist.
@@ -35,7 +47,7 @@ class RuntimeDaemon:
         self.thread = None
         self.catalog = RealmCatalog(self.support_root / "catalog.json")
         self.discovery = LiveDiscovery(self.support_root / "discovery.json")
-        self.credentials = CredentialStore(self.support_root / "credentials")
+        self.credentials = CredentialStore(_authority_path(self.support_root / "credentials", "credential root"))
         self.token = None
         self.worker_token = None
         self.credential_path = None
@@ -52,11 +64,12 @@ class RuntimeDaemon:
             return self
         self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist)
         self.token, self.credential_path = self.credentials.provision("owner", ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"])
-        # The built-in worker token exists solely for the generated acceptance
-        # harness, whose owner registers arbitrary fixture executor ids.  Mark
-        # that compatibility credential explicitly so real worker credentials
-        # remain executor-bound at the HTTP boundary.
-        self.worker_token, _ = self.credentials.provision("fake-worker", ["handshake", "worker:execute", "tasks:read"], metadata={"legacy_worker": True})
+        # The owner credential is retained as the fixture's control-plane
+        # worker handle for older in-process harnesses.  It is an administrator
+        # credential, so the normal admin authorization path applies; runtime
+        # worker credentials provisioned for real executors remain explicitly
+        # bound to their executor identity.
+        self.worker_token = self.token
         if self.bootstrap_token_file and self.bootstrap_token_file.exists():
             bootstrap_token = self.bootstrap_token_file.read_text(encoding="utf-8").strip()
             self.credentials.provision_static("bootstrap", bootstrap_token, ["admin", "credentials:provision"])

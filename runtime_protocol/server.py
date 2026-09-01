@@ -69,6 +69,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             raise InvalidRequestError("request body must be a JSON object")
         return body
 
+    def _idempotency_key(self):
+        key = self.headers.get("Idempotency-Key")
+        if not key:
+            raise ProtocolError("Idempotency-Key header is required")
+        return key
+
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         self.send_response(status)
         self.send_header("Cache-Control", "no-store")
@@ -187,7 +193,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime._timeline_resource(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
-            self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body()))
+            self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("history", "diff") and method == "GET":
             self._identity("projects:read")
             query = parse_qs(urlsplit(self.path).query)
@@ -200,8 +206,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:write")
             body = self._body()
             if path[3] == "archive":
-                return self._send(200, self.runtime.archive_timeline(path[2], body))
-            return self._send(200, self.runtime.recover_timeline(path[2], body))
+                return self._send(200, self.runtime.archive_timeline(path[2], body, idempotency_key=self._idempotency_key()))
+            return self._send(200, self.runtime.recover_timeline(path[2], body, idempotency_key=self._idempotency_key()))
         if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_shot(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "shots"] and method == "PATCH":
@@ -252,17 +258,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
                     return self._send(200, self.runtime.list_documents(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
-                if method == "POST": return self._send(201, self.runtime.create_document(selector, self._body()))
+                if method == "POST": return self._send(201, self.runtime.create_document(selector, self._body(), idempotency_key=self._idempotency_key()))
             if len(path) == 5 and path[3] == "documents" and method in ("GET", "PATCH"):
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET": return self._send(200, self.runtime.get_document(selector, path[4]))
-                return self._send(200, self.runtime.update_document(selector, path[4], self._body()))
+                return self._send(200, self.runtime.update_document(selector, path[4], self._body(), idempotency_key=self._idempotency_key()))
             if len(path) == 4 and path[3] == "generations":
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
                     return self._send(200, self.runtime.list_generations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
-                if method == "POST": return self._send(201, self.runtime.create_generation(selector, self._body()))
+                if method == "POST": return self._send(201, self.runtime.create_generation(selector, self._body(), idempotency_key=self._idempotency_key()))
             if len(path) == 4 and path[3] == "objects":
                 self._identity("objects:read" if method == "GET" else "objects:write")
                 if method == "GET":
@@ -337,7 +343,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
                     return self._send(200, self.runtime.list_media_relations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
-                if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body()))
+                if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body(), idempotency_key=self._idempotency_key()))
         if path == ["v1", "objects"] and method == "POST":
             self._identity("objects:write")
             data = self._raw_body()
@@ -435,7 +441,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if method == "GET":
                 query = parse_qs(urlsplit(self.path).query)
                 return self._send(200, self.runtime.list_variants(path[2], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
-            if method == "POST": return self._send(201, self.runtime.create_variant(path[2], self._body()))
+            if method == "POST": return self._send(201, self.runtime.create_variant(path[2], self._body(), idempotency_key=self._idempotency_key()))
         if len(path) == 3 and path[:2] == ["v1", "variants"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_variant(path[2]))
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] == "events" and method == "GET":

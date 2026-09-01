@@ -55,6 +55,23 @@ class RealmStore:
 
     @contextmanager
     def _transaction(self):
+        # Service decorators and a few domain operations compose transactions
+        # (for example a timeline mutation records its revision inside the
+        # command transaction).  SQLite has no nested ``BEGIN``; use a
+        # savepoint so an inner failure still rolls back with the outer
+        # mutation while preserving the single commit boundary.
+        if self.conn.in_transaction:
+            savepoint = f"runtime_nested_{id(self)}_{threading.get_ident()}"
+            self.conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                yield
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            else:
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield

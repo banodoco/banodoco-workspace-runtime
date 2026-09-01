@@ -201,16 +201,16 @@ class RuntimeService:
 
         ``identity`` is supplied only by the HTTP boundary.  Direct service
         calls remain useful for in-process control-plane tests and have no
-        bearer principal to bind.  The daemon's explicitly marked fixture
-        worker credential is retained as a compatibility bridge for the
-        existing generated end-to-end tests; ordinary credentials are strict.
+        bearer principal to bind.  HTTP worker credentials are accepted only
+        when their actor is the executor itself or they carry the explicit
+        administrator scope.
         """
         if identity is None:
             return
         if not executor_id:
             raise AuthorizationError("executor identity is required")
         actor = identity.get("actor")
-        if actor == executor_id or "admin" in set(identity.get("scopes", [])) or identity.get("legacy_worker") is True:
+        if actor == executor_id or "admin" in set(identity.get("scopes", [])):
             return
         raise AuthorizationError("worker credential is not bound to executor", details={"executor_id": executor_id, "actor_id": actor})
 
@@ -294,50 +294,57 @@ class RuntimeService:
             raise ValidationError("expected_version must be a positive integer")
         return value
 
-    def update_timeline(self, timeline_id, body):
+    @_durable_mutation
+    def update_timeline(self, timeline_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         expected = self._expected_version(body)
-        with self.store._mutex:
-            row = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
-            if not row:
-                raise NotFoundError("timeline not found")
-            if int(row["version"]) != expected:
-                raise ConflictError("timeline version conflict", details={"expected": expected, "actual": int(row["version"])})
-            shots = body.get("shots")
-            refs = body.get("references")
-            if shots is not None:
-                if not isinstance(shots, list) or len({item.get("shot_id") for item in shots if isinstance(item, dict)}) != len(shots):
-                    raise ValidationError("shots must be a list with unique shot_id values")
-                for shot in shots:
-                    if not isinstance(shot, dict) or not shot.get("shot_id") or int(shot.get("start_ms", -1)) < 0 or int(shot.get("duration_ms", 0)) < 1:
-                        raise ValidationError("invalid shot timing")
-            if refs is not None:
-                if not isinstance(refs, list) or len({item.get("reference_id") for item in refs if isinstance(item, dict)}) != len(refs):
-                    raise ValidationError("references must be a list with unique reference_id values")
-                for reference in refs:
-                    if not isinstance(reference, dict) or not reference.get("reference_id") or not reference.get("object_id"):
-                        raise ValidationError("references require reference_id and object_id")
-            if shots is None:
-                shots = [dict(value) for value in self.store.conn.execute("SELECT * FROM timeline_shots WHERE timeline_id=?", (timeline_id,))]
-                shots = [{"shot_id": value["id"], "start_ms": value["start_ms"], "duration_ms": value["duration_ms"], "reference_ids": json.loads(value["reference_ids_json"])} for value in shots]
-            if refs is None:
-                refs = [dict(value) for value in self.store.conn.execute("SELECT * FROM timeline_references WHERE timeline_id=?", (timeline_id,))]
-                refs = [{"reference_id": value["id"], "object_id": value["object_id"], **({"role": value["role"]} if value["role"] else {})} for value in refs]
-            with self.store._transaction():
-                timestamp = now()
-                self.store.conn.execute("DELETE FROM timeline_shot_state WHERE id IN (SELECT id FROM timeline_shots WHERE timeline_id=?)", (timeline_id,))
-                self.store.conn.execute("DELETE FROM timeline_reference_state WHERE id IN (SELECT id FROM timeline_references WHERE timeline_id=?)", (timeline_id,))
-                self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
-                self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
-                for shot in shots:
-                    self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
-                    self.store.conn.execute("INSERT INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (shot["shot_id"],))
-                for reference in refs:
-                    self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
-                    self.store.conn.execute("INSERT INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (reference["reference_id"],))
-                self.store.conn.execute("UPDATE timelines SET version=?, created_at=created_at WHERE id=?", (expected + 1, timeline_id))
-                resource = self._timeline_resource(timeline_id)
-                self._record_timeline_revision(timeline_id, resource)
-            return resource
+        row = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
+        if not row:
+            raise NotFoundError("timeline not found")
+        project_id = str(row["project_id"])
+        request_hash = hashlib.sha256(canonical_json({"timeline_id": timeline_id, "body": body}).encode()).hexdigest()
+        replay = self._command_replay("timeline.update", timeline_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        if int(row["version"]) != expected:
+            raise ConflictError("timeline version conflict", details={"expected": expected, "actual": int(row["version"])})
+        shots = body.get("shots")
+        refs = body.get("references")
+        if shots is not None:
+            if not isinstance(shots, list) or len({item.get("shot_id") for item in shots if isinstance(item, dict)}) != len(shots):
+                raise ValidationError("shots must be a list with unique shot_id values")
+            for shot in shots:
+                if not isinstance(shot, dict) or not shot.get("shot_id") or int(shot.get("start_ms", -1)) < 0 or int(shot.get("duration_ms", 0)) < 1:
+                    raise ValidationError("invalid shot timing")
+        if refs is not None:
+            if not isinstance(refs, list) or len({item.get("reference_id") for item in refs if isinstance(item, dict)}) != len(refs):
+                raise ValidationError("references must be a list with unique reference_id values")
+            for reference in refs:
+                if not isinstance(reference, dict) or not reference.get("reference_id") or not reference.get("object_id"):
+                    raise ValidationError("references require reference_id and object_id")
+        if shots is None:
+            shots = [dict(value) for value in self.store.conn.execute("SELECT * FROM timeline_shots WHERE timeline_id=?", (timeline_id,))]
+            shots = [{"shot_id": value["id"], "start_ms": value["start_ms"], "duration_ms": value["duration_ms"], "reference_ids": json.loads(value["reference_ids_json"])} for value in shots]
+        if refs is None:
+            refs = [dict(value) for value in self.store.conn.execute("SELECT * FROM timeline_references WHERE timeline_id=?", (timeline_id,))]
+            refs = [{"reference_id": value["id"], "object_id": value["object_id"], **({"role": value["role"]} if value["role"] else {})} for value in refs]
+        with self.store._transaction():
+            self.store.conn.execute("DELETE FROM timeline_shot_state WHERE id IN (SELECT id FROM timeline_shots WHERE timeline_id=?)", (timeline_id,))
+            self.store.conn.execute("DELETE FROM timeline_reference_state WHERE id IN (SELECT id FROM timeline_references WHERE timeline_id=?)", (timeline_id,))
+            self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
+            self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
+            for shot in shots:
+                self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
+                self.store.conn.execute("INSERT INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (shot["shot_id"],))
+            for reference in refs:
+                self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
+                self.store.conn.execute("INSERT INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (reference["reference_id"],))
+            self.store.conn.execute("UPDATE timelines SET version=?, created_at=created_at WHERE id=?", (expected + 1, timeline_id))
+            resource = self._timeline_resource(timeline_id)
+            self._record_timeline_revision(timeline_id, resource)
+            event_id = self.store._append_timeline_event(timeline_id, "timeline.updated", {"project_id": project_id, "version": resource["version"]})
+            event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
+            return self._command_record("timeline.update", timeline_id, idempotency_key, request_hash, resource, project_id=project_id, event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
 
     @_durable_mutation
     def create_timeline(self, project_id, timeline_id, *, idempotency_key=None):
@@ -799,43 +806,59 @@ class RuntimeService:
         after = self._timeline_revision(timeline_id, int(to_version))
         return {"timeline_id": timeline_id, "from_version": int(from_version), "to_version": int(to_version), "changes": {"shots": self._diff_items(before["shots"], after["shots"], "shot_id"), "references": self._diff_items(before["references"], after["references"], "reference_id")}}
 
-    def archive_timeline(self, timeline_id, body):
+    @_durable_mutation
+    def archive_timeline(self, timeline_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         expected = self._expected_version(body)
-        with self.store._mutex:
-            current = self._timeline_resource(timeline_id)
-            if current["version"] != expected:
-                raise ConflictError("timeline version conflict", details={"expected": expected, "actual": current["version"]})
-            with self.store._transaction():
-                self.store.conn.execute("UPDATE timelines SET archived_at=?, version=? WHERE id=?", (now(), expected + 1, timeline_id))
-                resource = self._timeline_resource(timeline_id)
-                self._record_timeline_revision(timeline_id, resource)
-            return resource
+        current = self._timeline_resource(timeline_id)
+        project_id = str(current["project_id"])
+        request_hash = hashlib.sha256(canonical_json({"timeline_id": timeline_id, "body": body, "action": "archive"}).encode()).hexdigest()
+        replay = self._command_replay("timeline.archive", timeline_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        if current["version"] != expected:
+            raise ConflictError("timeline version conflict", details={"expected": expected, "actual": current["version"]})
+        with self.store._transaction():
+            self.store.conn.execute("UPDATE timelines SET archived_at=?, version=? WHERE id=?", (now(), expected + 1, timeline_id))
+            resource = self._timeline_resource(timeline_id)
+            self._record_timeline_revision(timeline_id, resource)
+            event_id = self.store._append_timeline_event(timeline_id, "timeline.archived", {"project_id": project_id, "version": resource["version"]})
+            event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
+            return self._command_record("timeline.archive", timeline_id, idempotency_key, request_hash, resource, project_id=project_id, event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
 
-    def recover_timeline(self, timeline_id, body):
+    @_durable_mutation
+    def recover_timeline(self, timeline_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         expected = self._expected_version(body)
         target = body.get("version")
         if isinstance(target, bool) or not isinstance(target, int) or target < 1:
             raise ValidationError("version must be a positive integer")
-        with self.store._mutex:
-            current = self._timeline_resource(timeline_id)
-            if current["version"] != expected:
-                raise ConflictError("timeline version conflict", details={"expected": expected, "actual": current["version"]})
-            revision = self._timeline_revision(timeline_id, target)
-            with self.store._transaction():
-                self.store.conn.execute("DELETE FROM timeline_shot_state WHERE id IN (SELECT id FROM timeline_shots WHERE timeline_id=?)", (timeline_id,))
-                self.store.conn.execute("DELETE FROM timeline_reference_state WHERE id IN (SELECT id FROM timeline_references WHERE timeline_id=?)", (timeline_id,))
-                self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
-                self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
-                for shot in revision["shots"]:
-                    self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
-                    self.store.conn.execute("INSERT INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (shot["shot_id"],))
-                for reference in revision["references"]:
-                    self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
-                    self.store.conn.execute("INSERT INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (reference["reference_id"],))
-                self.store.conn.execute("UPDATE timelines SET archived_at=NULL, version=? WHERE id=?", (expected + 1, timeline_id))
-                resource = self._timeline_resource(timeline_id)
-                self._record_timeline_revision(timeline_id, resource)
-            return resource
+        current = self._timeline_resource(timeline_id)
+        project_id = str(current["project_id"])
+        request_hash = hashlib.sha256(canonical_json({"timeline_id": timeline_id, "body": body, "action": "recover"}).encode()).hexdigest()
+        replay = self._command_replay("timeline.recover", timeline_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        if current["version"] != expected:
+            raise ConflictError("timeline version conflict", details={"expected": expected, "actual": current["version"]})
+        revision = self._timeline_revision(timeline_id, target)
+        with self.store._transaction():
+            self.store.conn.execute("DELETE FROM timeline_shot_state WHERE id IN (SELECT id FROM timeline_shots WHERE timeline_id=?)", (timeline_id,))
+            self.store.conn.execute("DELETE FROM timeline_reference_state WHERE id IN (SELECT id FROM timeline_references WHERE timeline_id=?)", (timeline_id,))
+            self.store.conn.execute("DELETE FROM timeline_shots WHERE timeline_id=?", (timeline_id,))
+            self.store.conn.execute("DELETE FROM timeline_references WHERE timeline_id=?", (timeline_id,))
+            for shot in revision["shots"]:
+                self.store.conn.execute("INSERT INTO timeline_shots VALUES (?, ?, ?, ?, ?)", (shot["shot_id"], timeline_id, int(shot["start_ms"]), int(shot["duration_ms"]), canonical_json(shot.get("reference_ids", []))))
+                self.store.conn.execute("INSERT INTO timeline_shot_state(id, version, archived_at) VALUES (?, 1, NULL)", (shot["shot_id"],))
+            for reference in revision["references"]:
+                self.store.conn.execute("INSERT INTO timeline_references VALUES (?, ?, ?, ?)", (reference["reference_id"], timeline_id, reference["object_id"], reference.get("role")))
+                self.store.conn.execute("INSERT INTO timeline_reference_state(id, version, archived_at) VALUES (?, 1, NULL)", (reference["reference_id"],))
+            self.store.conn.execute("UPDATE timelines SET archived_at=NULL, version=? WHERE id=?", (expected + 1, timeline_id))
+            resource = self._timeline_resource(timeline_id)
+            self._record_timeline_revision(timeline_id, resource)
+            event_id = self.store._append_timeline_event(timeline_id, "timeline.recovered", {"project_id": project_id, "version": resource["version"], "target_version": target})
+            event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
+            return self._command_record("timeline.recover", timeline_id, idempotency_key, request_hash, resource, project_id=project_id, event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
 
     @_durable_mutation
     def create_shot(self, timeline_id, body, *, idempotency_key=None):
@@ -903,22 +926,28 @@ class RuntimeService:
         value["content"] = json.loads(value.pop("content_json"))
         return value
 
-    def create_document(self, project_id, body):
+    @_durable_mutation
+    def create_document(self, project_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id)
         document_id = str(body.get("document_id") or "")
         kind = str(body.get("kind") or "")
         if not document_id or not kind or "content" not in body:
             raise ValidationError("document_id, kind, and content are required")
         content = body["content"]
-        with self.store._mutex:
-            existing = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
-            if existing:
-                if existing["kind"] == kind and json.loads(existing["content_json"]) == content:
-                    return self._document_resource(existing)
-                raise ConflictError("document already exists", details={"document_id": document_id})
-            timestamp = now()
-            self.store.conn.execute("INSERT INTO project_documents VALUES (?, ?, ?, ?, 1, ?, ?)", (document_id, project["id"], kind, canonical_json(content), timestamp, timestamp))
-            return self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
+        request_hash = hashlib.sha256(canonical_json({"project_id": project["id"], "document_id": document_id, "kind": kind, "content": content}).encode()).hexdigest()
+        replay = self._command_replay("document.create", document_id, idempotency_key, request_hash, project_id=project["id"])
+        if replay is not None:
+            return replay
+        existing = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
+        if existing:
+            if existing["kind"] == kind and json.loads(existing["content_json"]) == content:
+                return self._document_resource(existing)
+            raise ConflictError("document already exists", details={"document_id": document_id})
+        timestamp = now()
+        self.store.conn.execute("INSERT INTO project_documents VALUES (?, ?, ?, ?, 1, ?, ?)", (document_id, project["id"], kind, canonical_json(content), timestamp, timestamp))
+        result = self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
+        return self._command_record("document.create", document_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     def list_documents(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
@@ -934,22 +963,28 @@ class RuntimeService:
             raise NotFoundError("document not found")
         return self._document_resource(row)
 
-    def update_document(self, project_id, document_id, body):
+    @_durable_mutation
+    def update_document(self, project_id, document_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         expected = self._expected_version(body)
         project = self.store.get_project(project_id)
-        with self.store._mutex:
-            row = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
-            if not row:
-                raise NotFoundError("document not found")
-            if int(row["version"]) != expected:
-                raise ConflictError("document version conflict", details={"expected": expected, "actual": int(row["version"])})
-            kind = str(body.get("kind", row["kind"]))
-            content = body.get("content", json.loads(row["content_json"]))
-            if not kind:
-                raise ValidationError("document kind is required")
-            timestamp = now()
-            self.store.conn.execute("UPDATE project_documents SET kind=?, content_json=?, version=?, updated_at=? WHERE id=?", (kind, canonical_json(content), expected + 1, timestamp, document_id))
-            return self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
+        request_hash = hashlib.sha256(canonical_json({"project_id": project["id"], "document_id": document_id, "body": body}).encode()).hexdigest()
+        replay = self._command_replay("document.update", document_id, idempotency_key, request_hash, project_id=project["id"])
+        if replay is not None:
+            return replay
+        row = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
+        if not row:
+            raise NotFoundError("document not found")
+        if int(row["version"]) != expected:
+            raise ConflictError("document version conflict", details={"expected": expected, "actual": int(row["version"])})
+        kind = str(body.get("kind", row["kind"]))
+        content = body.get("content", json.loads(row["content_json"]))
+        if not kind:
+            raise ValidationError("document kind is required")
+        timestamp = now()
+        self.store.conn.execute("UPDATE project_documents SET kind=?, content_json=?, version=?, updated_at=? WHERE id=?", (kind, canonical_json(content), expected + 1, timestamp, document_id))
+        result = self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
+        return self._command_record("document.update", document_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     def _generation_resource(self, row):
         value = dict(row)
@@ -957,7 +992,9 @@ class RuntimeService:
         value["metadata"] = json.loads(value.pop("metadata_json"))
         return value
 
-    def create_generation(self, project_id, body):
+    @_durable_mutation
+    def create_generation(self, project_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project = self.store.get_project(project_id)
         generation_id = str(body.get("generation_id") or "")
         if not generation_id:
@@ -965,12 +1002,19 @@ class RuntimeService:
         metadata = body.get("metadata", {})
         if not isinstance(metadata, dict):
             raise ValidationError("generation metadata must be an object")
-        with self.store._mutex:
-            try:
-                self.store.conn.execute("INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)", (generation_id, project["id"], body.get("source_task_id"), body.get("type", "generation"), body.get("status", "created"), canonical_json(metadata), now(), now()))
-            except sqlite3.IntegrityError as exc:
-                raise ConflictError("generation already exists", details={"generation_id": generation_id}) from exc
-            return self._generation_resource(self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone())
+        generation_type = str(body.get("type", "generation"))
+        status = str(body.get("status", "created"))
+        source_task_id = body.get("source_task_id")
+        request_hash = hashlib.sha256(canonical_json({"project_id": project["id"], "generation_id": generation_id, "source_task_id": source_task_id, "type": generation_type, "status": status, "metadata": metadata}).encode()).hexdigest()
+        replay = self._command_replay("generation.create", generation_id, idempotency_key, request_hash, project_id=project["id"])
+        if replay is not None:
+            return replay
+        try:
+            self.store.conn.execute("INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)", (generation_id, project["id"], source_task_id, generation_type, status, canonical_json(metadata), now(), now()))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("generation already exists", details={"generation_id": generation_id}) from exc
+        result = self._generation_resource(self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone())
+        return self._command_record("generation.create", generation_id, idempotency_key, request_hash, result, project_id=project["id"])
 
     def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
@@ -985,8 +1029,10 @@ class RuntimeService:
             raise NotFoundError("generation not found")
         return self._generation_resource(row)
 
-    def create_variant(self, generation_id, body):
-        self.get_generation(generation_id)
+    @_durable_mutation
+    def create_variant(self, generation_id, body, *, idempotency_key=None):
+        self._require_object_body(body)
+        generation = self.get_generation(generation_id)
         variant_id = str(body.get("variant_id") or "")
         if not variant_id:
             raise ValidationError("variant_id is required")
@@ -998,12 +1044,17 @@ class RuntimeService:
             object_id = str(object_id).removeprefix("sha256:")
             if not self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (object_id,)).fetchone():
                 raise NotFoundError("object not found")
-        with self.store._mutex:
-            try:
-                self.store.conn.execute("INSERT INTO generation_variants VALUES (?, ?, ?, ?, ?, ?)", (variant_id, generation_id, object_id, body.get("variant_type", "original"), canonical_json(metadata), now()))
-            except sqlite3.IntegrityError as exc:
-                raise ConflictError("generation variant already exists", details={"variant_id": variant_id}) from exc
-            return self._variant_resource(self.store.conn.execute("SELECT * FROM generation_variants WHERE id=?", (variant_id,)).fetchone())
+        variant_type = str(body.get("variant_type", "original"))
+        request_hash = hashlib.sha256(canonical_json({"generation_id": generation_id, "variant_id": variant_id, "object_id": object_id, "variant_type": variant_type, "metadata": metadata}).encode()).hexdigest()
+        replay = self._command_replay("variant.create", variant_id, idempotency_key, request_hash, project_id=generation["project_id"])
+        if replay is not None:
+            return replay
+        try:
+            self.store.conn.execute("INSERT INTO generation_variants VALUES (?, ?, ?, ?, ?, ?)", (variant_id, generation_id, object_id, variant_type, canonical_json(metadata), now()))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("generation variant already exists", details={"variant_id": variant_id}) from exc
+        result = self._variant_resource(self.store.conn.execute("SELECT * FROM generation_variants WHERE id=?", (variant_id,)).fetchone())
+        return self._command_record("variant.create", variant_id, idempotency_key, request_hash, result, project_id=generation["project_id"])
 
     @staticmethod
     def _variant_resource(row):
@@ -1131,7 +1182,9 @@ class RuntimeService:
                           key_fn=lambda row: (str(row["created_at"]), str(row["digest"])),
                           resource_fn=lambda row: self._object_resource(row) | {"relation": row["relation"]})
 
-    def create_media_relation(self, project, body):
+    @_durable_mutation
+    def create_media_relation(self, project, body, *, idempotency_key=None):
+        self._require_object_body(body)
         project_id = self.store.get_project(project)["id"]
         allowed = {"derived_from", "variant_of", "uses_as_input", "mask_for", "audio_for"}
         kind = str(body.get("kind") or "")
@@ -1149,12 +1202,18 @@ class RuntimeService:
         except (TypeError, ValueError) as exc:
             raise ValidationError("media relation ordinal must be an integer") from exc
         if ordinal < 0: raise ValidationError("media relation ordinal must be non-negative")
-        with self.store._mutex:
-            try:
-                self.store.conn.execute("INSERT INTO media_relations VALUES (?, ?, ?, ?, ?, ?, ?)", (project_id, source, target, kind, ordinal, canonical_json(metadata), now()))
-            except sqlite3.IntegrityError as exc:
-                raise ConflictError("media relation already exists") from exc
-        return {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "ordinal": ordinal, "metadata": metadata, "created_at": self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=? AND ordinal=?", (project_id, source, target, kind, ordinal)).fetchone()[0]}
+        request_hash = hashlib.sha256(canonical_json({"project_id": project_id, "from_object_id": source, "to_object_id": target, "kind": kind, "ordinal": ordinal, "metadata": metadata}).encode()).hexdigest()
+        aggregate_id = "media-relations"
+        replay = self._command_replay("media_relation.create", aggregate_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        try:
+            self.store.conn.execute("INSERT INTO media_relations VALUES (?, ?, ?, ?, ?, ?, ?)", (project_id, source, target, kind, ordinal, canonical_json(metadata), now()))
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("media relation already exists") from exc
+        created_at = self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=? AND ordinal=?", (project_id, source, target, kind, ordinal)).fetchone()[0]
+        result = {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "ordinal": ordinal, "metadata": metadata, "created_at": created_at}
+        return self._command_record("media_relation.create", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
 
     def list_media_relations(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project_id = self.store.get_project(project)["id"]
@@ -1241,12 +1300,6 @@ class RuntimeService:
         result["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (result["id"],))]
         return result
 
-    def _ensure_default_capability(self):
-        # Kept as a compatibility hook for older embedders.  Capability
-        # registration is executor-owned now; startup must never manufacture a
-        # ready render.basic entry without a live matching host.
-        return None
-
     def list_capabilities(self, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
         return _page_rows(rows, scope="capabilities", cursor=cursor, limit=limit,
@@ -1284,13 +1337,15 @@ class RuntimeService:
         replay = self._command_replay("executor.register", aggregate_id, idempotency_key, request_hash)
         if replay is not None:
             return replay
-        # Fence the identity before checking duplicate state or registering
-        # capability descriptors. A stale executor request must have no
-        # observable side effect and must fail as an epoch error, even when
-        # its identity is already present in the canonical registry.
-        epoch = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=body.get("executor_id"))
-        if self.store.conn.execute("SELECT 1 FROM executors WHERE id=?", (body["executor_id"],)).fetchone():
-            raise ConflictError("executor already exists", details={"executor_id": body["executor_id"]})
+        # Re-registration is the canonical reconnect path after a runtime
+        # restart or a deliberate capability/readiness refresh.  The bearer
+        # fence above binds the caller to this executor (or an administrator),
+        # while an existing identity must present the current runtime epoch.
+        existing = self.store.conn.execute("SELECT runtime_epoch FROM executors WHERE id=?", (body["executor_id"],)).fetchone()
+        epoch = self.store._validate_runtime_epoch(
+            body.get("runtime_epoch"), identity="executor",
+            identity_id=body.get("executor_id"), required=existing is not None,
+        )
         self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch)
         result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result)

@@ -173,26 +173,26 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         assert cursor is None and projects == []
         project = client.create_project("Domain Project", idempotency_key="domain-project")
 
-        document = client.create_document(project.project_id, "doc-1", "notes", {"text": "one"})
+        document = client.create_document(project.project_id, "doc-1", "notes", {"text": "one"}, idempotency_key="doc-1")
         assert document.version == 1
-        updated = client.update_document(project.project_id, "doc-1", expected_version=1, content={"text": "two"})
+        updated = client.update_document(project.project_id, "doc-1", expected_version=1, idempotency_key="doc-1-update", content={"text": "two"})
         assert updated.version == 2 and updated.content == {"text": "two"}
         with pytest.raises(ApiError) as stale_document:
-            client.update_document(project.project_id, "doc-1", expected_version=1, content={"text": "three"})
+            client.update_document(project.project_id, "doc-1", expected_version=1, idempotency_key="doc-1-stale", content={"text": "three"})
         assert stale_document.value.status == 409
 
         timeline = client.create_timeline(project.project_id, "timeline-1", idempotency_key="timeline-1")
         assert timeline["version"] == 1
-        saved = client.update_timeline("timeline-1", expected_version=1, shots=[{"shot_id": "shot-1", "start_ms": 0, "duration_ms": 1000, "reference_ids": []}])
+        saved = client.update_timeline("timeline-1", expected_version=1, idempotency_key="timeline-1-update", shots=[{"shot_id": "shot-1", "start_ms": 0, "duration_ms": 1000, "reference_ids": []}])
         assert saved["version"] == 2 and saved["shots"][0]["shot_id"] == "shot-1"
         with pytest.raises(ApiError) as stale_timeline:
-            client.update_timeline("timeline-1", expected_version=1, shots=[])
+            client.update_timeline("timeline-1", expected_version=1, idempotency_key="timeline-1-stale", shots=[])
         assert stale_timeline.value.status == 409
 
         object_row = client.ingest_object(b"variant", media_type="application/octet-stream", idempotency_key="variant-object")
-        generation = client.create_generation(project.project_id, "generation-1", metadata={"prompt": "neutral"})
+        generation = client.create_generation(project.project_id, "generation-1", idempotency_key="generation-1", metadata={"prompt": "neutral"})
         assert generation.project_id == project.project_id
-        variant = client.create_variant(generation.generation_id, "variant-1", object_id=object_row.object_id, metadata={"seed": 1})
+        variant = client.create_variant(generation.generation_id, "variant-1", idempotency_key="variant-1", object_id=object_row.object_id, metadata={"seed": 1})
         assert variant.object_id == object_row.object_id
         variants, _ = client.list_variants(generation.generation_id)
         assert [item.variant_id for item in variants] == ["variant-1"]
@@ -310,10 +310,10 @@ def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path
         objects, cursor = client.list_project_objects(project.project_id)
         assert cursor is None and objects[0].object_id == object_row.object_id and objects[0].relation == "managed"
 
-        client.create_document(project.project_id, "settings", "settings", {"theme": "dark"})
-        client.create_document(project.project_id, "review", "review", {"approved": False})
+        client.create_document(project.project_id, "settings", "settings", {"theme": "dark"}, idempotency_key="settings-document")
+        client.create_document(project.project_id, "review", "review", {"approved": False}, idempotency_key="review-document")
         timeline = client.create_timeline(project.project_id, "timeline", idempotency_key="timeline")
-        saved = client.update_timeline("timeline", expected_version=1, shots=[{"shot_id": "shot", "start_ms": 0, "duration_ms": 100}])
+        saved = client.update_timeline("timeline", expected_version=1, idempotency_key="timeline-update", shots=[{"shot_id": "shot", "start_ms": 0, "duration_ms": 100}])
         history, _ = client.list_timeline_history("timeline")
         assert [item["version"] for item in history] == [1, 2]
         assert client.diff_timeline("timeline", from_version=1, to_version=2)["changes"]["shots"]["added"]
@@ -343,8 +343,8 @@ def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path
         relations, _ = client.list_media_relations(project.project_id)
         assert relation["kind"] == "derived_from" and relations[0]["to_object_id"] == second_object.object_id
 
-        generation = client.create_generation(project.project_id, "generation")
-        client.create_variant(generation.generation_id, "variant")
+        generation = client.create_generation(project.project_id, "generation", idempotency_key="generation")
+        client.create_variant(generation.generation_id, "variant", idempotency_key="variant")
         assert client.get_variant("variant").generation_id == generation.generation_id
 
         client.register_capability("render.basic", _digest("render.basic"), idempotency_key="listed-capability")

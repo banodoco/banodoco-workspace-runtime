@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from .bootstrap import BootstrapError, SourceProfile
 
@@ -124,15 +126,44 @@ class LocalRuntimeBoundary:
         checkout path is provenance for the editable source profile, never an
         import or launch fallback for the neutral runtime.
         """
-        source_checkout = Path(source.source_checkout).expanduser().resolve()
+        runtime_checkout = Path(source.runtime_checkout).expanduser()
+        if not runtime_checkout.is_absolute():
+            raise BootstrapError("Source profile must provide an absolute pinned runtime_checkout.")
+        LocalRuntimeBoundary._validate_path(runtime_checkout, "runtime checkout")
+        source_checkout = Path(source.source_checkout).expanduser()
+        LocalRuntimeBoundary._validate_path(source_checkout, "source checkout")
+        if source_checkout.is_symlink():
+            raise BootstrapError("Source checkout from the editable profile must not be a symlink.")
+        source_checkout = source_checkout.resolve()
         if not source_checkout.exists():
             raise BootstrapError(f"Source checkout from the editable profile does not exist: {source_checkout}")
+        if source.runtime_environment:
+            environment = Path(source.runtime_environment).expanduser()
+            LocalRuntimeBoundary._validate_path(environment, "runtime environment")
+            if not environment.is_dir():
+                raise BootstrapError(f"Configured runtime environment does not exist: {environment}")
+
+    @staticmethod
+    def _validate_path(path: Path, label: str) -> Path:
+        """Reject operator-controlled path aliases before resolving them."""
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            raise BootstrapError(f"{label} must be absolute")
+        current = Path(target.anchor)
+        for component in target.parts[1:]:
+            current /= component
+            # /var and /tmp are protected macOS compatibility aliases; all
+            # support-relative components below them are still checked.
+            if current.is_symlink() and current not in {Path("/var"), Path("/tmp")}:
+                raise BootstrapError(f"{label} must not traverse a symlink")
+        return target
 
     def configure_source(self, source: SourceProfile) -> None:
         self._source = source
 
     @staticmethod
     def _token_file(support_root: Path, token: str) -> Path:
+        LocalRuntimeBoundary._validate_path(support_root, "runtime support root")
         support_root.mkdir(parents=True, exist_ok=True)
         support_root.chmod(0o700)
         fd, name = tempfile.mkstemp(prefix=".bootstrap-token-", dir=support_root)
@@ -185,8 +216,15 @@ class LocalRuntimeBoundary:
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
         if self._process and self._process.poll() is None:
             raise BootstrapError("runtime boundary already owns a live daemon")
-        realm_root = Path(realm_root).expanduser().resolve()
-        support_root = owner_lock.parent.expanduser().resolve()
+        realm_root = self._validate_path(Path(realm_root), "realm root")
+        owner_lock = self._validate_path(Path(owner_lock), "owner lock")
+        support_root = self._validate_path(owner_lock.parent, "runtime support root")
+        self._validate_source(source_profile)
+        # Resolve only after the lexical fence.  No source profile field can
+        # replace these neutral authority paths.
+        realm_root = realm_root.resolve()
+        support_root = support_root.resolve()
+        owner_lock = owner_lock.resolve()
         bootstrap_token = os.urandom(32).hex()
         token_file = self._token_file(support_root, bootstrap_token)
         argv = self._argv(source_profile, realm_id=realm_id, realm_root=realm_root, support_root=support_root, display_name=self._display_name, owner_lock=owner_lock, token_file=token_file)
@@ -219,10 +257,27 @@ class LocalRuntimeBoundary:
         }
 
     def _read_discovery(self, support_root: Path) -> dict[str, Any]:
+        return self._read_discovery_file(self._validate_path(Path(support_root) / "discovery.json", "runtime discovery"))
+
+    @classmethod
+    def _read_discovery_file(cls, path: Path) -> dict[str, Any]:
         try:
-            value = json.loads((support_root / "discovery.json").read_text(encoding="utf-8"))
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return {}
+                chunks = []
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                value = json.loads(b"".join(chunks).decode("utf-8"))
+            finally:
+                os.close(fd)
             return value if isinstance(value, dict) else {}
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
             return {}
 
     @staticmethod
@@ -261,7 +316,16 @@ class LocalRuntimeBoundary:
 
     @staticmethod
     def _http_health(endpoint: str) -> bool:
-        request = urllib.request.Request(endpoint.rstrip("/") + "/v1/health", headers={"Accept": "application/json"})
+        try:
+            parsed = urlsplit(str(endpoint))
+            if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment
+                    or parsed.path not in ("", "/")
+                    or parsed.port is None or not (1 <= parsed.port <= 65535)):
+                return False
+        except ValueError:
+            return False
+        request = urllib.request.Request(str(endpoint).rstrip("/") + "/v1/health", headers={"Accept": "application/json"})
         try:
             with urllib.request.urlopen(request, timeout=0.5) as response:
                 value = json.loads(response.read().decode("utf-8"))
@@ -270,6 +334,15 @@ class LocalRuntimeBoundary:
             return False
 
     def connect(self, *, endpoint: str, credential: str) -> RuntimeConnection:
+        try:
+            parsed = urlsplit(str(endpoint))
+            if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment
+                    or parsed.path not in ("", "/")
+                    or parsed.port is None or not (1 <= parsed.port <= 65535)):
+                raise ValueError
+        except ValueError as exc:
+            raise BootstrapError("runtime endpoint must be an HTTP loopback authority") from exc
         try:
             from banodoco_workspace_client import WorkspaceClient
         except ImportError as exc:
@@ -285,8 +358,23 @@ class LocalRuntimeBoundary:
         if not self.is_pid_alive(pid):
             return False
         try:
-            marker = json.loads(Path(owner_lock).read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            path = self._validate_path(Path(owner_lock), "owner lock")
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return False
+                chunks = []
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                marker = json.loads(b"".join(chunks).decode("utf-8"))
+            finally:
+                os.close(fd)
+        except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, OSError):
+            return False
+        if not isinstance(marker, dict):
             return False
         if str(marker.get("pid")) != str(pid) or str(marker.get("runtime_instance_id")) != instance_id:
             return False
@@ -339,8 +427,8 @@ class LocalRuntimeBoundary:
         """
         self._source = source_profile
         self._realm_id = str(realm_id)
-        self._realm_root = Path(realm_root).expanduser().resolve()
-        self._support_root = Path(support_root).expanduser().resolve()
+        self._realm_root = self._validate_path(Path(realm_root), "realm root").resolve()
+        self._support_root = self._validate_path(Path(support_root), "runtime support root").resolve()
         self._detached_pid = int(pid)
 
     def restart(self, **kwargs) -> Mapping[str, Any]:
@@ -352,8 +440,8 @@ class LocalRuntimeBoundary:
         expected_instance = str(kwargs.get("instance_id", ""))
         expected_birth = str(kwargs.get("process_birth_id", ""))
         expected_realm = str(kwargs.get("realm_id", realm_id))
-        owner_lock = Path(kwargs.get("owner_lock", support / "instance.lock")).expanduser().resolve()
-        discovery_path = Path(kwargs.get("discovery_path", support / "discovery.json")).expanduser().resolve()
+        owner_lock = self._validate_path(Path(kwargs.get("owner_lock", support / "instance.lock")), "owner lock").resolve()
+        discovery_path = self._validate_path(Path(kwargs.get("discovery_path", support / "discovery.json")), "runtime discovery").resolve()
 
         def validate_before_signal(*, require_health: bool = True) -> None:
             """Re-read every fence immediately before the first signal."""
@@ -362,9 +450,15 @@ class LocalRuntimeBoundary:
             if expected_pid == os.getpid():
                 raise BootstrapError("Runtime restart refused: owner PID is the current operator process.")
             try:
-                discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
-                marker = json.loads(owner_lock.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                discovery = self._read_discovery_file(discovery_path)
+                fd = os.open(owner_lock, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise OSError("owner lock is not a regular file")
+                    marker = json.loads(os.read(fd, 1024 * 1024).decode("utf-8"))
+                finally:
+                    os.close(fd)
+            except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 raise BootstrapError("Runtime restart refused: owner discovery or lock is unavailable.") from exc
             checks = (
                 str(discovery.get("pid")) == str(expected_pid),

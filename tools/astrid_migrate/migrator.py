@@ -857,9 +857,10 @@ class Migrator:
             if document is not None and hasattr(self.client, "create_document"):
                 body = {"document_id": f"timeline:{row['id']}", "kind": "timeline", "content": document}
                 try:
-                    doc = self.client.create_document(project_id, body)
+                    key = f"astrid-migrate-document-{row['id']}"
+                    doc = self.client.create_document(project_id, body, idempotency_key=key)
                 except TypeError:
-                    doc = self.client.create_document(project_id, body["document_id"], body["kind"], body["content"])
+                    doc = self.client.create_document(project_id, body["document_id"], body["kind"], body["content"], idempotency_key=f"astrid-migrate-document-{row['id']}")
                 self._document_ids[str(row["id"])] = self._result_id(doc, "document_id", "id")
         for row in data.get("shots", []):
             metadata = _json(row.get("metadata_json"), {}) or {}

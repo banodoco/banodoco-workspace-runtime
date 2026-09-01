@@ -452,13 +452,14 @@ class RuntimeServiceAdapter:
             if source_task_id is None:
                 raise MigrationError(f"generation {generation.get('id')} task mapping unavailable")
         try:
-            return self.service.create_generation(project_id, {
+            result = self.service.create_generation(project_id, {
                 "generation_id": generation["id"],
                 "type": generation.get("type", "generation"),
                 "source_task_id": source_task_id,
                 "status": "deleted" if generation.get("deleted_at") else "created",
                 "metadata": generation.get("metadata") or {},
-            })
+            }, idempotency_key=idempotency_key)
+            return result.get("data", result) if isinstance(result, Mapping) else result
         except Exception as exc:
             # Generation IDs are the migration idempotency key in the runtime
             # contract. A retry after a crash reads the durable row.
@@ -466,8 +467,9 @@ class RuntimeServiceAdapter:
                 raise
             return self.service.get_generation(str(generation["id"]))
 
-    def create_document(self, project_id, body):
-        return self.service.create_document(project_id, body)
+    def create_document(self, project_id, body, *, idempotency_key=None):
+        result = self.service.create_document(project_id, body, idempotency_key=idempotency_key)
+        return result.get("data", result) if isinstance(result, Mapping) else result
 
     def create_task(self, body):
         value = dict(body)

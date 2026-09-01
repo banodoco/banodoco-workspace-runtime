@@ -114,9 +114,9 @@ paths:
       responses: { '200': { description: Project documents, content: { application/json: { schema: { $ref: '#/components/schemas/DocumentPage' } } } } }
     post:
       operationId: createDocument
-      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateDocument' } } } }
-      responses: { '201': { description: Versioned document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } } }
+      responses: { '201': { description: Versioned document with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/documents/{document_id}:
     get:
       operationId: getDocument
@@ -124,9 +124,9 @@ paths:
       responses: { '200': { description: Versioned document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } } }
     patch:
       operationId: updateDocument
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/DocumentId' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/DocumentId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateDocument' } } } }
-      responses: { '200': { description: Updated document, content: { application/json: { schema: { $ref: './schemas/document.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '200': { description: Updated document with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/objects:
     get:
       operationId: listProjectObjects
@@ -165,9 +165,9 @@ paths:
       responses: { '200': { description: Timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } } }
     patch:
       operationId: updateTimeline
-      parameters: [ { $ref: '#/components/parameters/TimelineId' } ]
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateTimeline' } } } }
-      responses: { '200': { description: Updated timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '200': { description: Updated timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/timelines/{timeline_id}/history:
     get:
       operationId: listTimelineHistory
@@ -186,13 +186,13 @@ paths:
       operationId: archiveTimeline
       parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Archived timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '200': { description: Archived timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/timelines/{timeline_id}/recover:
     post:
       operationId: recoverTimeline
       parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoverTimeline' } } } }
-      responses: { '200': { description: Recovered timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '200': { description: Recovered timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/timelines/{timeline_id}/shots:
     post:
       operationId: createShot
@@ -358,7 +358,7 @@ paths:
       operationId: createMediaRelation
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateMediaRelation' } } } }
-      responses: { '201': { description: Media relation, content: { application/json: { schema: { $ref: './schemas/media-relation.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '201': { description: Media relation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/objects:
     post:
       operationId: ingestObject
@@ -462,9 +462,9 @@ paths:
       responses: { '200': { description: Project generations, content: { application/json: { schema: { $ref: '#/components/schemas/GenerationPage' } } } } }
     post:
       operationId: createGeneration
-      parameters: [ { $ref: '#/components/parameters/ProjectId' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateGeneration' } } } }
-      responses: { '201': { description: Generation, content: { application/json: { schema: { $ref: './schemas/generation.json' } } } } }
+      responses: { '201': { description: Generation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/generations/{generation_id}:
     get:
       operationId: getGeneration
@@ -477,9 +477,9 @@ paths:
       responses: { '200': { description: Generation variants, content: { application/json: { schema: { $ref: '#/components/schemas/VariantPage' } } } } }
     post:
       operationId: createVariant
-      parameters: [ { $ref: '#/components/parameters/GenerationId' } ]
+      parameters: [ { $ref: '#/components/parameters/GenerationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateVariant' } } } }
-      responses: { '201': { description: Generation variant, content: { application/json: { schema: { $ref: '#/components/schemas/Variant' } } } } }
+      responses: { '201': { description: Generation variant with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/variants/{variant_id}:
     get:
       operationId: getVariant
@@ -759,7 +759,7 @@ components:
       type: object
       additionalProperties: false
       required: [from_object_id, to_object_id, kind]
-      properties: { from_object_id: { type: string, minLength: 1 }, to_object_id: { type: string, minLength: 1 }, kind: { type: string }, metadata: { type: object, additionalProperties: true } }
+      properties: { from_object_id: { type: string, minLength: 1 }, to_object_id: { type: string, minLength: 1 }, kind: { type: string }, ordinal: { type: integer, minimum: 0 }, metadata: { type: object, additionalProperties: true } }
     ClaimTask:
       type: object
       additionalProperties: false

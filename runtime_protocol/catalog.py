@@ -12,6 +12,19 @@ from .dirfd import capture_parent, close_pinned, validate_parent
 from .backup import _open_relative
 
 
+def _safe_path(path: str | Path, label: str) -> Path:
+    """Validate an authority path before any resolve/open operation."""
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    current = Path(target.anchor)
+    for component in target.parts[1:]:
+        current /= component
+        if current.is_symlink() and current not in {Path("/var"), Path("/tmp")}:
+            raise ValueError(f"{label} must not traverse a symlink")
+    return target
+
+
 def process_birth_identity(pid: int | None = None) -> str | None:
     """Return an OS birth marker that changes when a PID is reused.
 
@@ -49,7 +62,7 @@ class RealmCatalog:
     """Persistent machine composition state, intentionally separate from realm authority."""
 
     def __init__(self, path: str | Path):
-        self.path = Path(path).expanduser().resolve()
+        self.path = _safe_path(path, "catalog path")
         self._path_identity = None
 
     def __del__(self):  # pragma: no cover - interpreter cleanup
@@ -93,9 +106,12 @@ class RealmCatalog:
                 close_pinned(identity)
 
     def register(self, *, realm_id: str, display_name: str, data_root: str, path_identity: Mapping[str, Any] | None = None) -> dict:
+        if not isinstance(realm_id, str) or not realm_id or "/" in realm_id or "\\" in realm_id:
+            raise ValueError("realm id must be an opaque path-safe identifier")
+        root = _safe_path(data_root, "realm root")
         catalog = self.read(path_identity=path_identity)
         realms = [r for r in catalog.get("realms", []) if r.get("realm_id") != realm_id]
-        realms.append({"realm_id": realm_id, "display_name": display_name, "data_root": str(Path(data_root).resolve()), "registered_at": now()})
+        realms.append({"realm_id": realm_id, "display_name": display_name, "data_root": str(root), "registered_at": now()})
         catalog.update(version=1, realms=realms, selected_realm_id=catalog.get("selected_realm_id") or realm_id)
         atomic_json_write(self.path, catalog, identity=path_identity)
         return catalog
@@ -113,13 +129,15 @@ class LiveDiscovery:
     """Ephemeral process advertisement; never includes a database path or secret."""
 
     def __init__(self, path: str | Path):
-        self.path = Path(path).expanduser().resolve()
+        self.path = _safe_path(path, "discovery path")
 
     def publish(self, **fields):
         allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file"}
         atomic_json_write(self.path, {k: fields[k] for k in allowed if k in fields})
 
     def clear(self, instance_id: str | None = None):
+        if self.path.is_symlink():
+            return
         if not self.path.exists():
             return
         if instance_id is None or self.read().get("runtime_instance_id") == instance_id:
@@ -129,5 +147,17 @@ class LiveDiscovery:
                 pass
 
     def read(self):
-        with self.path.open(encoding="utf-8") as stream:
-            return json.load(stream)
+        fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("discovery is not a regular file")
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return json.loads(b"".join(chunks).decode("utf-8"))
+        finally:
+            os.close(fd)

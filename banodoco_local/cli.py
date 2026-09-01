@@ -10,7 +10,20 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__
-from .bootstrap import BootstrapConfig, BootstrapError, SourceProfile, _durable_activation_trust_key, bootstrap, connect, doctor, restart
+from .bootstrap import (
+    BootstrapConfig,
+    BootstrapError,
+    SourceProfile,
+    _durable_activation_trust_key,
+    _read_catalog,
+    _read_support_json,
+    _validate_loopback_endpoint,
+    _validate_support_paths,
+    bootstrap,
+    connect,
+    doctor,
+    restart,
+)
 from .io import read_json
 from .paths import RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
@@ -179,14 +192,15 @@ def _credential(paths: RuntimePaths) -> str:
 
 
 def _client(paths: RuntimePaths):
-    discovery = read_json(paths.discovery_path)
+    _validate_support_paths(paths)
+    discovery = _read_support_json(paths.discovery_path)
     if not discovery or not discovery.get("endpoint"):
         raise BootstrapError("No runtime discovery is available; run banodoco-local up --profile astrid.")
     try:
         from banodoco_workspace_client import WorkspaceClient
     except ImportError as exc:
         raise BootstrapError("The installed generated workspace client is unavailable; install banodoco-workspace-client.") from exc
-    return WorkspaceClient(str(discovery["endpoint"]), _credential(paths))
+    return WorkspaceClient(_validate_loopback_endpoint(str(discovery["endpoint"])), _credential(paths))
 
 
 def _typed_health(paths: RuntimePaths) -> Mapping[str, Any]:
@@ -207,7 +221,8 @@ def _migrate(args: argparse.Namespace, paths: RuntimePaths, *, dry_run: bool) ->
     # The migrator is intentionally offline and source-root scoped.  It gets
     # only the generated client, never a RealmStore or direct SQLite handle.
     from tools.astrid_migrate import MigrationConfig, migrate
-    client = _client(paths) if read_json(paths.discovery_path) else None
+    _validate_support_paths(paths)
+    client = _client(paths) if _read_support_json(paths.discovery_path) else None
     trust_key = _durable_activation_trust_key(paths, provision=not dry_run)
     return migrate(MigrationConfig(args.source_root, args.archive_root, args.destination_root, dry_run=dry_run, activation_registry_root=paths.activations_dir, activation_trust_key=trust_key), client)
 
@@ -246,10 +261,10 @@ def main(argv: list[str] | None = None) -> int:
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
             source = config.resolve_source_profile(paths)
-            catalog = read_json(paths.catalog_path) or {}
+            catalog = _read_catalog(paths)
             realm_id = str(catalog.get("selected_realm_id") or "")
             realm = next((item for item in catalog.get("realms", []) if str(item.get("realm_id")) == realm_id), None)
-            discovery = read_json(paths.discovery_path) or {}
+            discovery = _read_support_json(paths.discovery_path) or {}
             if not realm or not discovery.get("pid"):
                 raise BootstrapError("No selected runtime owner to restart; run banodoco-local up --profile astrid.")
             boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=Path(str(realm["data_root"])), support_root=paths.runtime_support, pid=int(discovery["pid"]))
@@ -257,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
             _emit(result, json_mode=args.json)
             return 0
         if args.command == "status":
-            discovery = read_json(paths.discovery_path)
+            _validate_support_paths(paths)
+            discovery = _read_support_json(paths.discovery_path)
             result = {"discovery": discovery, "support": doctor(paths, LocalRuntimeBoundary())}
             if discovery is not None and not result["support"].get("pid_alive", False):
                 result["stale_discovery"] = True

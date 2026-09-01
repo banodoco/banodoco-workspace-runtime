@@ -34,7 +34,7 @@ export async function runSecondProduct(client: WorkspaceClient): Promise<Record<
   const timeline = await client.getTimeline(timelineId);
   const shot = await client.createShot(timelineId, { shot_id: "second-product-shot-1", start_ms: 0, duration_ms: 1000, reference_ids: [] }, "second-product-shot-1");
   const reference = await client.createReference(timelineId, { reference_id: "second-product-reference-1", object_id: object.object_id, role: "source" }, "second-product-reference-1");
-  const updatedTimeline = await client.updateTimeline(timelineId, 1, [shot], [reference]);
+  const updatedTimeline = await client.updateTimeline(timelineId, 1, "second-product-timeline-update-1", [shot], [reference]);
   const readShot = await client.getShot("second-product-shot-1");
   const readReference = await client.getReference("second-product-reference-1");
   if (!listedTimelines.items.some((item) => item.timeline_id === timelineId) || timeline.timeline_id !== timelineId || updatedTimeline.version !== 2 || readShot.shot_id !== shot.shot_id || readReference.reference_id !== reference.reference_id) throw new Error("minimum composition contract failed");
