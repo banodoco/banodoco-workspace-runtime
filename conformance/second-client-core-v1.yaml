@@ -40,5 +40,5 @@ steps:
     then: ["GET /v1/runs/{run_id}", "GET /v1/tasks/{task_id}", "GET /v1/events"]
     assert: [capability digest pinned, durable cursor, monotonic sequence]
   - id: claim-heartbeat-fenced-settlement-cas-output
-    request: "POST /v1/tasks/claim then POST /v1/attempts/{attempt_id}/heartbeat then POST /v1/objects then POST /v1/attempts/{attempt_id}/settle"
-    assert: [lease_id and fence required, output digest already in CAS, succeeded state, duplicate settlement rejected]
+    request: "POST /v1/tasks/claim then POST /v1/attempts/{attempt_id}/heartbeat then POST /v1/attempts/{attempt_id}/settle with inline output"
+    assert: [lease_id and fence required, output bytes bound to task project during settlement, succeeded state, duplicate settlement rejected]

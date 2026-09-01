@@ -14,6 +14,7 @@ from .util import atomic_json_write
 
 WORKER_ACTOR = "astrid-pack-host"
 WORKER_SCOPES = (
+    "handshake",
     "worker:register",
     "worker:execute",
     "tasks:read",

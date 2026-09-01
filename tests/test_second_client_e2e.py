@@ -19,7 +19,7 @@ ACTOR = ROOT / "conformance" / "dist" / "conformance" / "fake-second-product.js"
 
 @pytest.fixture()
 def daemon(tmp_path: Path):
-    instance = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
+    instance = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support", production_worker_credentials=True).start()
     try:
         yield instance
     finally:
@@ -68,7 +68,7 @@ def test_second_client_core_journey_is_executable(daemon: RuntimeDaemon) -> None
     env.pop("BANODOCO_RUNTIME_OWNER_TOKEN", None)
     env.pop("BANODOCO_LOCAL_OWNER_TOKEN", None)
     completed = subprocess.run(
-        ["node", str(ACTOR), "--endpoint", daemon.endpoint, "--token", daemon.token],
+        ["node", str(ACTOR), "--endpoint", daemon.endpoint, "--token", daemon.token, "--worker-token", daemon.worker_token],
         cwd=ROOT,
         env=env,
         check=True,
