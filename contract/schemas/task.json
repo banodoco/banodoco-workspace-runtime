@@ -3,7 +3,7 @@
   "$id": "https://banodoco.dev/workspace/v1/schemas/task.json",
   "title": "Task and run state",
   "type": "object", "additionalProperties": false,
-  "required": ["task_id", "run_id", "project_id", "state", "version", "capability_id", "capability_digest", "idempotency_key", "created_at", "updated_at", "runtime_epoch"],
+  "required": ["task_id", "run_id", "project_id", "state", "version", "capability_id", "capability_digest", "idempotency_key", "created_at", "updated_at", "runtime_epoch", "input_object_ids"],
   "properties": {
     "task_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },
     "run_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },

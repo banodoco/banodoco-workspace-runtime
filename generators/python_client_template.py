@@ -206,6 +206,7 @@ class Task:
     created_at: str
     updated_at: str
     runtime_epoch: int
+    input_object_ids: list[str]
     spec: Mapping[str, Any]
     project_id: str | None = None
     attempt_id: str | None = None
@@ -213,7 +214,7 @@ class Task:
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Task":
-        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], spec=dict(value.get("spec") or {}), project_id=value.get("project_id"), attempt_id=value.get("attempt_id"), runtime_epoch=int(value["runtime_epoch"]), result=value.get("result"))
+        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), project_id=value.get("project_id"), attempt_id=value.get("attempt_id"), runtime_epoch=int(value["runtime_epoch"]), result=value.get("result"))
 
 
 @dataclass(frozen=True)
@@ -224,12 +225,13 @@ class AttemptFence:
     fence: int
     lease_expires_at: str
     runtime_epoch: int
+    input_object_ids: list[str]
     spec: Mapping[str, Any]
     project_id: str | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "AttemptFence":
-        return cls(attempt_id=value["attempt_id"], task_id=value["task_id"], lease_id=value["lease_id"], fence=int(value["fence"]), lease_expires_at=value["lease_expires_at"], runtime_epoch=int(value["runtime_epoch"]), spec=dict(value.get("spec") or {}), project_id=value.get("project_id"))
+        return cls(attempt_id=value["attempt_id"], task_id=value["task_id"], lease_id=value["lease_id"], fence=int(value["fence"]), lease_expires_at=value["lease_expires_at"], runtime_epoch=int(value["runtime_epoch"]), input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), project_id=value.get("project_id"))
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
