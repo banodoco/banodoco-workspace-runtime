@@ -36,6 +36,7 @@ CATALOG_VERSION = 1
 DISCOVERY_VERSION = 1
 WORKER_ACTOR = "astrid-pack-host"
 WORKER_SCOPES = (
+    "handshake",
     "worker:register",
     "worker:execute",
     "tasks:read",
