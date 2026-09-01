@@ -905,10 +905,12 @@ class RuntimeServiceAdapter:
                 # fails, report that fact without attempting to restore a
                 # partially deleted old tree.
                 try:
+                    os.close(quarantine_fd)
+                    quarantine_fd = -1
                     _remove_tree_at(parent_fd, quarantine_name)
                 except (OSError, MigrationError) as exc:
                     raise MigrationError("activation committed but quarantine cleanup failed") from exc
-            return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": str(target.parent / quarantine_name), "realm_id": realm_id, "candidate_verification": candidate_verification}
+            return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": None if not retain_quarantine else str(target.parent / quarantine_name), "quarantine_removed": not retain_quarantine, "realm_id": realm_id, "candidate_verification": candidate_verification}
         except Exception:
             if published and not committed:
                 try:

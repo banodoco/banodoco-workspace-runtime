@@ -39,6 +39,8 @@ def test_compact_journey_reuses_signed_destination_backup_without_restore_siblin
         assert binding["redundancy"] == "compact"
         active_effect = next(effect for effect in report["journal"]["effects"] if effect["name"] == "active-activation")
         assert active_effect["payload"]["candidate"].endswith("archive-live-destination-backup")
+        assert active_effect["payload"]["activation"]["quarantine"] is None
+        assert active_effect["payload"]["activation"]["quarantine_removed"] is True
         assert not (tmp_path / "archive-live-candidate").exists()
         assert not (tmp_path / "archive-live-reactivated").exists()
         assert not list(tmp_path.glob(".active.inactive-*"))
@@ -52,6 +54,10 @@ def test_extreme_journey_keeps_historical_restore_trees(tmp_path):
     try:
         report = run_live_migration(config, active, auth, writer_stop=lambda: {"stopped": True})
         assert report["journal"]["binding"]["redundancy"] == "extreme"
+        active_effect = next(effect for effect in report["journal"]["effects"] if effect["name"] == "active-activation")
+        quarantine = active_effect["payload"]["activation"]["quarantine"]
+        assert quarantine and Path(quarantine).name.startswith(".active.inactive-active-")
+        assert active_effect["payload"]["activation"]["quarantine_removed"] is False
         assert (tmp_path / "archive-live-candidate").is_dir()
         assert (tmp_path / "archive-live-reactivated").is_dir()
         assert len(list(tmp_path.glob(".active.inactive-*"))) == 3
