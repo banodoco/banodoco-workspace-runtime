@@ -12,7 +12,7 @@ dependencies = []
 [project.scripts]
 banodoco-runtime = "runtime_protocol.cli:main"
 banodoco-local = "banodoco_local.cli:main"
-astrid-live-migrate = "tools.astrid_migrate.operator:main"
+astrid-live-migrate = "banodoco_local.astrid_live:main"
 
 [tool.setuptools]
 # The offline migrator owns the shared public error taxonomy.  Package that

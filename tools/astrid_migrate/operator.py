@@ -24,8 +24,9 @@ import stat
 import sys
 import tempfile
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+from banodoco_local.astrid_live_bridge import open_runtime
 from .boundary import atomic_json_write, capture_parent, close_pinned, durable_json_bytes
 from .live import LIVE_AUTHORIZATION_IDS, issue_live_authorizations, run_live_migration
 from .migrator import (
@@ -39,17 +40,6 @@ from .migrator import (
 
 
 CONFIRMATION = "MIGRATE LIVE ASTRID"
-
-
-def _runtime_service_type():
-    """Load the selected runtime only at the explicit live bridge.
-
-    The offline migrator package must remain importable on a machine that has
-    no Astrid/runtime installation.  The live command is the sole deliberate
-    crossing into the generated runtime implementation.
-    """
-    return __import__("runtime_protocol.service", fromlist=["RuntimeService"]).RuntimeService
-
 
 def _absolute(path: str | Path, *, label: str) -> Path:
     value = Path(path).expanduser()
@@ -247,7 +237,7 @@ def issue_authorizations(args: argparse.Namespace) -> dict[str, Any]:
     return {"ok": True, "source_root": str(source), "realm_id": realm_id, "source_manifest_sha256": inventory["source_manifest_sha256"], "authorization_file": str(output), "authorization_ids": list(LIVE_AUTHORIZATION_IDS)}
 
 
-def live_migrate(args: argparse.Namespace) -> dict[str, Any]:
+def live_migrate(args: argparse.Namespace, *, runtime_factory: Callable[..., Any] = open_runtime) -> dict[str, Any]:
     if args.confirm != CONFIRMATION:
         raise MigrationError(f"live migration requires --confirm {CONFIRMATION!r}")
     source, database = _require_source(args.source_root)
@@ -276,7 +266,7 @@ def live_migrate(args: argparse.Namespace) -> dict[str, Any]:
     config = MigrationConfig(source, archive, destination, evidence_root=evidence, capacity_margin_bytes=args.capacity_margin_bytes, expected_source_manifest_sha256=source_manifest, activation_registry_root=support / "activations", activation_trust_key=trust_key)
     runtime = None
     try:
-        runtime = _runtime_service_type()(active, display_name=args.display_name, realm_id=realm_id, support_root=support)
+        runtime = runtime_factory(active, display_name=args.display_name, realm_id=realm_id, support_root=support)
         if str(runtime.realm["id"]) != realm_id:
             raise MigrationError("active realm identity does not match --realm-id")
         report = run_live_migration(config, runtime, authorizations, writer_stop=_writer_stop_callback(source, database, receipt_path, receipt_digest, receipt))
