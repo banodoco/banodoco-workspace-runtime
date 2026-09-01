@@ -12,13 +12,17 @@ from __future__ import annotations
 import hashlib
 import json
 from argparse import Namespace
+import os
 from pathlib import Path
 import secrets
 import shutil
 import sqlite3
+import subprocess
 from typing import Any
 
 from banodoco_local.io import atomic_write_json
+from banodoco_local.bootstrap import SourceProfile
+from banodoco_local.paths import RuntimePaths
 from runtime_protocol.catalog import RealmCatalog
 from runtime_protocol.service import RuntimeService
 
@@ -28,6 +32,15 @@ from tools.astrid_migrate.rehearsal import build_synthetic_fixture
 
 
 REALM_ID = "stage1-tiny-acceptance"
+
+
+def _has_symlink_component(path: Path) -> bool:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            return True
+    return False
 
 
 def _managed_media(source: Path, digest: str) -> None:
@@ -48,28 +61,42 @@ def _managed_media(source: Path, digest: str) -> None:
         connection.close()
 
 
-def _provision_neutral_realm(active: Path, support: Path) -> None:
+def _provision_neutral_realm(active: Path, paths: RuntimePaths, source_checkout: Path, runtime_environment: Path) -> Path:
     """Create one disposable neutral realm and its activation trust anchor."""
 
-    support.mkdir(parents=True)
-    (support / "activations").mkdir()
-    runtime = RuntimeService(active, display_name="Stage 1 tiny acceptance", realm_id=REALM_ID, support_root=support)
+    paths.ensure_support_dirs()
+    runtime = RuntimeService(active, display_name="Stage 1 tiny acceptance", realm_id=REALM_ID, support_root=paths.runtime_support)
     try:
         # The service creates the neutral SQLite realm; the catalog is the
         # durable selected-realm boundary consumed by the live operator.
-        RealmCatalog(support / "catalog.json").register(
+        RealmCatalog(paths.catalog_path).register(
             realm_id=REALM_ID,
             display_name="Stage 1 tiny acceptance",
             data_root=str(active),
         )
-        RealmCatalog(support / "catalog.json").select(REALM_ID)
+        RealmCatalog(paths.catalog_path).select(REALM_ID)
         atomic_write_json(
-            support / "activation-trust.json",
+            paths.activation_trust_path,
             {"version": 1, "key_hex": secrets.token_hex(32)},
         )
-        (support / "activation-trust.json").chmod(0o600)
+        paths.activation_trust_path.chmod(0o600)
+        source_manifest = paths.source_profiles_dir / "astrid.json"
+        manifest = {
+            "profile": "astrid",
+            "runtime_checkout": str(Path(__file__).resolve().parents[1]),
+            "source_checkout": str(source_checkout.resolve()),
+            "runtime_environment": str(runtime_environment),
+        }
+        manifest = SourceProfile.from_mapping(manifest).as_dict()
+        atomic_write_json(source_manifest, manifest)
+        source_manifest.chmod(0o600)
+        catalog = json.loads(paths.catalog_path.read_text(encoding="utf-8"))
+        catalog["source_profiles"] = {"astrid": SourceProfile.from_mapping(manifest).as_dict()}
+        catalog["realms"][0]["source_profile"] = "astrid"
+        atomic_write_json(paths.catalog_path, catalog)
     finally:
         runtime.close()
+    return source_manifest
 
 
 def _cold_open(active: Path, support: Path) -> dict[str, Any]:
@@ -101,7 +128,7 @@ def _cold_open(active: Path, support: Path) -> dict[str, Any]:
         runtime.close()
 
 
-def run_tiny_acceptance(output_root: str | Path) -> dict[str, Any]:
+def run_tiny_acceptance(output_root: str | Path, source_checkout: str | Path, runtime_environment: str | Path) -> dict[str, Any]:
     """Run the routine tiny B12 journey under ``output_root``.
 
     ``output_root`` is intentionally fresh and owns source, support, active
@@ -119,10 +146,41 @@ def run_tiny_acceptance(output_root: str | Path) -> dict[str, Any]:
     if root.exists() and any(root.iterdir()):
         raise ValueError(f"tiny acceptance output root is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    astrid_checkout = Path(source_checkout).expanduser()
+    environment = Path(runtime_environment).expanduser()
+    if not astrid_checkout.is_absolute() or not astrid_checkout.is_dir() or astrid_checkout.is_symlink():
+        raise ValueError(f"tiny acceptance requires an existing absolute Astrid source checkout: {astrid_checkout}")
+    if not environment.is_absolute() or not environment.is_dir() or _has_symlink_component(environment):
+        raise ValueError(f"tiny acceptance requires an existing absolute runtime environment: {environment}")
+    interpreter = environment / "bin" / "python"
+    if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+        raise ValueError(f"tiny acceptance runtime environment has no executable Python: {interpreter}")
+    probe = subprocess.run(
+        [
+            str(interpreter),
+            "-c",
+            "from pathlib import Path; import banodoco_local, banodoco_workspace_client, sys; root=Path(sys.executable).parent.parent; [Path(module.__file__).resolve().relative_to(root) for module in (banodoco_local, banodoco_workspace_client)]",
+        ],
+        cwd=str(environment),
+        env={"PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        raise ValueError("tiny acceptance runtime environment must import banodoco_local and banodoco_workspace_client")
 
     source = root / "source"
-    support = root / "support"
-    active = root / "active"
+    home = root / "home"
+    paths = RuntimePaths.current_mac(home)
+    support = paths.runtime_support
+    active = paths.realms_dir / REALM_ID
+    # The neutral product support root owns the current-Mac realm layout.  The
+    # offline migrator deliberately rejects an active realm nested below its
+    # support argument, so its serialized B12 activation registry uses this
+    # disposable sidecar while the selected neutral catalog/trust remain in
+    # the real support root.
+    migration_support = root / "migration-support"
     archive = root / "archive"
     destination = root / "destination"
     evidence = root / "evidence"
@@ -131,7 +189,12 @@ def run_tiny_acceptance(output_root: str | Path) -> dict[str, Any]:
 
     fixture = build_synthetic_fixture(source)
     _managed_media(source, fixture.media_digest)
-    _provision_neutral_realm(active, support)
+    source_manifest = _provision_neutral_realm(active, paths, astrid_checkout, environment)
+    migration_support.mkdir()
+    (migration_support / "activations").mkdir()
+    shutil.copy2(paths.catalog_path, migration_support / "catalog.json")
+    shutil.copy2(paths.activation_trust_path, migration_support / "activation-trust.json")
+    (migration_support / "activation-trust.json").chmod(0o600)
 
     issue_authorizations(
         Namespace(
@@ -163,7 +226,7 @@ def run_tiny_acceptance(output_root: str | Path) -> dict[str, Any]:
             confirm=CONFIRMATION,
             source_root=str(source),
             active_root=str(active),
-            support_root=str(support),
+            support_root=str(migration_support),
             archive_root=str(archive),
             destination_root=str(destination),
             evidence_root=str(evidence),
@@ -188,8 +251,13 @@ def run_tiny_acceptance(output_root: str | Path) -> dict[str, Any]:
         "redundancy": report["journal"]["binding"]["redundancy"],
         "realm_id": REALM_ID,
         "source_root": str(source),
+        "source_checkout": str(astrid_checkout.resolve()),
+        "runtime_environment": str(environment.resolve()),
         "source_bytes": sum(path.stat().st_size for path in source.rglob("*") if path.is_file()),
         "support_root": str(support),
+        "migration_support_root": str(migration_support),
+        "neutral_home": str(home),
+        "source_manifest": str(source_manifest),
         "active_root": str(active),
         "archive_root": str(archive),
         "destination_root": str(destination),

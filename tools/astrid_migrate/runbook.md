@@ -14,7 +14,10 @@ reactivated realm before returning. The fixture is only kilobytes, so it does
 not require capacity for the historical corpus:
 
 ```bash
-astrid-live-migrate tiny-acceptance --output-root /absolute/stage1-tiny-b12
+astrid-live-migrate tiny-acceptance \
+  --output-root /absolute/stage1-tiny-b12 \
+  --source-checkout /absolute/Astrid-stage1-convergence2 \
+  --runtime-environment /absolute/venvs/banodoco-runtime
 ```
 
 This command is the routine default and always uses compact redundancy. A
@@ -22,12 +25,11 @@ historical/full-corpus migration is a separate, explicit operator action; use
 the `live-migrate` command below only with an explicitly selected real source.
 `--redundancy extreme` is likewise opt-in and is not part of routine acceptance.
 
-The tiny fixture is a disposable direct `RuntimeService` layout: its support
-root is the fixture's `support/` directory and it has no neutral-launcher
-`source-profiles/astrid.json`. Therefore its reboot plist only resumes an
-already-arranged runtime launch; it cannot honestly invoke
-`banodoco-local up --profile astrid` for that fixture. The actual-machine path
-must keep the selected runtime's existing neutral launcher/startup arrangement.
+The tiny fixture provisions the current-Mac-shaped runtime support, selected
+realm, activation trust, canonical Astrid source profile, and installed runtime
+environment needed by its reboot plist. Its migration activation registry is
+reported separately as `migration_support_root`; pass that path as the
+terminal-support binding when arming the same evidence.
 
 Use a fresh archive/destination parent on a volume with enough capacity for
 source, archive, active backup, destination, signed destination backup,
@@ -123,7 +125,10 @@ astrid-live-migrate stage1-reboot-arm \
   --evidence-root /absolute/migration/migration-evidence-b12 \
   --active-root /absolute/Banodoco/runtime/realms/REALM_ID \
   --support-root /absolute/Banodoco/runtime \
-  --realm-id REALM_ID
+  --terminal-support-root /absolute/stage1-tiny-b12/migration-support \
+  --realm-id REALM_ID \
+  --neutral-home "$HOME" \
+  --source-manifest "/absolute/Banodoco/runtime/source-profiles/astrid.json"
 ```
 
 Review the JSON output and R1 at
@@ -145,35 +150,42 @@ launchctl print "gui/$(id -u)/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID"
 sudo /sbin/reboot
 ```
 
-The existing runtime launch must bring the selected realm back. The
-LaunchAgent has a bounded 120-second wait for that existing cold launch, then
-calls `stage1-reboot-resume`; it refuses to proceed unless the OS boot identity
-and runtime epoch both changed, and writes
-`stage1-b12-reboot-r2.json`. If launchd ran before the runtime came up, rerun
-the same resume command manually after the runtime launch; it is durable and
-idempotent:
+The one-shot job first invokes the bound neutral `banodoco-local up` bootstrap,
+then calls the R2 capture. It refuses to proceed unless the OS boot identity
+and runtime epoch both changed, and writes `stage1-b12-reboot-r2.json`. If
+launchd ran before the runtime came up, rerun the same bounded postboot command
+manually:
 
 Keep this checkout and its verified interpreter in place until R2 is captured;
 the generated plist binds this checkout in `WorkingDirectory`.
 
 ```bash
-astrid-live-migrate stage1-reboot-resume \
+astrid-live-migrate stage1-reboot-postboot \
   --evidence-root /absolute/migration/migration-evidence-b12 \
   --active-root /absolute/Banodoco/runtime/realms/REALM_ID \
   --support-root /absolute/Banodoco/runtime \
-  --realm-id REALM_ID
+  --terminal-support-root /absolute/stage1-tiny-b12/migration-support \
+  --realm-id REALM_ID \
+  --neutral-home "$HOME" \
+  --source-manifest "/absolute/Banodoco/runtime/source-profiles/astrid.json"
 ```
 
 R2 is complete only when `stage1-b12-reboot-r2.json` exists with
 `state=completed`, changed `boot_identity_after`, increased
-`runtime_epoch_after`, and zero SQLite integrity errors. Repeating the resume
+`runtime_epoch_after`, and zero SQLite integrity errors. Repeating the postboot
 command returns the same receipt and does not rerun migration or reboot. The R2
-receipt records `launch_agent_cleanup.status=pending_bootout_and_remove`; after
-retaining the evidence, unload the job and remove exactly its bound plist:
+receipt records `launch_agent_cleanup.status=plist_removed_external_bootout_verification_required`.
+The postboot job removes its installed plist before final R2 and deliberately
+leaves bootout verification external because a job may terminate itself while
+requesting bootout. After retaining the evidence, verify/boot out the exact
+bound label and confirm the path is absent:
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID"
-rm -- "$HOME/Library/LaunchAgents/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID.plist"
+launchctl bootout "gui/$(id -u)/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID" || {
+  status=$?
+  test "$status" -eq 3  # already unloaded is an idempotent replay
+}
+test ! -e "$HOME/Library/LaunchAgents/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID.plist"
 ```
 
 ## Nested intro source

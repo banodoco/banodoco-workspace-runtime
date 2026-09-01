@@ -222,6 +222,37 @@ def _working_directory() -> Path:
     return root
 
 
+def _source_binding(manifest: Path) -> dict[str, str]:
+    """Validate the pinned profile and its installed runtime boundary."""
+    value = _read_json(manifest, "neutral source manifest")
+    if value.get("profile") != "astrid":
+        raise MigrationError("Stage 1 source manifest must select the astrid profile")
+    working = _working_directory()
+    runtime_checkout = _absolute(str(value.get("runtime_checkout", "")), "runtime checkout")
+    source_checkout = _absolute(str(value.get("source_checkout", "")), "source checkout")
+    environment = _absolute(str(value.get("runtime_environment", "")), "runtime environment")
+    if runtime_checkout != working or not runtime_checkout.is_dir() or not source_checkout.is_dir() or not environment.is_dir():
+        raise MigrationError("Stage 1 source profile checkout binding is invalid")
+    interpreter = environment / "bin" / "python"
+    if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+        raise MigrationError(f"Stage 1 runtime environment has no executable Python: {interpreter}")
+    try:
+        result = subprocess.run(
+            [str(interpreter), "-c", "import sys; from pathlib import Path; import banodoco_local, banodoco_workspace_client; from banodoco_local.bootstrap import SourceProfile; SourceProfile.load(sys.argv[1]); root=Path(sys.executable).parent.parent; [Path(module.__file__).resolve().relative_to(root) for module in (banodoco_local, banodoco_workspace_client)]", str(manifest)],
+            cwd=str(environment), env={"PATH": os.defpath}, capture_output=True, text=True,
+            check=False, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MigrationError("Stage 1 installed runtime environment could not be checked") from exc
+    if result.returncode != 0:
+        raise MigrationError("Stage 1 installed runtime environment must import banodoco_local and banodoco_workspace_client")
+    return {
+        "source_manifest_sha256": _sha256(manifest),
+        "runtime_environment": str(environment),
+        "runtime_environment_python": str(interpreter),
+    }
+
+
 def _terminal(evidence: Path, active: Path, support: Path, realm_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     journal = _read_json(evidence / "migration-journal-b12.json", "B12 migration journal")
     receipt = _read_json(evidence / "activated-destination-b12.json", "B12 terminal receipt")
@@ -255,8 +286,12 @@ def _provider(provider: Callable[[], str] | None) -> str:
     return value
 
 
-def _r1_payload(evidence: Path, active: Path, support: Path, realm_id: str, boot: str) -> dict[str, Any]:
-    journal, terminal = _terminal(evidence, active, support, realm_id)
+def _r1_payload(evidence: Path, active: Path, support: Path, terminal_support: Path, realm_id: str, boot: str) -> dict[str, Any]:
+    journal, terminal = _terminal(evidence, active, terminal_support, realm_id)
+    neutral_catalog = _read_json(support / "catalog.json", "neutral realm catalog")
+    rows = [row for row in neutral_catalog.get("realms", []) if isinstance(row, Mapping) and row.get("realm_id") == realm_id]
+    if neutral_catalog.get("selected_realm_id") != realm_id or len(rows) != 1 or rows[0].get("data_root") != str(active):
+        raise MigrationError("Stage 1 neutral catalog does not match the selected realm")
     runtime = _runtime_state(active)
     return {
         "packet": "B12.R1",
@@ -265,6 +300,8 @@ def _r1_payload(evidence: Path, active: Path, support: Path, realm_id: str, boot
         "realm_id": realm_id,
         "active_root": str(active),
         "support_root": str(support),
+        "terminal_support_root": str(terminal_support),
+        "neutral_catalog_sha256": _sha256(support / "catalog.json"),
         "evidence_root": str(evidence),
         "working_directory": str(_working_directory()),
         "boot_identity_before": boot,
@@ -282,15 +319,21 @@ def _plist(payload: Mapping[str, Any], python_executable: str) -> bytes:
         python_executable,
         "-m",
         "tools.astrid_migrate.operator",
-        "stage1-reboot-resume",
+        "stage1-reboot-postboot",
         "--evidence-root",
         str(payload["evidence_root"]),
         "--active-root",
         str(payload["active_root"]),
         "--support-root",
         str(payload["support_root"]),
+        "--terminal-support-root",
+        str(payload["terminal_support_root"]),
         "--realm-id",
         str(payload["realm_id"]),
+        "--neutral-home",
+        str(payload["neutral_home"]),
+        "--source-manifest",
+        str(payload["source_manifest"]),
         "--wait-seconds",
         "120",
         "--poll-seconds",
@@ -310,19 +353,27 @@ def _plist(payload: Mapping[str, Any], python_executable: str) -> bytes:
     return plistlib.dumps(value, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
-def arm_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, boot_identity_provider: Callable[[], str] | None = None, python_executable: str | None = None, launch_agents_dir: str | Path | None = None) -> dict[str, Any]:
+def arm_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, neutral_home: str | Path | None = None, source_manifest: str | Path | None = None, terminal_support_root: str | Path | None = None, boot_identity_provider: Callable[[], str] | None = None, python_executable: str | None = None, launch_agents_dir: str | Path | None = None) -> dict[str, Any]:
     """Durably arm one postboot R2 capture; never invokes reboot or launchctl."""
     evidence = _absolute(evidence_root, "evidence root")
     active = _absolute(active_root, "active root")
     support = _absolute(support_root, "support root")
+    terminal_support = _absolute(terminal_support_root or support, "terminal support root")
+    neutral = _absolute(neutral_home or Path.home(), "neutral home")
+    manifest = _absolute(source_manifest or (support / "source-profiles" / "astrid.json"), "neutral source manifest")
     if not evidence.is_dir() or not active.is_dir() or not support.is_dir():
         raise MigrationError("Stage 1 reboot arm requires existing evidence, active, and support directories")
     marker = evidence / ARMED_NAME
+    if not neutral.is_dir() or not manifest.is_file() or manifest.is_symlink():
+        raise MigrationError("Stage 1 reboot arm requires an existing neutral home and source manifest")
+    binding = _source_binding(manifest)
     launch_agents = _launch_agents_dir(launch_agents_dir, create=True)
-    interpreter = _verified_executable(python_executable)
+    interpreter = binding["runtime_environment_python"]
+    if python_executable is not None and _verified_executable(python_executable) != interpreter:
+        raise MigrationError("LaunchAgent interpreter must be the bound runtime environment Python")
     if marker.is_file():
         existing = _read_json(marker, "Stage 1 reboot marker")
-        expected = {"active_root": str(active), "support_root": str(support), "evidence_root": str(evidence), "realm_id": realm_id, "working_directory": str(_working_directory()), "python_executable": interpreter, "launch_agents_dir": str(launch_agents)}
+        expected = {"active_root": str(active), "support_root": str(support), "terminal_support_root": str(terminal_support), "evidence_root": str(evidence), "realm_id": realm_id, "working_directory": str(_working_directory()), "python_executable": interpreter, "launch_agents_dir": str(launch_agents), "neutral_home": str(neutral), "source_manifest": str(manifest), **binding}
         if all(existing.get(key) == value for key, value in expected.items()):
             if existing.get("state") == "completed":
                 raise MigrationError("Stage 1 reboot checkpoint is already completed")
@@ -338,7 +389,7 @@ def arm_stage1_reboot(evidence_root: str | Path, active_root: str | Path, suppor
     if marker.exists() or marker.is_symlink():
         raise MigrationError("Stage 1 reboot marker is not a regular file")
     plist_path = evidence / PLIST_NAME
-    payload = _r1_payload(evidence, active, support, realm_id, _provider(boot_identity_provider)) | {"plist_path": str(plist_path), "launch_agents_dir": str(launch_agents), "python_executable": interpreter}
+    payload = _r1_payload(evidence, active, support, terminal_support, realm_id, _provider(boot_identity_provider)) | {"plist_path": str(plist_path), "launch_agents_dir": str(launch_agents), "python_executable": interpreter, "neutral_home": str(neutral), "source_manifest": str(manifest), **binding}
     payload = payload | {"launch_agent_label": _launch_agent_label(payload), "launch_agent_path": str(launch_agents / f"{_launch_agent_label(payload)}.plist")}
     plist_bytes = _plist(payload, interpreter)
     payload = payload | {"launch_agent_sha256": hashlib.sha256(plist_bytes).hexdigest()}
@@ -348,13 +399,14 @@ def arm_stage1_reboot(evidence_root: str | Path, active_root: str | Path, suppor
     return payload
 
 
-def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, boot_identity_provider: Callable[[], str] | None = None, wait_seconds: int = 0, poll_seconds: int = 5) -> dict[str, Any]:
+def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, terminal_support_root: str | Path | None = None, boot_identity_provider: Callable[[], str] | None = None, wait_seconds: int = 0, poll_seconds: int = 5, runtime_bootstrap: Mapping[str, Any] | None = None, launch_agent_cleanup: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Capture R2 after a changed host boot and runtime cold launch."""
     evidence = _absolute(evidence_root, "evidence root")
     active = _absolute(active_root, "active root")
     support = _absolute(support_root, "support root")
+    terminal_support = _absolute(terminal_support_root or support, "terminal support root")
     marker = _read_json(evidence / ARMED_NAME, "Stage 1 reboot marker")
-    expected = {"active_root": str(active), "support_root": str(support), "evidence_root": str(evidence), "realm_id": realm_id, "working_directory": str(_working_directory())}
+    expected = {"active_root": str(active), "support_root": str(support), "terminal_support_root": str(terminal_support), "evidence_root": str(evidence), "realm_id": realm_id, "working_directory": str(_working_directory())}
     if any(marker.get(key) != value for key, value in expected.items()):
         raise MigrationError("Stage 1 reboot marker is bound to a different objective")
     r2_path = evidence / R2_NAME
@@ -364,15 +416,31 @@ def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, sup
             raise MigrationError("Stage 1 completed marker does not match its R2 receipt")
         if marker.get("r2_receipt_sha256") != _sha256(r2_path):
             raise MigrationError("Stage 1 R2 receipt digest changed")
+        if marker.get("neutral_catalog_sha256") != _sha256(support / "catalog.json"):
+            raise MigrationError("Stage 1 neutral catalog changed after R1")
+        binding = _source_binding(_absolute(str(marker.get("source_manifest", "")), "neutral source manifest"))
+        if any(marker.get(key) != value for key, value in binding.items()):
+            raise MigrationError("Stage 1 source profile binding changed after R1")
+        _terminal(evidence, active, terminal_support, realm_id)
         return existing
     if marker.get("state") != "armed":
         raise MigrationError("Stage 1 reboot marker is neither armed nor completed")
-    launch_agent = _verify_launch_agent(marker, evidence)
+    binding = _source_binding(_absolute(str(marker.get("source_manifest", "")), "neutral source manifest"))
+    if any(marker.get(key) != value for key, value in binding.items()):
+        raise MigrationError("Stage 1 source profile binding changed after R1")
+    if launch_agent_cleanup is None:
+        launch_agent = _verify_launch_agent(marker, evidence)
+    else:
+        launch_agent = _absolute(str(launch_agent_cleanup.get("path", "")), "bound LaunchAgent")
+        if launch_agent_cleanup.get("status") != "plist_removed_external_bootout_verification_required" or launch_agent != _absolute(str(marker.get("launch_agent_path", "")), "bound LaunchAgent") or _sha256(evidence / PLIST_NAME) != str(marker.get("launch_agent_sha256", "")):
+            raise MigrationError("Stage 1 removed LaunchAgent cleanup is not bound to R1")
     journal_path = evidence / "migration-journal-b12.json"
     terminal_path = evidence / "activated-destination-b12.json"
     if marker.get("journal_sha256") != _sha256(journal_path) or marker.get("terminal_receipt_sha256") != _sha256(terminal_path):
         raise MigrationError("Stage 1 R1-pinned B12 evidence changed")
-    journal, terminal = _terminal(evidence, active, support, realm_id)
+    if marker.get("neutral_catalog_sha256") != _sha256(support / "catalog.json"):
+        raise MigrationError("Stage 1 neutral catalog changed after R1")
+    journal, terminal = _terminal(evidence, active, terminal_support, realm_id)
     current_boot = _provider(boot_identity_provider)
     if current_boot == marker.get("boot_identity_before"):
         raise MigrationError("Stage 1 R2 requires a changed host boot identity")
@@ -403,6 +471,7 @@ def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, sup
         "realm_id": realm_id,
         "active_root": str(active),
         "support_root": str(support),
+        "terminal_support_root": str(terminal_support),
         "evidence_root": str(evidence),
         "boot_identity_before": marker["boot_identity_before"],
         "boot_identity_after": current_boot,
@@ -419,11 +488,12 @@ def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, sup
         "launch_agent_path": str(launch_agent),
         "launch_agent_label": marker["launch_agent_label"],
         "launch_agent_sha256": marker["launch_agent_sha256"],
-        "launch_agent_cleanup": {
-            "status": "pending_bootout_and_remove",
+        "launch_agent_cleanup": dict(launch_agent_cleanup or {
+            "status": "pending_plist_removal_and_external_bootout_verification",
             "path": str(launch_agent),
             "label": marker["launch_agent_label"],
-        },
+        }),
+        "runtime_bootstrap": dict(runtime_bootstrap or {"status": "not_invoked_by_direct_resume"}),
         "captured_at": time.time(),
     }
     if r2_path.exists() or r2_path.is_symlink():
@@ -439,4 +509,98 @@ def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, sup
     return payload
 
 
-__all__ = ["ARMED_NAME", "R2_NAME", "PLIST_NAME", "arm_stage1_reboot", "resume_stage1_reboot"]
+def _neutral_bootstrap(marker: Mapping[str, Any], realm_id: str, *, wait_seconds: int) -> dict[str, Any]:
+    command = [
+        str(marker["runtime_environment_python"]),
+        "-m",
+        "banodoco_local",
+        "up",
+        "--profile",
+        "astrid",
+        "--source-manifest",
+        str(marker["source_manifest"]),
+        "--json",
+    ]
+    # launchd does not promise the interactive shell environment.  Bind the
+    # selected support home and manifest explicitly while keeping the launch
+    # authority in the existing neutral ``banodoco-local up`` boundary.
+    environment = {
+        "BANODOCO_LOCAL_HOME": str(marker["neutral_home"]),
+        "BANODOCO_LOCAL_SOURCE_MANIFEST": str(marker["source_manifest"]),
+        "PATH": os.defpath,
+    }
+    try:
+        result = subprocess.run(command, cwd=str(marker["neutral_home"]), env=environment, capture_output=True, text=True, check=False, timeout=max(1, wait_seconds))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MigrationError("Stage 1 neutral runtime bootstrap failed") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip()
+        if not detail:
+            try:
+                error = json.loads(result.stdout).get("error")
+            except (ValueError, AttributeError, TypeError):
+                error = ""
+            detail = str(error or result.stdout.strip() or "no diagnostic returned")
+        raise MigrationError(f"Stage 1 neutral runtime bootstrap failed: {detail}")
+    try:
+        value = json.loads(result.stdout)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise MigrationError("Stage 1 neutral runtime bootstrap returned invalid JSON") from exc
+    if not isinstance(value, Mapping) or value.get("realm_id") != realm_id or value.get("status") not in {"started", "reconnected", "restarted"}:
+        raise MigrationError("Stage 1 neutral runtime bootstrap selected the wrong realm")
+    return dict(value)
+
+
+def _remove_launch_agent(marker: Mapping[str, Any], launch_agent: Path) -> dict[str, Any]:
+    label = str(marker["launch_agent_label"])
+    command = ["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"]
+    if launch_agent.exists() or launch_agent.is_symlink():
+        try:
+            launch_agent.unlink()
+            parent_fd = os.open(launch_agent.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError as exc:
+            raise MigrationError("Stage 1 postboot could not durably remove its LaunchAgent plist") from exc
+    return {
+        "status": "plist_removed_external_bootout_verification_required",
+        "path": str(launch_agent),
+        "label": label,
+        "command": command,
+    }
+
+
+def postboot_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, neutral_home: str | Path | None = None, source_manifest: str | Path | None = None, terminal_support_root: str | Path | None = None, wait_seconds: int = 120, poll_seconds: int = 1) -> dict[str, Any]:
+    evidence = _absolute(evidence_root, "evidence root")
+    active = _absolute(active_root, "active root")
+    support = _absolute(support_root, "support root")
+    terminal_support = _absolute(terminal_support_root or support, "terminal support root")
+    marker = _read_json(evidence / ARMED_NAME, "Stage 1 reboot marker")
+    expected = {"active_root": str(active), "support_root": str(support), "terminal_support_root": str(terminal_support), "evidence_root": str(evidence), "realm_id": realm_id}
+    if any(marker.get(key) != value for key, value in expected.items()):
+        raise MigrationError("Stage 1 postboot arguments do not match R1")
+    neutral = _absolute(neutral_home or str(marker.get("neutral_home", "")), "neutral home")
+    manifest = _absolute(source_manifest or str(marker.get("source_manifest", "")), "neutral source manifest")
+    if neutral != Path(str(marker.get("neutral_home", ""))):
+        raise MigrationError("Stage 1 postboot neutral home does not match R1")
+    if manifest != Path(str(marker.get("source_manifest", ""))):
+        raise MigrationError("Stage 1 postboot source manifest does not match R1")
+    if marker.get("state") == "completed":
+        return resume_stage1_reboot(evidence, active, support, realm_id, terminal_support_root=terminal_support)
+    try:
+        launch_agent = _verify_launch_agent(marker, evidence)
+    except MigrationError:
+        # A crash after durable plist removal but before R2 must remain
+        # recoverable.  The immutable evidence copy still proves which plist
+        # was armed; resume can safely finish the one-shot receipt.
+        launch_agent = _absolute(str(marker.get("launch_agent_path", "")), "bound LaunchAgent")
+        if launch_agent.exists() or _sha256(evidence / PLIST_NAME) != str(marker.get("launch_agent_sha256", "")):
+            raise
+    bootstrap = _neutral_bootstrap(marker, realm_id, wait_seconds=wait_seconds)
+    cleanup = _remove_launch_agent(marker, launch_agent)
+    return resume_stage1_reboot(evidence, active, support, realm_id, terminal_support_root=terminal_support, wait_seconds=wait_seconds, poll_seconds=poll_seconds, runtime_bootstrap=bootstrap, launch_agent_cleanup=cleanup)
+
+
+__all__ = ["ARMED_NAME", "R2_NAME", "PLIST_NAME", "arm_stage1_reboot", "resume_stage1_reboot", "postboot_stage1_reboot"]
