@@ -160,6 +160,34 @@ def test_managed_local_cas_locator_can_follow_an_explicitly_moved_snapshot(tmp_p
     assert report["reconciliation"]["ok"] is True
 
 
+def test_external_local_cas_shaped_locator_cannot_change_authority(tmp_path):
+    """Only an explicitly managed-local locator may follow a moved snapshot."""
+
+    _fixture(tmp_path)
+    digest = hashlib.sha256(b"fixture-media").hexdigest()
+    cas_path = tmp_path / ".astrid" / "media" / "sha256" / digest[:2] / digest[2:4] / digest
+    cas_path.parent.mkdir(parents=True)
+    shutil.copy2(tmp_path / "media" / "clip.mp4", cas_path)
+    connection = sqlite3.connect(tmp_path / ".astrid" / "astrid.sqlite3")
+    connection.execute(
+        "UPDATE media_locations SET realm='external_local', locator=?",
+        (f"/attacker/.astrid/media/sha256/{digest[:2]}/{digest[2:4]}/{digest}",),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(MigrationError, match="escapes source root"):
+        migrate(
+            MigrationConfig(
+                tmp_path,
+                tmp_path.parent / "archive-external-cas-shape",
+                tmp_path.parent / "destination-external-cas-shape",
+                dry_run=True,
+            ),
+            FakeClient(),
+        )
+
+
 def test_archive_file_map_ignores_only_appledouble_metadata(tmp_path):
     _fixture(tmp_path)
     (tmp_path / "._finder-metadata").write_bytes(b"\x00\x05\x16\x07metadata")

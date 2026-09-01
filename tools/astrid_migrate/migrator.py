@@ -539,7 +539,11 @@ class Migrator:
                 path = Path(locator).expanduser()
                 if not path.is_absolute():
                     path = self.config.source_root / path
-                relocated = _relocated_managed_local_path(self.config.source_root, locator)
+                relocated = (
+                    _relocated_managed_local_path(self.config.source_root, locator)
+                    if realm == "managed_local"
+                    else None
+                )
                 if relocated is not None:
                     path = relocated
                 try:
@@ -744,7 +748,11 @@ class Migrator:
             path = Path(locator).expanduser()
             if not path.is_absolute():
                 path = self.config.source_root / path
-            relocated = _relocated_managed_local_path(self.config.source_root, locator)
+            relocated = (
+                _relocated_managed_local_path(self.config.source_root, locator)
+                if realm == "managed_local"
+                else None
+            )
             if relocated is not None:
                 path = relocated
             try:
