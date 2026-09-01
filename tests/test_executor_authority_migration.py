@@ -33,7 +33,7 @@ def test_schema18_worker_state_migrates_to_one_executor_authority(tmp_path):
     _make_schema18_realm(root)
     store = RealmStore(root)
     try:
-        assert store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 19
+        assert store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 20
         assert store.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workers'").fetchone() is None
         executor = store.conn.execute("SELECT * FROM executors WHERE id='legacy-executor'").fetchone()
         assert executor["max_concurrency"] == 2
@@ -64,7 +64,7 @@ def test_schema19_authority_migration_is_safe_to_retry_after_structural_upgrade(
 
     retried = RealmStore(root)
     try:
-        assert retried.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 19
+        assert retried.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 20
         assert retried.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='workers'").fetchone() is None
         assert "readiness" in {row[1] for row in retried.conn.execute("PRAGMA table_info(executors)")}
         assert "executor_id" in {row[1] for row in retried.conn.execute("PRAGMA table_info(tasks)")}
