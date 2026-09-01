@@ -10,6 +10,7 @@ import json
 import sqlite3
 import base64
 import os
+import re
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,23 @@ OBJECT_MAX_BYTES = 64 * 1024 * 1024
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
+IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
+
+
+def validate_idempotency_key(value):
+    """Validate the wire-level idempotency-key grammar in one place."""
+    if not isinstance(value, str) or not IDEMPOTENCY_KEY_RE.fullmatch(value):
+        raise InvalidRequestError(
+            "Idempotency-Key must start with an alphanumeric character and contain at most 256 ASCII characters"
+        )
+    return value
+
+
+def require_idempotency_key(value):
+    """Require and validate the key for every durable state mutation."""
+    if value is None:
+        raise InvalidRequestError("Idempotency-Key is required for state mutations")
+    return validate_idempotency_key(value)
 
 
 def _page_args(cursor, limit):
@@ -84,8 +102,17 @@ def _durable_mutation(function):
     @wraps(function)
     def wrapped(self, *args, **kwargs):
         with self.store._mutex:
-            with self.store._transaction():
-                return function(self, *args, **kwargs)
+            try:
+                with self.store._transaction():
+                    result = function(self, *args, **kwargs)
+            except Exception:
+                # A CAS publication is journaled before its destination is
+                # renamed.  Reconcile after SQLite has rolled back so a
+                # failed commit cannot leave an unreferenced object behind.
+                self._recover_cas_publication_journals()
+                raise
+            self._recover_cas_publication_journals()
+            return result
     return wrapped
 
 
@@ -104,6 +131,7 @@ class RuntimeService:
         if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
             raise ValidationError("reboot allowlist contains an unsupported command", details={"allowlist": sorted(configured_allowlist), "supported": sorted(REBOOT_COMMAND_ALLOWLIST)})
         self.reboot_allowlist = configured_allowlist
+        self._recover_cas_publication_journals()
 
     def close(self):
         self.store.close()
@@ -502,9 +530,10 @@ class RuntimeService:
             ).fetchone()
         return self._receipt_payload(row, project_id=project_id) if row else None
 
-    def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None):
-        if not idempotency_key:
+    def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None, with_receipt=True):
+        if idempotency_key is None:
             return None
+        validate_idempotency_key(idempotency_key)
         prior = self.store.conn.execute(
             "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
             "first_project_seq, last_project_seq, event_ids_json, created_at "
@@ -515,12 +544,13 @@ class RuntimeService:
             return None
         if prior["request_hash"] != request_hash:
             raise ConflictError("idempotency key was already used with different input")
-        if project_id is not None:
+        if project_id is not None and with_receipt:
             return {"data": json.loads(prior["result_json"]), "receipt": self._receipt_payload(prior, project_id=project_id)}
         return json.loads(prior["result_json"])
 
-    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
-        if idempotency_key:
+    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, with_receipt=True):
+        if idempotency_key is not None:
+            validate_idempotency_key(idempotency_key)
             if project_id is not None:
                 self.store._record_command_receipt(
                     kind, aggregate_id, idempotency_key, request_hash, result,
@@ -534,12 +564,140 @@ class RuntimeService:
                     "FROM command_idempotency WHERE command_kind=? AND aggregate_id=? AND idempotency_key=?",
                     (kind, aggregate_id, idempotency_key),
                 ).fetchone()
-                return {"data": result, "receipt": self._receipt_payload(row, project_id=project_id)}
+                if with_receipt:
+                    return {"data": result, "receipt": self._receipt_payload(row, project_id=project_id)}
+                return result
             self.store.conn.execute(
                 "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (kind, aggregate_id, idempotency_key, request_hash, canonical_json(result), now()),
             )
         return result
+
+    def _publication_journal_root(self):
+        root = self.store.staging_root / "publications"
+        root.mkdir(parents=True, exist_ok=True)
+        root.chmod(0o700)
+        return root
+
+    def _begin_cas_publication_journal(self, kind, entries, *, project_id=None, task_id=None):
+        """Durably describe CAS destinations before making them reachable.
+
+        The journal is intentionally outside SQLite: a process crash can occur
+        after ``rename`` and before the SQLite commit.  Startup then keeps a
+        destination only when the durable metadata proves that this operation
+        committed; otherwise it removes the exact content-addressed path.
+        """
+        if not entries:
+            return None
+        payload = {
+            "version": 1,
+            "kind": kind,
+            "project_id": project_id,
+            "task_id": task_id,
+            "entries": [{"digest": str(entry["digest"])} for entry in entries],
+        }
+        path = self._publication_journal_root() / f"{new_id()}.json"
+        atomic_json_write(path, payload)
+        return path
+
+    @staticmethod
+    def _remove_publication_journal(path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+
+    def _publication_committed(self, journal):
+        entries = journal.get("entries")
+        if not isinstance(entries, list) or not entries:
+            return False
+        digests = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("digest"), str):
+                return False
+            digest = entry["digest"]
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                return False
+            digests.append(digest)
+            if not self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone():
+                return False
+        project_id = journal.get("project_id")
+        if project_id and project_id != "unscoped":
+            for digest in digests:
+                if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
+                    return False
+        if journal.get("kind") == "settlement":
+            task_id = journal.get("task_id")
+            task = self.store.conn.execute("SELECT status, result_json FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not task or task["status"] != "completed":
+                return False
+            try:
+                result_digests = {
+                    str(item.get("digest", "")).removeprefix("sha256:")
+                    for item in (json.loads(task["result_json"] or "{}").get("outputs") or [])
+                    if isinstance(item, dict)
+                }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if not set(digests).issubset(result_digests):
+                return False
+        return True
+
+    def _recover_cas_publication_journals(self):
+        """Finish or roll back CAS publications left by a crashed mutation."""
+        root = self.store.staging_root / "publications"
+        if not root.exists() or root.is_symlink() or not root.is_dir():
+            return
+        for path in sorted(root.glob("*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                journal = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                # Leave malformed evidence for doctor/operator inspection; do
+                # not guess at a path and risk deleting an unrelated object.
+                continue
+            if not isinstance(journal, dict) or journal.get("version") != 1:
+                continue
+            try:
+                committed = self._publication_committed(journal)
+            except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+                continue
+            if not committed:
+                for entry in journal.get("entries", []):
+                    digest = entry.get("digest") if isinstance(entry, dict) else None
+                    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                        continue
+                    # If another operation has since durable-metadata-claimed
+                    # this object, it owns the file and it must be retained.
+                    if self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone():
+                        continue
+                    destination = self.cas.path_for(digest)
+                    try:
+                        destination.unlink()
+                    except FileNotFoundError:
+                        continue
+                    except OSError:
+                        continue
+                    try:
+                        directory_fd = os.open(destination.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
+                    except OSError:
+                        pass
+            self._remove_publication_journal(path)
 
     def _project_shot_resource(self, row):
         value = dict(row)
@@ -1142,25 +1300,107 @@ class RuntimeService:
     def archive_reference(self, reference_id, body, *, idempotency_key=None): return self._update_reference_state(reference_id, body, archived=True, idempotency_key=idempotency_key)
     def recover_reference(self, reference_id, body, *, idempotency_key=None): return self._update_reference_state(reference_id, body, archived=False, idempotency_key=idempotency_key)
 
-    def ingest(self, project, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None):
+    @_durable_mutation
+    def ingest(self, project, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise InvalidRequestError("object body must be bytes")
         if len(data) > OBJECT_MAX_BYTES:
             raise ValidationError("object exceeds 64 MiB limit")
         data = bytes(data)
-        obj = self.cas.put(data, expected_digest=(expected_digest or "").removeprefix("sha256:") or None)
-        row = self.store.record_object(obj["digest"], obj["size"], media_type, original_name)
-        self.store.add_object_ref(project, obj["digest"])
-        return row | {"project": self.store.get_project(project)["id"], "deduplicated": obj["deduplicated"]}
+        project_row = self.store.get_project(project)
+        expected = (expected_digest or "").removeprefix("sha256:") or None
+        request_hash = hashlib.sha256(canonical_json({
+            "project_id": project_row["id"],
+            "content_digest": sha256_bytes(data),
+            "media_type": media_type,
+            "original_name": original_name,
+            "expected_digest": expected,
+        }).encode()).hexdigest()
+        aggregate_id = project_row["id"]
+        replay = self._command_replay("object.ingest", aggregate_id, idempotency_key, request_hash, project_id=project_row["id"])
+        if replay is not None:
+            return replay
+        destination = self.cas.path_for(sha256_bytes(data))
+        if not destination.exists():
+            self._begin_cas_publication_journal("ingest", [{"digest": sha256_bytes(data)}], project_id=project_row["id"])
+        obj = self.cas.put(data, expected_digest=expected)
+        try:
+            timestamp = now()
+            self.store.conn.execute(
+                "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                (obj["digest"], obj["size"], media_type, original_name, timestamp),
+            )
+            self.store.conn.execute(
+                "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)",
+                (project_row["id"], obj["digest"], timestamp),
+            )
+            row = dict(self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (obj["digest"],)).fetchone())
+            result = self._object_resource(row) | {
+                "project": project_row["id"],
+                "relation": "managed",
+                "deduplicated": obj["deduplicated"],
+            }
+            return self._command_record("object.ingest", aggregate_id, idempotency_key, request_hash, result, project_id=project_row["id"])
+        except Exception:
+            # The CAS write precedes the SQLite transaction.  If the durable
+            # metadata/receipt transaction fails, remove only the file this
+            # command introduced so a retry cannot observe a phantom object.
+            if not obj["deduplicated"]:
+                self._discard_published_digest(obj["digest"])
+            raise
 
-    def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None):
+    @_durable_mutation
+    def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise InvalidRequestError("object body must be bytes")
         if len(data) > OBJECT_MAX_BYTES:
             raise ValidationError("object exceeds 64 MiB limit")
         data = bytes(data)
-        obj = self.cas.put(data, expected_digest=(expected_digest or "").removeprefix("sha256:") or None)
-        return self._object_resource(self.store.record_object(obj["digest"], obj["size"], media_type, original_name))
+        expected = (expected_digest or "").removeprefix("sha256:") or None
+        request_hash = hashlib.sha256(canonical_json({
+            "content_digest": sha256_bytes(data),
+            "media_type": media_type,
+            "original_name": original_name,
+            "expected_digest": expected,
+        }).encode()).hexdigest()
+        aggregate_id = "objects"
+        replay = self._command_replay("object.ingest", aggregate_id, idempotency_key, request_hash, project_id="unscoped")
+        if replay is not None:
+            return replay
+        destination = self.cas.path_for(sha256_bytes(data))
+        if not destination.exists():
+            self._begin_cas_publication_journal("ingest", [{"digest": sha256_bytes(data)}], project_id="unscoped")
+        obj = self.cas.put(data, expected_digest=expected)
+        try:
+            timestamp = now()
+            self.store.conn.execute(
+                "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                (obj["digest"], obj["size"], media_type, original_name, timestamp),
+            )
+            result = self._object_resource(dict(self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (obj["digest"],)).fetchone()))
+            return self._command_record("object.ingest", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped")
+        except Exception:
+            if not obj["deduplicated"]:
+                self._discard_published_digest(obj["digest"])
+            raise
+
+    def _discard_published_digest(self, digest):
+        """Remove a newly published CAS file after a failed metadata commit."""
+        path = self.cas.path_for(digest)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
 
     def _object_resource(self, row):
         return {"object_id": "sha256:" + row["digest"], "digest": "sha256:" + row["digest"], "media_type": row["media_type"], "size": int(row["size"]), "version": 1, "created_at": row["created_at"], **({"filename": row["original_name"]} if row.get("original_name") else {})}
@@ -1259,16 +1499,39 @@ class RuntimeService:
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
 
-    def cancel_task_canonical(self, task_id, body=None):
-        current = self.store.get_task(task_id)
-        expected = (body or {}).get("expected_version")
-        if expected is not None and int(expected) != int(current["task"].get("attempt", 0)) + 1:
-            raise ConflictError("stale task version", details={"expected": expected, "actual": int(current["task"].get("attempt", 0)) + 1})
-        return self._task_resource(self.store.cancel_task(task_id))
-
-    def retry_task(self, task_id, body=None):
+    def cancel_task_canonical(self, task_id, body=None, *, idempotency_key=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = {} if body is None else body
+        self._require_object_body(body)
         with self.store._mutex:
             current = self.store.get_task(task_id)
+            project_id = current["run"].get("project_id") or "unscoped"
+            request_hash = hashlib.sha256(canonical_json({"task_id": task_id, "body": body}).encode()).hexdigest()
+            replay = self._command_replay("task.cancel", task_id, idempotency_key, request_hash, project_id=project_id)
+            if replay is not None:
+                return replay
+            expected = body.get("expected_version")
+            if expected is not None and int(expected) != int(current["task"].get("attempt", 0)) + 1:
+                raise ConflictError("stale task version", details={"expected": expected, "actual": int(current["task"].get("attempt", 0)) + 1})
+            with self.store._transaction():
+                recorded = None
+                def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
+                    nonlocal recorded
+                    recorded = self._command_record("task.cancel", task_id, idempotency_key, request_hash, self._task_resource(value), project_id=project_id, event_ids=event_ids, primary_stream_id=primary_stream_id, resulting_stream_seq=resulting_stream_seq)
+                self.store.cancel_task(task_id, record=record)
+                return recorded
+
+    def retry_task(self, task_id, body=None, *, idempotency_key=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = {} if body is None else body
+        self._require_object_body(body)
+        with self.store._mutex:
+            current = self.store.get_task(task_id)
+            project_id = current["run"].get("project_id") or "unscoped"
+            request_hash = hashlib.sha256(canonical_json({"task_id": task_id, "body": body}).encode()).hexdigest()
+            replay = self._command_replay("task.retry", task_id, idempotency_key, request_hash, project_id=project_id)
+            if replay is not None:
+                return replay
             status = current["task"]["status"]
             if status not in {"completed", "cancelled", "failed"}:
                 raise ConflictError("task is not retryable", details={"status": status})
@@ -1281,8 +1544,10 @@ class RuntimeService:
                 self.store._release_reservations(task_id, current["task"].get("lease_token"))
                 self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
                 self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, current["run"]["id"]))
-                self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
-            return self._task_resource(self.store.get_task(task_id))
+                event_id = self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
+                result = self._task_resource(self.store.get_task(task_id))
+                event_seq = self.store.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (current["run"]["id"],)).fetchone()[0]
+                return self._command_record("task.retry", task_id, idempotency_key, request_hash, result, project_id=project_id, event_ids=(event_id,), primary_stream_id=current["run"]["id"], resulting_stream_seq=event_seq)
 
     def events(self, run_id):
         return self.store.list_events(run_id)
@@ -1334,21 +1599,45 @@ class RuntimeService:
         # hash includes executor identity and all registration fields, so a
         # reused key can only replay the exact durable result.
         aggregate_id = "executors"
-        replay = self._command_replay("executor.register", aggregate_id, idempotency_key, request_hash)
-        if replay is not None:
+        existing = self.store.conn.execute("SELECT runtime_epoch FROM executors WHERE id=?", (body["executor_id"],)).fetchone()
+        current_epoch = self.store._current_runtime_epoch()
+        if body.get("runtime_epoch") is not None:
+            self.store._validate_runtime_epoch(
+                body.get("runtime_epoch"), identity="executor",
+                identity_id=body.get("executor_id"), required=True,
+            )
+        prior = None
+        if idempotency_key is not None:
+            validate_idempotency_key(idempotency_key)
+            prior = self.store.conn.execute(
+                "SELECT request_hash, result_json FROM command_idempotency "
+                "WHERE command_kind='executor.register' AND aggregate_id=? AND idempotency_key=?",
+                (aggregate_id, idempotency_key),
+            ).fetchone()
+        if prior:
+            if prior["request_hash"] != request_hash:
+                raise ConflictError("idempotency key was already used with different input")
+            replay = json.loads(prior["result_json"])
+            # A replay is safe only in the same runtime session.  In
+            # particular, do not let a pre-restart registration refresh a
+            # dead executor lease merely because its key is known.
+            if int(replay.get("runtime_epoch") or 0) != current_epoch:
+                self.store._validate_runtime_epoch(
+                    body.get("runtime_epoch"), identity="executor",
+                    identity_id=body.get("executor_id"), required=True,
+                )
             return replay
         # Re-registration is the canonical reconnect path after a runtime
         # restart or a deliberate capability/readiness refresh.  The bearer
         # fence above binds the caller to this executor (or an administrator),
         # while an existing identity must present the current runtime epoch.
-        existing = self.store.conn.execute("SELECT runtime_epoch FROM executors WHERE id=?", (body["executor_id"],)).fetchone()
         epoch = self.store._validate_runtime_epoch(
             body.get("runtime_epoch"), identity="executor",
             identity_id=body.get("executor_id"), required=existing is not None,
         )
         self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch)
         result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
-        return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result)
+        return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
     @_durable_mutation
     def claim_next(self, body, *, idempotency_key=None, identity=None):
@@ -1374,33 +1663,19 @@ class RuntimeService:
             "executor_id": executor_id, "capability_ids": capability_ids,
             "runtime_epoch": runtime_epoch,
         }).encode()).hexdigest()
-        prior = None
-        if idempotency_key:
-            prior = self.store.conn.execute(
-                "SELECT request_hash, result_json FROM command_idempotency WHERE command_kind='task.claim' AND aggregate_id='claim' AND idempotency_key=?",
-                (idempotency_key,),
-            ).fetchone()
-        if prior:
-            if prior["request_hash"] != request_hash:
-                raise ConflictError("idempotency key was already used with different input")
-            value = json.loads(prior["result_json"])
-            return value
-
-        # Keep the store's epoch-fencing error for direct service callers;
-        # HTTP callers are schema-validated at the boundary.
+        # Epoch validation intentionally precedes the idempotency lookup: a
+        # stale worker must never turn an old claim receipt into a live lease.
         epoch = self.store._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id, required=True)
+        replay = self._command_replay("task.claim", "claim", idempotency_key, request_hash, with_receipt=False)
+        if replay is not None:
+            return replay
         caps = set(capability_ids)
         rows = self.store.conn.execute("SELECT id, capability FROM tasks WHERE status='queued' ORDER BY created_at, id").fetchall()
         row = next((item for item in rows if not caps or item["capability"] in caps), None)
         if row is None:
             # Persist the empty outcome too.  Otherwise a retry after another
             # task is admitted would silently claim new work.
-            if idempotency_key:
-                self.store.conn.execute(
-                    "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, 'claim', ?, ?, 'null', ?)",
-                    ("task.claim", idempotency_key, request_hash, now()),
-                )
-            return None
+            return self._command_record("task.claim", "claim", idempotency_key, request_hash, None, project_id="unscoped", with_receipt=False)
         attempt_id, lease_id = new_id(), new_id()
         value = self.store._claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
         if value["task"]["status"] != "running":
@@ -1414,24 +1689,28 @@ class RuntimeService:
             # Return the immutable admitted spec alongside the lease. Workers
             # must execute exactly what was claimed, without a racy second read.
             result = {"attempt_id": attempt_id, "task_id": row["id"], "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "spec": dict(task.get("spec") or {})}
-        if idempotency_key:
-            self.store.conn.execute(
-                "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, 'claim', ?, ?, ?, ?)",
-                ("task.claim", idempotency_key, request_hash, canonical_json(result), now()),
-            )
-        return result
+        return self._command_record("task.claim", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
-    def settle_attempt(self, attempt_id, body, *, identity=None):
+    @_durable_mutation
+    def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
         # The identity/fence and effect preconditions must precede CAS writes.
         # Keep this entire sequence under the owner mutex so a concurrent
         # recovery cannot invalidate an attempt between validation and
         # publication.
+        self._require_object_body(body)
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
             current_epoch = self.store._current_runtime_epoch()
-            self._validate_attempt_lease(row, body, current_epoch)
+            self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=row["executor_id"] if row else None, required=True)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+            project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
+            request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
+            replay = self._command_replay("attempt.settle", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
+            if replay is not None:
+                return replay
+            self._validate_attempt_lease(row, body, current_epoch)
             if not task or (task["runtime_epoch"] is not None and int(task["runtime_epoch"]) != current_epoch):
                 raise LeaseError("attempt belongs to a stale runtime epoch")
             if task["status"] != "running" or task["attempt_id"] != attempt_id or task["lease_token"] != row["lease_id"] or int(task["lease_fence"] or 0) != int(row["fence"]):
@@ -1444,16 +1723,26 @@ class RuntimeService:
                 raise ValidationError("declared settlement effect is required")
             if effect is not None:
                 self.store._validate_settlement_effect(effect)
-            project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0]
             staged = self._stage_outputs(attempt_id, body.get("outputs", []), project_id=project_id)
             try:
                 result = {"outputs": staged["outputs"]}
+                recorded = None
+                def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
+                    nonlocal recorded
+                    recorded = self._command_record(
+                        "attempt.settle", attempt_id, idempotency_key, request_hash,
+                        self._task_resource(value), project_id=project_id or "unscoped",
+                        event_ids=event_ids, primary_stream_id=primary_stream_id,
+                        resulting_stream_seq=resulting_stream_seq,
+                    )
                 value = self.store._settle_attempt(
                     row["task_id"], row["lease_id"], result,
                     effect=effect, fence=body.get("fence"), attempt_id=attempt_id,
                     publish=lambda: self._publish_staged_outputs(staged, project_id=project_id),
+                    record=record,
                 )
-                return self._task_resource(value)
+                staged["committed"] = True
+                return recorded
             finally:
                 self._discard_staged_outputs(staged)
 
@@ -1537,13 +1826,28 @@ class RuntimeService:
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 normalized = {"name": name, "kind": kind, "digest": digest_value, "media_type": media_type, "size": size}
                 staged.append({"digest": digest, "path": stage_path, "size": size, "media_type": media_type, "name": name, "output": normalized})
-            return {"stage_dir": stage_dir, "items": staged, "outputs": [item["output"] for item in staged]}
+            return {"stage_dir": stage_dir, "attempt_id": attempt_id, "items": staged, "outputs": [item["output"] for item in staged]}
         except Exception:
             self._discard_staged_outputs({"stage_dir": stage_dir, "items": staged})
             raise
 
     def _publish_staged_outputs(self, staged, *, project_id=None):
         """Publish already validated bytes as part of the settlement transaction."""
+        staged.setdefault("published", [])
+        candidate_entries = []
+        task_id = None
+        attempt_id = staged.get("attempt_id")
+        if attempt_id:
+            row = self.store.conn.execute("SELECT task_id FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            task_id = row["task_id"] if row else None
+        for item in staged["items"]:
+            destination = self.cas.path_for(item["digest"])
+            if item["path"] is not None and not destination.exists():
+                candidate_entries.append({"digest": item["digest"]})
+        if candidate_entries:
+            staged["journal_path"] = self._begin_cas_publication_journal(
+                "settlement", candidate_entries, project_id=project_id or "unscoped", task_id=task_id,
+            )
         for item in staged["items"]:
             digest = item["digest"]
             destination = self.cas.path_for(digest)
@@ -1555,6 +1859,16 @@ class RuntimeService:
                     item["path"].unlink(missing_ok=True)
                 else:
                     os.replace(item["path"], destination)
+                    staged["published"].append(destination)
+                    # The destination directory is durable before SQLite can
+                    # commit the corresponding object metadata.  The durable
+                    # publication journal remains until recovery proves the
+                    # commit, so a crash can remove only this exact destination.
+                    directory_fd = os.open(destination.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
             self.store.conn.execute(
                 "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
                 (digest, item["size"], item["media_type"], item["name"], now()),
@@ -1568,6 +1882,7 @@ class RuntimeService:
     @staticmethod
     def _discard_staged_outputs(staged):
         stage_dir = staged.get("stage_dir") if isinstance(staged, dict) else None
+        committed = bool(staged.get("committed")) if isinstance(staged, dict) else False
         for item in (staged.get("items", []) if isinstance(staged, dict) else []):
             path = item.get("path")
             if path is not None:
@@ -1588,15 +1903,22 @@ class RuntimeService:
                 stage_dir.rmdir()
             except OSError:
                 pass
-
-    def _publish_outputs(self, outputs):
-        """Compatibility helper for in-process callers; settlement uses staging."""
-        staged = self._stage_outputs("compatibility", outputs)
-        try:
-            self._publish_staged_outputs(staged)
-            return staged["outputs"]
-        finally:
-            self._discard_staged_outputs(staged)
+        if not committed:
+            for path in (staged.get("published", []) if isinstance(staged, dict) else []):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    continue
+                try:
+                    directory_fd = os.open(path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
 
     def _checkpoint_row(self, checkpoint_id=None, attempt_id=None):
         if checkpoint_id:
@@ -1839,26 +2161,55 @@ class RuntimeService:
 
     resume = resume_attempt
 
-    def heartbeat_attempt(self, attempt_id, body, *, identity=None):
-        row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
-        self._assert_attempt_identity(row, identity)
-        current = self.store._current_runtime_epoch()
-        self._validate_attempt_lease(row, body, current)
-        value = self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30))
-        expires = value["task"].get("lease_expires_at")
-        self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
-        return {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires, "runtime_epoch": self.store._current_runtime_epoch()}
+    def heartbeat_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        self._require_object_body(body)
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            self._assert_attempt_identity(row, identity)
+            current = self.store._current_runtime_epoch()
+            self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=row["executor_id"] if row else None, required=True)
+            task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone() if row else None
+            project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
+            request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
+            replay = self._command_replay("attempt.heartbeat", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
+            if replay is not None:
+                return replay
+            self._validate_attempt_lease(row, body, current)
+            recorded = None
+            def record(value):
+                nonlocal recorded
+                expires = value["task"].get("lease_expires_at")
+                self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
+                result = {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires, "runtime_epoch": self.store._current_runtime_epoch()}
+                recorded = self._command_record("attempt.heartbeat", attempt_id, idempotency_key, request_hash, result, project_id=project_id or "unscoped")
+            self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30), record=record)
+            return recorded
 
-    def fail_attempt(self, attempt_id, body, *, identity=None):
-        row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
-        self._assert_attempt_identity(row, identity)
-        current = self.store._current_runtime_epoch()
-        self._validate_attempt_lease(row, body, current)
-        if "reason" in body:
-            raise ValidationError("reason is not supported; use error")
-        failure = body.get("error") or {"code": "executor_failed"}
-        value = self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"], attempt_id=attempt_id)
-        return self._task_resource(value)
+    def fail_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        self._require_object_body(body)
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            self._assert_attempt_identity(row, identity)
+            current = self.store._current_runtime_epoch()
+            self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=row["executor_id"] if row else None, required=True)
+            task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone() if row else None
+            project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
+            request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
+            replay = self._command_replay("attempt.fail", attempt_id, idempotency_key, request_hash, project_id=project_id or "unscoped")
+            if replay is not None:
+                return replay
+            self._validate_attempt_lease(row, body, current)
+            if "reason" in body:
+                raise ValidationError("reason is not supported; use error")
+            failure = body.get("error") or {"code": "executor_failed"}
+            recorded = None
+            def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
+                nonlocal recorded
+                recorded = self._command_record("attempt.fail", attempt_id, idempotency_key, request_hash, self._task_resource(value), project_id=project_id or "unscoped", event_ids=event_ids, primary_stream_id=primary_stream_id, resulting_stream_seq=resulting_stream_seq)
+            self.store.fail_task(row["task_id"], row["lease_id"], failure, fence=row["fence"], attempt_id=attempt_id, record=record)
+            return recorded
 
     def events_page(self, aggregate_id=None, *, cursor=None, limit=50):
         rows = self.store.conn.execute("SELECT * FROM events ORDER BY id").fetchall()

@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
 from .errors import RuntimeErrorBase, AuthorizationError, NotFoundError, ProtocolError, InvalidRequestError
+from .service import validate_idempotency_key
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -73,7 +74,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         key = self.headers.get("Idempotency-Key")
         if not key:
             raise ProtocolError("Idempotency-Key header is required")
-        return key
+        try:
+            return validate_idempotency_key(key)
+        except InvalidRequestError as exc:
+            raise ProtocolError(str(exc)) from exc
 
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         self.send_response(status)
@@ -275,9 +279,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     query = parse_qs(urlsplit(self.path).query)
                     return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST":
+                    key = self._idempotency_key()
                     data = self._raw_body()
-                    result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"))
-                    return self._send(201, self.runtime._object_resource(result))
+                    result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key)
+                    return self._send(201, result)
             if len(path) == 4 and path[3] in ("tasks", "runs") and method == "GET":
                 self._identity("tasks:read")
                 query = parse_qs(urlsplit(self.path).query)
@@ -295,6 +300,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 key = self.headers.get("Idempotency-Key")
                 if method == "PATCH" and path[5:] == []:
                     body = self._project_mutation_body()
+                    if not key:
+                        raise ProtocolError("Idempotency-Key header is required")
+                    key = self._idempotency_key()
                     value = self.runtime.update_project_shot(selector, resource_id, body, idempotency_key=key) if kind == "shots" else self.runtime.update_project_reference(selector, resource_id, body, idempotency_key=key)
                     return self._send(200, value)
                 if method == "POST" and path[5:] in (["archive"], ["recover"]):
@@ -346,8 +354,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body(), idempotency_key=self._idempotency_key()))
         if path == ["v1", "objects"] and method == "POST":
             self._identity("objects:write")
+            key = self._idempotency_key()
             data = self._raw_body()
-            return self._send(201, self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest")))
+            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key)
+            return self._send(201, value)
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")
             metadata, data = self.runtime.object(path[2])
@@ -406,9 +416,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             task_id, action = path[2:]
             self._identity("tasks:write")
             if method == "POST" and action == "cancel":
-                return self._send(200, self.runtime.cancel_task_canonical(task_id, self._body()))
+                key = self._idempotency_key()
+                value = self.runtime.cancel_task_canonical(task_id, self._body(), idempotency_key=key)
+                task = self.runtime.store.get_task(task_id)
+                return self._send(200, value)
             if method == "POST" and action == "retry":
-                return self._send(200, self.runtime.retry_task(task_id, self._body()))
+                key = self._idempotency_key()
+                value = self.runtime.retry_task(task_id, self._body(), idempotency_key=key)
+                task = self.runtime.store.get_task(task_id)
+                return self._send(200, value)
             if method == "GET" and action == "events":
                 task = self.runtime.store.get_task(task_id)
                 query = parse_qs(urlsplit(self.path).query)
@@ -425,9 +441,18 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 body["attempt_id"] = path[2]
                 return self._send(200, self.runtime.prepare_reboot(body, identity=identity))
             if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body(), identity=identity))
-            if action == "settle": return self._send(200, self.runtime.settle_attempt(path[2], self._body(), identity=identity))
-            if action == "heartbeat": return self._send(200, self.runtime.heartbeat_attempt(path[2], self._body(), identity=identity))
-            if action == "fail": return self._send(200, self.runtime.fail_attempt(path[2], self._body(), identity=identity))
+            if action == "settle":
+                key = self._idempotency_key()
+                value = self.runtime.settle_attempt(path[2], self._body(), idempotency_key=key, identity=identity)
+                return self._send(200, value)
+            if action == "heartbeat":
+                key = self._idempotency_key()
+                value = self.runtime.heartbeat_attempt(path[2], self._body(), idempotency_key=key, identity=identity)
+                return self._send(200, value)
+            if action == "fail":
+                key = self._idempotency_key()
+                value = self.runtime.fail_attempt(path[2], self._body(), idempotency_key=key, identity=identity)
+                return self._send(200, value)
         if path == ["v1", "recovery", "reboot"] and method == "POST":
             identity = self._identity("worker:execute")
             return self._send(200, self.runtime.request_reboot(self._body(), identity=identity))

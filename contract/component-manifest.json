@@ -82,11 +82,9 @@
       "value": {
         "attempt_id": "attempt-neutral-1",
         "effect": {
-          "effect_type": "publish_generation",
+          "effect_type": "project.update",
           "expected_version": 1,
-          "payload": {
-            "generation_id": "generation-neutral-1"
-          },
+          "payload": {},
           "target_id": "project-neutral-1"
         },
         "fence": 1,

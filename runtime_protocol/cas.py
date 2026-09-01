@@ -27,16 +27,40 @@ class ContentAddressedStore:
         destination = self.path_for(digest)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if destination.exists():
+            if destination.is_symlink():
+                raise ConflictError("CAS destination must not be a symlink")
             if destination.read_bytes() != data:
                 raise ConflictError("CAS collision or corrupt existing object")
             return {"digest": digest, "size": len(data), "deduplicated": True}
         temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+        published = False
         try:
             with open(temporary, "xb") as stream:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, destination)
+            published = True
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            if published:
+                try:
+                    destination.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    directory_fd = os.open(destination.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+            raise
         finally:
             try:
                 temporary.unlink()

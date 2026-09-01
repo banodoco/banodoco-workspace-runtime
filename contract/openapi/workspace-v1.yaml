@@ -132,6 +132,11 @@ paths:
       operationId: listProjectObjects
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Project-scoped managed objects, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedObjectPage' } } } } }
+    post:
+      operationId: ingestProjectObject
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+      responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/tasks:
     get:
       operationId: listProjectTasks
@@ -369,7 +374,7 @@ paths:
           application/octet-stream:
             schema: { type: string, format: binary }
       responses:
-        '201': { description: Managed object, content: { application/json: { schema: { $ref: './schemas/managed-object.json' } } } }
+        '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
   /v1/objects/{object_id}:
     get:
       operationId: getObject
@@ -406,13 +411,13 @@ paths:
       operationId: cancelTask
       parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Cancellation requested, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+      responses: { '200': { description: Cancellation requested with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/tasks/{task_id}/retry:
     post:
       operationId: retryTask
       parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
-      responses: { '200': { description: Retry requested, content: { application/json: { schema: { $ref: './schemas/task.json' } } } } }
+      responses: { '200': { description: Retry requested with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
   /v1/runs/{run_id}:
     get:
       operationId: getRun
@@ -490,7 +495,7 @@ paths:
       operationId: settleAttempt
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Settlement' } } } }
-      responses: { '200': { description: Settled, content: { application/json: { schema: { $ref: './schemas/task.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '200': { description: Settled with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/prepare-reboot:
     post:
       operationId: prepareReboot
@@ -508,13 +513,13 @@ paths:
       operationId: failAttempt
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/AttemptFailure' } } } }
-      responses: { '200': { description: Failed, content: { application/json: { schema: { $ref: './schemas/task.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '200': { description: Failed with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/heartbeat:
     post:
       operationId: heartbeatAttempt
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/Heartbeat' } } } }
-      responses: { '200': { description: Lease renewed, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/AttemptFence' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '200': { description: Lease renewed with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/recovery/reboot:
     post:
       operationId: requestReboot

@@ -76,7 +76,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["effect_type", "target_id", "expected_version", "payload"],
       "properties": {
-        "effect_type": { "type": "string", "enum": ["set_document", "append_relation", "publish_generation"] },
+        "effect_type": { "type": "string", "const": "project.update" },
         "target_id": { "type": "string", "minLength": 1 },
         "expected_version": { "type": "integer", "minimum": 1 },
         "payload": { "type": "object", "additionalProperties": true }

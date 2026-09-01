@@ -58,7 +58,7 @@ test("generated TypeScript client registers capabilities and fences failure", as
     }
     if (path === "/v1/attempts/a/fail") {
       assert.equal(JSON.parse(new TextDecoder().decode(body)).fence, 4);
-      return { status: 200, headers: {}, body: json(task) };
+      return { status: 200, headers: {}, body: json({ data: task, receipt: { receipt_id: "fail-receipt" } }) };
     }
     throw new Error(`unexpected ${method} ${path}`);
   };

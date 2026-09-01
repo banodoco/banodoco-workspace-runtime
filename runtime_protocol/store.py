@@ -1122,7 +1122,7 @@ class RealmStore:
         if changed.rowcount != 1:
             raise ConflictError("stale settlement effect target version")
 
-    def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id, publish=None):
+    def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id, publish=None, record=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
@@ -1157,10 +1157,13 @@ class RealmStore:
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
-                self._append_event(task["run_id"], task_id, "task.completed", {"result": result, "effect": effect, "objects": result.get("outputs", [])})
-                return self.get_task(task_id)
+                event_id = self._append_event(task["run_id"], task_id, "task.completed", {"result": result, "effect": effect, "objects": result.get("outputs", [])})
+                value = self.get_task(task_id)
+                if record is not None:
+                    record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
+                return value
 
-    def heartbeat_task(self, task_id, lease_token, *, fence=None, lease_seconds=LEASE_SECONDS):
+    def heartbeat_task(self, task_id, lease_token, *, fence=None, lease_seconds=LEASE_SECONDS, record=None):
         if int(lease_seconds) <= 0:
             raise ValidationError("lease_seconds must be positive")
         with self._mutex:
@@ -1181,21 +1184,30 @@ class RealmStore:
                 self.conn.execute("UPDATE tasks SET lease_expires_at=?, updated_at=? WHERE id=?", (deadline, now(), task_id))
                 self.conn.execute("UPDATE reservations SET lease_expires_at=? WHERE task_id=? AND lease_token=? AND released_at IS NULL", (deadline, task_id, lease_token))
                 self.conn.execute("UPDATE executors SET last_seen_at=? WHERE id=?", (now(), task["executor_id"]))
-            return self.get_task(task_id)
+                value = self.get_task(task_id)
+                if record is not None:
+                    record(value)
+                return value
 
-    def cancel_task(self, task_id):
+    def cancel_task(self, task_id, *, record=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
             if task["status"] in ("completed", "cancelled"):
-                return self.get_task(task_id)
+                value = self.get_task(task_id)
+                if record is not None:
+                    record(value)
+                return value
             with self._transaction():
                 self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
-                self._append_event(task["run_id"], task_id, "task.cancelled", {})
-                return self.get_task(task_id)
+                event_id = self._append_event(task["run_id"], task_id, "task.cancelled", {})
+                value = self.get_task(task_id)
+                if record is not None:
+                    record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
+                return value
 
     def cancel_run(self, run_id, *, idempotency_key=None):
         """Cancel every non-terminal child of a queued/running run atomically."""
@@ -1277,7 +1289,7 @@ class RealmStore:
                     self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.retry", run_id, idempotency_key, request_hash, canonical_json(result), now()))
             return result
 
-    def fail_task(self, task_id, lease_token, failure, *, fence=None, attempt_id=None):
+    def fail_task(self, task_id, lease_token, failure, *, fence=None, attempt_id=None, record=None):
         with self._mutex:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
@@ -1300,8 +1312,11 @@ class RealmStore:
                 if attempt_id is not None:
                     self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
-                self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
-                return self.get_task(task_id)
+                event_id = self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
+                value = self.get_task(task_id)
+                if record is not None:
+                    record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
+                return value
 
     def doctor(self, *, catalog_path=None):
         """Return a read-only, actionable integrity report.
