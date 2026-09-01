@@ -19,6 +19,12 @@ def test_tiny_acceptance_runs_real_compact_b12_and_cold_opens(tmp_path: Path) ->
     assert result["cold_open"]["object_count"] >= 1
 
     evidence = output / "evidence"
+    capacity = json.loads((evidence / "capacity-receipt-b12.json").read_text())
+    assert capacity["redundancy"] == "compact"
+    assert capacity["candidate_bytes"] == 0
+    assert capacity["reactivation_bytes"] == 0
+    assert capacity["margin_bytes"] == int(result["source_bytes"] * 0.2)
+    assert capacity["required_bytes"] < 10 * 1024 * 1024
     assert (evidence / "activated-destination-b12.json").is_file()
     assert (evidence / "activated-destination-b12-rollback.json").is_file()
     assert (evidence / "activated-destination-b12-reactivated.json").is_file()

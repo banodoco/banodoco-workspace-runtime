@@ -171,7 +171,7 @@ def run_tiny_acceptance(output_root: str | Path) -> dict[str, Any]:
             authorization_file=str(authorizations_path),
             writer_stop_receipt=str(writer_receipt_path),
             display_name="Stage 1 tiny acceptance",
-            capacity_margin_bytes=0,
+            capacity_margin_bytes=None,
             redundancy="compact",
         )
     )
