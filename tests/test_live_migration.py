@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+import hashlib
+import shutil
 
 import pytest
 
@@ -322,6 +324,82 @@ def test_b12_live_migration_resumes_after_each_durable_crash_seam(tmp_path, redu
         resumed = run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
         assert resumed["journal"]["state"] == "reactivated"
         assert [entry["to"] for entry in resumed["journal"]["entries"]] == ["active", "rolled_back", "reactivated"]
+    finally:
+        active.close()
+
+
+@pytest.mark.parametrize(
+    ("crash_at", "phase"),
+    [
+        ("after_active_activation", "active"),
+        ("after_rollback_activation", "rolled_back"),
+        ("after_reactivation_activation", "reactivated"),
+    ],
+)
+def test_compact_replay_cleans_residual_activation_quarantine(tmp_path, crash_at, phase):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    config = _config(source, tmp_path)
+    active = RuntimeService(tmp_path / "active")
+    try:
+        authorizations = _auth(config, active)
+        with pytest.raises(MigrationError, match="injected rehearsal crash"):
+            run_live_migration(
+                config,
+                active,
+                authorizations,
+                writer_stop=lambda: {"stopped": True},
+                crash_at=crash_at,
+            )
+        residual = tmp_path / f".active.inactive-{phase}-1700000000000000000"
+        shutil.copytree(active.store.root, residual)
+        marker = {
+            "format_version": 1,
+            "kind": "b12-compact-quarantine",
+            "quarantine": residual.name,
+            "target_name": "active",
+            "state": phase,
+            "realm_id": active.realm["id"],
+            "token": hashlib.sha256(f"{active.realm['id']}:{residual.name}:{phase}".encode("utf-8")).hexdigest(),
+        }
+        (tmp_path / f"{residual.name}.b12-owner").write_text(json.dumps(marker), encoding="utf-8")
+        non_owned = tmp_path / f".active.inactive-{phase}-1700000000000000001"
+        shutil.copytree(active.store.root, non_owned)
+        resumed = run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
+        assert resumed["journal"]["state"] == "reactivated"
+        assert not residual.exists()
+        assert non_owned.is_dir()
+        assert list(tmp_path.glob(".active.inactive-*")) == [non_owned]
+    finally:
+        active.close()
+
+
+def test_compact_terminal_replay_cleans_residual_quarantine(tmp_path):
+    source = tmp_path / "source"
+    build_synthetic_fixture(source)
+    config = _config(source, tmp_path)
+    active = RuntimeService(tmp_path / "active")
+    try:
+        authorizations = _auth(config, active)
+        run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
+        residual = tmp_path / ".active.inactive-reactivated-1700000000000000001"
+        shutil.copytree(active.store.root, residual)
+        marker = {
+            "format_version": 1,
+            "kind": "b12-compact-quarantine",
+            "quarantine": residual.name,
+            "target_name": "active",
+            "state": "reactivated",
+            "realm_id": active.realm["id"],
+            "token": hashlib.sha256(f"{active.realm['id']}:{residual.name}:reactivated".encode("utf-8")).hexdigest(),
+        }
+        (tmp_path / f"{residual.name}.b12-owner").write_text(json.dumps(marker), encoding="utf-8")
+        orphan = tmp_path / ".active.inactive-active-1700000000000000002.b12-owner"
+        orphan.write_text(json.dumps({**marker, "quarantine": orphan.name.removesuffix(".b12-owner"), "state": "active", "token": hashlib.sha256(f"{active.realm['id']}:{orphan.name.removesuffix('.b12-owner')}:active".encode("utf-8")).hexdigest()}), encoding="utf-8")
+        replay = run_live_migration(config, active, authorizations, writer_stop=lambda: {"stopped": True})
+        assert replay["idempotent"] is True
+        assert not residual.exists()
+        assert not orphan.exists()
     finally:
         active.close()
 

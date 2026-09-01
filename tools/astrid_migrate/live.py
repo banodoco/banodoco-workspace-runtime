@@ -16,8 +16,10 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import sqlite3
+import stat
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -476,6 +478,7 @@ class LiveMigration:
         release = journal.effects().get("capacity-release")
         if not release or release.get("payload", {}).get("reservation_id") != journal.effects().get("capacity-reservation", {}).get("payload", {}).get("reservation_id"):
             raise MigrationError("B12 terminal capacity reservation was not durably released")
+        self._cleanup_compact_quarantines(self.active_runtime)
         return {"packet": "B12", "journal": current, "identity": dict(identity), "idempotent": True}
 
     def _backup_or_reuse(self, runtime: Any, destination: Path, *, binding: Mapping[str, Any], journal: MigrationJournal, effect_name: str, seam: str) -> dict[str, Any]:
@@ -784,6 +787,84 @@ class LiveMigration:
         if payload.get("semantic_snapshot_sha256") != _canonical_digest(_semantic_snapshot(snapshot)):
             raise MigrationError("B12 active runtime changed after the writer-stop boundary")
 
+    def _cleanup_compact_quarantines(self, active: Any) -> None:
+        """Remove residual compact activation quarantines through a pinned parent.
+
+        A process can die after publishing a new active root but before the
+        adapter finishes removing its old-root quarantine. Replay/reuse must
+        clean that residue without resolving the replaceable active path again.
+        Extreme mode retains these historical trees and never enters this
+        helper.
+        """
+        if self.config.redundancy != "compact":
+            return
+        target = Path(os.path.abspath(os.fspath(active.store.root)))
+        identity = capture_activation_path(target)
+        parent_fd = int(identity.get("_parent_fd", -1))
+        if parent_fd < 0:
+            close_activation_path(identity)
+            raise MigrationError("B12 compact quarantine cleanup has no retained parent descriptor")
+        quarantine_pattern = re.compile(rf"\.{re.escape(target.name)}\.inactive-(?:active|rolled_back|reactivated)-[0-9]+$")
+        marker_pattern = re.compile(rf"\.{re.escape(target.name)}\.inactive-(?:active|rolled_back|reactivated)-[0-9]+\.b12-owner$")
+        try:
+            revalidate_activation_path(target, identity)
+            try:
+                marker_names = {}
+                for name in os.listdir(parent_fd):
+                    if not marker_pattern.fullmatch(name):
+                        continue
+                    try:
+                        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if not stat.S_ISREG(entry.st_mode):
+                        continue
+                    marker_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+                    try:
+                        marker_data = bytearray()
+                        while True:
+                            block = os.read(marker_fd, 1024 * 1024)
+                            if not block:
+                                break
+                            marker_data.extend(block)
+                    finally:
+                        os.close(marker_fd)
+                    try:
+                        marker = json.loads(bytes(marker_data).decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError):
+                        continue
+                    quarantine_name = name.removesuffix(".b12-owner")
+                    quarantine_suffix = quarantine_name.removeprefix(f".{target.name}.inactive-")
+                    state = quarantine_suffix.rsplit("-", 1)[0]
+                    expected_token = hashlib.sha256(f"{active.realm['id']}:{quarantine_name}:{state}".encode("utf-8")).hexdigest()
+                    if not isinstance(marker, Mapping) or marker.get("format_version") != 1 or marker.get("kind") != "b12-compact-quarantine" or marker.get("quarantine") != quarantine_name or marker.get("target_name") != target.name or marker.get("state") != state or marker.get("realm_id") != active.realm["id"] or marker.get("token") != expected_token:
+                        continue
+                    marker_names[quarantine_name] = name
+                names = []
+                for quarantine_name, marker_name in sorted(marker_names.items()):
+                    try:
+                        entry = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        os.unlink(marker_name, dir_fd=parent_fd)
+                        continue
+                    # Only adapter-created directory quarantines qualify. A
+                    # similarly named file or symlink is not runtime-owned and
+                    # remains untouched.
+                    if stat.S_ISDIR(entry.st_mode) and quarantine_pattern.fullmatch(quarantine_name):
+                        names.append((quarantine_name, marker_name))
+            except OSError as exc:
+                raise MigrationError("B12 compact quarantine cleanup could not inspect its pinned parent") from exc
+            for name, marker_name in names:
+                revalidate_activation_path(target, identity)
+                try:
+                    _remove_tree_at(parent_fd, name)
+                    os.unlink(marker_name, dir_fd=parent_fd)
+                except (OSError, MigrationError) as exc:
+                    raise MigrationError(f"B12 compact quarantine cleanup failed: {name}") from exc
+            revalidate_activation_path(target, identity)
+        finally:
+            close_activation_path(identity)
+
     def _assert_destination_baseline(self, destination: Any, payload: Mapping[str, Any]) -> None:
         current = self._destination_truth(destination)
         if any(payload.get(key) != current.get(key) for key in ("semantic_snapshot_sha256", "cas_manifest_sha256", "database_semantic_sha256", "realm_id")):
@@ -1061,6 +1142,7 @@ class LiveMigration:
                 # activation source.
                 self._verify_root_against_backup(self.config.destination_root, destination_backup_root, realm_id=realm_id)
                 self._consume_authorization("AUTH-ACTIVATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
+                self._cleanup_compact_quarantines(active)
                 activation_effect = self._existing_effect(journal, "active-activation")
                 if activation_effect:
                     activation_payload = activation_effect.get("payload", {})
@@ -1108,6 +1190,7 @@ class LiveMigration:
                 reservation.recheck()
                 rollback_result = self._restore_or_reuse(active_backup_root, rollback_root, journal=journal, effect_name="rollback-restore", realm_id=realm_id, seam="rollback_restore", source_manifest_sha256=source_manifest_sha256)
                 rollback_verification = rollback_result["verification"]
+                self._cleanup_compact_quarantines(active)
                 rollback_effect = self._existing_effect(journal, "rollback-activation")
                 if rollback_effect:
                     rollback_payload = rollback_effect.get("payload", {})
@@ -1142,6 +1225,7 @@ class LiveMigration:
                 else:
                     reactivation_verification = verify_backup(destination_backup_root)
                     reactivation_result = {"destination": str(destination_backup_root), "source": "signed-destination-backup", "verification": reactivation_verification}
+                self._cleanup_compact_quarantines(active)
                 reactivation_effect = self._existing_effect(journal, "reactivation-activation")
                 if reactivation_effect:
                     reactivation_payload = reactivation_effect.get("payload", {})

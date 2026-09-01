@@ -737,7 +737,7 @@ class RuntimeServiceAdapter:
                 raise MigrationError("signed backup could not be verified for activation") from exc
 
         candidate_parent_fd = candidate_fd = quarantine_fd = temporary_fd = -1
-        temporary_name = quarantine_name = None
+        temporary_name = quarantine_name = quarantine_marker_name = None
         published = False
         committed = False
         reopened = None
@@ -795,6 +795,21 @@ class RuntimeServiceAdapter:
             # particular, do not use Path.rename/mkdtemp: both resolve the
             # parent path again after validation.
             quarantine_name = f".{target.name}.inactive-{state}-{time.time_ns()}"
+            if not retain_quarantine:
+                quarantine_marker_name = f"{quarantine_name}.b12-owner"
+                quarantine_marker = {
+                    "format_version": 1,
+                    "kind": "b12-compact-quarantine",
+                    "quarantine": quarantine_name,
+                    "target_name": target.name,
+                    "state": state,
+                    "realm_id": realm_id,
+                    "token": hashlib.sha256(f"{realm_id}:{quarantine_name}:{state}".encode("utf-8")).hexdigest(),
+                }
+                # Publish the owner receipt through the pinned parent before
+                # the rename. A crash after rename therefore cannot leave an
+                # otherwise indistinguishable quarantine.
+                _write_bytes_at(parent_fd, quarantine_marker_name, _canonical(quarantine_marker) + b"\n")
             _rename_at(parent_fd, target.name, quarantine_name)
             quarantine_fd = os.open(quarantine_name, _DIR_FLAGS, dir_fd=parent_fd)
             temporary_name, temporary_fd = _mkdir_at(parent_fd, f".{target.name}.activate-")
@@ -908,6 +923,7 @@ class RuntimeServiceAdapter:
                     os.close(quarantine_fd)
                     quarantine_fd = -1
                     _remove_tree_at(parent_fd, quarantine_name)
+                    os.unlink(quarantine_marker_name, dir_fd=parent_fd)
                 except (OSError, MigrationError) as exc:
                     raise MigrationError("activation committed but quarantine cleanup failed") from exc
             return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": None if not retain_quarantine else str(target.parent / quarantine_name), "quarantine_removed": not retain_quarantine, "realm_id": realm_id, "candidate_verification": candidate_verification}
@@ -918,6 +934,8 @@ class RuntimeServiceAdapter:
                     _rename_at(parent_fd, target.name, failed_name)
                     _rename_at(parent_fd, quarantine_name, target.name)
                     _remove_tree_at(parent_fd, failed_name)
+                    if quarantine_marker_name is not None:
+                        os.unlink(quarantine_marker_name, dir_fd=parent_fd)
                 except (OSError, MigrationError):
                     pass
             if reopened is not None and not committed:
@@ -938,6 +956,11 @@ class RuntimeServiceAdapter:
                     _rename_at(parent_fd, quarantine_name, target.name)
                 except (OSError, MigrationError):
                     pass
+                if quarantine_marker_name is not None:
+                    try:
+                        os.unlink(quarantine_marker_name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
             raise
         finally:
             for fd in (candidate_fd, candidate_parent_fd, quarantine_fd):
