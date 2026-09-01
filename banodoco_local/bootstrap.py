@@ -34,6 +34,15 @@ RUNTIME_VERSION = PROTOCOL_VERSION
 IMPORTER_VERSION = "t5"
 CATALOG_VERSION = 1
 DISCOVERY_VERSION = 1
+WORKER_ACTOR = "astrid-pack-host"
+WORKER_SCOPES = (
+    "worker:register",
+    "worker:execute",
+    "tasks:read",
+    "tasks:write",
+    "objects:read",
+    "objects:write",
+)
 LEGACY_NEXT_ACTION = (
     "Run the offline migrator before launching: "
     "banodoco-local migrate --profile astrid --source {legacy_root}"
@@ -218,6 +227,12 @@ class BootstrapResult:
     # The handoff exposes only the owner-only credential *path*.  The secret
     # itself never crosses the launcher stdout boundary.
     credential_file: Path | None = field(default=None, compare=False)
+    # The launcher hands the Astrid pack host a separate scoped credential;
+    # the user-facing Astrid credential remains the value above.
+    worker_credential_file: Path | None = field(default=None, compare=False)
+    worker_actor: str | None = field(default=None, compare=False)
+    worker_scopes: tuple[str, ...] = field(default=(), compare=False)
+    source_checkout: str | None = field(default=None, compare=False)
 
     @property
     def ready(self) -> bool:
@@ -392,6 +407,40 @@ def _validate_loopback_endpoint(endpoint: str) -> str:
     return str(endpoint).rstrip("/")
 
 
+def _worker_handoff(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate the non-secret pack-host credential handoff.
+
+    The token itself stays in the owner-only file.  Discovery carries only
+    its path and the exact scope declaration so a launcher can activate one
+    host without promoting the Astrid user credential or an owner token.
+    Older fake boundaries may omit the optional fields; real runtime launch
+    always supplies them.
+    """
+    if not isinstance(value, Mapping) or not value.get("worker_credential_file"):
+        return {}
+    raw_path = value.get("worker_credential_file")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise BootstrapError("Runtime worker credential handoff is invalid; " + RECONFIGURE_NEXT_ACTION)
+    path = Path(raw_path).expanduser()
+    if (not path.is_absolute() or _has_symlink_component(path)
+            or path.is_symlink() or not path.is_file()):
+        raise BootstrapError("Runtime worker credential handoff is unsafe; " + RECONFIGURE_NEXT_ACTION)
+    try:
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise BootstrapError("Runtime worker credential file must be owner-only; " + RECONFIGURE_NEXT_ACTION)
+    except OSError as exc:
+        raise BootstrapError("Runtime worker credential handoff is unavailable; " + RECONFIGURE_NEXT_ACTION) from exc
+    actor = str(value.get("worker_actor") or "")
+    scopes = tuple(str(scope) for scope in (value.get("worker_scopes") or ()))
+    if actor != WORKER_ACTOR or scopes != WORKER_SCOPES:
+        raise CompatibilityError("Runtime worker credential scopes are incompatible. " + RECONFIGURE_NEXT_ACTION)
+    return {
+        "worker_credential_file": path,
+        "worker_actor": actor,
+        "worker_scopes": scopes,
+    }
+
+
 def _validate_support_paths(paths: RuntimePaths) -> None:
     """Validate the fixed support composition before reading or writing it."""
     directories = (
@@ -404,6 +453,8 @@ def _validate_support_paths(paths: RuntimePaths) -> None:
         paths.instance_lock_path, paths.bootstrap_lock_path,
         paths.runtime_support / "credentials" / "owner.token",
         paths.runtime_support / "credentials" / "owner.json",
+        paths.runtime_support / "credentials" / "astrid-pack-host.token",
+        paths.runtime_support / "credentials" / "astrid-pack-host.json",
     )
     for item in (*directories, *files):
         target = Path(item).expanduser()
@@ -884,7 +935,15 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             realm_id = str(discovery["active_realm"])
             _provision_connection(connection, actor_id, token, realm_id)
             diagnostics.append("runtime checkout differences are provenance only")
-            return BootstrapResult("reconnected", realm_id, str(realm.get("display_name", "Astrid Workspace")) if realm else "Astrid Workspace", endpoint, actor_id, source.profile, tuple(diagnostics), paths.discovery_path, paths.credentials_dir / "astrid.json")
+            worker = _worker_handoff(discovery)
+            return BootstrapResult(
+                "reconnected", realm_id,
+                str(realm.get("display_name", "Astrid Workspace")) if realm else "Astrid Workspace",
+                endpoint, actor_id, source.profile, tuple(diagnostics),
+                paths.discovery_path, paths.credentials_dir / "astrid.json",
+                worker.get("worker_credential_file"), worker.get("worker_actor"),
+                worker.get("worker_scopes", ()), source.source_checkout,
+            )
         # A dead advertisement is ephemeral support state.  Remove it before
         # starting so a crash cannot be mistaken for a live owner.
         remove_file(paths.discovery_path)
@@ -961,6 +1020,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     if not healthy:
         _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
         raise BootstrapError("Runtime started but failed health check; next action: " + RECONFIGURE_NEXT_ACTION)
+    worker = _worker_handoff(handle)
     # The marker contains ownership metadata only and never a credential.
     try:
         atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id})
@@ -991,6 +1051,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         "schema_version": handle.get("schema_version", source.schema_version),
         "capability_digest": handle.get("capability_digest", source.capability_digest),
         "credential_file": str(paths.credentials_dir / "astrid.json"),
+        "worker_credential_file": str(handle.get("worker_credential_file") or ""),
+        "worker_actor": str(handle.get("worker_actor") or ""),
+        "worker_scopes": list(handle.get("worker_scopes") or ()),
         "advertised_at": time.time(),
     }
     try:
@@ -998,7 +1061,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     except Exception:
         _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
         raise
-    return BootstrapResult("started", realm_id, str(realm["display_name"]), endpoint, actor_id, source.profile, tuple(diagnostics), paths.discovery_path, paths.credentials_dir / "astrid.json")
+    return BootstrapResult(
+        "started", realm_id, str(realm["display_name"]), endpoint, actor_id,
+        source.profile, tuple(diagnostics), paths.discovery_path,
+        paths.credentials_dir / "astrid.json",
+        worker.get("worker_credential_file"), worker.get("worker_actor"),
+        worker.get("worker_scopes", ()), source.source_checkout,
+    )
 
 
 def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
@@ -1027,7 +1096,15 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     actor_id, token = _credential(paths)
     connection = boundary.connect(endpoint=endpoint, credential=token)
     _provision_connection(connection, actor_id, token, str(realm["realm_id"]))
-    return BootstrapResult("reconnected", str(realm["realm_id"]), str(realm.get("display_name", "Astrid Workspace")), endpoint, actor_id, source.profile, (), paths.discovery_path, paths.credentials_dir / "astrid.json")
+    worker = _worker_handoff(discovery)
+    return BootstrapResult(
+        "reconnected", str(realm["realm_id"]),
+        str(realm.get("display_name", "Astrid Workspace")), endpoint, actor_id,
+        source.profile, (), paths.discovery_path,
+        paths.credentials_dir / "astrid.json",
+        worker.get("worker_credential_file"), worker.get("worker_actor"),
+        worker.get("worker_scopes", ()), source.source_checkout,
+    )
 
 
 def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
@@ -1060,7 +1137,13 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     if restart_fn is None:
         remove_file(paths.discovery_path)
         result = bootstrap(paths, boundary, config)
-        return BootstrapResult("restarted", result.realm_id, result.display_name, result.endpoint, result.actor_id, result.source_profile, result.diagnostics, result.discovery_path, result.credential_file)
+        return BootstrapResult(
+            "restarted", result.realm_id, result.display_name, result.endpoint,
+            result.actor_id, result.source_profile, result.diagnostics,
+            result.discovery_path, result.credential_file,
+            result.worker_credential_file, result.worker_actor,
+            result.worker_scopes, result.source_checkout,
+        )
     handle = restart_fn(endpoint=endpoint, pid=pid, instance_id=instance_id, process_birth_id=process_birth_id, realm_id=realm_id, owner_lock=paths.instance_lock_path, discovery_path=paths.discovery_path)
     # The boundary restart returns the same metadata shape as start.  Publish
     # its fresh advertisement, then let normal bootstrap validation reconnect;
@@ -1085,7 +1168,13 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     })
     atomic_write_json(paths.discovery_path, refreshed)
     result = bootstrap(paths, boundary, config)
-    return BootstrapResult("restarted", result.realm_id, result.display_name, result.endpoint, result.actor_id, result.source_profile, result.diagnostics, result.discovery_path, result.credential_file)
+    return BootstrapResult(
+        "restarted", result.realm_id, result.display_name, result.endpoint,
+        result.actor_id, result.source_profile, result.diagnostics,
+        result.discovery_path, result.credential_file,
+        result.worker_credential_file, result.worker_actor,
+        result.worker_scopes, result.source_checkout,
+    )
 
 
 def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict[str, Any]:

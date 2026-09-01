@@ -254,6 +254,11 @@ class LocalRuntimeBoundary:
             "protocol_version": PROTOCOL_VERSION,
             "schema_version": SCHEMA_VERSION,
             "capability_digest": source_profile.capability_digest,
+            # These are paths and public metadata only; the scoped worker
+            # secret remains in the runtime-owned 0600 file.
+            "worker_credential_file": discovery.get("worker_credential_file"),
+            "worker_actor": discovery.get("worker_actor"),
+            "worker_scopes": discovery.get("worker_scopes", ()),
         }
 
     def _read_discovery(self, support_root: Path) -> dict[str, Any]:

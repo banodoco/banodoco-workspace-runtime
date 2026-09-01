@@ -12,6 +12,17 @@ from .service import RuntimeService
 from .util import atomic_json_write
 
 
+WORKER_ACTOR = "astrid-pack-host"
+WORKER_SCOPES = (
+    "worker:register",
+    "worker:execute",
+    "tasks:read",
+    "tasks:write",
+    "objects:read",
+    "objects:write",
+)
+
+
 def _authority_path(value, label):
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -27,7 +38,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None):
+    def __init__(self, root, *, support_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, production_worker_credentials=False):
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("runtime daemon only binds to loopback")
         self.root = _authority_path(root, "realm root").resolve()
@@ -41,6 +52,13 @@ class RuntimeDaemon:
         # its small, explicit allowlist.
         self.reboot_executor = reboot_executor
         self.reboot_allowlist = reboot_allowlist
+        # In-process RuntimeDaemon fixtures historically use ``worker_token``
+        # as an administrator convenience for arbitrary fake executor IDs.
+        # The installed CLI passes production_worker_credentials=True, which
+        # switches the real process to the bound least-privilege pack-host
+        # credential below.  Keeping the fixture mode explicit avoids granting
+        # that administrator credential to the production host.
+        self.production_worker_credentials = bool(production_worker_credentials)
         self.instance_id = uuid.uuid4().hex
         self.service = None
         self.httpd = None
@@ -51,6 +69,7 @@ class RuntimeDaemon:
         self.token = None
         self.worker_token = None
         self.credential_path = None
+        self.worker_credential_path = None
 
     @property
     def endpoint(self):
@@ -64,12 +83,12 @@ class RuntimeDaemon:
             return self
         self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist)
         self.token, self.credential_path = self.credentials.provision("owner", ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"])
-        # The owner credential is retained as the fixture's control-plane
-        # worker handle for older in-process harnesses.  It is an administrator
-        # credential, so the normal admin authorization path applies; runtime
-        # worker credentials provisioned for real executors remain explicitly
-        # bound to their executor identity.
-        self.worker_token = self.token
+        self.worker_token, self.worker_credential_path = self.credentials.provision(WORKER_ACTOR, list(WORKER_SCOPES))
+        if not self.production_worker_credentials:
+            # Test-only in-process convenience.  The production CLI never
+            # selects this branch; its pack host receives WORKER_ACTOR's
+            # scoped token and cannot call admin/project routes.
+            self.worker_token = self.token
         if self.bootstrap_token_file and self.bootstrap_token_file.exists():
             bootstrap_token = self.bootstrap_token_file.read_text(encoding="utf-8").strip()
             self.credentials.provision_static("bootstrap", bootstrap_token, ["admin", "credentials:provision"])
@@ -81,7 +100,7 @@ class RuntimeDaemon:
         birth_id = process_birth_identity()
         if self.owner_lock:
             atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"]})
-        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path))
+        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES))
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="banodoco-runtime", daemon=True)
         self.thread.start()
         return self
