@@ -46,6 +46,17 @@ def _completed_b12(tmp_path: Path) -> tuple[Path, Path, Path, str]:
     return evidence, active, support, realm_id
 
 
+def _arm(evidence: Path, active: Path, support: Path, realm_id: str, **kwargs):
+    return arm_stage1_reboot(
+        evidence,
+        active,
+        support,
+        realm_id,
+        launch_agents_dir=evidence.parent / "launch-agents",
+        **kwargs,
+    )
+
+
 def test_stage1_reboot_commands_are_explicitly_named() -> None:
     parser = _parser()
     arm = parser.parse_args(["stage1-reboot-arm", "--evidence-root", "/e", "--active-root", "/a", "--support-root", "/s", "--realm-id", "r"])
@@ -58,7 +69,7 @@ def test_stage1_reboot_commands_are_explicitly_named() -> None:
 
 def test_stage1_reboot_arm_then_resume_is_one_shot(tmp_path: Path) -> None:
     evidence, active, support, realm_id = _completed_b12(tmp_path)
-    armed = arm_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before", python_executable=sys.executable)
+    armed = _arm(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before", python_executable=sys.executable)
 
     assert armed["packet"] == "B12.R1"
     assert armed["state"] == "armed"
@@ -69,9 +80,14 @@ def test_stage1_reboot_arm_then_resume_is_one_shot(tmp_path: Path) -> None:
     assert launchd["WorkingDirectory"] == str(Path(__file__).resolve().parents[1])
     assert launchd["ProgramArguments"][3] == "stage1-reboot-resume"
     assert launchd["ProgramArguments"][-4:] == ["--wait-seconds", "120", "--poll-seconds", "1"]
+    stable_plist = Path(armed["launch_agent_path"])
+    assert stable_plist.parent == tmp_path / "launch-agents"
+    assert stable_plist.is_file()
+    assert stable_plist.stat().st_mode & 0o777 == 0o600
+    assert armed["launch_agent_sha256"] == hashlib.sha256(stable_plist.read_bytes()).hexdigest()
 
     # A second arm is a harmless replay of the same explicit checkpoint.
-    assert arm_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "different") == armed
+    assert _arm(evidence, active, support, realm_id, boot_identity_provider=lambda: "different") == armed
 
     with pytest.raises(MigrationError, match="cold-launched runtime epoch"):
         resume_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-after")
@@ -79,7 +95,7 @@ def test_stage1_reboot_arm_then_resume_is_one_shot(tmp_path: Path) -> None:
     # RuntimeService's normal startup is the existing cold-launch boundary.
     restarted = RuntimeService(active, realm_id=realm_id, support_root=support)
     restarted.close()
-    launch_result = subprocess.run(launchd["ProgramArguments"], cwd=launchd["WorkingDirectory"], capture_output=True, text=True, check=True)
+    launch_result = subprocess.run(plistlib.loads(stable_plist.read_bytes())["ProgramArguments"], cwd=launchd["WorkingDirectory"], capture_output=True, text=True, check=True)
     r2 = json.loads(launch_result.stdout)
     assert r2["packet"] == "B12.R2"
     assert r2["state"] == "completed"
@@ -87,8 +103,15 @@ def test_stage1_reboot_arm_then_resume_is_one_shot(tmp_path: Path) -> None:
     assert r2["boot_identity_after"] != "boot-before"
     assert r2["runtime_epoch_after"] > r2["runtime_epoch_before"]
     assert (evidence / R2_NAME).is_file()
+    assert r2["launch_agent_cleanup"] == {
+        "status": "pending_bootout_and_remove",
+        "path": str(stable_plist),
+        "label": armed["launch_agent_label"],
+    }
+    assert stable_plist.is_file()
 
     # LaunchAgent retries and manual recovery return the durable receipt.
+    stable_plist.unlink()
     assert resume_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "later") == r2
 
 
@@ -97,10 +120,10 @@ def test_stage1_reboot_requires_terminal_b12_and_changed_os_boot(tmp_path: Path)
     journal = evidence / "migration-journal-b12.json"
     journal.write_text(json.dumps({"format_version": 1, "generation": 0, "state": "active", "entries": [], "effects": []}), encoding="utf-8")
     with pytest.raises(MigrationError, match="terminal B12 journal"):
-        arm_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
+        _arm(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
 
     journal.write_text(json.dumps({"format_version": 1, "generation": 0, "state": "reactivated", "entries": [], "effects": []}), encoding="utf-8")
-    arm_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
+    _arm(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
     with pytest.raises(MigrationError, match="changed host boot identity"):
         resume_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
 
@@ -108,7 +131,7 @@ def test_stage1_reboot_requires_terminal_b12_and_changed_os_boot(tmp_path: Path)
 def test_stage1_reboot_rejects_changed_pinned_evidence_and_realm_binding(tmp_path: Path) -> None:
     evidence, active, support, realm_id = _completed_b12(tmp_path)
     original_journal = (evidence / "migration-journal-b12.json").read_bytes()
-    arm_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
+    _arm(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before")
     (evidence / "migration-journal-b12.json").write_bytes(original_journal + b" ")
     with pytest.raises(MigrationError, match="R1-pinned B12 evidence changed"):
         resume_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-after")
@@ -126,7 +149,7 @@ def test_stage1_reboot_rejects_changed_pinned_evidence_and_realm_binding(tmp_pat
 
 def test_stage1_launchagent_waits_for_delayed_runtime_from_clean_environment(tmp_path: Path) -> None:
     evidence, active, support, realm_id = _completed_b12(tmp_path)
-    arm_stage1_reboot(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before", python_executable=sys.executable)
+    _arm(evidence, active, support, realm_id, boot_identity_provider=lambda: "boot-before", python_executable=sys.executable)
     launchd = plistlib.loads((evidence / PLIST_NAME).read_bytes())
     child = subprocess.Popen(launchd["ProgramArguments"], cwd=launchd["WorkingDirectory"], env={"PATH": os.environ.get("PATH", "")}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     time.sleep(0.2)

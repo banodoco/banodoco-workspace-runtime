@@ -178,6 +178,43 @@ def _verified_executable(value: str | None) -> str:
     return str(executable)
 
 
+def _launch_agents_dir(value: str | Path | None, *, create: bool) -> Path:
+    path = _absolute(value or (Path.home() / "Library" / "LaunchAgents"), "user LaunchAgents directory")
+    if path.exists():
+        if not path.is_dir() or path.is_symlink():
+            raise MigrationError(f"user LaunchAgents directory is not a regular directory: {path}")
+        return path
+    if not create:
+        raise MigrationError(f"user LaunchAgents directory is missing: {path}")
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except OSError as exc:
+        raise MigrationError(f"cannot create user LaunchAgents directory: {path}") from exc
+    path.chmod(0o700)
+    return path
+
+
+def _launch_agent_label(payload: Mapping[str, Any]) -> str:
+    return f"com.banodoco.stage1.b12.reboot.{payload['checkpoint_id']}"
+
+
+def _verify_launch_agent(marker: Mapping[str, Any], evidence: Path) -> Path:
+    evidence_plist = evidence / PLIST_NAME
+    stable_value = marker.get("launch_agent_path")
+    launch_agents_value = marker.get("launch_agents_dir")
+    expected_hash = marker.get("launch_agent_sha256")
+    label = marker.get("launch_agent_label")
+    if not all(isinstance(value, str) and value for value in (stable_value, launch_agents_value, expected_hash, label)):
+        raise MigrationError("Stage 1 reboot marker has no bound LaunchAgent")
+    stable = _absolute(stable_value, "bound LaunchAgent")
+    launch_agents = _absolute(launch_agents_value, "bound user LaunchAgents directory")
+    if stable.parent != launch_agents or stable.name != f"{label}.plist":
+        raise MigrationError("Stage 1 LaunchAgent path is not bound to its marker")
+    if _sha256(evidence_plist) != expected_hash or _sha256(stable) != expected_hash:
+        raise MigrationError("Stage 1 bound LaunchAgent changed")
+    return stable
+
+
 def _working_directory() -> Path:
     root = Path(__file__).resolve().parents[2]
     if not root.is_dir() or any(part.is_symlink() for part in _existing_parts(root)):
@@ -260,7 +297,7 @@ def _plist(payload: Mapping[str, Any], python_executable: str) -> bytes:
         "1",
     ]
     value = {
-        "Label": f"com.banodoco.stage1.b12.reboot.{payload['checkpoint_id']}",
+        "Label": _launch_agent_label(payload),
         "ProgramArguments": args,
         "WorkingDirectory": str(payload["working_directory"]),
         "RunAtLoad": True,
@@ -273,7 +310,7 @@ def _plist(payload: Mapping[str, Any], python_executable: str) -> bytes:
     return plistlib.dumps(value, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
-def arm_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, boot_identity_provider: Callable[[], str] | None = None, python_executable: str | None = None) -> dict[str, Any]:
+def arm_stage1_reboot(evidence_root: str | Path, active_root: str | Path, support_root: str | Path, realm_id: str, *, boot_identity_provider: Callable[[], str] | None = None, python_executable: str | None = None, launch_agents_dir: str | Path | None = None) -> dict[str, Any]:
     """Durably arm one postboot R2 capture; never invokes reboot or launchctl."""
     evidence = _absolute(evidence_root, "evidence root")
     active = _absolute(active_root, "active root")
@@ -281,24 +318,33 @@ def arm_stage1_reboot(evidence_root: str | Path, active_root: str | Path, suppor
     if not evidence.is_dir() or not active.is_dir() or not support.is_dir():
         raise MigrationError("Stage 1 reboot arm requires existing evidence, active, and support directories")
     marker = evidence / ARMED_NAME
+    launch_agents = _launch_agents_dir(launch_agents_dir, create=True)
+    interpreter = _verified_executable(python_executable)
     if marker.is_file():
         existing = _read_json(marker, "Stage 1 reboot marker")
-        expected = {"active_root": str(active), "support_root": str(support), "evidence_root": str(evidence), "realm_id": realm_id, "working_directory": str(_working_directory())}
+        expected = {"active_root": str(active), "support_root": str(support), "evidence_root": str(evidence), "realm_id": realm_id, "working_directory": str(_working_directory()), "python_executable": interpreter, "launch_agents_dir": str(launch_agents)}
         if all(existing.get(key) == value for key, value in expected.items()):
             if existing.get("state") == "completed":
                 raise MigrationError("Stage 1 reboot checkpoint is already completed")
             plist_path = evidence / PLIST_NAME
-            if not plist_path.exists():
-                _write_bytes(plist_path, _plist(existing, _verified_executable(python_executable)))
-            return existing | {"plist_path": str(plist_path)}
+            if not plist_path.is_file():
+                raise MigrationError("Stage 1 reboot evidence copy of LaunchAgent is missing")
+            stable = _absolute(existing.get("launch_agent_path", ""), "bound LaunchAgent")
+            if not stable.is_file():
+                _write_bytes(stable, plist_path.read_bytes())
+            _verify_launch_agent(existing, evidence)
+            return existing | {"plist_path": str(plist_path), "launch_agent_path": str(stable)}
         raise MigrationError("Stage 1 reboot marker is bound to a different objective")
     if marker.exists() or marker.is_symlink():
         raise MigrationError("Stage 1 reboot marker is not a regular file")
     plist_path = evidence / PLIST_NAME
-    interpreter = _verified_executable(python_executable)
-    payload = _r1_payload(evidence, active, support, realm_id, _provider(boot_identity_provider)) | {"plist_path": str(plist_path)}
+    payload = _r1_payload(evidence, active, support, realm_id, _provider(boot_identity_provider)) | {"plist_path": str(plist_path), "launch_agents_dir": str(launch_agents), "python_executable": interpreter}
+    payload = payload | {"launch_agent_label": _launch_agent_label(payload), "launch_agent_path": str(launch_agents / f"{_launch_agent_label(payload)}.plist")}
+    plist_bytes = _plist(payload, interpreter)
+    payload = payload | {"launch_agent_sha256": hashlib.sha256(plist_bytes).hexdigest()}
     _write_new(marker, payload)
-    _write_bytes(plist_path, _plist(payload, interpreter))
+    _write_bytes(plist_path, plist_bytes)
+    _write_bytes(Path(payload["launch_agent_path"]), plist_bytes)
     return payload
 
 
@@ -321,6 +367,7 @@ def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, sup
         return existing
     if marker.get("state") != "armed":
         raise MigrationError("Stage 1 reboot marker is neither armed nor completed")
+    launch_agent = _verify_launch_agent(marker, evidence)
     journal_path = evidence / "migration-journal-b12.json"
     terminal_path = evidence / "activated-destination-b12.json"
     if marker.get("journal_sha256") != _sha256(journal_path) or marker.get("terminal_receipt_sha256") != _sha256(terminal_path):
@@ -369,6 +416,14 @@ def resume_stage1_reboot(evidence_root: str | Path, active_root: str | Path, sup
         "journal_state": journal.get("state"),
         "quick_check": runtime["quick_check"],
         "foreign_key_errors": runtime["foreign_key_errors"],
+        "launch_agent_path": str(launch_agent),
+        "launch_agent_label": marker["launch_agent_label"],
+        "launch_agent_sha256": marker["launch_agent_sha256"],
+        "launch_agent_cleanup": {
+            "status": "pending_bootout_and_remove",
+            "path": str(launch_agent),
+            "label": marker["launch_agent_label"],
+        },
         "captured_at": time.time(),
     }
     if r2_path.exists() or r2_path.is_symlink():

@@ -22,6 +22,13 @@ historical/full-corpus migration is a separate, explicit operator action; use
 the `live-migrate` command below only with an explicitly selected real source.
 `--redundancy extreme` is likewise opt-in and is not part of routine acceptance.
 
+The tiny fixture is a disposable direct `RuntimeService` layout: its support
+root is the fixture's `support/` directory and it has no neutral-launcher
+`source-profiles/astrid.json`. Therefore its reboot plist only resumes an
+already-arranged runtime launch; it cannot honestly invoke
+`banodoco-local up --profile astrid` for that fixture. The actual-machine path
+must keep the selected runtime's existing neutral launcher/startup arrangement.
+
 Use a fresh archive/destination parent on a volume with enough capacity for
 source, archive, active backup, destination, signed destination backup,
 rollback copy, activation temporary, CAS, evidence, and the safety margin.
@@ -106,9 +113,10 @@ state `reactivated`.
 
 Run this only after B12 is terminal and the runtime is not performing a
 migration. The arm command is read-only with respect to the realm and writes
-two owner-only artifacts below the existing evidence root: `stage1-b12-reboot.json`
-(R1) and a one-shot user LaunchAgent plist. It never invokes `reboot` or
-`launchctl`:
+the owner-only R1 marker and evidence copy below the existing evidence root,
+plus a checkpoint-specific owner-only plist at
+`~/Library/LaunchAgents/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID.plist`.
+It never invokes `reboot` or `launchctl`:
 
 ```bash
 astrid-live-migrate stage1-reboot-arm \
@@ -120,13 +128,14 @@ astrid-live-migrate stage1-reboot-arm \
 
 Review the JSON output and R1 at
 `/absolute/migration/migration-evidence-b12/stage1-b12-reboot.json`. It must
-show the terminal B12.4 receipt, `journal_state=reactivated`, and the
-pre-reboot OS boot identity. Explicitly load the generated LaunchAgent; this
+show the terminal B12.4 receipt, `journal_state=reactivated`, the pre-reboot OS
+boot identity, and the bound LaunchAgent path/hash. Explicitly load the
+generated LaunchAgent from that bound `~/Library/LaunchAgents` path; this
 changes the user's launchd state and is the first machine-level action:
 
 ```bash
 launchctl bootstrap "gui/$(id -u)" \
-  /absolute/migration/migration-evidence-b12/stage1-b12-reboot-resume.plist
+  "$HOME/Library/LaunchAgents/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID.plist"
 ```
 
 Confirm that the job is loaded, then perform the one actual machine reboot:
@@ -158,11 +167,13 @@ astrid-live-migrate stage1-reboot-resume \
 R2 is complete only when `stage1-b12-reboot-r2.json` exists with
 `state=completed`, changed `boot_identity_after`, increased
 `runtime_epoch_after`, and zero SQLite integrity errors. Repeating the resume
-command returns the same receipt and does not rerun migration or reboot.
-Remove the loaded one-shot job after retaining the evidence:
+command returns the same receipt and does not rerun migration or reboot. The R2
+receipt records `launch_agent_cleanup.status=pending_bootout_and_remove`; after
+retaining the evidence, unload the job and remove exactly its bound plist:
 
 ```bash
 launchctl bootout "gui/$(id -u)/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID"
+rm -- "$HOME/Library/LaunchAgents/com.banodoco.stage1.b12.reboot.CHECKPOINT_ID.plist"
 ```
 
 ## Nested intro source
