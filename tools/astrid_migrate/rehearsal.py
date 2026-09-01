@@ -711,7 +711,7 @@ class RuntimeServiceAdapter:
             if path.is_file() and path.name not in baseline_objects:
                 path.unlink(missing_ok=True)
 
-    def activate_destination(self, candidate_root: str | Path, *, state: str, target_identity: Mapping[str, Any] | None = None, activation_manifest_source: str | Path | None = None):
+    def activate_destination(self, candidate_root: str | Path, *, state: str, target_identity: Mapping[str, Any] | None = None, activation_manifest_source: str | Path | None = None, retain_quarantine: bool = True):
         """Install a verified candidate into the configured realm root.
 
         A sibling restore is only a staging artifact.  The active authority is
@@ -897,6 +897,17 @@ class RuntimeServiceAdapter:
             # point its pinned SQLite and lock descriptors provide an operable
             # rollback authority.
             committed = True
+            if not retain_quarantine:
+                # Compact B12 has a signed destination backup as its rollback
+                # authority, so retaining the old active tree would silently
+                # reintroduce a full extra copy. The publication is already
+                # committed and the new service owns ``target``: if cleanup
+                # fails, report that fact without attempting to restore a
+                # partially deleted old tree.
+                try:
+                    _remove_tree_at(parent_fd, quarantine_name)
+                except (OSError, MigrationError) as exc:
+                    raise MigrationError("activation committed but quarantine cleanup failed") from exc
             return {"state": state, "configured_destination": str(target), "candidate": str(candidate), "quarantine": str(target.parent / quarantine_name), "realm_id": realm_id, "candidate_verification": candidate_verification}
         except Exception:
             if published and not committed:

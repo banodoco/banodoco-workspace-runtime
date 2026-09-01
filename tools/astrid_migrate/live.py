@@ -1090,7 +1090,7 @@ class LiveMigration:
                     reservation.recheck()
                     revalidate_activation_path(active.store.root, target_identity)
                     activation_source = candidate_root if self.config.redundancy == "extreme" else destination_backup_root
-                    activated = RuntimeServiceAdapter(active).activate_destination(activation_source, state="active", target_identity=target_identity, activation_manifest_source=(self.config.destination_root / "activation-manifest.json" if self.config.redundancy == "compact" else None))
+                    activated = RuntimeServiceAdapter(active).activate_destination(activation_source, state="active", target_identity=target_identity, activation_manifest_source=(self.config.destination_root / "activation-manifest.json" if self.config.redundancy == "compact" else None), retain_quarantine=self.config.redundancy != "compact")
                     journal._inject("after_active_activation")
                     journal.effect("active-activation", candidate=str(activation_source), state="active", activation=activated, database_sha256=candidate_db)
                 active_snapshot = RuntimeServiceAdapter(active).destination_snapshot()
@@ -1123,7 +1123,7 @@ class LiveMigration:
                     journal._inject("before_rollback_activation")
                     reservation.recheck()
                     revalidate_activation_path(active.store.root, target_identity)
-                    rolled_back = RuntimeServiceAdapter(active).activate_destination(rollback_root, state="rolled_back", target_identity=target_identity)
+                    rolled_back = RuntimeServiceAdapter(active).activate_destination(rollback_root, state="rolled_back", target_identity=target_identity, retain_quarantine=self.config.redundancy != "compact")
                     journal._inject("after_rollback_activation")
                     journal.effect("rollback-activation", candidate=str(rollback_root), state="rolled_back", activation=rolled_back, database_sha256=rollback_verification["database_sha256"])
                 rollback_entry = journal.transition("rolled_back", predecessor=active_entry["entries"][-1], activation=rolled_back, runtime_epoch=active.health()["runtime_epoch"], activation_epoch=2)
@@ -1164,7 +1164,7 @@ class LiveMigration:
                     reservation.recheck()
                     revalidate_activation_path(active.store.root, target_identity)
                     activation_source = reactivation_root if self.config.redundancy == "extreme" else destination_backup_root
-                    reactivated = RuntimeServiceAdapter(active).activate_destination(activation_source, state="reactivated", target_identity=target_identity, activation_manifest_source=(self.config.destination_root / "activation-manifest.json" if self.config.redundancy == "compact" else None))
+                    reactivated = RuntimeServiceAdapter(active).activate_destination(activation_source, state="reactivated", target_identity=target_identity, activation_manifest_source=(self.config.destination_root / "activation-manifest.json" if self.config.redundancy == "compact" else None), retain_quarantine=self.config.redundancy != "compact")
                     journal._inject("after_reactivation_activation")
                     database_sha256 = reactivation_verification.get("database_sha256") or reactivation_verification["manifest"].get("database_sha256")
                     journal.effect("reactivation-activation", candidate=str(activation_source), state="reactivated", activation=reactivated, database_sha256=database_sha256)

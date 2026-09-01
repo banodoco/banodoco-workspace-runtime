@@ -41,6 +41,7 @@ def test_compact_journey_reuses_signed_destination_backup_without_restore_siblin
         assert active_effect["payload"]["candidate"].endswith("archive-live-destination-backup")
         assert not (tmp_path / "archive-live-candidate").exists()
         assert not (tmp_path / "archive-live-reactivated").exists()
+        assert not list(tmp_path.glob(".active.inactive-*"))
         assert before == json.dumps(sorted(str(path.relative_to(config.source_root)) for path in config.source_root.rglob("*")), sort_keys=True)
     finally:
         active.close()
@@ -53,6 +54,7 @@ def test_extreme_journey_keeps_historical_restore_trees(tmp_path):
         assert report["journal"]["binding"]["redundancy"] == "extreme"
         assert (tmp_path / "archive-live-candidate").is_dir()
         assert (tmp_path / "archive-live-reactivated").is_dir()
+        assert len(list(tmp_path.glob(".active.inactive-*"))) == 3
     finally:
         active.close()
 
