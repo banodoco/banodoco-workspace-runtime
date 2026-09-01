@@ -106,6 +106,17 @@ def _read_json(path: Path, *, label: str) -> dict[str, Any]:
     return value
 
 
+def _require_owner_only(path: Path, *, label: str) -> None:
+    try:
+        value = path.lstat()
+    except OSError as exc:
+        raise MigrationError(f"{label} is unavailable: {path}") from exc
+    if not stat.S_ISREG(value.st_mode) or stat.S_IMODE(value.st_mode) != 0o600:
+        raise MigrationError(f"{label} must be a regular owner-only 0600 file: {path}")
+    if hasattr(os, "getuid") and value.st_uid != os.getuid():
+        raise MigrationError(f"{label} must be owned by the current operator: {path}")
+
+
 def _write_new_json(path: Path, value: Mapping[str, Any]) -> None:
     """Publish a new operator artifact without silently replacing one."""
     if not path.is_absolute() or _has_symlink_component(path):
@@ -154,6 +165,7 @@ def _require_catalog(support: Path, active: Path, realm_id: str) -> None:
 
 
 def _load_authorizations(path: Path, *, source: Path, realm_id: str, source_manifest: str) -> dict[str, dict[str, Any]]:
+    _require_owner_only(path, label="B12 authorization file")
     envelope = _read_json(path, label="B12 authorization file")
     if envelope.get("format_version") != 1:
         raise MigrationError("B12 authorization file format_version must be 1")
@@ -184,10 +196,13 @@ def _load_authorizations(path: Path, *, source: Path, realm_id: str, source_mani
 
 
 def _load_writer_receipt(path: Path, *, source: Path) -> tuple[dict[str, Any], str]:
+    _require_owner_only(path, label="writer-stop receipt")
     value = _read_json(path, label="writer-stop receipt")
     if value.get("source_root") != str(source):
         raise MigrationError("writer-stop receipt is bound to a different source root")
-    if value.get("stopped") is not True or value.get("writer_count") != 0:
+    writer_count = value.get("writer_count")
+    if (value.get("stopped") is not True or isinstance(writer_count, bool)
+            or not isinstance(writer_count, int) or writer_count != 0):
         raise MigrationError("writer-stop receipt must assert stopped=true and writer_count=0")
     if not isinstance(value.get("method"), str) or not value["method"].strip():
         raise MigrationError("writer-stop receipt must identify the stop method")

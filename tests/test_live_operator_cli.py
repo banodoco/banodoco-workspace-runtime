@@ -7,10 +7,12 @@ import sqlite3
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 from banodoco_local.io import atomic_write_json
 from runtime_protocol.catalog import RealmCatalog
 from runtime_protocol.service import RuntimeService
-from tools.astrid_migrate import build_synthetic_fixture
+from tools.astrid_migrate import MigrationError, build_synthetic_fixture
 from tools.astrid_migrate.operator import (
     CONFIRMATION,
     LIVE_AUTHORIZATION_IDS,
@@ -75,6 +77,64 @@ def test_public_b12_operator_cli_runs_synthetic_full_journey_and_keeps_source_un
     assert (active / "activation-manifest.json").is_file()
     assert list((support / "activations").glob("*.json"))
     assert json.loads((tmp_path / "evidence" / "activated-destination-b12.json").read_text())["activation_epoch"] == 3
+
+
+def test_b12_rejects_nonfinite_authorization_expiry(tmp_path):
+    source, active, support, _ = _paths(tmp_path)
+    auth_path = _issue(source, tmp_path, "authorizations-nan.json")
+    envelope = json.loads(auth_path.read_text())
+    for value in envelope["authorizations"].values():
+        value["expires_at"] = float("nan")
+    auth_path.write_text(json.dumps(envelope), encoding="utf-8")
+    receipt = _receipt(source, tmp_path)
+    with pytest.raises(MigrationError, match="invalid expiry"):
+        live_migrate(_live_args(source, active, support, auth_path, receipt, tmp_path, "-nan"))
+
+
+def test_public_b12_requires_owner_only_authorization_and_writer_artifacts(tmp_path, capsys):
+    source, active, support, _ = _paths(tmp_path)
+    auth_path = _issue(source, tmp_path, "authorizations-mode.json")
+    receipt = _receipt(source, tmp_path)
+    auth_path.chmod(0o644)
+    args = _live_args(source, active, support, auth_path, receipt, tmp_path, "-auth-mode")
+    status = main([
+        "live-migrate", "--confirm", CONFIRMATION,
+        "--source-root", str(source), "--active-root", str(active),
+        "--support-root", str(support), "--archive-root", str(args.archive_root),
+        "--destination-root", str(args.destination_root), "--evidence-root", str(args.evidence_root),
+        "--realm-id", args.realm_id, "--authorization-file", str(auth_path),
+        "--writer-stop-receipt", str(receipt),
+    ])
+    assert status == 2
+    assert "owner-only" in capsys.readouterr().err
+
+    auth_path.chmod(0o600)
+    receipt.chmod(0o644)
+    status = main([
+        "live-migrate", "--confirm", CONFIRMATION,
+        "--source-root", str(source), "--active-root", str(active),
+        "--support-root", str(support), "--archive-root", str(tmp_path / "archive-receipt-mode"),
+        "--destination-root", str(tmp_path / "destination-receipt-mode"), "--evidence-root", str(tmp_path / "evidence-receipt-mode"),
+        "--realm-id", args.realm_id, "--authorization-file", str(auth_path),
+        "--writer-stop-receipt", str(receipt),
+    ])
+    assert status == 2
+    assert "owner-only" in capsys.readouterr().err
+
+
+def test_public_b12_rejects_boolean_writer_count(tmp_path):
+    source, active, support, _ = _paths(tmp_path)
+    auth_path = _issue(source, tmp_path, "authorizations-bool.json")
+    receipt = _receipt(source, tmp_path)
+    receipt.write_text(json.dumps({
+        "format_version": 1,
+        "source_root": str(source),
+        "stopped": True,
+        "writer_count": False,
+        "method": "test-supervisor",
+    }), encoding="utf-8")
+    with pytest.raises(MigrationError, match="writer-stop receipt"):
+        live_migrate(_live_args(source, active, support, auth_path, receipt, tmp_path, "-bool"))
 
 
 def test_public_cli_requires_exact_six_authorizations_and_writer_receipt(tmp_path, capsys):

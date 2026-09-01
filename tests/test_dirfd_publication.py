@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import threading
 
@@ -14,6 +15,9 @@ import tools.astrid_migrate.rehearsal as rehearsal_module
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.errors import ConflictError
 from tools.astrid_migrate import MigrationConfig, MigrationError, build_synthetic_fixture
+from tools.astrid_migrate.boundary import RealmCatalog as MigrationRealmCatalog
+from tools.astrid_migrate.boundary import capture_parent as migration_capture_parent
+from tools.astrid_migrate.boundary import close_pinned as migration_close_pinned
 from tools.astrid_migrate.recovery import RecoveryJournal
 from tools.astrid_migrate.rehearsal import MigrationJournal
 
@@ -191,6 +195,33 @@ def test_backup_verification_read_is_pinned_against_parent_replacement(tmp_path)
         if replacement.exists():
             replacement.rename(parent)
         active.close()
+
+
+def test_migration_catalog_publication_honors_retained_parent_identity(tmp_path):
+    support = tmp_path / "catalog-support"
+    support.mkdir()
+    catalog_path = support / "catalog.json"
+    catalog_path.write_text('{"format_version": 1, "realms": [], "selected_realm_id": null}\n', encoding="utf-8")
+    identity = migration_capture_parent(catalog_path)
+    replacement = tmp_path / "catalog-support-replacement"
+    try:
+        support.rename(replacement)
+        support.mkdir()
+        with pytest.raises((ConflictError, MigrationError), match="identity|parent"):
+            MigrationRealmCatalog(catalog_path).register(
+                realm_id="realm",
+                display_name="Realm",
+                data_root=str(tmp_path / "realm"),
+                path_identity=identity,
+            )
+        assert not (support / "catalog.json").exists()
+        assert not json.loads((replacement / "catalog.json").read_text(encoding="utf-8")).get("realms")
+    finally:
+        migration_close_pinned(identity)
+        if support.exists() and not any(support.iterdir()):
+            support.rmdir()
+        if replacement.exists():
+            replacement.rename(support)
 
 
 def test_backup_manifest_file_replacement_at_read_syscall_fails_closed(tmp_path, monkeypatch):

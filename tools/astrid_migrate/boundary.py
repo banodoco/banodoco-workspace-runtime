@@ -32,18 +32,54 @@ class RealmCatalog:
     """Minimal public catalog writer used by operator activation."""
     def __init__(self, path: str | Path):
         self.path = absolute_path(path)
-    def _read(self):
-        try: return json.loads(self.path.read_text())
-        except FileNotFoundError: return {"format_version": 1, "realms": [], "selected_realm_id": None}
-    def _write(self, value, **kwargs):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
-    def register(self, *, realm_id, display_name, data_root, **kwargs):
-        value = self._read(); rows = [r for r in value.get("realms", []) if r.get("realm_id") != realm_id]
-        rows.append({"realm_id": realm_id, "display_name": display_name, "data_root": str(data_root)})
-        value["realms"] = rows; self._write(value); return value
-    def select(self, realm_id, **kwargs):
-        value = self._read(); value["selected_realm_id"] = realm_id; self._write(value); return value
+    def _read(self, *, identity: Mapping[str, Any]):
+        try:
+            validate_parent(self.path, identity, allow_parent_appeared=True)
+            parent = Path(str(identity["parent"]))
+            fd = _open_relative(int(identity["_parent_fd"]), self.path.relative_to(parent))
+            try:
+                value = os.fstat(fd)
+                if not stat.S_ISREG(value.st_mode):
+                    raise ConflictError(f"catalog is not an ordinary file: {self.path}")
+                chunks = []
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                os.close(fd)
+            validate_parent(self.path, identity, allow_parent_appeared=True)
+            return json.loads(b"".join(chunks).decode("utf-8"))
+        except FileNotFoundError:
+            return {"format_version": 1, "realms": [], "selected_realm_id": None}
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            raise ConflictError(f"catalog is unreadable: {self.path}") from exc
+
+    def _write(self, value, *, identity: Mapping[str, Any]):
+        atomic_json_write(self.path, value, identity=identity)
+
+    def _update(self, update, *, identity: Mapping[str, Any] | None = None):
+        own = identity is None
+        identity = identity or capture_parent(self.path)
+        try:
+            value = self._read(identity=identity)
+            update(value)
+            self._write(value, identity=identity)
+            return value
+        finally:
+            if own:
+                close_pinned(identity)
+
+    def register(self, *, realm_id, display_name, data_root, path_identity=None):
+        def update(value):
+            rows = [r for r in value.get("realms", []) if r.get("realm_id") != realm_id]
+            rows.append({"realm_id": realm_id, "display_name": display_name, "data_root": str(data_root)})
+            value["realms"] = rows
+        return self._update(update, identity=path_identity)
+
+    def select(self, realm_id, *, path_identity=None):
+        return self._update(lambda value: value.__setitem__("selected_realm_id", realm_id), identity=path_identity)
 
 
 def canonical_json(value: Any) -> str:

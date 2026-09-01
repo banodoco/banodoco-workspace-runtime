@@ -14,6 +14,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -21,7 +22,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .boundary import restore_backup, verify_backup, verify_restore_candidate, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, ensure_parent_at as _ensure_parent_at, pin_directory as _pin_directory, copy_file_at as _copy_file_at, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_created_parent as _validate_created_parent, validate_parent as _validate_parent, canonical_json, RealmCatalog
+from runtime_protocol.backup import verify_restore_candidate
+
+from .boundary import verify_backup, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, ensure_parent_at as _ensure_parent_at, pin_directory as _pin_directory, copy_file_at as _copy_file_at, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_created_parent as _validate_created_parent, validate_parent as _validate_parent, canonical_json, RealmCatalog
 
 from .migrator import MigrationConfig, MigrationError, Migrator, _sha256_file, _tree_size
 from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path, close_activation_path
@@ -146,11 +149,6 @@ def _has_symlink_component(path: str | Path) -> bool:
     return False
 
 
-# Kept as a private compatibility alias for callers that used the original
-# B12 implementation-level class.
-_CapacityReservation = CapacityReservation
-
-
 def issue_live_authorizations(*, source_manifest_sha256: str | None = None, selected_realm_id: str | None = None, ttl_seconds: int = 3600) -> dict[str, dict[str, Any]]:
     """Create a fresh set of B12 command authorizations.
 
@@ -231,7 +229,10 @@ class LiveMigration:
         if not isinstance(bound_source, str) or not bound_source.strip() or not isinstance(source_manifest_sha256, str) or not source_manifest_sha256.strip() or bound_source != source_manifest_sha256:
             raise MigrationError(f"{authorization_id} source manifest does not match the frozen source")
         try:
-            if float(value.get("expires_at", 0)) <= time.time():
+            expires_at = float(value.get("expires_at", 0))
+            if not math.isfinite(expires_at):
+                raise MigrationError(f"{authorization_id} has an invalid expiry")
+            if expires_at <= time.time():
                 raise MigrationError(f"{authorization_id} has expired")
         except (TypeError, ValueError) as exc:
             raise MigrationError(f"{authorization_id} has an invalid expiry") from exc
@@ -518,7 +519,7 @@ class LiveMigration:
                 return False
         return actual_reconciliation.get("ok") is True
 
-    def _restore_or_reuse(self, backup: Path, destination: Path, *, journal: MigrationJournal, effect_name: str, realm_id: str, seam: str) -> dict[str, Any]:
+    def _restore_or_reuse(self, backup: Path, destination: Path, *, journal: MigrationJournal, effect_name: str, realm_id: str, seam: str, source_manifest_sha256: str | None = None) -> dict[str, Any]:
         if _has_symlink_component(backup):
             raise MigrationError(f"B12 {effect_name} backup contains a symlink component")
         if _has_symlink_component(destination):
@@ -528,18 +529,25 @@ class LiveMigration:
             payload = existing.get("payload", {})
             if payload.get("destination") != str(destination) or payload.get("realm_id") != realm_id:
                 raise MigrationError(f"B12 {effect_name} conflicts with the durable effect")
+            candidate_identity = _capture_parent(destination)
             try:
-                verification = verify_restore_candidate(destination)
+                verification = verify_restore_candidate(destination, directory_identity=candidate_identity)
             except Exception as exc:
                 raise MigrationError(f"B12 durable restore effect is not reusable: {destination}") from exc
+            finally:
+                _close_pinned(candidate_identity)
             if payload.get("source_manifest_sha256") != verification["handoff"].get("source_manifest_sha256"):
                 raise MigrationError(f"B12 durable restore effect changed source binding: {destination}")
+            self._assert_restore_binding(verification, realm_id=realm_id, source_manifest_sha256=source_manifest_sha256)
             return {"destination": str(destination), "realm_id": realm_id, "verification": verification}
         if self._path_exists(destination):
+            candidate_identity = _capture_parent(destination)
             try:
-                verification = verify_restore_candidate(destination)
+                verification = verify_restore_candidate(destination, directory_identity=candidate_identity)
             except Exception as exc:
                 raise MigrationError(f"B12 existing restore candidate is not reusable: {destination}") from exc
+            finally:
+                _close_pinned(candidate_identity)
         else:
             reservation = getattr(self, "_capacity_reservation", None)
             if reservation is not None:
@@ -552,17 +560,29 @@ class LiveMigration:
                 if reservation is not None:
                     reservation.recheck()
                 revalidate_write_path(destination, write_identity)
-                restored = restore_backup(backup, destination, destination_identity=write_identity, source_identity=source_identity)
+                self.active_runtime.restore(backup, destination, destination_identity=write_identity, source_identity=source_identity)
                 journal._inject(f"after_{seam}")
+                verification = verify_restore_candidate(destination, directory_identity=write_identity)
             finally:
                 close_activation_path(write_identity)
                 if source_identity is not None:
                     _close_pinned(source_identity)
-            verification = verify_restore_candidate(destination)
         if verification["manifest"].get("realm_id") != realm_id:
             raise MigrationError(f"B12 restore candidate has the wrong realm: {destination}")
+        self._assert_restore_binding(verification, realm_id=realm_id, source_manifest_sha256=source_manifest_sha256)
         journal.effect(effect_name, destination=str(destination), realm_id=realm_id, source_manifest_sha256=verification["handoff"].get("source_manifest_sha256"), database_sha256=verification.get("database_sha256"))
         return {"destination": str(destination), "realm_id": realm_id, "verification": verification}
+
+    @staticmethod
+    def _assert_restore_binding(verification: Mapping[str, Any], *, realm_id: str, source_manifest_sha256: str | None) -> None:
+        manifest = verification.get("manifest")
+        if not isinstance(manifest, Mapping) or manifest.get("realm_id") != realm_id:
+            raise MigrationError("B12 restore candidate has an invalid backup realm binding")
+        if source_manifest_sha256 is None:
+            return
+        binding = manifest.get("destination_binding")
+        if not isinstance(binding, Mapping) or binding.get("selected_realm_id") != realm_id or binding.get("source_manifest_sha256") != source_manifest_sha256:
+            raise MigrationError("B12 restore candidate has a conflicting source binding")
 
     @staticmethod
     def _cas_manifest_digest(snapshot: Mapping[str, Any]) -> str:
@@ -809,7 +829,7 @@ class LiveMigration:
                 reservation_id = str(reservation_payload["reservation_id"])
             else:
                 reservation_id = secrets.token_urlsafe(18)
-            reservation = _CapacityReservation.acquire(plan=plan, reservation_id=reservation_id)
+            reservation = CapacityReservation.acquire(plan=plan, reservation_id=reservation_id)
             object.__setattr__(self, "_capacity_reservation", reservation)
             stack.callback(reservation.release)
             immediate_free = reservation.recheck()
@@ -958,7 +978,7 @@ class LiveMigration:
                     destination.close()
 
                 reservation.recheck()
-                candidate_result = self._restore_or_reuse(destination_backup_root, candidate_root, journal=journal, effect_name="candidate-restore", realm_id=realm_id, seam="candidate_restore")
+                candidate_result = self._restore_or_reuse(destination_backup_root, candidate_root, journal=journal, effect_name="candidate-restore", realm_id=realm_id, seam="candidate_restore", source_manifest_sha256=source_manifest_sha256)
                 destination_activation_manifest = self.config.destination_root / "activation-manifest.json"
                 if _has_symlink_component(destination_activation_manifest):
                     raise MigrationError("B12 destination activation manifest contains a symlink component")
@@ -1026,7 +1046,7 @@ class LiveMigration:
             if journal._read()["state"] == "active":
                 self._consume_authorization("AUTH-ROLLBACK-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
                 reservation.recheck()
-                rollback_result = self._restore_or_reuse(active_backup_root, rollback_root, journal=journal, effect_name="rollback-restore", realm_id=realm_id, seam="rollback_restore")
+                rollback_result = self._restore_or_reuse(active_backup_root, rollback_root, journal=journal, effect_name="rollback-restore", realm_id=realm_id, seam="rollback_restore", source_manifest_sha256=source_manifest_sha256)
                 rollback_verification = rollback_result["verification"]
                 rollback_effect = self._existing_effect(journal, "rollback-activation")
                 if rollback_effect:
@@ -1055,7 +1075,7 @@ class LiveMigration:
             if journal._read()["state"] == "rolled_back":
                 self._consume_authorization("AUTH-REACTIVATION-B12", source_manifest_sha256=source_manifest_sha256, realm_id=realm_id, journal=journal)
                 reservation.recheck()
-                reactivation_result = self._restore_or_reuse(destination_backup_root, reactivation_root, journal=journal, effect_name="reactivation-restore", realm_id=realm_id, seam="reactivation_restore")
+                reactivation_result = self._restore_or_reuse(destination_backup_root, reactivation_root, journal=journal, effect_name="reactivation-restore", realm_id=realm_id, seam="reactivation_restore", source_manifest_sha256=source_manifest_sha256)
                 reactivation_verification = reactivation_result["verification"]
                 reactivation_effect = self._existing_effect(journal, "reactivation-activation")
                 if reactivation_effect:

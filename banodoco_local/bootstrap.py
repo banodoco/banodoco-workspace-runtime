@@ -39,7 +39,6 @@ WORKER_SCOPES = (
     "worker:register",
     "worker:execute",
     "tasks:read",
-    "tasks:write",
     "objects:read",
     "objects:write",
 )

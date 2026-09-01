@@ -29,9 +29,14 @@ def test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client(tmp_
         assert discovery["schema_version"] == "workspace-schema-v1"
         assert discovery["active_realm"] == first.realm_id
         assert discovery["runtime_instance_id"]
-        assert "token" not in json.dumps(discovery)
 
         credential = json.loads((paths.credentials_dir / "astrid.json").read_text())
+        serialized_discovery = json.dumps(discovery)
+        # Discovery may advertise owner-only credential paths so the pack
+        # host can start, but neither bearer value may cross that boundary.
+        assert credential["token"] not in serialized_discovery
+        worker_credential = Path(discovery["worker_credential_file"]).read_text(encoding="utf-8").strip()
+        assert worker_credential not in serialized_discovery
         client = WorkspaceClient(first.endpoint, credential["token"])
         assert client.health()["protocol"] == "workspace.v1"
         assert client.get_realm().realm_id == first.realm_id

@@ -22,7 +22,9 @@ import sqlite3
 import time
 from typing import Any, Callable, Mapping
 
-from .boundary import restore_backup, verify_backup, verify_restore_candidate, _open_relative, _sha256_at, _connection_from_fd, canonical_json, new_id, atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_parent as _validate_parent, pin_directory as _pin_directory
+from runtime_protocol.backup import verify_restore_candidate
+
+from .boundary import verify_backup, _open_relative, _sha256_at, _connection_from_fd, canonical_json, new_id, atomic_json_write as _atomic_json_write, capture_parent as _capture_parent, close_pinned as _close_pinned, ensure_directory as _ensure_directory, mkdir_temp_at as _mkdir_temp_at, remove_tree_at as _remove_tree_at, validate_parent as _validate_parent, pin_directory as _pin_directory
 
 from .migrator import MigrationError, _sha256_file
 from .capacity import CapacityPlan, CapacityReservation, StorageDomain, capture_activation_path, capture_write_path, revalidate_activation_path, revalidate_write_path
@@ -587,15 +589,21 @@ class B13Recovery:
             payload = existing["payload"]
             if payload.get("destination") != str(destination) or payload.get("realm_id") != realm_id:
                 raise MigrationError(f"B13.2 {effect_name} has a conflicting destination")
+            candidate_identity = _capture_parent(destination)
             try:
-                verification = verify_restore_candidate(destination)
+                verification = verify_restore_candidate(destination, directory_identity=candidate_identity)
             except Exception as exc:
                 raise MigrationError(f"B13.2 durable restore candidate is invalid: {destination}") from exc
+            finally:
+                _close_pinned(candidate_identity)
         elif os.path.lexists(str(destination)):
+            candidate_identity = _capture_parent(destination)
             try:
-                verification = verify_restore_candidate(destination)
+                verification = verify_restore_candidate(destination, directory_identity=candidate_identity)
             except Exception as exc:
                 raise MigrationError(f"B13.2 pre-existing restore candidate is not reusable: {destination}") from exc
+            finally:
+                _close_pinned(candidate_identity)
         else:
             reservation = getattr(self, "_capacity_reservation", None)
             if reservation is not None:
@@ -612,13 +620,13 @@ class B13Recovery:
                 # restore so a hostile parent rename/symlink/device swap cannot
                 # redirect restore_backup's temporary directory or final rename.
                 revalidate_write_path(destination, write_identity)
-                restore_backup(backup, destination, destination_identity=write_identity, source_identity=source_identity)
+                self.active_runtime.restore(backup, destination, destination_identity=write_identity, source_identity=source_identity)
                 journal._inject(f"after_{seam}")
+                verification = verify_restore_candidate(destination, directory_identity=write_identity)
             finally:
                 _close_pinned(write_identity)
                 if source_identity is not None:
                     _close_pinned(source_identity)
-            verification = verify_restore_candidate(destination)
         if verification["manifest"].get("realm_id") != realm_id:
             raise MigrationError("B13.2 restore candidate realm identity mismatch")
         journal.effect(effect_name, destination=str(destination), realm_id=realm_id, database_sha256=verification["database_sha256"], source_manifest_sha256=verification["handoff"].get("source_manifest_sha256"))
