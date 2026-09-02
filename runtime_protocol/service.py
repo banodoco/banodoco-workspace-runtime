@@ -48,6 +48,30 @@ def require_idempotency_key(value):
     if value is None:
         raise InvalidRequestError("Idempotency-Key is required for state mutations")
     return validate_idempotency_key(value)
+def _wire_string(body, field):
+    value = body.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{field} is required")
+    return value
+
+
+def _wire_integer(body, field, *, positive=False):
+    value = body.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or (positive and value < 1):
+        kind = "positive integer" if positive else "an integer"
+        raise ValidationError(f"{field} must be {kind}")
+    return value
+def _wire_object(body, *, required=(), allowed=()):
+    """Validate a worker JSON object before any durable lookup or side effect."""
+    if not isinstance(body, dict):
+        raise InvalidRequestError("request body must be a JSON object")
+    missing = sorted(field for field in required if field not in body)
+    if missing:
+        raise ValidationError("request body is missing required fields", details={"fields": missing})
+    unknown = sorted(set(body) - set(allowed))
+    if unknown:
+        raise ValidationError("request body contains unsupported fields", details={"fields": unknown})
+    return body
 
 
 def _page_args(cursor, limit):
@@ -537,9 +561,10 @@ class RuntimeService:
             ).fetchone()
         return self._receipt_payload(row, project_id=project_id) if row else None
 
-    def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None, with_receipt=True):
+    def _command_replay_state(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None, with_receipt=True):
+        """Return ``(found, value)`` so a committed null result is replayable."""
         if idempotency_key is None:
-            return None
+            return False, None
         validate_idempotency_key(idempotency_key)
         prior = self.store.conn.execute(
             "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
@@ -548,12 +573,20 @@ class RuntimeService:
             (kind, aggregate_id, idempotency_key),
         ).fetchone()
         if not prior:
-            return None
+            return False, None
         if prior["request_hash"] != request_hash:
             raise ConflictError("idempotency key was already used with different input")
+        result = json.loads(prior["result_json"])
         if project_id is not None and with_receipt:
-            return {"data": json.loads(prior["result_json"]), "receipt": self._receipt_payload(prior, project_id=project_id)}
-        return json.loads(prior["result_json"])
+            result = {"data": result, "receipt": self._receipt_payload(prior, project_id=project_id)}
+        return True, result
+
+    def _command_replay(self, kind, aggregate_id, idempotency_key, request_hash, *, project_id=None, with_receipt=True):
+        found, result = self._command_replay_state(
+            kind, aggregate_id, idempotency_key, request_hash,
+            project_id=project_id, with_receipt=with_receipt,
+        )
+        return result if found else None
 
     def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, with_receipt=True):
         if idempotency_key is not None:
@@ -2009,14 +2042,32 @@ class RuntimeService:
 
     @_durable_mutation
     def register_executor(self, body, *, idempotency_key=None, identity=None):
-        self._require_object_body(body)
-        if not body.get("executor_id"):
-            raise ValidationError("executor_id is required")
-        self._assert_executor_identity(identity, body.get("executor_id"))
-        max_concurrency = int(body.get("max_concurrency", 1))
-        if max_concurrency < 1:
+        body = _wire_object(
+            body,
+            allowed=(
+                "executor_id", "max_concurrency", "resource_keys", "capabilities",
+                "protocol", "readiness", "readiness_reason", "runtime_epoch",
+            ),
+        )
+        executor_id = _wire_string(body, "executor_id")
+        self._assert_executor_identity(identity, executor_id)
+        max_concurrency = body.get("max_concurrency", 1)
+        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
             raise ValidationError("max_concurrency must be positive")
         capabilities = body.get("capabilities", [])
+        if not isinstance(capabilities, list):
+            raise ValidationError("capabilities must be a list")
+        resource_keys = body.get("resource_keys", [])
+        if not isinstance(resource_keys, list):
+            raise ValidationError("resource_keys must be a list")
+        protocol = body.get("protocol", "workspace.v1")
+        if not isinstance(protocol, str) or protocol != "workspace.v1":
+            raise ValidationError("protocol must be workspace.v1")
+        readiness = body.get("readiness", "ready")
+        if readiness not in {"ready", "not_ready"}:
+            raise ValidationError("readiness must be ready or not_ready")
+        if body.get("runtime_epoch") is not None:
+            _wire_integer(body, "runtime_epoch", positive=True)
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         # Executor registration is an endpoint-scoped command.  The request
         # hash includes executor identity and all registration fields, so a
@@ -2070,18 +2121,18 @@ class RuntimeService:
         claim namespace.  The request hash binds executor, capabilities, and
         runtime epoch; a replay can never consume a second queued task.
         """
-        if not isinstance(body, dict):
-            raise InvalidRequestError("request body must be a JSON object")
-        executor_id = body.get("executor_id")
+        body = _wire_object(
+            body,
+            required=("executor_id", "capability_ids", "runtime_epoch"),
+            allowed=("executor_id", "capability_ids", "runtime_epoch"),
+        )
+        executor_id = _wire_string(body, "executor_id")
         capability_ids = body.get("capability_ids")
         runtime_epoch = body.get("runtime_epoch")
-        if not isinstance(executor_id, str) or not executor_id:
-            raise ValidationError("executor_id is required")
         self._assert_executor_identity(identity, executor_id)
         if not isinstance(capability_ids, list) or any(not isinstance(value, str) or not value for value in capability_ids) or len(set(capability_ids)) != len(capability_ids):
             raise ValidationError("capability_ids must be a list of unique non-empty strings")
-        if runtime_epoch is not None and (isinstance(runtime_epoch, bool) or not isinstance(runtime_epoch, int) or runtime_epoch < 1):
-            raise ValidationError("runtime_epoch must be a positive integer")
+        _wire_integer(body, "runtime_epoch", positive=True)
         request_hash = hashlib.sha256(canonical_json({
             "executor_id": executor_id, "capability_ids": capability_ids,
             "runtime_epoch": runtime_epoch,
@@ -2089,8 +2140,10 @@ class RuntimeService:
         # Epoch validation intentionally precedes the idempotency lookup: a
         # stale worker must never turn an old claim receipt into a live lease.
         epoch = self.store._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id, required=True)
-        replay = self._command_replay("task.claim", "claim", idempotency_key, request_hash, with_receipt=False)
-        if replay is not None:
+        replayed, replay = self._command_replay_state(
+            "task.claim", "claim", idempotency_key, request_hash, with_receipt=False,
+        )
+        if replayed:
             return replay
         caps = set(capability_ids)
         rows = self.store.conn.execute("SELECT id, capability FROM tasks WHERE status='queued' ORDER BY created_at, id").fetchall()
@@ -2118,16 +2171,29 @@ class RuntimeService:
     @_durable_mutation
     def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
-        # The identity/fence and effect preconditions must precede CAS writes.
-        # Keep this entire sequence under the owner mutex so a concurrent
-        # recovery cannot invalidate an attempt between validation and
-        # publication.
-        self._require_object_body(body)
+        body = dict(_wire_object(
+            body,
+            allowed=("attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect"),
+        ))
+        supplied_attempt_id = body.get("attempt_id")
+        if supplied_attempt_id is not None and str(supplied_attempt_id) != str(attempt_id):
+            raise ConflictError("attempt_id does not match the attempt path")
+        body["attempt_id"] = str(attempt_id)
+        _wire_string(body, "lease_id")
+        # Keep a numerically typed stale fence on the lease path. A worker
+        # presenting fence 0 (or another old fence) is a fenced lease error,
+        # not a request-shape error; this preserves one guard taxonomy.
+        _wire_integer(body, "fence")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        if "outputs" in body and not isinstance(body["outputs"], list):
+            raise ValidationError("outputs must be a list")
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
+            if not row:
+                raise LeaseError("attempt lease is stale or already settled")
             current_epoch = self.store._current_runtime_epoch()
-            self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=row["executor_id"] if row else None, required=True)
+            self.store._validate_runtime_epoch(body["runtime_epoch"], identity="executor", identity_id=row["executor_id"], required=True)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
             project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
             request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()
@@ -2159,9 +2225,9 @@ class RuntimeService:
                         event_ids=event_ids, primary_stream_id=primary_stream_id,
                         resulting_stream_seq=resulting_stream_seq,
                     )
-                value = self.store._settle_attempt(
+                self.store._settle_attempt(
                     row["task_id"], row["lease_id"], result,
-                    effect=effect, fence=body.get("fence"), attempt_id=attempt_id,
+                    effect=effect, fence=body["fence"], attempt_id=attempt_id,
                     publish=lambda: self._publish_staged_outputs(staged, project_id=project_id),
                     record=record,
                 )
@@ -2654,18 +2720,24 @@ class RuntimeService:
                     raise LeaseError("attempt lease has expired")
             except ValueError as exc:
                 raise LeaseError("attempt lease deadline is invalid") from exc
-
     def prepare_reboot(self, body=None, *, identity=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
-        body = body or {}
-        attempt_id = body.get("attempt_id")
-        row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
-        self._assert_attempt_identity(row, identity)
-        if not row or row["settled"]:
-            raise LeaseError("attempt lease is stale or already settled")
-        current = self.store._current_runtime_epoch()
-        self._validate_attempt_lease(row, body, current)
+        body = _wire_object(
+            {} if body is None else body,
+            required=("attempt_id", "lease_id", "fence", "runtime_epoch"),
+            allowed=("attempt_id", "lease_id", "fence", "runtime_epoch"),
+        )
+        attempt_id = _wire_string(body, "attempt_id")
+        _wire_string(body, "lease_id")
+        _wire_integer(body, "fence")
+        _wire_integer(body, "runtime_epoch", positive=True)
         with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            self._assert_attempt_identity(row, identity)
+            if not row or row["settled"]:
+                raise LeaseError("attempt lease is stale or already settled")
+            current = self.store._current_runtime_epoch()
+            self._validate_attempt_lease(row, body, current)
             with self.store._transaction():
                 current_row = self.store.conn.execute("SELECT recovery_nonce, recovery_nonce_expires_at, recovery_nonce_used FROM attempts WHERE id=?", (attempt_id,)).fetchone()
                 if current_row["recovery_nonce"] and not current_row["recovery_nonce_used"] and (not current_row["recovery_nonce_expires_at"] or current_row["recovery_nonce_expires_at"] > now()):
@@ -2680,6 +2752,18 @@ class RuntimeService:
 
     def checkpoint_attempt(self, attempt_id, body, *, identity=None):
         """Persist a bounded, fsync'd R1 checkpoint before a reboot request."""
+        body = _wire_object(
+            body,
+            required=("lease_id", "fence", "nonce", "authorization", "runtime_epoch"),
+            allowed=("lease_id", "fence", "nonce", "authorization", "runtime_epoch", "checkpoint", "state"),
+        )
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValidationError("attempt_id is required")
+        _wire_string(body, "lease_id")
+        _wire_integer(body, "fence")
+        _wire_string(body, "nonce")
+        _wire_string(body, "authorization")
+        _wire_integer(body, "runtime_epoch", positive=True)
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
@@ -2728,6 +2812,19 @@ class RuntimeService:
 
     def request_reboot(self, body, *, identity=None):
         """Execute only an allowlisted reboot command after durable checkpointing."""
+        body = _wire_object(
+            body,
+            required=("nonce", "authorization", "runtime_epoch"),
+            allowed=("checkpoint_id", "attempt_id", "nonce", "authorization", "runtime_epoch", "command"),
+        )
+        _wire_string(body, "nonce")
+        _wire_string(body, "authorization")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        for field in ("checkpoint_id", "attempt_id"):
+            if field in body and body[field] is not None:
+                _wire_string(body, field)
+        if "command" in body and body["command"] is not None:
+            _wire_string(body, "command")
         # Claim and consume the one-shot authorization in the same SQLite
         # transaction as the durable-state transition.  The executor is
         # intentionally called after commit (it may block or terminate the
@@ -2797,6 +2894,17 @@ class RuntimeService:
         return receipt
 
     def resume_attempt(self, body, *, identity=None):
+        body = _wire_object(
+            body,
+            required=("nonce", "authorization", "runtime_epoch"),
+            allowed=("checkpoint_id", "attempt_id", "nonce", "authorization", "runtime_epoch"),
+        )
+        _wire_string(body, "nonce")
+        _wire_string(body, "authorization")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        for field in ("checkpoint_id", "attempt_id"):
+            if field in body and body[field] is not None:
+                _wire_string(body, field)
         def attempt_resource(attempt):
             task_value = self.store.get_task(attempt["task_id"])
             admitted_spec = dict(task_value["task"].get("spec") or {})
@@ -2852,7 +2960,22 @@ class RuntimeService:
 
     def heartbeat_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
-        self._require_object_body(body)
+        body = _wire_object(
+            body,
+            required=("lease_id", "fence", "runtime_epoch"),
+            allowed=("lease_id", "fence", "runtime_epoch", "lease_seconds"),
+        )
+        _wire_string(body, "lease_id")
+        # Fence zero is deliberately accepted as a typed stale fence. The
+        # lease validator must classify it as LeaseError, not ValidationError.
+        _wire_integer(body, "fence")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        if "lease_seconds" in body and (
+            isinstance(body["lease_seconds"], bool)
+            or not isinstance(body["lease_seconds"], int)
+            or body["lease_seconds"] <= 0
+        ):
+            raise ValidationError("lease_seconds must be a positive integer")
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
@@ -2877,12 +3000,22 @@ class RuntimeService:
 
     def fail_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
-        self._require_object_body(body)
+        body = _wire_object(
+            body,
+            required=("lease_id", "fence", "runtime_epoch"),
+            allowed=("lease_id", "fence", "runtime_epoch", "error", "reason"),
+        )
+        _wire_string(body, "lease_id")
+        # A typed fence of zero is stale lease state, not malformed wire.
+        _wire_integer(body, "fence")
+        _wire_integer(body, "runtime_epoch", positive=True)
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
+            if not row:
+                raise LeaseError("attempt lease is stale or already settled")
             current = self.store._current_runtime_epoch()
-            self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", identity_id=row["executor_id"] if row else None, required=True)
+            self.store._validate_runtime_epoch(body["runtime_epoch"], identity="executor", identity_id=row["executor_id"], required=True)
             task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone() if row else None
             project_id = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0] if task else "unscoped"
             request_hash = hashlib.sha256(canonical_json({"attempt_id": attempt_id, "body": body}).encode()).hexdigest()

@@ -458,8 +458,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             identity = self._identity("worker:execute")
             action = path[3]
             if action == "prepare-reboot":
-                body = self._body()
-                # The canonical attempt identity is the path parameter.  The
+                body = self._project_mutation_body()
                 # generated clients intentionally do not duplicate it in the
                 # JSON body, so bind it at the HTTP boundary before invoking
                 # the service.
