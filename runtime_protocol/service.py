@@ -2145,6 +2145,10 @@ class RuntimeService:
         )
         if replayed:
             return replay
+        # Reap before selecting work. Otherwise an expired running task is
+        # invisible to the queued-task query and reclaim waits for another
+        # claim attempt.
+        self.store._reap_expired_leases()
         caps = set(capability_ids)
         rows = self.store.conn.execute("SELECT id, capability FROM tasks WHERE status='queued' ORDER BY created_at, id").fetchall()
         row = next((item for item in rows if not caps or item["capability"] in caps), None)
