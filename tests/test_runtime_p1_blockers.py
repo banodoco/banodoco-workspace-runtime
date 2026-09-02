@@ -226,17 +226,17 @@ def test_publication_journal_is_retained_when_cleanup_fails_then_retried(
     destination = service.cas.path_for(digest)
     service.close()
 
-    original_unlink = Path.unlink
+    original_unlink = RuntimeService._unlink_cas_destination
     failed = False
 
-    def fail_destination_once(path, *args, **kwargs):
+    def fail_destination_once(runtime, candidate_digest, *args, **kwargs):
         nonlocal failed
-        if path == destination and not failed:
+        if candidate_digest == digest and not failed:
             failed = True
             raise OSError("simulated cleanup failure")
-        return original_unlink(path, *args, **kwargs)
+        return original_unlink(runtime, candidate_digest, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", fail_destination_once)
+    monkeypatch.setattr(RuntimeService, "_unlink_cas_destination", fail_destination_once)
     interrupted = RuntimeService(root)
     try:
         journal_paths = list((root / "staging" / "publications").glob("*.json"))
@@ -246,7 +246,6 @@ def test_publication_journal_is_retained_when_cleanup_fails_then_retried(
     finally:
         interrupted.close()
 
-    monkeypatch.setattr(Path, "unlink", original_unlink)
     recovered = RuntimeService(root)
     try:
         assert not destination.exists()

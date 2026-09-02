@@ -98,7 +98,9 @@ class RealmStore:
 
     def _open(self):
         self.root.mkdir(parents=True, exist_ok=True)
-        self.root.chmod(0o700)
+        if any(path.is_symlink() for path in (self.cas_root.parent, self.cas_root, self.staging_root)):
+            raise ValidationError("runtime storage roots must not be symlinks")
+        self.cas_root.parent.mkdir(parents=True, exist_ok=True)
         self.cas_root.mkdir(parents=True, exist_ok=True)
         self.cas_root.parent.chmod(0o700)
         self.cas_root.chmod(0o700)
@@ -111,6 +113,17 @@ class RealmStore:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=10000")
         self._migrate()
+
+    def attempt_staging_dir(self, attempt_id):
+        """Return the private staging directory for one persisted attempt."""
+        if not isinstance(attempt_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", attempt_id):
+            raise ValidationError("attempt_id is invalid")
+        settlements_root = self.staging_root / "settlements"
+        if settlements_root.is_symlink() or (settlements_root.exists() and not settlements_root.is_dir()):
+            raise ValidationError("attempt staging root is invalid")
+        settlements_root.mkdir(parents=True, exist_ok=True)
+        settlements_root.chmod(0o700)
+        return settlements_root / attempt_id
 
     def _migrate(self):
         self.conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")

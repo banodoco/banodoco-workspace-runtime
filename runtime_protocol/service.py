@@ -12,13 +12,13 @@ import base64
 import os
 import re
 import uuid
-from collections.abc import Mapping
+import stat
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
-from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
+from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
 
 
@@ -580,11 +580,29 @@ class RuntimeService:
             )
         return result
 
-    def _publication_journal_root(self):
-        root = self.store.staging_root / "publications"
-        root.mkdir(parents=True, exist_ok=True)
-        root.chmod(0o700)
-        return root
+    def _open_publication_directory(self, *, create):
+        """Open the publication journal directory below pinned staging fds."""
+        staging_fd = _open_directory_chain(self.store.staging_root)
+        try:
+            if create:
+                publication_fd = _mkdir_chain_at(staging_fd, "publications")
+            else:
+                publication_fd = os.open(
+                    "publications",
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=staging_fd,
+                )
+            try:
+                if not stat.S_ISDIR(os.fstat(publication_fd).st_mode):
+                    raise ConflictError("publication journal directory is invalid")
+            except Exception:
+                os.close(publication_fd)
+                raise
+            return staging_fd, publication_fd
+        except Exception:
+            os.close(staging_fd)
+            raise
+
 
     def _begin_cas_publication_journal(self, kind, entries, *, project_id=None, task_id=None):
         """Durably describe CAS destinations before making them reachable.
@@ -603,26 +621,33 @@ class RuntimeService:
             "task_id": task_id,
             "entries": [{"digest": str(entry["digest"])} for entry in entries],
         }
-        path = self._publication_journal_root() / f"{new_id()}.json"
-        atomic_json_write(path, payload)
-        return path
+        journal_name = f"{new_id()}.json"
+        staging_fd = publication_fd = -1
+        try:
+            staging_fd, publication_fd = self._open_publication_directory(create=True)
+            _write_bytes_at(publication_fd, journal_name, durable_json_bytes(payload))
+            os.fsync(staging_fd)
+        finally:
+            if publication_fd >= 0:
+                os.close(publication_fd)
+            if staging_fd >= 0:
+                os.close(staging_fd)
+        return self.store.staging_root / "publications" / journal_name
 
     @staticmethod
-    def _remove_publication_journal(path):
+    def _remove_publication_journal_at(directory_fd, name):
         try:
-            path.unlink()
+            os.unlink(name, dir_fd=directory_fd)
         except FileNotFoundError:
-            return
+            return True
         except OSError:
-            return
+            return False
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(directory_fd)
         except OSError:
-            pass
+            return False
+        return True
+
 
     def _publication_committed(self, journal):
         entries = journal.get("entries")
@@ -662,55 +687,76 @@ class RuntimeService:
 
     def _recover_cas_publication_journals(self):
         """Finish or roll back CAS publications left by a crashed mutation."""
-        root = self.store.staging_root / "publications"
-        if not root.exists() or root.is_symlink() or not root.is_dir():
-            return
-        for path in sorted(root.glob("*.json")):
-            if path.is_symlink() or not path.is_file():
-                continue
+        staging_fd = publication_fd = -1
+        try:
             try:
-                journal = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                # Leave malformed evidence for doctor/operator inspection; do
-                # not guess at a path and risk deleting an unrelated object.
-                continue
-            if not isinstance(journal, dict) or journal.get("version") != 1:
-                continue
+                staging_fd, publication_fd = self._open_publication_directory(create=False)
+            except FileNotFoundError:
+                return
             try:
-                committed = self._publication_committed(journal)
-            except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-                continue
-            if not committed:
-                cleanup_failed = False
-                for entry in journal.get("entries", []):
-                    digest = entry.get("digest") if isinstance(entry, dict) else None
-                    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-                        continue
-                    # If another operation has since durable-metadata-claimed
-                    # this object, it owns the file and it must be retained.
-                    if self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone():
-                        continue
-                    destination = self.cas.path_for(digest)
-                    try:
-                        destination.unlink()
-                    except FileNotFoundError:
-                        continue
-                    except OSError:
-                        # Keep the durable evidence when cleanup fails so a
-                        # later startup can retry the exact destination.
-                        cleanup_failed = True
-                        continue
-                    try:
-                        directory_fd = os.open(destination.parent, os.O_RDONLY)
-                        try:
-                            os.fsync(directory_fd)
-                        finally:
-                            os.close(directory_fd)
-                    except OSError:
-                        pass
-                if cleanup_failed:
+                names = sorted(
+                    entry.name
+                    for entry in os.scandir(publication_fd)
+                    if entry.name.endswith(".json")
+                    and not entry.is_symlink()
+                    and stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode)
+                )
+            except OSError:
+                return
+            for name in names:
+                journal_fd = -1
+                try:
+                    journal_fd = os.open(
+                        name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=publication_fd,
+                    )
+                    chunks = []
+                    while True:
+                        chunk = os.read(journal_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    journal = json.loads(b"".join(chunks).decode("utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    # Leave malformed evidence for doctor/operator inspection;
+                    # do not guess at a path and risk deleting unrelated data.
                     continue
-            self._remove_publication_journal(path)
+                finally:
+                    if journal_fd >= 0:
+                        os.close(journal_fd)
+                if not isinstance(journal, dict) or journal.get("version") != 1:
+                    continue
+                try:
+                    committed = self._publication_committed(journal)
+                except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+                    continue
+                if not committed:
+                    cleanup_failed = False
+                    for entry in journal.get("entries", []):
+                        digest = entry.get("digest") if isinstance(entry, dict) else None
+                        if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                            continue
+                        # If another operation has since durable-metadata-claimed
+                        # this object, it owns the file and it must be retained.
+                        if self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone():
+                            continue
+                        try:
+                            self._unlink_cas_destination(digest)
+                        except (OSError, ConflictError):
+                            # Keep durable evidence when the CAS prefix cannot
+                            # be opened or its pinned entry cannot be removed.
+                            cleanup_failed = True
+                            continue
+                    if cleanup_failed:
+                        continue
+                if not self._remove_publication_journal_at(publication_fd, name):
+                    continue
+        finally:
+            if publication_fd >= 0:
+                os.close(publication_fd)
+            if staging_fd >= 0:
+                os.close(staging_fd)
 
     def _project_shot_resource(self, row):
         value = dict(row)
@@ -1773,18 +1819,10 @@ class RuntimeService:
 
     def _discard_published_digest(self, digest):
         """Remove a newly published CAS file after a failed metadata commit."""
-        path = self.cas.path_for(digest)
         try:
-            path.unlink()
-        except FileNotFoundError:
-            return
-        try:
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        except OSError:
+            self._unlink_cas_destination(digest)
+        except (FileNotFoundError, OSError, ConflictError):
+            # A failed cleanup is reconciled from the publication journal.
             pass
 
     def _object_resource(self, row):
@@ -2136,8 +2174,10 @@ class RuntimeService:
         """Validate and stage every output without making it globally reachable."""
         if not isinstance(outputs, list):
             raise ValidationError("outputs must be a list")
-        stage_dir = self.store.staging_root / "settlements" / attempt_id
+        stage_dir = self.store.attempt_staging_dir(attempt_id)
         stage_dir.mkdir(parents=True, exist_ok=True)
+        if stage_dir.is_symlink() or not stage_dir.is_dir():
+            raise ValidationError("attempt staging directory is invalid")
         stage_dir.chmod(0o700)
         staged = []
         seen = set()
@@ -2193,13 +2233,37 @@ class RuntimeService:
                         os.fsync(stream.fileno())
                     size = len(data)
                 else:
-                    path = self.cas.path_for(digest)
-                    if not path.is_file() or path.is_symlink():
-                        raise ConflictError("output must be staged or published to runtime CAS before settlement", details={"digest": digest_value})
-                    size = path.stat().st_size
-                    if size > OBJECT_MAX_BYTES:
-                        raise ValidationError("output exceeds 64 MiB object limit")
-                    self.cas.verify(digest)
+                    root_fd = prefix_fd = file_fd = -1
+                    try:
+                        try:
+                            root_fd, prefix_fd = self._cas_prefix_fds(digest, create=False)
+                        except (FileNotFoundError, OSError) as exc:
+                            raise ConflictError(
+                                "output must be staged or published to runtime CAS before settlement",
+                                details={"digest": digest_value},
+                            ) from exc
+                        try:
+                            file_fd = os.open(
+                                digest[2:],
+                                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                                dir_fd=prefix_fd,
+                            )
+                        except OSError as exc:
+                            raise ConflictError(
+                                "output must be staged or published to runtime CAS before settlement",
+                                details={"digest": digest_value},
+                            ) from exc
+                        size = int(os.fstat(file_fd).st_size)
+                        if size > OBJECT_MAX_BYTES:
+                            raise ValidationError("output exceeds 64 MiB object limit")
+                        self._verify_open_file(file_fd, digest, size, label="CAS object")
+                    finally:
+                        if file_fd >= 0:
+                            os.close(file_fd)
+                        if prefix_fd >= 0:
+                            os.close(prefix_fd)
+                        if root_fd >= 0:
+                            os.close(root_fd)
                     if declared_size is not None and declared_size != size:
                         raise ValidationError("output size does not match CAS bytes")
                 existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
@@ -2217,6 +2281,169 @@ class RuntimeService:
             self._discard_staged_outputs({"stage_dir": stage_dir, "items": staged})
             raise
 
+
+    @staticmethod
+    def _verify_open_file(file_fd, digest, expected_size, *, label):
+        """Hash one already-open file without reopening its pathname."""
+        try:
+            initial = os.fstat(file_fd)
+            if not stat.S_ISREG(initial.st_mode):
+                raise ConflictError(f"{label} must be a regular file")
+            if initial.st_size != expected_size:
+                raise ConflictError(f"{label} size does not match staged metadata")
+            os.lseek(file_fd, 0, os.SEEK_SET)
+            hasher = hashlib.sha256()
+            while True:
+                chunk = os.read(file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+            final = os.fstat(file_fd)
+        except OSError as exc:
+            raise ConflictError(f"{label} is unavailable") from exc
+        if (
+            final.st_dev != initial.st_dev
+            or final.st_ino != initial.st_ino
+            or final.st_size != expected_size
+            or hasher.hexdigest() != digest
+        ):
+            raise ConflictError(f"{label} hash or size does not match staged metadata")
+        return initial
+
+    def _cas_prefix_fds(self, digest, *, create):
+        """Open a CAS digest prefix below descriptors, never through a path."""
+        root_fd = _open_directory_chain(self.cas.root)
+        try:
+            prefix = digest[:2]
+            if create:
+                prefix_fd = _mkdir_chain_at(root_fd, prefix)
+            else:
+                prefix_fd = os.open(
+                    prefix,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=root_fd,
+                )
+            try:
+                if not stat.S_ISDIR(os.fstat(prefix_fd).st_mode):
+                    raise ConflictError("CAS destination directory is invalid")
+            except Exception:
+                os.close(prefix_fd)
+                raise
+            return root_fd, prefix_fd
+        except Exception:
+            os.close(root_fd)
+            raise
+
+    @staticmethod
+    def _copy_open_file_at(source_fd, destination_fd, destination_name, digest, expected_size, *, label):
+        """Copy verified bytes to a private file, then atomically link it."""
+        temporary_name = f".{destination_name}.{os.getpid()}-{uuid.uuid4().hex}.tmp"
+        temporary_fd = -1
+        linked = False
+        try:
+            initial = RuntimeService._verify_open_file(source_fd, digest, expected_size, label=label)
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=destination_fd,
+            )
+            os.lseek(source_fd, 0, os.SEEK_SET)
+            hasher = hashlib.sha256()
+            copied = 0
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                copied += len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(temporary_fd, view)
+                    view = view[written:]
+            final = os.fstat(source_fd)
+            if (
+                final.st_dev != initial.st_dev
+                or final.st_ino != initial.st_ino
+                or copied != expected_size
+                or hasher.hexdigest() != digest
+            ):
+                raise ConflictError(f"{label} hash or size does not match staged metadata")
+            os.fsync(temporary_fd)
+            os.close(temporary_fd)
+            temporary_fd = -1
+            RuntimeService._verify_file_at(
+                destination_fd, temporary_name, digest, expected_size, label="temporary CAS object",
+            )
+            try:
+                os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ConflictError("CAS destination appeared during publication")
+            os.link(
+                temporary_name,
+                destination_name,
+                src_dir_fd=destination_fd,
+                dst_dir_fd=destination_fd,
+                follow_symlinks=False,
+            )
+            linked = True
+            os.unlink(temporary_name, dir_fd=destination_fd)
+        except OSError as exc:
+            raise ConflictError(f"{label} is unavailable") from exc
+        finally:
+            if temporary_fd >= 0:
+                os.close(temporary_fd)
+            try:
+                os.unlink(temporary_name, dir_fd=destination_fd)
+            except OSError:
+                pass
+        RuntimeService._verify_file_at(destination_fd, destination_name, digest, expected_size, label="CAS object")
+        return initial
+
+    @staticmethod
+    def _verify_file_at(directory_fd, name, digest, expected_size, *, label):
+        try:
+            file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+        except OSError as exc:
+            raise ConflictError(f"{label} is unavailable") from exc
+        try:
+            RuntimeService._verify_open_file(file_fd, digest, expected_size, label=label)
+        finally:
+            os.close(file_fd)
+
+    @staticmethod
+    def _unlink_stage_entry(stage_fd, name, expected_stat=None):
+        try:
+            current = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+            if expected_stat is not None and (
+                current.st_dev != expected_stat.st_dev or current.st_ino != expected_stat.st_ino
+            ):
+                return
+            os.unlink(name, dir_fd=stage_fd)
+        except FileNotFoundError:
+            pass
+
+    def _unlink_cas_destination(self, digest, *, create_prefix=False):
+        """Unlink a CAS object relative to a descriptor-pinned prefix."""
+        root_fd = prefix_fd = -1
+        try:
+            try:
+                root_fd, prefix_fd = self._cas_prefix_fds(digest, create=create_prefix)
+            except FileNotFoundError:
+                return False
+            try:
+                os.unlink(digest[2:], dir_fd=prefix_fd)
+            except FileNotFoundError:
+                return False
+            os.fsync(prefix_fd)
+            return True
+        finally:
+            if prefix_fd >= 0:
+                os.close(prefix_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
     def _publish_staged_outputs(self, staged, *, project_id=None):
         """Publish already validated bytes as part of the settlement transaction."""
         staged.setdefault("published", [])
@@ -2226,85 +2453,146 @@ class RuntimeService:
         if attempt_id:
             row = self.store.conn.execute("SELECT task_id FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             task_id = row["task_id"] if row else None
-        for item in staged["items"]:
-            destination = self.cas.path_for(item["digest"])
-            if item["path"] is not None and not destination.exists():
-                candidate_entries.append({"digest": item["digest"]})
-        if candidate_entries:
-            staged["journal_path"] = self._begin_cas_publication_journal(
-                "settlement", candidate_entries, project_id=project_id or "unscoped", task_id=task_id,
-            )
-        for item in staged["items"]:
-            digest = item["digest"]
-            destination = self.cas.path_for(digest)
-            if item["path"] is not None:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                if destination.exists():
-                    if destination.is_symlink() or self.cas.read(digest) != item["path"].read_bytes():
-                        raise ConflictError("CAS collision or corrupt existing object")
-                    item["path"].unlink(missing_ok=True)
-                else:
-                    os.replace(item["path"], destination)
-                    staged["published"].append(destination)
-                    # The destination directory is durable before SQLite can
-                    # commit the corresponding object metadata.  The durable
-                    # publication journal remains until recovery proves the
-                    # commit, so a crash can remove only this exact destination.
-                    directory_fd = os.open(destination.parent, os.O_RDONLY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-            self.store.conn.execute(
-                "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
-                (digest, item["size"], item["media_type"], item["name"], now()),
-            )
-            if project_id:
-                self.store.conn.execute(
-                    "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)",
-                    (project_id, digest, now()),
+
+        stage_identity = None
+        stage_fd = -1
+        cas_handles = {}
+        try:
+            if any(item["path"] is not None for item in staged["items"]):
+                stage_identity, stage_fd, _ = _pin_directory(staged["stage_dir"])
+
+            for item in staged["items"]:
+                digest = item["digest"]
+                root_fd, prefix_fd = self._cas_prefix_fds(digest, create=True)
+                cas_handles[digest] = (root_fd, prefix_fd)
+                destination_name = digest[2:]
+                try:
+                    os.stat(destination_name, dir_fd=prefix_fd, follow_symlinks=False)
+                    destination_exists = True
+                except FileNotFoundError:
+                    destination_exists = False
+                except OSError as exc:
+                    raise ConflictError("CAS destination is unavailable") from exc
+                if item["path"] is not None and not destination_exists:
+                    candidate_entries.append({"digest": digest})
+
+            if candidate_entries:
+                staged["journal_path"] = self._begin_cas_publication_journal(
+                    "settlement", candidate_entries, project_id=project_id or "unscoped", task_id=task_id,
                 )
 
-    @staticmethod
-    def _discard_staged_outputs(staged):
+            for item in staged["items"]:
+                digest = item["digest"]
+                _root_fd, prefix_fd = cas_handles[digest]
+                destination_name = digest[2:]
+                if item["path"] is not None:
+                    source_name = item["path"].name
+                    try:
+                        source_fd = os.open(
+                            source_name,
+                            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=stage_fd,
+                        )
+                    except OSError as exc:
+                        raise ConflictError("staged output is unavailable") from exc
+                    try:
+                        source_stat = self._verify_open_file(
+                            source_fd, digest, item["size"], label="staged output",
+                        )
+                        try:
+                            destination_exists = os.stat(
+                                destination_name, dir_fd=prefix_fd, follow_symlinks=False,
+                            )
+                        except FileNotFoundError:
+                            destination_exists = None
+                        except OSError as exc:
+                            raise ConflictError("CAS destination is unavailable") from exc
+                        if destination_exists is not None:
+                            self._verify_file_at(
+                                prefix_fd, destination_name, digest, item["size"], label="CAS object",
+                            )
+                        else:
+                            self._copy_open_file_at(
+                                source_fd, prefix_fd, destination_name, digest, item["size"],
+                                label="staged output",
+                            )
+                            staged["published"].append(digest)
+                            os.fsync(prefix_fd)
+                        self._unlink_stage_entry(stage_fd, source_name, source_stat)
+                    finally:
+                        os.close(source_fd)
+                else:
+                    self._verify_file_at(
+                        prefix_fd, destination_name, digest, item["size"], label="CAS object",
+                    )
+                self.store.conn.execute(
+                    "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (digest, item["size"], item["media_type"], item["name"], now()),
+                )
+                if project_id:
+                    self.store.conn.execute(
+                        "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)",
+                        (project_id, digest, now()),
+                    )
+        finally:
+            if stage_fd >= 0:
+                os.close(stage_fd)
+            if stage_identity is not None:
+                _close_pinned(stage_identity)
+            for root_fd, prefix_fd in cas_handles.values():
+                os.close(prefix_fd)
+                os.close(root_fd)
+
+
+    def _discard_staged_outputs(self, staged):
         stage_dir = staged.get("stage_dir") if isinstance(staged, dict) else None
         committed = bool(staged.get("committed")) if isinstance(staged, dict) else False
-        for item in (staged.get("items", []) if isinstance(staged, dict) else []):
-            path = item.get("path")
-            if path is not None:
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
+
         if stage_dir is not None:
-            # Include a file whose validation failed immediately after its
-            # fsync, before it could be appended to ``items``.
+            stage_identity = None
+            stage_fd = -1
             try:
-                for path in stage_dir.iterdir():
-                    if path.is_file() or path.is_symlink():
-                        path.unlink(missing_ok=True)
-            except FileNotFoundError:
+                stage_identity, stage_fd, stage_stat = _pin_directory(stage_dir)
+            except (OSError, ConflictError):
+                # Never fall back to pathname unlinking when the staging
+                # directory cannot be descriptor-pinned.
                 pass
-            try:
-                stage_dir.rmdir()
-            except OSError:
-                pass
-        if not committed:
-            for path in (staged.get("published", []) if isinstance(staged, dict) else []):
+            else:
                 try:
-                    path.unlink()
-                except FileNotFoundError:
-                    continue
-                except OSError:
-                    continue
-                try:
-                    directory_fd = os.open(path.parent, os.O_RDONLY)
                     try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
-                except OSError:
-                    pass
+                        for entry in os.scandir(stage_fd):
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            if stat.S_ISREG(entry_stat.st_mode) or stat.S_ISLNK(entry_stat.st_mode):
+                                os.unlink(entry.name, dir_fd=stage_fd)
+                        os.fsync(stage_fd)
+                    except OSError:
+                        pass
+                    parent_fd = stage_identity.get("_parent_fd")
+                    if parent_fd is not None:
+                        try:
+                            current = os.stat(
+                                stage_dir.name, dir_fd=int(parent_fd), follow_symlinks=False,
+                            )
+                            if (
+                                stat.S_ISDIR(current.st_mode)
+                                and current.st_dev == stage_stat.st_dev
+                                and current.st_ino == stage_stat.st_ino
+                            ):
+                                os.rmdir(stage_dir.name, dir_fd=int(parent_fd))
+                                os.fsync(int(parent_fd))
+                        except OSError:
+                            pass
+                finally:
+                    os.close(stage_fd)
+                    _close_pinned(stage_identity)
+
+        if not committed:
+            for digest in (staged.get("published", []) if isinstance(staged, dict) else []):
+                try:
+                    if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+                        self._unlink_cas_destination(digest)
+                except (FileNotFoundError, OSError, ConflictError):
+                    continue
 
     def _checkpoint_row(self, checkpoint_id=None, attempt_id=None):
         if checkpoint_id:
