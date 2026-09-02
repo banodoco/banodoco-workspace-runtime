@@ -585,28 +585,6 @@ class WorkspaceClient:
         _, _, body = self._request("POST", f"/v1/projects/{_path_part(project_id)}/timeline-documents", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(201,))
         return self._mutation_json(body)
 
-    def update_timeline_document(
-        self,
-        project_id: str,
-        timeline_id: str,
-        *,
-        expected_version: int,
-        config: Mapping[str, Any],
-        registry: Mapping[str, Any],
-        idempotency_key: str,
-        slug: str | None = None,
-        name: str | None = None,
-    ) -> MutationResult:
-        current = self.get_document(project_id, f"timeline:{timeline_id}")
-        content = dict(current.content) if isinstance(current.content, Mapping) else {}
-        content.update({"config": dict(config), "registry": dict(registry)})
-        if slug is not None: content["slug"] = slug
-        if name is not None: content["name"] = name
-        document = self.update_document(project_id, f"timeline:{timeline_id}", expected_version=expected_version, idempotency_key=idempotency_key, content=content)
-        timeline = self.get_timeline(timeline_id)
-        result = dict(timeline)
-        result.update({"slug": content.get("slug", timeline_id), "name": content.get("name", timeline_id), "config_version": document.version, "config": dict(config), "registry": dict(registry)})
-        return MutationResult(result, document.receipt)
 
     def list_timelines(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")

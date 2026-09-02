@@ -80,15 +80,6 @@ export class WorkspaceClient {
     const payload = { timeline_id: timelineId, slug: slug ?? timelineId, name: name ?? slug ?? timelineId, config, registry };
     return this.mutation((await this.request("POST", `/v1/projects/${encodeURIComponent(projectId)}/timeline-documents`, new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [201])).body);
   }
-  async updateTimelineDocument(projectId: string, timelineId: string, expectedVersion: number, idempotencyKey: string, config: Record<string, unknown>, registry: Record<string, unknown>, slug?: string, name?: string): Promise<MutationResult<Record<string, unknown>>> {
-    const current = await this.getDocument(projectId, `timeline:${timelineId}`);
-    const content: Record<string, unknown> = { ...(current.content as Record<string, unknown>), config, registry };
-    if (slug !== undefined) content.slug = slug;
-    if (name !== undefined) content.name = name;
-    const document = await this.updateDocument(projectId, `timeline:${timelineId}`, expectedVersion, idempotencyKey, content);
-    const timeline = await this.getTimeline(timelineId);
-    return Object.assign({ ...timeline, slug: content.slug ?? timelineId, name: content.name ?? timelineId, config_version: document.version, config, registry }, { receipt: document.receipt }) as MutationResult<Record<string, unknown>>;
-  }
   async listTimelines(projectId: string, cursor?: string, limit = 50): Promise<Page<Record<string, unknown>>> { return this.page((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/timelines?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).body) }
   async getTimeline(timelineId: string): Promise<Record<string, unknown>> { return this.json((await this.request("GET", `/v1/timelines/${encodeURIComponent(timelineId)}`)).body) }
   async listTimelineHistory(timelineId: string, cursor?: string, limit = 50): Promise<Page<Record<string, unknown>>> { return this.page((await this.request("GET", `/v1/timelines/${encodeURIComponent(timelineId)}/history?limit=${limit}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)).body) }
