@@ -385,10 +385,13 @@ class Executor:
     capabilities: tuple[Capability, ...]
     protocol: str
     runtime_epoch: int | None = None
+    source_digest: str | None = None
+    dependency_digest: str | None = None
+    source_epoch: str | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Executor":
-        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"], runtime_epoch=int(value["runtime_epoch"]) if value.get("runtime_epoch") is not None else None)
+        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"], runtime_epoch=int(value["runtime_epoch"]) if value.get("runtime_epoch") is not None else None, source_digest=value.get("source_digest"), dependency_digest=value.get("dependency_digest"), source_epoch=value.get("source_epoch"))
 
 
 def _decode_error(status: int, body: bytes) -> ApiError:

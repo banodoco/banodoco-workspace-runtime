@@ -25,7 +25,14 @@
         "max_concurrency": { "type": "integer", "minimum": 1 },
         "resource_keys": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
         "capabilities": { "type": "array", "items": { "$ref": "#/definitions/Capability" } },
-        "protocol": { "type": "string", "const": "workspace.v1" }
+        "protocol": { "type": "string", "const": "workspace.v1" },
+        "source_digest": { "type": ["string", "null"], "minLength": 1 },
+        "dependency_digest": { "type": ["string", "null"], "minLength": 1 },
+        "source_epoch": { "type": ["string", "null"], "minLength": 1 },
+        "schema_digest": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+        "runtime_epoch": { "type": ["integer", "null"], "minimum": 1 },
+        "readiness": { "type": "string", "enum": ["ready", "not_ready"] },
+        "readiness_reason": { "type": ["string", "null"] }
       }
     },
     "AttemptFence": {
@@ -67,6 +74,11 @@
         "lease_id": { "type": "string", "minLength": 1 },
         "fence": { "type": "integer", "minimum": 1 },
         "runtime_epoch": { "type": "integer", "minimum": 1 },
+        "result": {
+          "type": "object",
+          "additionalProperties": true,
+          "not": { "required": ["outputs"] }
+        },
         "outputs": { "type": "array", "items": { "$ref": "#/definitions/Output" } },
         "effect": { "anyOf": [{ "$ref": "#/definitions/Effect" }, { "type": "null" }] }
       }

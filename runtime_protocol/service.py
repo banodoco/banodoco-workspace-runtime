@@ -2052,6 +2052,7 @@ class RuntimeService:
             allowed=(
                 "executor_id", "max_concurrency", "resource_keys", "capabilities",
                 "protocol", "readiness", "readiness_reason", "runtime_epoch",
+                "source_digest", "dependency_digest", "source_epoch", "schema_digest",
             ),
         )
         executor_id = _wire_string(body, "executor_id")
@@ -2073,6 +2074,12 @@ class RuntimeService:
             raise ValidationError("readiness must be ready or not_ready")
         if body.get("runtime_epoch") is not None:
             _wire_integer(body, "runtime_epoch", positive=True)
+        for field in ("source_digest", "dependency_digest", "source_epoch"):
+            if body.get(field) is not None:
+                _wire_string(body, field)
+        if body.get("schema_digest") is not None:
+            if not isinstance(body["schema_digest"], str) or body["schema_digest"] != SCHEMA_DIGEST:
+                raise ValidationError("schema_digest does not match the runtime contract")
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         # Executor registration is an endpoint-scoped command.  The request
         # hash includes executor identity and all registration fields, so a
@@ -2114,8 +2121,8 @@ class RuntimeService:
             body.get("runtime_epoch"), identity="executor",
             identity_id=body.get("executor_id"), required=existing is not None,
         )
-        self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch)
-        result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch}
+        self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"))
+        result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
     @_durable_mutation
@@ -2184,7 +2191,7 @@ class RuntimeService:
         idempotency_key = require_idempotency_key(idempotency_key)
         body = dict(_wire_object(
             body,
-            allowed=("attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect"),
+            allowed=("attempt_id", "lease_id", "fence", "runtime_epoch", "outputs", "effect", "result"),
         ))
         supplied_attempt_id = body.get("attempt_id")
         if supplied_attempt_id is not None and str(supplied_attempt_id) != str(attempt_id):
@@ -2198,6 +2205,10 @@ class RuntimeService:
         _wire_integer(body, "runtime_epoch", positive=True)
         if "outputs" in body and not isinstance(body["outputs"], list):
             raise ValidationError("outputs must be a list")
+        if "result" in body and not isinstance(body["result"], dict):
+            raise ValidationError("result must be an object")
+        if isinstance(body.get("result"), dict) and "outputs" in body["result"]:
+            raise ValidationError("result.outputs is reserved; send outputs at the settlement top level")
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
@@ -2226,7 +2237,10 @@ class RuntimeService:
                 self.store._validate_settlement_effect(effect)
             staged = self._stage_outputs(attempt_id, body.get("outputs", []), project_id=project_id)
             try:
-                result = {"outputs": staged["outputs"]}
+                # Persist one flat result object. Outputs are the only
+                # reserved field and are added atomically with user fields.
+                result = dict(body.get("result") or {})
+                result["outputs"] = staged["outputs"]
                 recorded = None
                 def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
                     nonlocal recorded

@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
@@ -213,6 +213,9 @@ class RealmStore:
         if version < 20:
             self._run_migration(20)
             version = 20
+        if version < 21:
+            self._run_migration(21)
+            version = 21
 
     def _run_receipt_backfill_migration(self):
         """Backfill pre-016 rows inside one retryable migration transaction."""
@@ -1169,7 +1172,7 @@ class RealmStore:
                 self._append_event(task["run_id"], task_id, "task.claimed", {"executor_id": executor_id, "attempt": task["attempt"] + 1, "fence": fence, "resource_keys": self._required_resource_keys(task["capability"])})
                 return self.get_task(task_id)
 
-    def upsert_executor(self, executor_id, capabilities, max_concurrency=1, resource_keys=None, *, protocol="workspace.v1", readiness="ready", readiness_reason=None, runtime_epoch=None):
+    def upsert_executor(self, executor_id, capabilities, max_concurrency=1, resource_keys=None, *, protocol="workspace.v1", readiness="ready", readiness_reason=None, runtime_epoch=None, source_digest=None, dependency_digest=None, source_epoch=None):
         if not executor_id or max_concurrency < 1:
             raise ValidationError("executor_id and positive max_concurrency are required")
         if readiness not in {"ready", "not_ready"}:
@@ -1212,7 +1215,7 @@ class RealmStore:
                 if not self.conn.execute("SELECT 1 FROM capabilities WHERE id=?", (capability_id,)).fetchone():
                     self.register_capability(capability_id, "sha256:" + hashlib.sha256(str(capability_id).encode()).hexdigest(), required_resource_keys=[])
             timestamp = now()
-            self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp))
+            self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at, source_digest, dependency_digest, source_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch, source_digest=excluded.source_digest, dependency_digest=excluded.dependency_digest, source_epoch=excluded.source_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp, source_digest, dependency_digest, source_epoch))
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             return self._executor_result(row)
 

@@ -32,7 +32,7 @@ export interface EventPage { items: Event[]; next_cursor: string | null }
 export interface Page<T> { items: T[]; next_cursor: string | null }
 export type CapabilityStatus = "ready" | "unavailable" | "unsupported" | "retired";
 export interface Capability { capability_id: string; definition_digest: string; status: CapabilityStatus; required_resource_keys: string[]; estimated_scratch_bytes: number; estimated_output_bytes: number; unavailable_reason?: string | null }
-export interface Executor { executor_id: string; max_concurrency: number; resource_keys: string[]; capabilities: Capability[]; protocol: typeof PROTOCOL; runtime_epoch?: number }
+export interface Executor { executor_id: string; max_concurrency: number; resource_keys: string[]; capabilities: Capability[]; protocol: typeof PROTOCOL; runtime_epoch?: number; source_digest?: string | null; dependency_digest?: string | null; source_epoch?: string | null }
 export class ApiError extends Error { constructor(public status: number, public code: string, message: string, public request_id = "", public details: Record<string, unknown> = {}) { super(`${code}: ${message}`); this.name = "ApiError" } }
 
 export class WorkspaceClient {
