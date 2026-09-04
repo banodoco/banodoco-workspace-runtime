@@ -20,7 +20,15 @@
     "attempt_id": { "type": ["string", "null"] },
     "runtime_epoch": { "type": "integer", "minimum": 1 },
     "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-    "spec": { "type": "object", "additionalProperties": true }
+    "spec": { "type": "object", "additionalProperties": true },
+    "storage_estimate": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scratch_bytes", "output_bytes"],
+      "properties": {
+        "scratch_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "output_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
     ,"waiting_reason": { "type": "string" }
     ,"lease_fence": { "type": "integer", "minimum": 1 }
     ,"lease_expires_at": { "type": "string", "format": "date-time" }

@@ -655,6 +655,14 @@ components:
         project: { type: string, description: Project selector whose managed-object associations authorize input_object_ids and output settlement. }
         spec: { type: object, additionalProperties: true }
         settlement_effect: { type: object, additionalProperties: true }
+        storage_estimate: { $ref: '#/components/schemas/StorageEstimate' }
+    StorageEstimate:
+      type: object
+      additionalProperties: false
+      required: [scratch_bytes, output_bytes]
+      properties:
+        scratch_bytes: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        output_bytes: { type: integer, minimum: 0, maximum: 9007199254740991 }
     EventPage:
       type: object
       additionalProperties: false

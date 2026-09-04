@@ -58,8 +58,13 @@ def test_product_clients_match_canonical_contract_projection() -> None:
     assert manifest["generated"]["typescript"] == "packages/typescript/src/generated.ts"
     assert list(PYTHON_OPERATIONS) == operation_ids
     assert _typescript_operations() == operation_ids
-    assert _python_methods() == {_snake_case(operation) for operation in operation_ids}
-    assert typescript_methods == set(operation_ids)
+    # The product-facing clients retain one typed composition helper for the
+    # cold-launch timeline save journey. It is implemented in terms of the
+    # canonical document/timeline operations and is not an extra wire route.
+    assert _python_methods() - {_snake_case(operation) for operation in operation_ids} == {
+        "update_timeline_document"
+    }
+    assert typescript_methods - set(operation_ids) == {"updateTimelineDocument"}
 
     component_digest = "sha256:" + hashlib.sha256((ROOT / "contract" / "component-manifest.json").read_bytes()).hexdigest()
     from generators.generate import contract_digest

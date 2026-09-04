@@ -25,6 +25,9 @@ SCHEMA_VERSION = 20
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
+# JSON clients (including TypeScript) must be able to preserve the exact byte
+# count used in the admission hash.  Stay within IEEE-754's safe integer range.
+MAX_STORAGE_ESTIMATE_BYTES = (1 << 53) - 1
 
 
 class RealmStore:
@@ -665,6 +668,10 @@ class RealmStore:
         """
         if not isinstance(spec, dict):
             raise ValidationError("task spec must be an object")
+        if "storage_estimate" in spec:
+            if spec["storage_estimate"] is None:
+                raise ValidationError("storage_estimate must be an object")
+            self._validate_storage_estimate(spec["storage_estimate"])
         input_object_ids = spec.get("input_object_ids", [])
         if not isinstance(input_object_ids, list):
             raise ValidationError("input_object_ids must be a list")
@@ -692,6 +699,45 @@ class RealmStore:
                     "task input object is not associated with the task project",
                     details={"project_id": project_id, "object_id": object_id},
                 )
+
+    @staticmethod
+    def _validate_storage_estimate(storage_estimate):
+        """Validate an optional immutable, request-specific disk estimate.
+
+        The estimate is stored in ``tasks.spec_json`` so admission, claim, and
+        replay all use the exact value supplied with the admitted task.  A
+        missing estimate deliberately retains the capability-wide fallback.
+        """
+        if storage_estimate is None:
+            return None
+        if not isinstance(storage_estimate, dict):
+            raise ValidationError("storage_estimate must be an object")
+        if any(not isinstance(key, str) for key in storage_estimate):
+            raise ValidationError("storage_estimate keys must be strings")
+        expected = {"scratch_bytes", "output_bytes"}
+        actual = set(storage_estimate)
+        if actual != expected:
+            raise ValidationError(
+                "storage_estimate must contain exactly scratch_bytes and output_bytes",
+                details={"missing": sorted(expected - actual), "unexpected": sorted(actual - expected)},
+            )
+        normalized = {}
+        for key in ("scratch_bytes", "output_bytes"):
+            value = storage_estimate[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValidationError(f"storage_estimate.{key} must be an integer")
+            if value < 0 or value > MAX_STORAGE_ESTIMATE_BYTES:
+                raise ValidationError(
+                    f"storage_estimate.{key} is out of range",
+                    details={"minimum": 0, "maximum": MAX_STORAGE_ESTIMATE_BYTES},
+                )
+            normalized[key] = value
+        if normalized["scratch_bytes"] + normalized["output_bytes"] > MAX_STORAGE_ESTIMATE_BYTES:
+            raise ValidationError(
+                "storage_estimate total is out of range",
+                details={"maximum": MAX_STORAGE_ESTIMATE_BYTES},
+            )
+        return normalized
 
     def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False):
         if not capability:
@@ -750,12 +796,13 @@ class RealmStore:
                     # The task cannot be claimed until a matching capability
                     # and live executor registration is present.
                     waiting_reason = "capability_unavailable" if capability_digest is not None else None
-                if enforce_readiness and waiting_reason is None and not self.matching_live_executor(capability, capability_digest):
+                storage_estimate = spec.get("storage_estimate")
+                if enforce_readiness and waiting_reason is None and not self.matching_live_executor(capability, capability_digest, include_storage=False):
                     # Queue the durable task while making the unavailable
                     # readiness explicit. Claiming remains impossible until a
                     # matching live executor appears.
                     waiting_reason = "capability_unavailable"
-                if waiting_reason is None and not self.storage_preflight(capability)["ok"]:
+                if waiting_reason is None and not self.storage_preflight(capability, storage_estimate=storage_estimate)["ok"]:
                     waiting_reason = "insufficient_storage"
                 timestamp, run_id, task_id = now(), new_id(), new_id()
                 self.conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)", (run_id, project_id, capability, canonical_json(spec), idempotency_key, timestamp, timestamp))
@@ -1008,7 +1055,7 @@ class RealmStore:
             return False
         return seen > datetime.now(timezone.utc) - timedelta(seconds=EXECUTOR_LIVENESS_SECONDS)
 
-    def _executor_can_run(self, executor, capability_id, capability_digest=None):
+    def _executor_can_run(self, executor, capability_id, capability_digest=None, *, include_storage=True):
         if not executor or executor["readiness"] != "ready" or not self._executor_live(executor):
             return False
         descriptor = self._executor_capability(executor, capability_id)
@@ -1026,20 +1073,28 @@ class RealmStore:
         for key in self._required_resource_keys(capability_id):
             if key not in available:
                 return False
-        return self.storage_preflight(capability_id)["ok"]
+        return not include_storage or self.storage_preflight(capability_id)["ok"]
 
-    def matching_live_executor(self, capability_id, capability_digest=None):
-        return any(self._executor_can_run(row, capability_id, capability_digest) for row in self.conn.execute("SELECT * FROM executors"))
+    def matching_live_executor(self, capability_id, capability_digest=None, *, include_storage=True):
+        return any(self._executor_can_run(row, capability_id, capability_digest, include_storage=include_storage) for row in self.conn.execute("SELECT * FROM executors"))
 
     def _required_resource_keys(self, capability):
         row = self.conn.execute("SELECT required_resource_keys_json FROM capabilities WHERE id=?", (capability,)).fetchone()
         return json.loads(row[0]) if row else []
 
-    def storage_preflight(self, capability):
-        row = self.conn.execute("SELECT estimated_scratch_bytes, estimated_output_bytes FROM capabilities WHERE id=?", (capability,)).fetchone()
-        required = int(row[0]) + int(row[1]) if row else 0
+    def storage_preflight(self, capability, *, storage_estimate=None):
+        estimate = self._validate_storage_estimate(storage_estimate)
+        if estimate is None:
+            row = self.conn.execute("SELECT estimated_scratch_bytes, estimated_output_bytes FROM capabilities WHERE id=?", (capability,)).fetchone()
+            scratch_bytes, output_bytes = (int(row[0]), int(row[1])) if row else (0, 0)
+            source = "capability"
+        else:
+            scratch_bytes = estimate["scratch_bytes"]
+            output_bytes = estimate["output_bytes"]
+            source = "task"
+        required = scratch_bytes + output_bytes
         available = int(shutil.disk_usage(self.root).free)
-        return {"ok": available >= required, "required_bytes": required, "available_bytes": available, "reason": None if available >= required else "insufficient_storage"}
+        return {"ok": available >= required, "required_bytes": required, "available_bytes": available, "scratch_bytes": scratch_bytes, "output_bytes": output_bytes, "estimate_source": source, "reason": None if available >= required else "insufficient_storage"}
 
     def _claim_task(self, task_id, executor_id, lease_token, *, runtime_epoch=None, _transactional=True):
         """Claim one exact task, optionally as part of a larger mutation.
@@ -1063,6 +1118,7 @@ class RealmStore:
                     raise ConflictError("task is not claimable", details={"status": task["status"]})
                 executor = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
                 capability = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (task["capability"],)).fetchone()
+                task_spec = json.loads(task["spec_json"])
                 waiting_reason = None
                 if not executor:
                     waiting_reason = "waiting_for_worker"
@@ -1075,7 +1131,7 @@ class RealmStore:
                     waiting_reason = "capability_unavailable"
                 elif capability and capability["status"] != "ready":
                     waiting_reason = "capability_unavailable"
-                elif not self.storage_preflight(task["capability"])["ok"]:
+                elif not self.storage_preflight(task["capability"], storage_estimate=task_spec.get("storage_estimate"))["ok"]:
                     waiting_reason = "insufficient_storage"
                 elif task["capability"] not in self._executor_capability_ids(executor):
                     waiting_reason = "waiting_for_worker"

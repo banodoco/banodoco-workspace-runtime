@@ -9,3 +9,11 @@ The protocol uses a clean, digest-pinned version (`workspace.v1`).  A client
 must complete the handshake before using any non-health operation.  Every
 state-changing request carries an idempotency key and mutating resources expose
 an opaque `version` for optimistic concurrency.
+
+Task admission may include an immutable `storage_estimate` derived from the
+same canonical input snapshot as the task spec. `scratch_bytes` is the peak
+additional temporary space needed while the task runs; `output_bytes` is the
+maximum final output written before temporary data is released. The runtime
+checks their sum against current free space at admission and again at claim.
+When the field is absent, the registered capability estimates remain the
+backward-compatible fallback.

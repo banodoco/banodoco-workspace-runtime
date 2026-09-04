@@ -25,6 +25,7 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
             admission = json.loads(body)
             assert admission["capability_digest"] == "sha256:" + "b" * 64
             assert admission["input_object_ids"] == ["obj"]
+            assert admission["storage_estimate"] == {"scratch_bytes": 300, "output_bytes": 40}
             return 201, {}, json.dumps({"data": TASK, "receipt": {"receipt_id": "runtime-command-1", "command_kind": "task.create", "idempotency_key": "task-1", "request_hash": "sha256:" + "a" * 64, "project_id": "runtime-realm", "project_seq": [1, 1], "event_ids": [], "result": {}, "created_at": "2026-01-01T00:00:00Z"}}).encode()
         if path.endswith("/cancel"):
             assert headers["Idempotency-Key"] == "cancel-1"
@@ -52,7 +53,7 @@ def test_control_plane_methods_preserve_fences_cursors_and_idempotency() -> None
         raise AssertionError((method, path))
 
     client = WorkspaceClient("http://runtime", transport=transport)
-    task = client.admit_task(capability_id="render.basic", capability_digest="sha256:" + "b" * 64, input_object_ids=["obj"], idempotency_key="task-1")
+    task = client.admit_task(capability_id="render.basic", capability_digest="sha256:" + "b" * 64, input_object_ids=["obj"], idempotency_key="task-1", storage_estimate={"scratch_bytes": 300, "output_bytes": 40})
     assert task.task_id == "t"
     cancelled = client.cancel_task("t", idempotency_key="cancel-1", expected_version=1)
     assert cancelled.state == "cancel_requested"
