@@ -30,9 +30,37 @@
         "dependency_digest": { "type": ["string", "null"], "minLength": 1 },
         "source_epoch": { "type": ["string", "null"], "minLength": 1 },
         "schema_digest": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+        "verified_facts": { "$ref": "#/definitions/VerifiedFacts" },
         "runtime_epoch": { "type": ["integer", "null"], "minimum": 1 },
         "readiness": { "type": "string", "enum": ["ready", "not_ready"] },
         "readiness_reason": { "type": ["string", "null"] }
+      }
+    },
+    "VerifiedFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "exact": { "$ref": "#/definitions/ExactFacts" },
+        "minimum": { "$ref": "#/definitions/MinimumFacts" }
+      }
+    },
+    "ExactFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "interpreter": { "type": "string", "minLength": 1 },
+        "runtime_lock": { "type": "string", "minLength": 1 },
+        "engine_lock": { "type": "string", "minLength": 1 },
+        "model_digest": { "type": "string", "minLength": 1 },
+        "custom_node_digest": { "type": "string", "minLength": 1 },
+        "driver": { "type": "string", "minLength": 1 },
+        "root": { "type": "string", "minLength": 1 },
+        "port": { "type": ["string", "integer"], "minimum": 0 }
+      }
+    },
+    "MinimumFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "vram_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "scratch_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     },
     "AttemptFence": {
@@ -48,6 +76,7 @@
         "runtime_epoch": { "type": "integer", "minimum": 1 },
         "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "spec": { "type": "object", "additionalProperties": true },
+        "required_facts": { "$ref": "#/definitions/VerifiedFacts" },
         "storage_estimate": {
           "type": "object", "additionalProperties": false,
           "required": ["scratch_bytes", "output_bytes"],
@@ -63,7 +92,7 @@
       "required": ["task", "waiting_reason"],
       "properties": {
         "task": { "$ref": "./task.json" },
-        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network"] }
+        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts"] }
       }
     },
     "Settlement": {

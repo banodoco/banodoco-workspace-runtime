@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .cas import ContentAddressedStore
 from .backup import create_backup, restore_backup, structured_export
-from .store import RealmStore
+from .store import RealmStore, normalize_execution_facts
 from .util import atomic_json_write
 from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 import hashlib
@@ -2154,6 +2154,8 @@ class RuntimeService:
         capability = body.get("capability_id")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
+        if "required_facts" in body:
+            task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
             task_spec["storage_estimate"] = self.store._validate_storage_estimate(body["storage_estimate"])
         value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness)
@@ -2175,6 +2177,8 @@ class RuntimeService:
         task, run = value["task"], value["run"]
         spec = task.get("spec", {})
         resource = {"task_id": task["id"], "run_id": run["id"], "project_id": run.get("project_id"), "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "spec": spec, "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id"), "runtime_epoch": int(task.get("runtime_epoch") or self.store._current_runtime_epoch())}
+        if "required_facts" in spec:
+            resource["required_facts"] = dict(spec["required_facts"])
         if "storage_estimate" in spec:
             resource["storage_estimate"] = dict(spec["storage_estimate"])
         if task.get("waiting_reason"):
@@ -2284,6 +2288,7 @@ class RuntimeService:
                 "executor_id", "max_concurrency", "resource_keys", "capabilities",
                 "protocol", "readiness", "readiness_reason", "runtime_epoch",
                 "source_digest", "dependency_digest", "source_epoch", "schema_digest",
+                "verified_facts",
             ),
         )
         executor_id = _wire_string(body, "executor_id")
@@ -2311,6 +2316,7 @@ class RuntimeService:
         if body.get("schema_digest") is not None:
             if not isinstance(body["schema_digest"], str) or body["schema_digest"] != SCHEMA_DIGEST:
                 raise ValidationError("schema_digest does not match the runtime contract")
+        verified_facts = normalize_execution_facts(body["verified_facts"], field="verified_facts") if "verified_facts" in body else None
         request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
         # Executor registration is an endpoint-scoped command.  The request
         # hash includes executor identity and all registration fields, so a
@@ -2352,8 +2358,10 @@ class RuntimeService:
             body.get("runtime_epoch"), identity="executor",
             identity_id=body.get("executor_id"), required=existing is not None,
         )
-        self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"))
+        self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts)
         result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
+        if verified_facts is not None:
+            result["verified_facts"] = verified_facts
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
     @_durable_mutation
@@ -2413,6 +2421,8 @@ class RuntimeService:
             # must execute exactly what was claimed, without a racy second read.
             admitted_spec = dict(task.get("spec") or {})
             result = {"attempt_id": attempt_id, "task_id": row["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            if "required_facts" in admitted_spec:
+                result["required_facts"] = dict(admitted_spec["required_facts"])
             if "storage_estimate" in admitted_spec:
                 result["storage_estimate"] = dict(admitted_spec["storage_estimate"])
         return self._command_record("task.claim", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)

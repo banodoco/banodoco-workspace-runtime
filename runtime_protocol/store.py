@@ -28,6 +28,63 @@ OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 # JSON clients (including TypeScript) must be able to preserve the exact byte
 # count used in the admission hash.  Stay within IEEE-754's safe integer range.
 MAX_STORAGE_ESTIMATE_BYTES = (1 << 53) - 1
+FACT_EXACT_KEYS = frozenset({
+    "interpreter", "runtime_lock", "engine_lock", "model_digest",
+    "custom_node_digest", "driver", "root", "port",
+})
+FACT_MINIMUM_KEYS = frozenset({"vram_bytes", "scratch_bytes"})
+
+
+def normalize_execution_facts(value, *, field="execution facts"):
+    """Validate the small engine-neutral required/verified-facts contract."""
+    if not isinstance(value, dict):
+        raise ValidationError(f"{field} must be an object")
+    unknown = set(value) - {"exact", "minimum"}
+    if unknown:
+        raise ValidationError(f"{field} contains unsupported fields", details={"fields": sorted(unknown)})
+    exact = value.get("exact", {})
+    minimum = value.get("minimum", {})
+    if not isinstance(exact, dict) or not isinstance(minimum, dict):
+        raise ValidationError(f"{field}.exact and {field}.minimum must be objects")
+    unknown_exact = set(exact) - FACT_EXACT_KEYS
+    if unknown_exact:
+        raise ValidationError(f"{field}.exact contains unsupported facts", details={"facts": sorted(unknown_exact)})
+    unknown_minimum = set(minimum) - FACT_MINIMUM_KEYS
+    if unknown_minimum:
+        raise ValidationError(f"{field}.minimum contains unsupported facts", details={"facts": sorted(unknown_minimum)})
+    normalized_exact = {}
+    for key, fact in exact.items():
+        if key == "port":
+            if isinstance(fact, bool) or not isinstance(fact, (str, int)) or not fact:
+                raise ValidationError(f"{field}.exact.port must be a non-empty string or integer")
+            if isinstance(fact, int) and not 0 <= fact <= 65535:
+                raise ValidationError(f"{field}.exact.port is out of range")
+        elif not isinstance(fact, str) or not fact:
+            raise ValidationError(f"{field}.exact.{key} must be a non-empty string")
+        normalized_exact[key] = fact
+    normalized_minimum = {}
+    for key, fact in minimum.items():
+        if isinstance(fact, bool) or not isinstance(fact, int):
+            raise ValidationError(f"{field}.minimum.{key} must be an integer")
+        if fact < 0 or fact > MAX_STORAGE_ESTIMATE_BYTES:
+            raise ValidationError(f"{field}.minimum.{key} is out of range")
+        normalized_minimum[key] = fact
+    return {"exact": normalized_exact, "minimum": normalized_minimum}
+
+
+def execution_facts_match(required, verified):
+    """Return whether verified facts satisfy every task-selected fact."""
+    required = normalize_execution_facts(required, field="required_facts")
+    verified = normalize_execution_facts(verified, field="verified_facts")
+    verified_exact = verified["exact"]
+    for key, expected in required["exact"].items():
+        if key not in verified_exact or verified_exact[key] != expected:
+            return False
+    verified_minimum = verified["minimum"]
+    for key, expected in required["minimum"].items():
+        if key not in verified_minimum or verified_minimum[key] < expected:
+            return False
+    return True
 
 
 class RealmStore:
@@ -748,6 +805,9 @@ class RealmStore:
     def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False):
         if not capability:
             raise ValidationError("capability is required")
+        if isinstance(spec, dict) and "required_facts" in spec:
+            spec = dict(spec)
+            spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
         predecessors = self._continuation_predecessors(spec)
         with self._mutex:
             project_id = self._project(project)["id"] if project else None
@@ -804,11 +864,14 @@ class RealmStore:
                     # and live executor registration is present.
                     waiting_reason = "capability_unavailable" if capability_digest is not None else None
                 storage_estimate = spec.get("storage_estimate")
-                if enforce_readiness and waiting_reason is None and not self.matching_live_executor(capability, capability_digest, include_storage=False):
+                if enforce_readiness and waiting_reason is None and not self.matching_live_executor(capability, capability_digest, include_storage=False, required_facts=spec.get("required_facts")):
                     # Queue the durable task while making the unavailable
                     # readiness explicit. Claiming remains impossible until a
                     # matching live executor appears.
-                    waiting_reason = "capability_unavailable"
+                    if spec.get("required_facts") and self.matching_live_executor(capability, capability_digest, include_storage=False):
+                        waiting_reason = "waiting_for_executor_facts"
+                    else:
+                        waiting_reason = "capability_unavailable"
                 if waiting_reason is None and not self.storage_preflight(capability, storage_estimate=storage_estimate)["ok"]:
                     waiting_reason = "insufficient_storage"
                 if predecessors:
@@ -970,6 +1033,8 @@ class RealmStore:
     def _task_result(self, run, task):
         result = dict(task)
         result["spec"] = json.loads(result.pop("spec_json"))
+        if "required_facts" in result["spec"]:
+            result["required_facts"] = dict(result["spec"]["required_facts"])
         if result.get("expected_effect_json"):
             result["expected_effect"] = json.loads(result.pop("expected_effect_json"))
         else:
@@ -1175,9 +1240,23 @@ class RealmStore:
 
     def _executor_result(self, row):
         result = dict(row)
-        result["capabilities"] = json.loads(result.pop("capabilities_json"))
+        stored_capabilities = json.loads(result.pop("capabilities_json"))
+        verified_facts = None
+        capabilities = []
+        for value in stored_capabilities:
+            if isinstance(value, dict) and "verified_facts" in value:
+                candidate = value["verified_facts"]
+                if verified_facts is None:
+                    verified_facts = candidate
+                elif verified_facts != candidate:
+                    raise ValidationError("executor capability facts are inconsistent")
+                value = {key: fact for key, fact in value.items() if key != "verified_facts"}
+            capabilities.append(value)
+        result["capabilities"] = capabilities
         result["resource_keys"] = json.loads(result.pop("resource_keys_json"))
         result.setdefault("readiness", "ready")
+        if verified_facts is not None:
+            result["verified_facts"] = verified_facts
         return result
 
     def _executor_capability_ids(self, row):
@@ -1203,7 +1282,7 @@ class RealmStore:
             return False
         return seen > datetime.now(timezone.utc) - timedelta(seconds=EXECUTOR_LIVENESS_SECONDS)
 
-    def _executor_can_run(self, executor, capability_id, capability_digest=None, *, include_storage=True):
+    def _executor_can_run(self, executor, capability_id, capability_digest=None, *, include_storage=True, required_facts=None):
         if not executor or executor["readiness"] != "ready" or not self._executor_live(executor):
             return False
         descriptor = self._executor_capability(executor, capability_id)
@@ -1217,14 +1296,18 @@ class RealmStore:
         advertised_digest = descriptor.get("definition_digest")
         if advertised_digest and advertised_digest != capability["definition_digest"]:
             return False
+        if required_facts is not None:
+            verified_facts = descriptor.get("verified_facts", {"exact": {}, "minimum": {}})
+            if not execution_facts_match(required_facts, verified_facts):
+                return False
         available = set(json.loads(executor["resource_keys_json"]))
         for key in self._required_resource_keys(capability_id):
             if key not in available:
                 return False
         return not include_storage or self.storage_preflight(capability_id)["ok"]
 
-    def matching_live_executor(self, capability_id, capability_digest=None, *, include_storage=True):
-        return any(self._executor_can_run(row, capability_id, capability_digest, include_storage=include_storage) for row in self.conn.execute("SELECT * FROM executors"))
+    def matching_live_executor(self, capability_id, capability_digest=None, *, include_storage=True, required_facts=None):
+        return any(self._executor_can_run(row, capability_id, capability_digest, include_storage=include_storage, required_facts=required_facts) for row in self.conn.execute("SELECT * FROM executors"))
 
     def _required_resource_keys(self, capability):
         row = self.conn.execute("SELECT required_resource_keys_json FROM capabilities WHERE id=?", (capability,)).fetchone()
@@ -1299,6 +1382,13 @@ class RealmStore:
                     waiting_reason = "capability_unavailable"
                 elif (self._executor_capability(executor, task["capability"]) or {}).get("status", "ready") != "ready":
                     waiting_reason = "waiting_for_worker"
+                elif not execution_facts_match(
+                    task_spec.get("required_facts", {"exact": {}, "minimum": {}}),
+                    (self._executor_capability(executor, task["capability"]) or {}).get(
+                        "verified_facts", {"exact": {}, "minimum": {}
+                    }),
+                ):
+                    waiting_reason = "waiting_for_executor_facts"
                 else:
                     active = self.conn.execute("SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,)).fetchone()[0]
                     if active >= executor["max_concurrency"]:
@@ -1327,7 +1417,7 @@ class RealmStore:
                 self._append_event(task["run_id"], task_id, "task.claimed", {"executor_id": executor_id, "attempt": task["attempt"] + 1, "fence": fence, "resource_keys": self._required_resource_keys(task["capability"])})
                 return self.get_task(task_id)
 
-    def upsert_executor(self, executor_id, capabilities, max_concurrency=1, resource_keys=None, *, protocol="workspace.v1", readiness="ready", readiness_reason=None, runtime_epoch=None, source_digest=None, dependency_digest=None, source_epoch=None):
+    def upsert_executor(self, executor_id, capabilities, max_concurrency=1, resource_keys=None, *, protocol="workspace.v1", readiness="ready", readiness_reason=None, runtime_epoch=None, source_digest=None, dependency_digest=None, source_epoch=None, verified_facts=None):
         if not executor_id or max_concurrency < 1:
             raise ValidationError("executor_id and positive max_concurrency are required")
         if readiness not in {"ready", "not_ready"}:
@@ -1338,6 +1428,7 @@ class RealmStore:
             # registration side effects.
             epoch = self._validate_runtime_epoch(runtime_epoch, identity="executor", identity_id=executor_id)
             capability_values = list(capabilities or [])
+            normalized_facts = normalize_execution_facts(verified_facts, field="verified_facts") if verified_facts is not None else None
             capability_ids = []
             descriptors = []
             for value in capability_values:
@@ -1369,8 +1460,16 @@ class RealmStore:
             for capability_id in capability_ids:
                 if not self.conn.execute("SELECT 1 FROM capabilities WHERE id=?", (capability_id,)).fetchone():
                     self.register_capability(capability_id, "sha256:" + hashlib.sha256(str(capability_id).encode()).hexdigest(), required_resource_keys=[])
+            stored_capabilities = capability_values
+            if normalized_facts is not None:
+                stored_capabilities = []
+                for value in capability_values:
+                    if isinstance(value, str):
+                        stored_capabilities.append({"capability_id": value, "verified_facts": normalized_facts})
+                    else:
+                        stored_capabilities.append({**value, "verified_facts": normalized_facts})
             timestamp = now()
-            self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at, source_digest, dependency_digest, source_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch, source_digest=excluded.source_digest, dependency_digest=excluded.dependency_digest, source_epoch=excluded.source_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp, source_digest, dependency_digest, source_epoch))
+            self.conn.execute("INSERT INTO executors(id, max_concurrency, resource_keys_json, capabilities_json, protocol, created_at, runtime_epoch, readiness, readiness_reason, last_seen_at, source_digest, dependency_digest, source_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET capabilities_json=excluded.capabilities_json, max_concurrency=excluded.max_concurrency, resource_keys_json=excluded.resource_keys_json, protocol=excluded.protocol, readiness=excluded.readiness, readiness_reason=excluded.readiness_reason, last_seen_at=excluded.last_seen_at, runtime_epoch=excluded.runtime_epoch, source_digest=excluded.source_digest, dependency_digest=excluded.dependency_digest, source_epoch=excluded.source_epoch", (executor_id, max_concurrency, canonical_json(keys), canonical_json(stored_capabilities), protocol, timestamp, epoch, readiness, None if readiness == "ready" else (readiness_reason or "executor_not_ready"), timestamp, source_digest, dependency_digest, source_epoch))
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             return self._executor_result(row)
 

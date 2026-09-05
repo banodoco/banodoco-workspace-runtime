@@ -659,6 +659,7 @@ components:
         capability_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
         schema_version: { type: string, minLength: 1 }
         input_object_ids: { type: array, items: { type: string, description: Canonical sha256 object ID already associated with the task project. }, uniqueItems: true }
+        required_facts: { $ref: './schemas/task.json#/definitions/RequiredFacts' }
         project: { type: string, description: Project selector whose managed-object associations authorize input_object_ids and output settlement. }
         spec: { type: object, additionalProperties: true }
         settlement_effect: { type: object, additionalProperties: true }
