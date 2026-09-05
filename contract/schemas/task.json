@@ -20,6 +20,7 @@
     "attempt_id": { "type": ["string", "null"] },
     "runtime_epoch": { "type": "integer", "minimum": 1 },
     "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "required_facts": { "$ref": "#/definitions/RequiredFacts" },
     "spec": { "type": "object", "additionalProperties": true },
     "storage_estimate": {
       "type": "object", "additionalProperties": false,
@@ -33,5 +34,34 @@
     ,"lease_fence": { "type": "integer", "minimum": 1 }
     ,"lease_expires_at": { "type": "string", "format": "date-time" }
     ,"result": { "type": "object", "additionalProperties": true }
+  },
+  "definitions": {
+    "RequiredFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "exact": { "$ref": "#/definitions/ExactFacts" },
+        "minimum": { "$ref": "#/definitions/MinimumFacts" }
+      }
+    },
+    "ExactFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "interpreter": { "type": "string", "minLength": 1 },
+        "runtime_lock": { "type": "string", "minLength": 1 },
+        "engine_lock": { "type": "string", "minLength": 1 },
+        "model_digest": { "type": "string", "minLength": 1 },
+        "custom_node_digest": { "type": "string", "minLength": 1 },
+        "driver": { "type": "string", "minLength": 1 },
+        "root": { "type": "string", "minLength": 1 },
+        "port": { "type": ["string", "integer"], "minimum": 0 }
+      }
+    },
+    "MinimumFacts": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "vram_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "scratch_bytes": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    }
   }
 }
