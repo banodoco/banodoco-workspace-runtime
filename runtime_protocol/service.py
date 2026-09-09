@@ -2517,7 +2517,7 @@ class RuntimeService:
             for index, output in enumerate(outputs):
                 if not isinstance(output, dict):
                     raise ValidationError("each output must be an object")
-                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64"}
+                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role", "is_primary"}
                 unknown = sorted(set(output) - allowed)
                 if unknown:
                     raise ValidationError("output contains unsupported fields", details={"fields": unknown})
@@ -2598,6 +2598,15 @@ class RuntimeService:
                             os.close(root_fd)
                     if declared_size is not None and declared_size != size:
                         raise ValidationError("output size does not match CAS bytes")
+                ordinal = output.get("ordinal")
+                if ordinal is not None and (isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0):
+                    raise ValidationError("output ordinal must be a non-negative integer")
+                role = output.get("role")
+                if role is not None and (not isinstance(role, str) or not role or len(role) > 255 or any(ord(char) < 32 for char in role)):
+                    raise ValidationError("output role is invalid")
+                is_primary = output.get("is_primary")
+                if is_primary is not None and not isinstance(is_primary, bool):
+                    raise ValidationError("output is_primary must be a boolean")
                 existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
@@ -2607,6 +2616,12 @@ class RuntimeService:
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 normalized = {"name": name, "kind": kind, "digest": digest_value, "media_type": media_type, "size": size}
+                if ordinal is not None:
+                    normalized["ordinal"] = ordinal
+                if role is not None:
+                    normalized["role"] = role
+                if is_primary is not None:
+                    normalized["is_primary"] = is_primary
                 staged.append({"digest": digest, "path": stage_path, "size": size, "media_type": media_type, "name": name, "output": normalized})
             return {"stage_dir": stage_dir, "attempt_id": attempt_id, "items": staged, "outputs": [item["output"] for item in staged]}
         except Exception:
