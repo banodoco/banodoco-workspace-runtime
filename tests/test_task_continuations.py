@@ -91,19 +91,20 @@ def _claim_children(service: RuntimeService, child_ids: list[str], prefix: str):
     return by_task_id
 
 
-def _settle(service: RuntimeService, attempt: dict, key: str, payload: bytes):
+def _settle(service: RuntimeService, attempt: dict, key: str, payload: bytes, *, duration_seconds: float | None = None):
+    output = {
+        "digest": _digest(payload),
+        "data_base64": base64.b64encode(payload).decode("ascii"),
+    }
+    if duration_seconds is not None:
+        output["duration_seconds"] = duration_seconds
     return service.settle_attempt(
         attempt["attempt_id"],
         {
             "lease_id": attempt["lease_id"],
             "fence": attempt["fence"],
             "runtime_epoch": attempt["runtime_epoch"],
-            "outputs": [
-                {
-                    "digest": _digest(payload),
-                    "data_base64": base64.b64encode(payload).decode("ascii"),
-                }
-            ],
+            "outputs": [output],
         },
         idempotency_key=key,
     )
@@ -132,10 +133,10 @@ def test_out_of_order_completion_admits_once_in_declared_order_and_paginates(tmp
         assert continuation["task"]["waiting_reason"] == "waiting_for_dependencies"
 
         attempts = _claim_children(service, child_ids, "claim-child")
-        _settle(service, attempts[child_ids[1]], "settle-second", b"second-output")
+        _settle(service, attempts[child_ids[1]], "settle-second", b"second-output", duration_seconds=2.5)
         assert service.task(continuation_id)["task"]["waiting_reason"] == "waiting_for_dependencies"
-        settled = _settle(service, attempts[child_ids[0]], "settle-first", b"first-output")
-        assert _settle(service, attempts[child_ids[0]], "settle-first", b"first-output") == settled
+        settled = _settle(service, attempts[child_ids[0]], "settle-first", b"first-output", duration_seconds=1.25)
+        assert _settle(service, attempts[child_ids[0]], "settle-first", b"first-output", duration_seconds=1.25) == settled
         with pytest.raises(ConflictError, match="different input"):
             _settle(service, attempts[child_ids[0]], "settle-first", b"changed-output")
 
@@ -145,6 +146,7 @@ def test_out_of_order_completion_admits_once_in_declared_order_and_paginates(tmp
         resolved = ready["spec"]["spec"]["runtime_dependencies"]["resolved_children"]
         assert [item["task_id"] for item in resolved] == child_ids
         assert [item["ordinal"] for item in resolved] == [0, 1]
+        assert [item["outputs"][0]["duration_seconds"] for item in resolved] == [1.25, 2.5]
 
         events = _event_pages(service, continuation["run"]["id"])
         assert [event["event_type"] for event in events] == ["task.admitted", "task.continuation_admitted"]

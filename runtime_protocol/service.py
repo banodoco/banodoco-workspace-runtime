@@ -2686,7 +2686,7 @@ class RuntimeService:
             for index, output in enumerate(outputs):
                 if not isinstance(output, dict):
                     raise ValidationError("each output must be an object")
-                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role", "is_primary"}
+                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role", "is_primary", "duration_seconds"}
                 unknown = sorted(set(output) - allowed)
                 if unknown:
                     raise ValidationError("output contains unsupported fields", details={"fields": unknown})
@@ -2776,6 +2776,14 @@ class RuntimeService:
                 is_primary = output.get("is_primary")
                 if is_primary is not None and not isinstance(is_primary, bool):
                     raise ValidationError("output is_primary must be a boolean")
+                duration_seconds = output.get("duration_seconds")
+                if duration_seconds is not None and (
+                    isinstance(duration_seconds, bool)
+                    or not isinstance(duration_seconds, (int, float))
+                    or not math.isfinite(float(duration_seconds))
+                    or float(duration_seconds) <= 0
+                ):
+                    raise ValidationError("output duration_seconds must be a positive finite number")
                 existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
@@ -2791,6 +2799,8 @@ class RuntimeService:
                     normalized["role"] = role
                 if is_primary is not None:
                     normalized["is_primary"] = is_primary
+                if duration_seconds is not None:
+                    normalized["duration_seconds"] = duration_seconds
                 staged.append({"digest": digest, "path": stage_path, "size": size, "media_type": media_type, "name": name, "output": normalized})
             return {"stage_dir": stage_dir, "attempt_id": attempt_id, "items": staged, "outputs": [item["output"] for item in staged]}
         except Exception:
