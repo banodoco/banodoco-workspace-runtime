@@ -9,6 +9,7 @@ import hashlib
 import json
 import sqlite3
 import base64
+import copy
 import os
 import re
 import uuid
@@ -404,6 +405,109 @@ class RuntimeService:
             event_id = self.store._append_timeline_event(timeline_id, "timeline.updated", {"project_id": project_id, "version": resource["version"]})
             event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
             return self._command_record("timeline.update", timeline_id, idempotency_key, request_hash, resource, project_id=project_id, event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
+
+    @_durable_mutation
+    def replace_timeline_clip(self, timeline_id, body, *, idempotency_key=None):
+        """Replace one canonical composition clip with a project-owned object."""
+        self._require_object_body(body)
+        expected = self._expected_version(body)
+        clip_id = body.get("clip_id")
+        source_object_id = body.get("source_object_id")
+        timing = body.get("timing", "preserve-duration")
+        if not isinstance(clip_id, str) or not clip_id:
+            raise ValidationError("clip_id is required")
+        if not isinstance(source_object_id, str) or not source_object_id:
+            raise ValidationError("source_object_id is required")
+        if timing != "preserve-duration":
+            raise ValidationError("timing must be preserve-duration")
+
+        timeline = self.store.conn.execute("SELECT * FROM timelines WHERE id=?", (timeline_id,)).fetchone()
+        if not timeline:
+            raise NotFoundError("timeline not found")
+        project_id = str(timeline["project_id"])
+        request = {
+            "timeline_id": timeline_id,
+            "clip_id": clip_id,
+            "source_object_id": source_object_id,
+            "expected_version": expected,
+            "timing": timing,
+        }
+        request_hash = hashlib.sha256(canonical_json(request).encode()).hexdigest()
+        replay = self._command_replay("timeline.clip.replace", timeline_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+
+        document_id = f"timeline:{timeline_id}"
+        document = self.store.conn.execute(
+            "SELECT * FROM project_documents WHERE id=? AND project_id=?",
+            (document_id, project_id),
+        ).fetchone()
+        if not document:
+            raise NotFoundError("timeline composition document not found")
+        if int(document["version"]) != expected:
+            raise ConflictError("timeline composition version conflict", details={"expected": expected, "actual": int(document["version"])})
+
+        digest = source_object_id.removeprefix("sha256:")
+        source = self.store.conn.execute(
+            "SELECT objects.* FROM objects JOIN project_objects ON project_objects.digest=objects.digest "
+            "WHERE objects.digest=? AND project_objects.project_id=? AND project_objects.relation='managed'",
+            (digest, project_id),
+        ).fetchone()
+        if not source:
+            raise NotFoundError("managed source object not found in timeline project", details={"source_object_id": source_object_id, "project_id": project_id})
+
+        content = json.loads(document["content_json"])
+        config = content.get("config") if isinstance(content, dict) else None
+        registry = content.get("registry") if isinstance(content, dict) else None
+        clips = config.get("clips") if isinstance(config, dict) else None
+        assets = registry.get("assets") if isinstance(registry, dict) else None
+        if not isinstance(clips, list):
+            raise ValidationError("timeline config.clips must be a list")
+        if not isinstance(assets, dict):
+            raise ValidationError("timeline registry.assets must be an object")
+        matches = [clip for clip in clips if isinstance(clip, dict) and clip.get("id") == clip_id]
+        if len(matches) != 1:
+            raise ValidationError("clip_id must identify exactly one clip", details={"clip_id": clip_id, "match_count": len(matches)})
+        target = matches[0]
+        if target.get("clipType", "media") not in {"media", "image", "video", "audio"}:
+            raise ValidationError("selected clip is not a media clip", details={"clip_id": clip_id})
+        old_asset_id = target.get("asset")
+        if not isinstance(old_asset_id, str) or not isinstance(assets.get(old_asset_id), Mapping):
+            raise ValidationError("selected clip must reference an existing registry asset", details={"clip_id": clip_id})
+
+        changed_content = copy.deepcopy(content)
+        changed_config = changed_content["config"]
+        changed_registry = changed_content["registry"]
+        changed_target = next(clip for clip in changed_config["clips"] if isinstance(clip, dict) and clip.get("id") == clip_id)
+        canonical_object_id = "sha256:" + digest
+        existing = changed_registry["assets"].get(canonical_object_id)
+        asset_entry = {
+            "media_id": canonical_object_id,
+            "content_sha256": digest,
+            "type": str(source["media_type"]),
+        }
+        if existing is not None and existing != asset_entry:
+            raise ConflictError("source object id collides with a different registry asset", details={"source_object_id": canonical_object_id})
+        changed_registry["assets"][canonical_object_id] = asset_entry
+        changed_target["asset"] = canonical_object_id
+
+        timestamp = now()
+        self.store.conn.execute(
+            "UPDATE project_documents SET content_json=?, version=?, updated_at=? WHERE id=? AND project_id=?",
+            (canonical_json(changed_content), expected + 1, timestamp, document_id, project_id),
+        )
+        resource = self._timeline_resource(timeline_id)
+        event_id = self.store._append_timeline_event(
+            timeline_id,
+            "timeline.clip.replaced",
+            {"project_id": project_id, "clip_id": clip_id, "source_object_id": canonical_object_id, "config_version": expected + 1},
+        )
+        event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
+        return self._command_record(
+            "timeline.clip.replace", timeline_id, idempotency_key, request_hash, resource,
+            project_id=project_id, event_ids=(event_id,), primary_stream_id=timeline_id,
+            resulting_stream_seq=event_seq,
+        )
 
     @_durable_mutation
     def create_timeline(self, project_id, timeline_id, *, idempotency_key=None):

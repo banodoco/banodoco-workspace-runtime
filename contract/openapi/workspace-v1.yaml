@@ -179,6 +179,13 @@ paths:
       operationId: listTimelineHistory
       parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Timeline revisions, content: { application/json: { schema: { $ref: '#/components/schemas/TimelineRevisionPage' } } } } }
+  /v1/timelines/{timeline_id}/replace-clip:
+    post:
+      operationId: replaceTimelineClip
+      description: Atomically replace one explicit composition clip with a managed object owned by the timeline project while preserving authored timing and unrelated document state.
+      parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/timeline-clip-replacement.json' } } } }
+      responses: { '200': { description: Updated canonical timeline with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/timelines/{timeline_id}/diff:
     get:
       operationId: diffTimeline

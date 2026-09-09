@@ -198,6 +198,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._identity("projects:read"); return self._send(200, self.runtime._timeline_resource(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
             self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body(), idempotency_key=self._idempotency_key()))
+        if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] == "replace-clip" and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.replace_timeline_clip(path[2], self._body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("history", "diff") and method == "GET":
             self._identity("projects:read")
             query = parse_qs(urlsplit(self.path).query)
