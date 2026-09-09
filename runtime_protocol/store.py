@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
@@ -216,6 +216,9 @@ class RealmStore:
         if version < 21:
             self._run_migration(21)
             version = 21
+        if version < 22:
+            self._run_migration(22)
+            version = 22
 
     def _run_receipt_backfill_migration(self):
         """Backfill pre-016 rows inside one retryable migration transaction."""
@@ -745,6 +748,7 @@ class RealmStore:
     def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False):
         if not capability:
             raise ValidationError("capability is required")
+        predecessors = self._continuation_predecessors(spec)
         with self._mutex:
             project_id = self._project(project)["id"] if project else None
             self._validate_task_inputs(project_id, spec)
@@ -807,20 +811,161 @@ class RealmStore:
                     waiting_reason = "capability_unavailable"
                 if waiting_reason is None and not self.storage_preflight(capability, storage_estimate=storage_estimate)["ok"]:
                     waiting_reason = "insufficient_storage"
+                if predecessors:
+                    self._validate_continuation_predecessors(predecessors, project_id)
+                    waiting_reason = "waiting_for_dependencies"
                 timestamp, run_id, task_id = now(), new_id(), new_id()
                 self.conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)", (run_id, project_id, capability, canonical_json(spec), idempotency_key, timestamp, timestamp))
                 self.conn.execute("INSERT INTO tasks(id, run_id, capability, spec_json, status, capability_digest, waiting_reason, expected_effect_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)", (task_id, run_id, capability, canonical_json(spec), capability_digest, waiting_reason, canonical_json(expected_effect) if expected_effect else None, timestamp, timestamp))
                 admitted_event_id = self._append_event(run_id, task_id, "task.admitted", {"capability": capability})
+                event_ids = [admitted_event_id]
+                if predecessors:
+                    for ordinal, predecessor_task_id in enumerate(predecessors):
+                        self.conn.execute(
+                            "INSERT INTO task_dependencies(continuation_task_id, predecessor_task_id, ordinal) VALUES (?, ?, ?)",
+                            (task_id, predecessor_task_id, ordinal),
+                        )
+                    continuation_event = self._admit_continuation(task_id)
+                    if continuation_event is not None:
+                        event_ids.append(continuation_event)
                 run = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
                 task = dict(self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone())
                 result = self._task_result(run, task)
                 if idempotency_key:
                     self._record_command_receipt(
                         "task.create", aggregate_id, idempotency_key, request_hash,
-                        result, project_id=project_id or "unscoped", event_ids=[admitted_event_id],
-                        primary_stream_id=run_id, resulting_stream_seq=1, created_at=timestamp,
+                        result, project_id=project_id or "unscoped", event_ids=event_ids,
+                        primary_stream_id=run_id, resulting_stream_seq=len(event_ids), created_at=timestamp,
                     )
                 return result
+
+    @staticmethod
+    def _continuation_predecessors(spec):
+        """Return the ordered predecessor ids for the bounded continuation form."""
+        public_spec = spec.get("spec") if isinstance(spec, dict) else None
+        dependencies = public_spec.get("runtime_dependencies") if isinstance(public_spec, dict) else None
+        if dependencies is None:
+            return ()
+        if not isinstance(dependencies, dict):
+            raise ValidationError("runtime_dependencies must be an object")
+        edges = dependencies.get("edges")
+        if not isinstance(edges, list) or len(edges) != 2:
+            raise ValidationError("runtime continuation requires exactly two ordered dependency edges")
+        aggregation = dependencies.get("aggregation")
+        if not isinstance(aggregation, dict) or aggregation.get("kind") != "ordered_cas_inputs":
+            raise ValidationError("runtime continuation requires ordered_cas_inputs aggregation")
+        if spec.get("input_object_ids"):
+            raise ValidationError("runtime continuation inputs are derived from predecessor outputs")
+        predecessors = []
+        for edge in edges:
+            if not isinstance(edge, dict):
+                raise ValidationError("runtime dependency edges must be objects")
+            predecessor = edge.get("from_task_id")
+            if not isinstance(predecessor, str) or not predecessor:
+                raise ValidationError("runtime dependency edge requires from_task_id")
+            if edge.get("to") != "self" or edge.get("requires_event") != "task.succeeded" or edge.get("fence") != "runtime_task":
+                raise ValidationError("runtime dependency edge must require fenced task.succeeded for self")
+            predecessors.append(predecessor)
+        if len(set(predecessors)) != 2:
+            raise ValidationError("runtime continuation predecessor task ids must be unique")
+        return tuple(predecessors)
+
+    def _validate_continuation_predecessors(self, predecessors, project_id):
+        for predecessor_task_id in predecessors:
+            row = self.conn.execute(
+                "SELECT runs.project_id FROM tasks JOIN runs ON runs.id=tasks.run_id WHERE tasks.id=?",
+                (predecessor_task_id,),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("runtime continuation predecessor task not found", details={"task_id": predecessor_task_id})
+            if row["project_id"] != project_id:
+                raise ConflictError("runtime continuation predecessor is outside the task project", details={"task_id": predecessor_task_id})
+
+    def _continuation_rows(self, task_id):
+        return self.conn.execute(
+            "SELECT dependency.ordinal, predecessor.id AS task_id, predecessor.status, predecessor.result_json "
+            "FROM task_dependencies AS dependency "
+            "JOIN tasks AS predecessor ON predecessor.id=dependency.predecessor_task_id "
+            "WHERE dependency.continuation_task_id=? ORDER BY dependency.ordinal",
+            (task_id,),
+        ).fetchall()
+
+    def _continuation_waiting_reason(self, rows):
+        statuses = [row["status"] for row in rows]
+        if "cancelled" in statuses:
+            return "dependency_cancelled"
+        if "failed" in statuses:
+            return "dependency_failed"
+        if any(status != "completed" for status in statuses):
+            return "waiting_for_dependencies"
+        return None
+
+    def _admit_continuation(self, task_id):
+        """Materialize ordered inputs once, inside the caller's transaction."""
+        rows = self._continuation_rows(task_id)
+        if not rows:
+            return None
+        task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not task or task["status"] != "queued":
+            return None
+        if self.conn.execute("SELECT 1 FROM continuation_admissions WHERE continuation_task_id=?", (task_id,)).fetchone():
+            return None
+        reason = self._continuation_waiting_reason(rows)
+        if reason is not None:
+            self._set_waiting_reason(task_id, reason)
+            return None
+
+        resolved_children = []
+        ordered_inputs = []
+        for row in rows:
+            result = json.loads(row["result_json"] or "{}")
+            outputs = result.get("outputs")
+            if not isinstance(outputs, list):
+                raise ValidationError("runtime continuation predecessor result has no outputs", details={"task_id": row["task_id"]})
+            child_outputs = []
+            for output in outputs:
+                digest = output.get("digest") if isinstance(output, dict) else None
+                if not isinstance(digest, str) or not OBJECT_ID_RE.fullmatch(digest):
+                    raise ValidationError("runtime continuation predecessor output is invalid", details={"task_id": row["task_id"]})
+                # Keep the complete already-validated settlement identity
+                # (including role/ordinal/primary fields when present) while
+                # deriving the claim's unique CAS input list from its digest.
+                child_outputs.append(dict(output))
+                if digest not in ordered_inputs:
+                    ordered_inputs.append(digest)
+            resolved_children.append({"task_id": row["task_id"], "ordinal": int(row["ordinal"]), "outputs": child_outputs})
+
+        spec = json.loads(task["spec_json"])
+        spec["input_object_ids"] = ordered_inputs
+        spec["spec"]["runtime_dependencies"]["resolved_children"] = resolved_children
+        run = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()
+        self._validate_task_inputs(run["project_id"], spec)
+        snapshot = {"children": resolved_children, "input_object_ids": ordered_inputs}
+        timestamp = now()
+        self.conn.execute(
+            "INSERT INTO continuation_admissions(continuation_task_id, dependency_snapshot_json, admitted_at) VALUES (?, ?, ?)",
+            (task_id, canonical_json(snapshot), timestamp),
+        )
+        self.conn.execute(
+            "UPDATE tasks SET spec_json=?, waiting_reason=NULL, updated_at=? WHERE id=? AND status='queued'",
+            (canonical_json(spec), timestamp, task_id),
+        )
+        return self._append_event(task["run_id"], task_id, "task.continuation_admitted", snapshot)
+
+    def _refresh_continuations_for_predecessor(self, predecessor_task_id):
+        rows = self.conn.execute(
+            "SELECT continuation_task_id FROM task_dependencies WHERE predecessor_task_id=? ORDER BY continuation_task_id",
+            (predecessor_task_id,),
+        ).fetchall()
+        event_ids = []
+        for row in rows:
+            event_id = self._admit_continuation(row["continuation_task_id"])
+            if event_id is not None:
+                event_ids.append(event_id)
+            if not self.conn.execute("SELECT 1 FROM continuation_admissions WHERE continuation_task_id=?", (row["continuation_task_id"],)).fetchone():
+                dependencies = self._continuation_rows(row["continuation_task_id"])
+                self._set_waiting_reason(row["continuation_task_id"], self._continuation_waiting_reason(dependencies))
+        return event_ids
 
     def _task_result(self, run, task):
         result = dict(task)
@@ -1119,6 +1264,16 @@ class RealmStore:
                     raise NotFoundError("task not found")
                 if task["status"] != "queued":
                     raise ConflictError("task is not claimable", details={"status": task["status"]})
+                dependency_rows = self._continuation_rows(task_id)
+                if dependency_rows and not self.conn.execute(
+                    "SELECT 1 FROM continuation_admissions WHERE continuation_task_id=?", (task_id,)
+                ).fetchone():
+                    self._admit_continuation(task_id)
+                    if not self.conn.execute(
+                        "SELECT 1 FROM continuation_admissions WHERE continuation_task_id=?", (task_id,)
+                    ).fetchone():
+                        return self.get_task(task_id)
+                    task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
                 executor = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
                 capability = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (task["capability"],)).fetchone()
                 task_spec = json.loads(task["spec_json"])
@@ -1291,9 +1446,10 @@ class RealmStore:
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
                 event_id = self._append_event(task["run_id"], task_id, "task.completed", {"result": result, "effect": effect, "objects": result.get("outputs", [])})
+                continuation_event_ids = self._refresh_continuations_for_predecessor(task_id)
                 value = self.get_task(task_id)
                 if record is not None:
-                    record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
+                    record(value, event_ids=[event_id, *continuation_event_ids], primary_stream_id=task["run_id"], resulting_stream_seq=None)
                 return value
 
     def heartbeat_task(self, task_id, lease_token, *, fence=None, lease_seconds=LEASE_SECONDS, record=None):
@@ -1337,6 +1493,7 @@ class RealmStore:
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
                 event_id = self._append_event(task["run_id"], task_id, "task.cancelled", {})
+                self._refresh_continuations_for_predecessor(task_id)
                 value = self.get_task(task_id)
                 if record is not None:
                     record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
@@ -1367,6 +1524,7 @@ class RealmStore:
                     self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
                     self._release_reservations(task["id"], task["lease_token"])
                     self._append_event(run_id, task["id"], "task.cancelled", {"reason": "run.cancelled"})
+                    self._refresh_continuations_for_predecessor(task["id"])
                     cancelled.append(task["id"])
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (timestamp, run_id))
                 self._append_event(run_id, None, "run.cancelled", {"task_ids": cancelled})
@@ -1414,6 +1572,7 @@ class RealmStore:
                     self._release_reservations(task["id"], task["lease_token"])
                     self.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
                     self._append_event(run_id, task["id"], "task.retried", {"from_status": "failed", "attempt": int(task["attempt"] or 0) + 1, "reason": "run.retry"})
+                    self._refresh_continuations_for_predecessor(task["id"])
                     retried.append(task["id"])
                 self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, run_id))
                 self._append_event(run_id, None, "run.retried", {"task_ids": retried})
@@ -1446,6 +1605,7 @@ class RealmStore:
                     self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
                 event_id = self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
+                self._refresh_continuations_for_predecessor(task_id)
                 value = self.get_task(task_id)
                 if record is not None:
                     record(value, event_ids=[event_id], primary_stream_id=task["run_id"], resulting_stream_seq=None)
@@ -1486,6 +1646,7 @@ class RealmStore:
             "realm_lifecycle",
             "migration_event_streams", "migration_events",
             "migration_owner_records",
+            "task_dependencies", "continuation_admissions",
         }
         actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing_tables = sorted(expected_tables - actual_tables)

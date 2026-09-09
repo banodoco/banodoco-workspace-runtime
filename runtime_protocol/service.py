@@ -2236,6 +2236,7 @@ class RuntimeService:
                 self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
                 self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, current["run"]["id"]))
                 event_id = self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
+                self.store._refresh_continuations_for_predecessor(task_id)
                 result = self._task_resource(self.store.get_task(task_id))
                 event_seq = self.store.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (current["run"]["id"],)).fetchone()[0]
                 return self._command_record("task.retry", task_id, idempotency_key, request_hash, result, project_id=project_id, event_ids=(event_id,), primary_stream_id=current["run"]["id"], resulting_stream_seq=event_seq)
