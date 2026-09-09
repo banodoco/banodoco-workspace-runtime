@@ -45,10 +45,12 @@ def _composition(asset_id: str = "old") -> tuple[dict, dict]:
     )
 
 
-def _service_fixture(tmp_path):
+def _service_fixture(tmp_path, *, clip_type: str | None = None):
     service = RuntimeService(tmp_path / "realm")
     project = service.create_project({"slug": "replace", "name": "Replace"})
     config, registry = _composition()
+    if clip_type is not None:
+        config["clips"][0]["clipType"] = clip_type
     service.create_timeline_document(
         project["id"],
         {"timeline_id": "main", "slug": "main", "name": "Main", "config": config, "registry": registry},
@@ -144,6 +146,30 @@ def test_replace_timeline_clip_rejects_too_short_source_without_mutation(tmp_pat
         before = service._timeline_resource("main")
         with pytest.raises(ValidationError, match="too short"):
             service.replace_timeline_clip("main", {"clip_id": "target", "source_object_id": short["data"]["object_id"], "expected_version": 1}, idempotency_key="too-short")
+        assert service._timeline_resource("main") == before
+    finally:
+        service.close()
+
+
+def test_replace_timeline_clip_requires_source_to_reach_authored_end(tmp_path):
+    service, project, _, _, _ = _service_fixture(tmp_path)
+    try:
+        source = service.ingest(project["id"], _media_bytes(duration=3.5), media_type="video/mp4", idempotency_key="end-short")
+        before = service._timeline_resource("main")
+        with pytest.raises(ValidationError, match="too short"):
+            service.replace_timeline_clip("main", {"clip_id": "target", "source_object_id": source["data"]["object_id"], "expected_version": 1}, idempotency_key="end-short-replace")
+        assert service._timeline_resource("main") == before
+    finally:
+        service.close()
+
+
+def test_replace_timeline_clip_generic_visual_media_requires_video_stream(tmp_path):
+    service, project, _, _, _ = _service_fixture(tmp_path, clip_type="media")
+    try:
+        source = service.ingest(project["id"], _media_bytes(kind="audio"), media_type="audio/mp4", idempotency_key="generic-audio")
+        before = service._timeline_resource("main")
+        with pytest.raises(ValidationError, match="stream"):
+            service.replace_timeline_clip("main", {"clip_id": "target", "source_object_id": source["data"]["object_id"], "expected_version": 1}, idempotency_key="generic-audio-replace")
         assert service._timeline_resource("main") == before
     finally:
         service.close()

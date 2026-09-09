@@ -411,7 +411,7 @@ class RuntimeService:
             raise ValidationError("expected_version must be a positive integer")
         return value
 
-    def _verified_source_media(self, source, digest, *, clip_type):
+    def _verified_source_media(self, source, digest, *, clip_type, track_kind=None):
         """Verify immutable bytes and the stream needed by the selected clip."""
         path = self.cas.path_for(digest)
         if path.is_symlink() or not path.is_file():
@@ -432,9 +432,12 @@ class RuntimeService:
         media_type = media_type.split(";", 1)[0].strip().lower()
         if "/" not in media_type:
             raise ValidationError("managed source media type is malformed")
-        expected_stream = {"image": "video", "video": "video", "audio": "audio"}.get(clip_type, None)
-        if expected_stream is None:
-            expected_stream = "video" if media_type.startswith("image/") else media_type.split("/", 1)[0]
+        expected_stream = {"image": "video", "video": "video", "audio": "audio"}.get(clip_type)
+        if expected_stream is None and clip_type == "media":
+            # A generic media clip inherits its stream from the canonical
+            # track. Visual tracks are video by definition; never let the
+            # replacement MIME type silently turn one into an audio clip.
+            expected_stream = "audio" if track_kind in {"audio", "sound"} else "video"
         if expected_stream not in {"video", "audio"}:
             raise ValidationError("selected clip has an unsupported media stream")
         if media_type.split("/", 1)[0] not in {"application", "binary"}:
@@ -448,13 +451,15 @@ class RuntimeService:
         return data, expected_stream, duration
 
     @staticmethod
-    def _authored_clip_duration(clip):
+    def _authored_clip_interval(clip):
         start, end = clip.get("from"), clip.get("to")
         if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
             raise ValidationError("selected clip must have a numeric authored interval")
         if not math.isfinite(float(start)) or not math.isfinite(float(end)) or end <= start:
             raise ValidationError("selected clip must have a positive authored interval")
-        return float(end) - float(start)
+        if start < 0:
+            raise ValidationError("selected clip must have a non-negative authored source offset")
+        return float(start), float(end)
 
     @_durable_mutation
     def update_timeline(self, timeline_id, body, *, idempotency_key=None):
@@ -583,10 +588,18 @@ class RuntimeService:
             raise ValidationError("selected clip must reference an existing registry asset", details={"clip_id": clip_id})
 
         clip_type = str(target.get("clipType", "media")).lower()
-        authored_duration = self._authored_clip_duration(target)
-        _, _, source_duration = self._verified_source_media(source, digest, clip_type=clip_type)
-        if (clip_type != "image" and source_duration is None) or (source_duration is not None and source_duration + 1e-6 < authored_duration):
-            raise ValidationError("source media is too short for preserve-duration", details={"required_duration": authored_duration, "source_duration": source_duration})
+        _, authored_source_end = self._authored_clip_interval(target)
+        track_kind = None
+        track_id = target.get("track")
+        tracks = config.get("tracks", []) if isinstance(config, dict) else []
+        if isinstance(tracks, list):
+            for track in tracks:
+                if isinstance(track, dict) and track.get("id") == track_id:
+                    track_kind = str(track.get("kind") or "").lower()
+                    break
+        _, _, source_duration = self._verified_source_media(source, digest, clip_type=clip_type, track_kind=track_kind)
+        if (clip_type != "image" and source_duration is None) or (source_duration is not None and source_duration + 1e-6 < authored_source_end):
+            raise ValidationError("source media is too short for preserve-duration", details={"required_source_end": authored_source_end, "source_duration": source_duration})
 
         changed_content = copy.deepcopy(content)
         changed_config = changed_content["config"]

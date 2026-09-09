@@ -21,11 +21,12 @@ Focused evidence:
 
 ```
 PYTHONPATH=packages/python:. pytest -q tests/test_timeline_clip_replacement.py
-7 passed in 1.72s
+10 passed in 1.72s
 ```
 
 The focused tests cover valid replacement, authored interval preservation,
-malformed media, wrong stream, too-short media, unchanged state on rejection,
-one receipt/event for duplicate replay, and replay after an intervening edit
-and reopen. No ripple or shot targeting behavior and no metadata service were
+source-end duration enforcement, malformed media, wrong stream, generic visual
+media stream enforcement, too-short media, unchanged state on rejection, one
+receipt/event for duplicate replay, and replay after an intervening edit and
+reopen. No ripple or shot targeting behavior and no metadata service were
 introduced.
