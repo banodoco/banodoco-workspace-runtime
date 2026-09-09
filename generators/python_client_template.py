@@ -919,6 +919,12 @@ class WorkspaceClient:
         payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "nonce": nonce, "authorization": authorization, "state": dict(state or {}), "runtime_epoch": runtime_epoch}
         return RecoveryCheckpointReceipt.from_json(self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/checkpoint", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"}, expected=(200, 201))[2]))
 
+    def publish_timeline_render(self, attempt_id: str, *, lease_id: str, fence: int, runtime_epoch: int, timeline_id: str, expected_version: int, config: Mapping[str, Any], registry: Mapping[str, Any], render: Mapping[str, Any], idempotency_key: str, slug: str | None = None, name: str | None = None) -> Mapping[str, Any]:
+        payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch, "timeline_id": timeline_id, "expected_version": expected_version, "config": dict(config), "registry": dict(registry), "render": dict(render)}
+        if slug is not None: payload["slug"] = slug
+        if name is not None: payload["name"] = name
+        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/publish-timeline-render", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
     def request_reboot(self, *, checkpoint_id: str, nonce: str, authorization: str, runtime_epoch: int, command: str = "reboot") -> RecoveryReceipt:
         payload = {"checkpoint_id": checkpoint_id, "nonce": nonce, "authorization": authorization, "runtime_epoch": runtime_epoch, "command": command}
         return RecoveryReceipt.from_json(self._json(self._request("POST", "/v1/recovery/reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))

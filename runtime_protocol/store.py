@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
@@ -276,6 +276,9 @@ class RealmStore:
         if version < 22:
             self._run_migration(22)
             version = 22
+        if version < 23:
+            self._run_migration(23)
+            version = 23
 
     def _run_receipt_backfill_migration(self):
         """Backfill pre-016 rows inside one retryable migration transaction."""
@@ -1029,6 +1032,58 @@ class RealmStore:
                 dependencies = self._continuation_rows(row["continuation_task_id"])
                 self._set_waiting_reason(row["continuation_task_id"], self._continuation_waiting_reason(dependencies))
         return event_ids
+
+    def timeline_render_publication(self, authoring_task_id):
+        row = self.conn.execute(
+            "SELECT * FROM timeline_render_publications WHERE authoring_task_id=?",
+            (authoring_task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["prepared"] = json.loads(value.pop("prepared_json"))
+        value["result"] = json.loads(value.pop("result_json")) if value.get("result_json") else None
+        return value
+
+    def prepare_timeline_render_publication(
+        self, authoring_task_id, attempt_id, fence, runtime_epoch, request_hash, prepared
+    ):
+        """Freeze one publication request before either downstream mutation."""
+        with self._transaction():
+            current = self.timeline_render_publication(authoring_task_id)
+            if current is not None:
+                if current["request_hash"] != request_hash:
+                    raise ConflictError("authoring task publication payload changed")
+                return current
+            timestamp = now()
+            self.conn.execute(
+                "INSERT INTO timeline_render_publications("
+                "authoring_task_id, attempt_id, fence, runtime_epoch, request_hash, prepared_json, state, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?, ?)",
+                (
+                    authoring_task_id, attempt_id, int(fence), int(runtime_epoch), request_hash,
+                    canonical_json(prepared), timestamp, timestamp,
+                ),
+            )
+            return self.timeline_render_publication(authoring_task_id)
+
+    def complete_timeline_render_publication(
+        self, authoring_task_id, *, attempt_id, fence, runtime_epoch,
+        timeline_id, timeline_version, render_task_id, render_run_id, result,
+    ):
+        """Record the link in the caller's timeline-save/task-admission transaction."""
+        updated = self.conn.execute(
+            "UPDATE timeline_render_publications SET attempt_id=?, fence=?, runtime_epoch=?, state='published', "
+            "timeline_id=?, timeline_version=?, render_task_id=?, render_run_id=?, result_json=?, updated_at=? "
+            "WHERE authoring_task_id=? AND state='prepared'",
+            (
+                attempt_id, int(fence), int(runtime_epoch), timeline_id, int(timeline_version),
+                render_task_id, render_run_id, canonical_json(result), now(), authoring_task_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ConflictError("timeline render publication checkpoint is no longer prepared")
+        return self.timeline_render_publication(authoring_task_id)
 
     def _task_result(self, run, task):
         result = dict(task)

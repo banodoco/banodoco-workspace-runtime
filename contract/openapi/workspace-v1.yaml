@@ -548,6 +548,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpoint' } } } }
       responses: { '201': { description: Durable checkpoint, content: { application/json: { schema: { $ref: '#/components/schemas/RecoveryCheckpointReceipt' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/publish-timeline-render:
+    post:
+      operationId: publishTimelineRender
+      description: Fenced, replay-safe publication of one canonical timeline revision and the render task bound to it.
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false, required: [lease_id, fence, runtime_epoch, timeline_id, expected_version, config, registry, render], properties: { lease_id: { type: string }, fence: { type: integer }, runtime_epoch: { type: integer, minimum: 1 }, timeline_id: { type: string }, expected_version: { type: integer, minimum: 1 }, config: { type: object }, registry: { type: object }, render: { type: object }, slug: { type: string }, name: { type: string } } } } } }
+      responses: { '200': { description: Durable timeline/render publication link, content: { application/json: { schema: { type: object } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/fail:
     post:
       operationId: failAttempt

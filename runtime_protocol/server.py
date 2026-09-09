@@ -468,6 +468,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 body["attempt_id"] = path[2]
                 return self._send(200, self.runtime.prepare_reboot(body, identity=identity))
             if action == "checkpoint": return self._send(201, self.runtime.checkpoint_attempt(path[2], self._body(), identity=identity))
+            if action == "publish-timeline-render":
+                key = self._idempotency_key()
+                return self._send(200, self.runtime.publish_timeline_render(path[2], self._body(), idempotency_key=key, identity=identity))
             if action == "settle":
                 key = self._idempotency_key()
                 value = self.runtime.settle_attempt(path[2], self._body(), idempotency_key=key, identity=identity)
