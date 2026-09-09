@@ -12,8 +12,11 @@ import base64
 import copy
 import os
 import re
+import subprocess
 import uuid
 import stat
+import math
+from collections.abc import Mapping
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +36,7 @@ TEXT_BINDING_KINDS = ("prompt", "voiceover_script", "transcript")
 TEXT_BINDING_MAX_BYTES = 1_048_576
 TEXT_BINDING_SLOT_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 TEXT_BINDING_IDENTITY_SCHEMA = "workspace.shot.text_binding.identity/v1"
+MEDIA_PROBE_TIMEOUT_SECONDS = 10
 
 
 def validate_idempotency_key(value):
@@ -73,6 +77,59 @@ def _wire_object(body, *, required=(), allowed=()):
     if unknown:
         raise ValidationError("request body contains unsupported fields", details={"fields": unknown})
     return body
+
+
+def _probe_media_bytes(data):
+    """Return verified stream facts for media bytes without a metadata service."""
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-print_format", "json",
+                "-show_entries", "stream=codec_type,duration:format=duration",
+                "-i", "pipe:0",
+            ],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=MEDIA_PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValidationError("source media could not be verified") from exc
+    if completed.returncode != 0:
+        raise ValidationError("source media is malformed")
+    try:
+        value = json.loads(completed.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("source media probe returned malformed metadata") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("streams"), list) or not value["streams"]:
+        raise ValidationError("source media has no streams")
+    stream_types = []
+    durations = {}
+    for stream in value["streams"]:
+        if not isinstance(stream, dict) or not isinstance(stream.get("codec_type"), str):
+            raise ValidationError("source media stream metadata is malformed")
+        stream_type = stream["codec_type"]
+        stream_types.append(stream_type)
+        raw_duration = stream.get("duration")
+        if raw_duration is not None and raw_duration not in ("N/A", ""):
+            try:
+                duration = float(raw_duration)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("source media duration is malformed") from exc
+            if not math.isfinite(duration) or duration < 0:
+                raise ValidationError("source media duration is malformed")
+            durations.setdefault(stream_type, duration)
+    raw_format_duration = (value.get("format") or {}).get("duration") if isinstance(value.get("format"), dict) else None
+    format_duration = None
+    if raw_format_duration is not None and raw_format_duration not in ("N/A", ""):
+        try:
+            format_duration = float(raw_format_duration)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("source media duration is malformed") from exc
+        if not math.isfinite(format_duration) or format_duration < 0:
+            raise ValidationError("source media duration is malformed")
+    return {"stream_types": tuple(stream_types), "durations": durations, "format_duration": format_duration}
 
 
 def _page_args(cursor, limit):
@@ -354,6 +411,51 @@ class RuntimeService:
             raise ValidationError("expected_version must be a positive integer")
         return value
 
+    def _verified_source_media(self, source, digest, *, clip_type):
+        """Verify immutable bytes and the stream needed by the selected clip."""
+        path = self.cas.path_for(digest)
+        if path.is_symlink() or not path.is_file():
+            raise ConflictError("managed source media is unavailable")
+        try:
+            data = self.cas.read(digest)
+        except (NotFoundError, ConflictError) as exc:
+            raise ConflictError("managed source media failed immutable verification") from exc
+        try:
+            expected_size = int(source["size"])
+        except (TypeError, ValueError) as exc:
+            raise ConflictError("managed source media metadata is malformed") from exc
+        if path.is_symlink() or len(data) != expected_size:
+            raise ConflictError("managed source media failed immutable verification")
+        media_type = source["media_type"]
+        if not isinstance(media_type, str) or not media_type:
+            raise ValidationError("managed source media type is malformed")
+        media_type = media_type.split(";", 1)[0].strip().lower()
+        if "/" not in media_type:
+            raise ValidationError("managed source media type is malformed")
+        expected_stream = {"image": "video", "video": "video", "audio": "audio"}.get(clip_type, None)
+        if expected_stream is None:
+            expected_stream = "video" if media_type.startswith("image/") else media_type.split("/", 1)[0]
+        if expected_stream not in {"video", "audio"}:
+            raise ValidationError("selected clip has an unsupported media stream")
+        if media_type.split("/", 1)[0] not in {"application", "binary"}:
+            declared_stream = "video" if media_type.startswith("image/") else media_type.split("/", 1)[0]
+            if declared_stream != expected_stream:
+                raise ValidationError("source media stream does not match selected clip")
+        probe = _probe_media_bytes(data)
+        if expected_stream not in probe["stream_types"]:
+            raise ValidationError("source media stream does not match selected clip")
+        duration = probe["durations"].get(expected_stream, probe["format_duration"])
+        return data, expected_stream, duration
+
+    @staticmethod
+    def _authored_clip_duration(clip):
+        start, end = clip.get("from"), clip.get("to")
+        if isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            raise ValidationError("selected clip must have a numeric authored interval")
+        if not math.isfinite(float(start)) or not math.isfinite(float(end)) or end <= start:
+            raise ValidationError("selected clip must have a positive authored interval")
+        return float(end) - float(start)
+
     @_durable_mutation
     def update_timeline(self, timeline_id, body, *, idempotency_key=None):
         self._require_object_body(body)
@@ -410,6 +512,9 @@ class RuntimeService:
     def replace_timeline_clip(self, timeline_id, body, *, idempotency_key=None):
         """Replace one canonical composition clip with a project-owned object."""
         self._require_object_body(body)
+        unexpected = set(body) - {"clip_id", "source_object_id", "expected_version", "timing"}
+        if unexpected:
+            raise ValidationError("replacement request contains unsupported fields", details={"fields": sorted(unexpected)})
         expected = self._expected_version(body)
         clip_id = body.get("clip_id")
         source_object_id = body.get("source_object_id")
@@ -418,6 +523,8 @@ class RuntimeService:
             raise ValidationError("clip_id is required")
         if not isinstance(source_object_id, str) or not source_object_id:
             raise ValidationError("source_object_id is required")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_object_id):
+            raise ValidationError("source_object_id must be a canonical SHA-256 object id")
         if timing != "preserve-duration":
             raise ValidationError("timing must be preserve-duration")
 
@@ -474,6 +581,12 @@ class RuntimeService:
         old_asset_id = target.get("asset")
         if not isinstance(old_asset_id, str) or not isinstance(assets.get(old_asset_id), Mapping):
             raise ValidationError("selected clip must reference an existing registry asset", details={"clip_id": clip_id})
+
+        clip_type = str(target.get("clipType", "media")).lower()
+        authored_duration = self._authored_clip_duration(target)
+        _, _, source_duration = self._verified_source_media(source, digest, clip_type=clip_type)
+        if (clip_type != "image" and source_duration is None) or (source_duration is not None and source_duration + 1e-6 < authored_duration):
+            raise ValidationError("source media is too short for preserve-duration", details={"required_duration": authored_duration, "source_duration": source_duration})
 
         changed_content = copy.deepcopy(content)
         changed_config = changed_content["config"]

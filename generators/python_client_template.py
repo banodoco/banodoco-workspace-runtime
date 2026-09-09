@@ -628,6 +628,31 @@ class WorkspaceClient:
         items, next_cursor = self._page(value)
         return list(items), next_cursor
 
+    def replace_timeline_clip(
+        self,
+        timeline_id: str,
+        *,
+        clip_id: str,
+        source_object_id: str,
+        expected_version: int,
+        idempotency_key: str,
+        timing: str = "preserve-duration",
+    ) -> MutationResult:
+        payload = {
+            "clip_id": clip_id,
+            "source_object_id": source_object_id,
+            "expected_version": expected_version,
+            "timing": timing,
+        }
+        return self._mutation_json(
+            self._request(
+                "POST",
+                f"/v1/timelines/{_path_part(timeline_id)}/replace-clip",
+                body=json.dumps(payload, separators=(",", ":")).encode(),
+                headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key},
+            )[2]
+        )
+
     def diff_timeline(self, timeline_id: str, *, from_version: int, to_version: int) -> Mapping[str, Any]:
         path = f"/v1/timelines/{_path_part(timeline_id)}/diff?from_version={int(from_version)}&to_version={int(to_version)}"
         return self._json(self._request("GET", path)[2])
