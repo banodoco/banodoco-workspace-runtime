@@ -105,6 +105,11 @@ class RuntimeConnection:
 
 
 class LocalRuntimeBoundary:
+    # Health is a loopback request, but the daemon may be briefly busy while
+    # finishing startup or serving another control-plane request.  Keep this
+    # bounded without making a normal, healthy runtime look stale.
+    HEALTH_TIMEOUT_SECONDS = 3.0
+
     """Launch and supervise a loopback daemon from an editable source profile."""
 
     def __init__(self, *, wait_seconds: float = WAIT_SECONDS):
@@ -234,7 +239,10 @@ class LocalRuntimeBoundary:
             # Do not derive imports from either checkout.  The selected
             # runtime_environment is an installed environment and the child
             # inherits the host's already-configured environment unchanged.
-            self._process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=log, text=True, start_new_session=True)
+            # Preserve the daemon's structured startup failure on the existing
+            # operator log boundary; successful stdout is only its one-line
+            # launch record.
+            self._process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         except Exception:
             log.close()
             token_file.unlink(missing_ok=True)
@@ -243,8 +251,14 @@ class LocalRuntimeBoundary:
             log.close()
         self._source, self._realm_root, self._support_root, self._realm_id = source_profile, realm_root, support_root, realm_id
         self._bootstrap_credential = bootstrap_token
-        endpoint = self._wait_endpoint(support_root, self._process)
-        discovery = self._read_discovery(support_root)
+        try:
+            endpoint = self._wait_endpoint(support_root, self._process)
+            discovery = self._read_discovery(support_root)
+        except Exception:
+            self._terminate(self._process)
+            token_file.unlink(missing_ok=True)
+            self._bootstrap_credential = None
+            raise
         return {
             "endpoint": endpoint,
             "pid": self._process.pid,
@@ -332,7 +346,7 @@ class LocalRuntimeBoundary:
             return False
         request = urllib.request.Request(str(endpoint).rstrip("/") + "/v1/health", headers={"Accept": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=0.5) as response:
+            with urllib.request.urlopen(request, timeout=LocalRuntimeBoundary.HEALTH_TIMEOUT_SECONDS) as response:
                 value = json.loads(response.read().decode("utf-8"))
             return value.get("status") == "ok" and value.get("protocol") == WIRE_PROTOCOL
         except (OSError, ValueError, json.JSONDecodeError):

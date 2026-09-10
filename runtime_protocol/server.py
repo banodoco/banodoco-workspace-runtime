@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
@@ -23,9 +25,19 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
 class RuntimeHandler(BaseHTTPRequestHandler):
     server_version = "BanodocoRuntime/0.1"
     MAX_BODY_BYTES = 64 * 1024 * 1024
+    REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 
     def log_message(self, *_):
         return
+
+    def _request_id(self):
+        current = getattr(self, "_runtime_request_id", None)
+        if current:
+            return current
+        supplied = self.headers.get("X-Request-ID", "")
+        value = supplied if self.REQUEST_ID_RE.fullmatch(supplied) else uuid.uuid4().hex
+        self._runtime_request_id = value
+        return value
 
     @property
     def runtime(self):
@@ -82,6 +94,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
         self.send_response(status)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", self._request_id())
         for key, value in (headers or {}).items():
             self.send_header(key, str(value))
         if body is None:
@@ -96,9 +109,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
 
     def _error(self, exc):
         if isinstance(exc, RuntimeErrorBase):
-            self._send(exc.status, error=exc.as_dict())
+            payload = exc.as_dict()
+            payload["request_id"] = self._request_id()
+            self._send(exc.status, error=payload)
         else:
-            self._send(500, error={"code": "internal_error", "message": "internal runtime error"})
+            self._send(500, error={"code": "internal_error", "message": "internal runtime error", "request_id": self._request_id()})
 
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]

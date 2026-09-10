@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError
+from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
@@ -186,11 +186,22 @@ def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn):
     return {"items": [resource for _, resource in selected], "next_cursor": _page_cursor(scope, selected[-1][0]) if has_more else None}
 
 
+def _verified_mutation(function):
+    """Fence the complete mutation against a concurrent admission loss."""
+    @wraps(function)
+    def wrapped(self, *args, **kwargs):
+        with self.store._mutex:
+            self._assert_mutation_admitted()
+            return function(self, *args, **kwargs)
+    return wrapped
+
+
 def _durable_mutation(function):
     """Keep a B7 project mutation and its idempotency receipt atomic."""
     @wraps(function)
     def wrapped(self, *args, **kwargs):
         with self.store._mutex:
+            self._assert_mutation_admitted()
             try:
                 with self.store._transaction():
                     result = function(self, *args, **kwargs)
@@ -209,11 +220,26 @@ class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
     def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, reboot_executor=None, reboot_allowlist=None):
-        self.store = RealmStore(root)
-        self.cas = ContentAddressedStore(self.store.cas_root)
-        self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
-        self.runtime_session_id = new_id()
-        self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
+        self.store = RealmStore(root, strict_admission=True)
+        self._verified = False
+        self._admission_failure = None
+        try:
+            if not self.store.admission_report.get("ok"):
+                raise RealmAdmissionError(
+                    "realm failed startup admission",
+                    details=self.store.admission_report,
+                )
+            self.cas = ContentAddressedStore(self.store.cas_root)
+            self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
+            report = self.store.doctor()
+            if not report.get("ok"):
+                raise RealmAdmissionError("realm is not usable after initialization", details=report)
+            self.runtime_session_id = new_id()
+            self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
+            self._verified = True
+        except Exception:
+            self.store.close()
+            raise
         self.support_root = Path(support_root).expanduser().resolve() if support_root else None
         self.reboot_executor = reboot_executor
         configured_allowlist = frozenset(reboot_allowlist or REBOOT_COMMAND_ALLOWLIST)
@@ -244,12 +270,22 @@ class RuntimeService:
         return value
 
     def doctor(self):
-        return self.store.doctor(catalog_path=(self.support_root / "catalog.json") if self.support_root else None)
+        with self.store._mutex:
+            report = self.store.doctor(catalog_path=(self.support_root / "catalog.json") if self.support_root else None)
+            if not report.get("ok"):
+                # Admission is monotonic for one service instance. Repair is
+                # verified by a fresh startup; an unhealthy process never
+                # silently resumes writes after observing damaged authority.
+                self._verified = False
+                self._admission_failure = report
+            return report
 
+    @_verified_mutation
     def tombstone(self, body=None):
         body = body or {}
         return self.store.tombstone_realm(reason=body.get("reason"), expected_version=body.get("expected_version"))
 
+    @_verified_mutation
     def recover_realm(self, body=None):
         body = body or {}
         # Recovery is a destructive lifecycle transition.  Require an
@@ -282,7 +318,15 @@ class RuntimeService:
         raise ConflictError("whole-realm purge is offline-only; stop the runtime and use the purge command", details={"next_action": "banodoco-runtime purge --root <realm> --confirm 'PURGE <realm_id>'"})
 
     def health(self):
-        return {"status": "ok", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
+        report = self.doctor()
+        return {"status": "ok" if self._verified and report.get("ok") else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
+
+    def _assert_mutation_admitted(self):
+        if not self._verified:
+            raise RealmAdmissionError(
+                "realm is not admitted for mutations",
+                details=self._admission_failure or self.store.admission_report,
+            )
 
     def runtime_lifecycle(self):
         """Return current boot/session and recovery facts for diagnostics."""
@@ -336,6 +380,7 @@ class RuntimeService:
             return
         self._assert_executor_identity(identity, row["executor_id"])
 
+    @_verified_mutation
     def create_project(self, body, *, idempotency_key=None):
         name = str(body.get("name") or "")
         slug = str(body.get("slug") or "-".join(name.lower().split()))
@@ -351,6 +396,7 @@ class RuntimeService:
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
                           resource_fn=lambda row: self._project_resource(self.store.get_project(row["id"])))
 
+    @_verified_mutation
     def select_project(self, actor_id, selector, *, scope="workspace", idempotency_key=None):
         value = self.store.select_project(actor_id, selector, scope, idempotency_key=idempotency_key)
         return {
@@ -369,6 +415,7 @@ class RuntimeService:
             "updated_at": value["updated_at"],
         }
 
+    @_verified_mutation
     def update_project(self, selector, body, *, idempotency_key=None):
         return self.store.update_project(selector, name=body.get("name"), metadata=body.get("metadata"), expected_version=body.get("expected_version"), idempotency_key=idempotency_key)
 
@@ -1935,6 +1982,7 @@ class RuntimeService:
         if not row: raise NotFoundError("reference not found")
         return self._reference_resource(row)
 
+    @_verified_mutation
     def _update_shot_state(self, shot_id, body, *, archived=None, idempotency_key=None):
         expected = self._expected_version(body)
         with self.store._mutex:
@@ -1965,6 +2013,7 @@ class RuntimeService:
     def archive_shot(self, shot_id, body, *, idempotency_key=None): return self._update_shot_state(shot_id, body, archived=True, idempotency_key=idempotency_key)
     def recover_shot(self, shot_id, body, *, idempotency_key=None): return self._update_shot_state(shot_id, body, archived=False, idempotency_key=idempotency_key)
 
+    @_verified_mutation
     def _update_reference_state(self, reference_id, body, *, archived=None, idempotency_key=None):
         expected = self._expected_version(body)
         with self.store._mutex:
@@ -2148,6 +2197,7 @@ class RuntimeService:
                           key_fn=lambda row: (str(row["created_at"]), str(row["from_digest"]), str(row["to_digest"]), str(row["kind"]), int(row["ordinal"])),
                           resource_fn=lambda row: {"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]})
 
+    @_verified_mutation
     def create_task(self, body, *, enforce_readiness=False):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
@@ -2191,9 +2241,11 @@ class RuntimeService:
             resource["result"] = task["result"]
         return resource
 
+    @_verified_mutation
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
 
+    @_verified_mutation
     def cancel_task_canonical(self, task_id, body=None, *, idempotency_key=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body
@@ -2216,6 +2268,7 @@ class RuntimeService:
                 self.store.cancel_task(task_id, record=record)
                 return recorded
 
+    @_verified_mutation
     def retry_task(self, task_id, body=None, *, idempotency_key=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = {} if body is None else body
@@ -2248,9 +2301,11 @@ class RuntimeService:
     def events(self, run_id):
         return self.store.list_events(run_id)
 
+    @_verified_mutation
     def cancel_run(self, run_id, body=None, *, idempotency_key=None):
         return self._run_resource(self.store.cancel_run(run_id, idempotency_key=idempotency_key))
 
+    @_verified_mutation
     def retry_run(self, run_id, body=None, *, idempotency_key=None):
         body = body or {}
         return self._run_resource(self.store.retry_run(run_id, selected_task_ids=body.get("selected_task_ids"), idempotency_key=idempotency_key))
@@ -2262,10 +2317,14 @@ class RuntimeService:
         return result
 
     def list_capabilities(self, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
-        rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
-        return _page_rows(rows, scope="capabilities", cursor=cursor, limit=limit,
-                          key_fn=lambda row: (str(row["id"]),),
-                          resource_fn=lambda r: self._capability_resource(r))
+        # Registration updates capability descriptors and executor visibility
+        # in one transaction. Readers share the same fence so the HTTP catalog
+        # cannot observe the transaction halfway through.
+        with self.store._mutex:
+            rows = self.store.conn.execute("SELECT * FROM capabilities ORDER BY id").fetchall()
+            return _page_rows(rows, scope="capabilities", cursor=cursor, limit=limit,
+                              key_fn=lambda row: (str(row["id"]),),
+                              resource_fn=lambda r: self._capability_resource(r))
 
     def _capability_resource(self, row):
         status = row["status"]
@@ -2274,6 +2333,7 @@ class RuntimeService:
             status, reason = "unavailable", "no_live_matching_executor"
         return {"capability_id": row["id"], "definition_digest": row["definition_digest"], "status": status, "required_resource_keys": json.loads(row["required_resource_keys_json"]), "estimated_scratch_bytes": row["estimated_scratch_bytes"], "estimated_output_bytes": row["estimated_output_bytes"], "unavailable_reason": reason}
 
+    @_verified_mutation
     def register_capability(self, body):
         value = self.store.register_capability(body.get("capability_id", ""), body.get("definition_digest", ""), required_resource_keys=body.get("required_resource_keys", []), status=body.get("status", "ready"), unavailable_reason=body.get("unavailable_reason"), estimated_scratch_bytes=body.get("estimated_scratch_bytes", 0), estimated_output_bytes=body.get("estimated_output_bytes", 0))
         # Registration acknowledges the executor's declared state. Discovery
@@ -2502,6 +2562,7 @@ class RuntimeService:
             finally:
                 self._discard_staged_outputs(staged)
 
+    @_verified_mutation
     def publish_timeline_render(self, attempt_id, body, *, idempotency_key=None, identity=None):
         """Publish one canonical timeline revision and its render task once.
 
@@ -3180,6 +3241,7 @@ class RuntimeService:
                     raise LeaseError("attempt lease has expired")
             except ValueError as exc:
                 raise LeaseError("attempt lease deadline is invalid") from exc
+    @_verified_mutation
     def prepare_reboot(self, body=None, *, identity=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
         body = _wire_object(
@@ -3210,6 +3272,7 @@ class RuntimeService:
         expires_in = max(0, int((datetime.fromisoformat(expires_at) - datetime.now(timezone.utc)).total_seconds()))
         return {"attempt_id": attempt_id, "task_id": row["task_id"], "executor_id": row["executor_id"], "runtime_epoch": current, "nonce": nonce, "expires_in_seconds": expires_in}
 
+    @_verified_mutation
     def checkpoint_attempt(self, attempt_id, body, *, identity=None):
         """Persist a bounded, fsync'd R1 checkpoint before a reboot request."""
         body = _wire_object(
@@ -3270,6 +3333,7 @@ class RuntimeService:
 
     create_checkpoint = checkpoint_attempt
 
+    @_verified_mutation
     def request_reboot(self, body, *, identity=None):
         """Execute only an allowlisted reboot command after durable checkpointing."""
         body = _wire_object(
@@ -3353,6 +3417,7 @@ class RuntimeService:
                 self.store.conn.execute("UPDATE recovery_checkpoints SET state='executed', recovery_receipt_json=?, updated_at=? WHERE id=? AND state='reboot_requested'", (canonical_json(receipt), now(), row["id"]))
         return receipt
 
+    @_verified_mutation
     def resume_attempt(self, body, *, identity=None):
         body = _wire_object(
             body,
@@ -3418,6 +3483,7 @@ class RuntimeService:
 
     resume = resume_attempt
 
+    @_verified_mutation
     def heartbeat_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = _wire_object(
@@ -3458,6 +3524,7 @@ class RuntimeService:
             self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30), record=record)
             return recorded
 
+    @_verified_mutation
     def fail_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = _wire_object(
