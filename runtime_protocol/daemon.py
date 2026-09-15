@@ -48,7 +48,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, production_worker_credentials=False):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, production_worker_credentials=False, admission_timeout=None):
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("runtime daemon only binds to loopback")
         self.root = _authority_path(root, "realm root").resolve()
@@ -70,6 +70,7 @@ class RuntimeDaemon:
         # credential below.  Keeping the fixture mode explicit avoids granting
         # that administrator credential to the production host.
         self.production_worker_credentials = bool(production_worker_credentials)
+        self.admission_timeout = admission_timeout
         self.instance_id = uuid.uuid4().hex
         self.service = None
         self.httpd = None
@@ -160,7 +161,7 @@ class RuntimeDaemon:
 
     def _start(self, *, rotate_credentials=False):
         epoch_floor = self._read_epoch_floor()
-        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor)
+        self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout)
         self.service.set_readiness_callback(self._revoke_readiness)
         self.catalog.bind_owner(self._catalog_owner_valid)
         self._provision_credentials(rotate=rotate_credentials)

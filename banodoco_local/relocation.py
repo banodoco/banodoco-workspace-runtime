@@ -7,6 +7,7 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import time
+import uuid
 from typing import Any, Mapping
 
 from .bootstrap import (
@@ -160,17 +161,84 @@ def _fsync_directory(path: Path) -> None:
 def _validate_move(old_root: Path, new_root: Path) -> None:
     if not old_root.is_dir() or old_root.is_symlink():
         raise RelocationError(f"current support root is unavailable: {old_root}")
-    if new_root.exists() or new_root.is_symlink():
-        raise RelocationError(f"relocation destination must be new: {new_root}")
+    if new_root.is_symlink() or (new_root.exists() and not new_root.is_dir()):
+        raise RelocationError(f"relocation destination must be a regular directory: {new_root}")
     if _inside(new_root, old_root) or _inside(old_root, new_root):
         raise RelocationError("relocation destination must not be inside the current support root")
     if not new_root.parent.is_dir() or new_root.parent.is_symlink():
         raise RelocationError("relocation destination parent must be an existing regular directory")
+    if new_root.is_dir():
+        old_names = {item.name for item in old_root.iterdir()}
+        conflicts = sorted(old_names.intersection(item.name for item in new_root.iterdir()))
+        if conflicts:
+            raise RelocationError("relocation destination contains support entries that would be overwritten: " + ", ".join(conflicts))
     try:
         if old_root.stat().st_dev != new_root.parent.stat().st_dev:
             raise RelocationError("relocation requires a same-filesystem destination")
     except OSError as exc:
         raise RelocationError("relocation filesystem identity is unavailable") from exc
+
+
+def _reject_live_pack_host(paths: RuntimePaths) -> None:
+    """Do not move support metadata while the separately managed host lives."""
+
+    for name in ("generic-host.json", "generic-host.ready.json"):
+        record = _read_support_json(paths.runtime_support / name) or {}
+        try:
+            pid = int(record.get("pid", 0))
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or pid == os.getpid():
+            if pid == os.getpid():
+                raise RelocationError("Astrid generic host is active; stop it through the host manager before relocation")
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            raise RelocationError("Astrid generic host ownership cannot be verified; stop it through the host manager")
+        except OSError:
+            continue
+        raise RelocationError("Astrid generic host is active; stop it through the host manager before relocation")
+
+
+def _validate_environment_relocation(path_value: Any, old_root: Path) -> None:
+    """Reject virtualenv links/shebangs that would still name the old root."""
+
+    if not isinstance(path_value, str):
+        return
+    environment = Path(path_value).expanduser()
+    if not environment.is_absolute() or not _inside(environment, old_root):
+        return
+    if not environment.is_dir() or environment.is_symlink():
+        raise RelocationError(f"configured runtime environment is unavailable: {environment}")
+    old_text = str(old_root).encode()
+    for item in environment.rglob("*"):
+        if item.is_symlink():
+            target = os.readlink(item)
+            if os.path.isabs(target) and _inside(Path(target), old_root):
+                raise RelocationError(f"runtime environment contains an absolute link into the old support root: {item}")
+            continue
+        if not item.is_file():
+            continue
+        try:
+            first = item.open("rb").readline(4096)
+        except OSError as exc:
+            raise RelocationError(f"runtime environment cannot be inspected: {item}") from exc
+        if first.startswith(b"#!") and old_text in first:
+            raise RelocationError(f"runtime environment has an absolute shebang into the old support root: {item}")
+
+
+def _validate_profile_environments(paths: RuntimePaths, old_root: Path, catalog: Mapping[str, Any]) -> None:
+    profiles = catalog.get("source_profiles", {})
+    if isinstance(profiles, Mapping):
+        for profile in profiles.values():
+            if isinstance(profile, Mapping):
+                _validate_environment_relocation(profile.get("runtime_environment"), old_root)
+    for profile_path in paths.source_profiles_dir.glob("*.json"):
+        value = _read_support_json(profile_path) or {}
+        _validate_environment_relocation(value.get("runtime_environment"), old_root)
 
 
 def plan_relocation(paths: RuntimePaths, destination: str | Path, backup: str | Path | None = None) -> dict[str, Any]:
@@ -183,6 +251,8 @@ def plan_relocation(paths: RuntimePaths, destination: str | Path, backup: str | 
     target_support = _absolute(destination, "relocation destination")
     backup_path = _absolute(backup, "backup destination") if backup is not None else None
     _validate_move(old_support, target_support)
+    _reject_live_pack_host(paths)
+    _validate_profile_environments(paths, old_support, catalog)
     old_realm = _absolute(str(realm.get("data_root") or ""), "current realm root")
     discovery = _read_support_json(paths.discovery_path) or {}
     if not discovery.get("pid"):
@@ -238,7 +308,13 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
         remove_file(paths.instance_lock_path)
 
         moved = False
+        target_staged = False
+        target_aux = new_support.parent / f".{new_support.name}.relocation-aux-{uuid.uuid4().hex}"
+        merged_aux: list[Path] = []
         try:
+            if new_support.exists():
+                os.replace(new_support, target_aux)
+                target_staged = True
             os.replace(old_support, new_support)
             moved = True
             _fsync_directory(old_support.parent)
@@ -251,6 +327,10 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
                 if value is not None:
                     atomic_write_json(profile_path, {**value, "runtime_environment": _rewrite_path(value.get("runtime_environment"), old_support, new_support)})
             atomic_write_json(new_support / "relocation-handoff.json", {"version": 1, "state": "moved", "realm_id": realm_id, "old_support_root": str(old_support), "new_support_root": str(new_support), "catalog_sha256": hashlib.sha256(target_paths.catalog_path.read_bytes()).hexdigest()})
+            if target_staged:
+                for entry in sorted(target_aux.iterdir(), key=lambda item: item.name):
+                    os.replace(entry, new_support / entry.name)
+                    merged_aux.append(entry)
             # The renamed bootstrap.lock is the same inode we already hold.
             # Calling bootstrap() would acquire it again and deadlock.
             relocated_source = replace(source, runtime_environment=_rewrite_path(source.runtime_environment, old_support, new_support))
@@ -260,6 +340,9 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
             if not result.ready or result.realm_id != realm_id:
                 raise RelocationError("new support root failed cold-start verification")
             atomic_write_json(new_support / "relocation-handoff.json", {"version": 1, "state": "verified", "realm_id": realm_id, "old_support_root": str(old_support), "new_support_root": str(new_support), "catalog_sha256": hashlib.sha256(target_paths.catalog_path.read_bytes()).hexdigest(), "verified_at": time.time()})
+            if target_staged:
+                target_aux.rmdir()
+                target_staged = False
             return {"status": "relocated", "realm_id": realm_id, "support_root": str(new_support), "data_root": str(new_support / Path(str(realm["data_root"])).relative_to(old_support)), "old_support_root": str(old_support)}
         except Exception as exc:
             try:
@@ -278,10 +361,31 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
                             )
                         except Exception as stop_exc:
                             raise RelocationError("relocation rollback cannot proceed while the candidate owner is live") from stop_exc
+                    if target_staged:
+                        for entry in reversed(merged_aux):
+                            os.replace(new_support / entry.name, target_aux / entry.name)
                     os.replace(new_support, old_support)
-                    _restore_metadata(old_support, snapshot)
-                    _fsync_directory(old_support.parent)
-            except OSError as rollback_exc:
+                # If staging the pre-existing target succeeded but the first
+                # root rename failed, the old root is still in place and the
+                # target auxiliary tree must be put back before restarting.
+                if target_staged and target_aux.exists() and not new_support.exists():
+                    os.replace(target_aux, new_support)
+                    target_staged = False
+                if not old_support.exists():
+                    raise OSError("old support root is missing during rollback")
+                runtime_relative = {
+                    paths.discovery_path.relative_to(paths.app_support),
+                    paths.instance_lock_path.relative_to(paths.app_support),
+                }
+                _restore_metadata(old_support, {
+                    relative: payload for relative, payload in snapshot.items()
+                    if relative not in runtime_relative
+                })
+                restored = _bootstrap_locked(paths, boundary, config)
+                if not restored.ready or restored.realm_id != realm_id:
+                    raise RelocationError("old owner could not be restored after relocation failure")
+                _fsync_directory(old_support.parent)
+            except Exception as rollback_exc:
                 raise RelocationError(f"relocation failed and rollback failed: {rollback_exc}") from exc
             raise RelocationError(f"relocation rolled back: {exc}") from exc
 

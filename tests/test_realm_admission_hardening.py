@@ -359,7 +359,9 @@ def test_health_degradation_revokes_mutations_and_http_errors_are_request_correl
         result = daemon.service.ingest_object(b"health-corruption", idempotency_key="health-object")
         digest = result["data"]["digest"].removeprefix("sha256:")
         (daemon.service.store.cas_root / digest[:2] / digest[2:]).write_bytes(b"corrupt")
-        assert daemon.service.health()["status"] == "degraded"
+        # Health is intentionally a cheap liveness probe. Deep CAS and
+        # SQLite integrity checks remain behind the explicit doctor route.
+        assert daemon.service.health()["status"] == "ok"
         assert daemon.service.doctor()["ok"] is False
         project_count = daemon.service.store.conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
         with pytest.raises(RealmAdmissionError) as mutation_error:
@@ -386,6 +388,20 @@ def test_health_degradation_revokes_mutations_and_http_errors_are_request_correl
         assert error.value.headers["X-Request-ID"] == payload["request_id"]
     finally:
         daemon.stop()
+
+
+def test_health_does_not_run_deep_doctor_and_preserves_latched_degradation(tmp_path, monkeypatch):
+    service = _new_service(tmp_path / "realm")
+    try:
+        def deep_doctor_must_not_run(**_kwargs):
+            raise AssertionError("health must not invoke the deep doctor")
+
+        monkeypatch.setattr(service, "doctor", deep_doctor_must_not_run)
+        assert service.health()["status"] == "ok"
+        service._verified = False
+        assert service.health()["status"] == "degraded"
+    finally:
+        service.close()
 
 
 def test_writer_holds_admission_fence_through_commit_during_degradation(tmp_path, monkeypatch):
@@ -437,7 +453,9 @@ def test_writer_holds_admission_fence_through_commit_during_degradation(tmp_path
 
     def report_degradation():
         try:
-            results["health"] = service.health()
+            # Integrity is an explicit maintenance probe; the normal health
+            # endpoint must stay cheap and must not discover CAS corruption.
+            results["health"] = service.doctor()
         except Exception as exc:  # pragma: no cover - asserted below
             failures.append(exc)
         finally:
@@ -464,7 +482,7 @@ def test_writer_holds_admission_fence_through_commit_during_degradation(tmp_path
         assert not failures
         assert writer_done.is_set() and health_done.is_set()
         assert results["project"]["slug"] == "fenced-writer"
-        assert results["health"]["status"] == "degraded"
+        assert results["health"]["ok"] is False
         project_count = service.store.conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
         with pytest.raises(RealmAdmissionError):
             service.create_project({"slug": "after-degradation", "name": "After degradation", "metadata": {}})

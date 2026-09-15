@@ -1,5 +1,6 @@
 import json
 import fcntl
+import os
 
 import pytest
 
@@ -33,7 +34,7 @@ def test_relocation_plan_binds_selected_owner(tmp_path):
     assert "bootstrap lock" in plan["steps"][0]
 
 
-def test_relocation_plan_rejects_existing_destination(tmp_path):
+def test_relocation_plan_allows_empty_existing_destination_for_aux_merge(tmp_path):
     paths = RuntimePaths.sandbox(tmp_path / "support")
     paths.ensure_support_dirs()
     current = paths.realms_dir / "realm-1"
@@ -43,12 +44,21 @@ def test_relocation_plan_rejects_existing_destination(tmp_path):
     target = tmp_path / "candidate"
     target.mkdir()
 
-    try:
-        plan_relocation(paths, target, tmp_path / "backup")
-    except RelocationError as exc:
-        assert "must be new" in str(exc)
-    else:
-        raise AssertionError("existing destination should be rejected")
+    plan = plan_relocation(paths, target, tmp_path / "backup")
+    assert plan["destination_support_root"] == str(target)
+
+
+def test_relocation_plan_rejects_live_generic_host(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path / "support")
+    paths.ensure_support_dirs()
+    current = paths.realms_dir / "realm-1"
+    current.mkdir()
+    paths.catalog_path.write_text(json.dumps({"version": 1, "realms": [{"realm_id": "realm-1", "display_name": "Realm", "data_root": str(current)}], "selected_realm_id": "realm-1", "source_profiles": {}}), encoding="utf-8")
+    paths.discovery_path.write_text(json.dumps({"pid": 1234, "active_realm": "realm-1"}), encoding="utf-8")
+    (paths.runtime_support / "generic-host.json").write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+
+    with pytest.raises(RelocationError, match="generic host is active"):
+        plan_relocation(paths, tmp_path / "candidate", tmp_path / "backup")
 
 
 def test_catalog_root_update_preserves_all_realms_and_metadata(tmp_path):
@@ -182,7 +192,12 @@ def test_relocation_restores_old_support_root_when_cutover_fails(tmp_path, monke
     before = paths.catalog_path.read_bytes()
     destination = tmp_path / "Astrid" / ".astrid-data"
     destination.parent.mkdir()
-    monkeypatch.setattr("banodoco_local.relocation._bootstrap_locked", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected cold-start failure")))
+    def fail_candidate_then_restore(target_paths, *_args, **_kwargs):
+        if target_paths.app_support == destination:
+            raise RuntimeError("injected cold-start failure")
+        return BootstrapResult("started", "realm-1", "Realm", "http://127.0.0.1:1", "actor", "astrid")
+
+    monkeypatch.setattr("banodoco_local.relocation._bootstrap_locked", fail_candidate_then_restore)
 
     try:
         relocate(paths, _StoppedBoundary(), _config(tmp_path), object(), destination=destination, backup=tmp_path / "unused-backup", confirmation="RELOCATE realm-1")
@@ -194,3 +209,31 @@ def test_relocation_restores_old_support_root_when_cutover_fails(tmp_path, monke
     assert paths.app_support.exists()
     assert not destination.exists()
     assert paths.catalog_path.read_bytes() == before
+
+
+def test_relocation_restores_target_aux_when_root_rename_fails(tmp_path, monkeypatch):
+    paths = RuntimePaths.sandbox(tmp_path / "support")
+    paths.ensure_support_dirs()
+    current = paths.realms_dir / "realm-1"
+    current.mkdir()
+    paths.catalog_path.write_text(json.dumps({"version": 1, "realms": [{"realm_id": "realm-1", "display_name": "Realm", "data_root": str(current)}], "selected_realm_id": "realm-1", "source_profiles": {}}), encoding="utf-8")
+    paths.discovery_path.write_text(json.dumps({"pid": 1234, "active_realm": "realm-1", "endpoint": "http://127.0.0.1:1", "runtime_instance_id": "instance", "process_birth_id": "birth"}), encoding="utf-8")
+    destination = tmp_path / "Astrid" / ".astrid-data"
+    destination.mkdir(parents=True)
+    (destination / "verification").mkdir()
+    (destination / "verification" / "keep.txt").write_text("keep", encoding="utf-8")
+    original_replace = os.replace
+
+    def fail_root_rename(source, target):
+        if Path(source) == paths.app_support and Path(target) == destination:
+            raise OSError("injected root rename failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr("banodoco_local.relocation.os.replace", fail_root_rename)
+    monkeypatch.setattr("banodoco_local.relocation._bootstrap_locked", lambda *_args, **_kwargs: BootstrapResult("started", "realm-1", "Realm", "http://127.0.0.1:1", "actor", "astrid"))
+
+    with pytest.raises(RelocationError, match="rolled back"):
+        relocate(paths, _StoppedBoundary(), _config(tmp_path), object(), destination=destination, confirmation="RELOCATE realm-1")
+
+    assert paths.app_support.is_dir()
+    assert (destination / "verification" / "keep.txt").read_text(encoding="utf-8") == "keep"
