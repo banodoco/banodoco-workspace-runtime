@@ -17,6 +17,23 @@ The runtime owns durable structured state, task/lease semantics, capability regi
 
 ## Run it
 
+The local launcher accepts an absolute `--data-root` support directory on
+lifecycle commands, or `BANODOCO_LOCAL_DATA_ROOT`. This directory directly
+contains the installation's `runtime/` and `credentials/` trees.
+`banodoco-local relocate --data-root /old/support --destination /new/support --plan`
+previews a same-filesystem move of that complete support tree. Execution uses
+`--confirm "RELOCATE <realm-id>"`, verifies the owner before stopping it,
+cold-starts at the new location, and restores the old tree if cutover fails.
+The optional backup path is recorded in the plan; relocation does not perform
+a backup/restore or migrate a legacy realm.
+
+Local consumers can resolve a project object through
+`get_project_object_location(project_id, object_id)` in Python or
+`getProjectObjectLocation(projectId, objectId)` in TypeScript. The authenticated
+lookup verifies ownership, size, and SHA-256 bytes before returning the current
+CAS path. Paths are valid for the local runtime host at lookup time; task and
+managed-output receipts remain portable and do not embed them.
+
 ```bash
 python3 -m runtime_protocol doctor --root .runtime --json
 python3 -m runtime_protocol create --root .runtime

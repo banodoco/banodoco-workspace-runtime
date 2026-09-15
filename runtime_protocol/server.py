@@ -313,6 +313,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     data = self._raw_body()
                     result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key)
                     return self._send(201, result)
+            if len(path) == 6 and path[3] == "objects" and path[5] == "location" and method == "GET":
+                self._identity("objects:read")
+                return self._send(200, self.runtime.object_location(selector, path[4]))
             if len(path) == 4 and path[3] in ("tasks", "runs") and method == "GET":
                 self._identity("tasks:read")
                 query = parse_qs(urlsplit(self.path).query)

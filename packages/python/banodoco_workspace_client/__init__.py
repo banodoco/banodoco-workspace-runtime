@@ -16,6 +16,7 @@ from .generated import (
     Handshake,
     ManagedObject,
     ManagedOutput,
+    ObjectLocation,
     ShotTextBinding,
     MutationResult,
     Project,
@@ -30,4 +31,4 @@ from .generated import (
     WorkspaceClient,
 )
 
-__all__ = ["ApiError", "AttemptFence", "ClaimWaiting", "ByteResponse", "Capability", "Event", "Executor", "Generation", "GenerationVariant", "Handshake", "Health", "IntegrityCheck", "IntegrityReport", "ManagedObject", "ManagedOutput", "ShotTextBinding", "MutationResult", "Project", "ProjectDocument", "Realm", "RealmLifecycle", "RecoveryAuthorization", "RecoveryCheckpointReceipt", "RecoveryReceipt", "RecoveryResumeReceipt", "Task", "WorkspaceClient"]
+__all__ = ["ApiError", "AttemptFence", "ClaimWaiting", "ByteResponse", "Capability", "Event", "Executor", "Generation", "GenerationVariant", "Handshake", "Health", "IntegrityCheck", "IntegrityReport", "ManagedObject", "ManagedOutput", "ObjectLocation", "ShotTextBinding", "MutationResult", "Project", "ProjectDocument", "Realm", "RealmLifecycle", "RecoveryAuthorization", "RecoveryCheckpointReceipt", "RecoveryReceipt", "RecoveryResumeReceipt", "Task", "WorkspaceClient"]

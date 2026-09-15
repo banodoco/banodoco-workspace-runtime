@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.local/schemas/object-location.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["object_id", "digest", "size", "media_type", "local_path", "storage", "verified"],
+  "properties": {
+    "object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "size": { "type": "integer", "minimum": 0 },
+    "media_type": { "type": "string", "minLength": 1 },
+    "filename": { "type": ["string", "null"] },
+    "local_path": { "type": "string", "minLength": 1 },
+    "storage": { "const": "runtime_cas" },
+    "verified": { "const": true }
+  }
+}

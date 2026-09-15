@@ -159,6 +159,12 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputAdoption' } } } }
       responses: { '200': { description: Named managed association adoption with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/objects/{object_id}/location:
+    parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/ObjectId' } ]
+    get:
+      operationId: getProjectObjectLocation
+      description: Verify project-owned CAS bytes and return their current local-host path. This lookup is not a portable receipt or a guarantee that the path remains valid after relocation.
+      responses: { '200': { description: Verified local object location, content: { application/json: { schema: { $ref: './schemas/object-location.json' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/managed-outputs/{association_id}/export:
     post:
       operationId: exportManagedOutput

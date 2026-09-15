@@ -149,6 +149,7 @@ export const SCHEMA_MANIFEST_SHA256 = "${schemaDigest}" as const;
 export const OPERATIONS = ${JSON.stringify(operationIds)} as const;
 export type HeadersLike = Record<string, string>;
 export type Transport = (method: string, path: string, headers: HeadersLike, body?: Uint8Array) => Promise<{ status: number; headers: HeadersLike; body: Uint8Array }>;
+export interface ObjectLocation { object_id: string; digest: string; size: number; media_type: string; filename?: string | null; local_path: string; storage: "runtime_cas"; verified: true }
 export type ManagedOutputDurability = "durable" | "temporary";
 export type ManagedCoverageMode = "interval" | "clips" | "cuts" | "shots";
 export interface ManagedOutput {
@@ -235,6 +236,9 @@ export class WorkspaceClient {
   }
   async getManagedOutput(associationId: string): Promise<ManagedOutput> {
     return this.json<ManagedOutput>((await this.call("getManagedOutput", "GET", "/v1/managed-outputs/" + encodeURIComponent(associationId))).body);
+  }
+  async getProjectObjectLocation(projectId: string, objectId: string): Promise<ObjectLocation> {
+    return this.json<ObjectLocation>((await this.call("getProjectObjectLocation", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/objects/" + encodeURIComponent(objectId) + "/location")).body);
   }
   async adoptManagedOutput(associationId: string, idempotencyKey: string, body: ManagedOutputAdoption = {}): Promise<MutationResult<ManagedOutput>> {
     return this.mutation<ManagedOutput>((await this.call("adoptManagedOutput", "POST", "/v1/managed-outputs/" + encodeURIComponent(associationId) + "/adopt", new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
