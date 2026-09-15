@@ -46,6 +46,12 @@ _VIDEO_MEDIA_TYPES = frozenset({
     "video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "clip/visual",
 })
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_HISTORICAL_ASSOCIATION_COLUMNS = (
+    "association_id", "task_id", "attempt_id", "project_id", "output_port", "group_key",
+    "generation_id", "variant_key", "object_digest", "manifest_digest", "size", "filename",
+    "media_type", "ordinal", "role", "producer_json", "provenance_json", "durability",
+    "regeneration_json", "coverage_json", "created_at",
+)
 
 
 def _regular(path: Path, label: str) -> None:
@@ -480,6 +486,13 @@ def _historical_filename(spec: object, output: dict) -> str | None:
             if isinstance(candidate, str) and candidate:
                 value = candidate
                 break
+            snapshot = current.get("timeline_snapshot")
+            config = snapshot.get("config") if isinstance(snapshot, dict) else None
+            declared_output = config.get("output") if isinstance(config, dict) else None
+            candidate = declared_output.get("file") if isinstance(declared_output, dict) else None
+            if isinstance(candidate, str) and candidate:
+                value = candidate
+                break
             pending.extend(child for child in current.values() if isinstance(child, dict))
     if not isinstance(value, str) or Path(value).name != value or not _SAFE_FILENAME.fullmatch(value):
         return None
@@ -572,6 +585,12 @@ def _collect_historical_candidates(
                 raise ValidationError(f"historical output task {task['id']} has an unrelated attempt")
             skip(task, "attempt_task_mismatch")
             continue
+        project = connection.execute(
+            "SELECT id FROM projects WHERE id=?", (task["project_id"],)
+        ).fetchone()
+        if not project:
+            skip(task, "project_missing")
+            continue
         try:
             result = json.loads(task["result_json"] or "{}")
             spec = json.loads(task["spec_json"] or "{}")
@@ -623,14 +642,13 @@ def _collect_historical_candidates(
                 skip(task, "missing_verified_filename_or_media_type", ordinal=ordinal)
                 continue
             object_row = connection.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
-            if not object_row or int(object_row["size"]) != raw_size or object_row["media_type"] != media_type:
+            if object_row and (int(object_row["size"]) != raw_size or object_row["media_type"] != media_type):
                 skip(task, "object_metadata_conflict", ordinal=ordinal)
                 continue
-            if not connection.execute(
-                "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (task["project_id"], digest)
-            ).fetchone():
-                skip(task, "object_outside_project", ordinal=ordinal)
-                continue
+            project_object = connection.execute(
+                "SELECT 1 FROM project_objects WHERE project_id=? AND digest=? AND relation='managed'",
+                (task["project_id"], digest),
+            ).fetchone()
             if verify_cas:
                 try:
                     _verified_cas_object(root, digest, raw_size, time.monotonic() + timeout_seconds)
@@ -649,6 +667,8 @@ def _collect_historical_candidates(
                 "durability": output.get("durability", "durable"),
                 "regeneration_json": None, "coverage_json": None,
                 "created_at": task["updated_at"],
+                "_object_missing": object_row is None,
+                "_project_object_missing": project_object is None,
             })
     return candidates, skipped
 
@@ -656,11 +676,27 @@ def _collect_historical_candidates(
 def _insert_historical_candidates(connection: sqlite3.Connection, candidates: list[dict]) -> int:
     inserted = 0
     for item in candidates:
-        columns = ", ".join(item)
-        placeholders = ", ".join("?" for _ in item)
+        if item.get("_object_missing"):
+            existing = connection.execute(
+                "SELECT size, media_type FROM objects WHERE digest=?", (item["object_digest"],)
+            ).fetchone()
+            if existing and (int(existing["size"]) != int(item["size"]) or existing["media_type"] != item["media_type"]):
+                raise ConflictError(f"historical object metadata conflicts: {item['object_digest']}")
+            if existing is None:
+                connection.execute(
+                    "INSERT INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (item["object_digest"], item["size"], item["media_type"], item["filename"], item["created_at"]),
+                )
+        if item.get("_project_object_missing"):
+            connection.execute(
+                "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)",
+                (item["project_id"], item["object_digest"], item["created_at"]),
+            )
+        columns = ", ".join(_HISTORICAL_ASSOCIATION_COLUMNS)
+        placeholders = ", ".join("?" for _ in _HISTORICAL_ASSOCIATION_COLUMNS)
         connection.execute(
             f"INSERT INTO managed_output_associations ({columns}) VALUES ({placeholders})",
-            tuple(item.values()),
+            tuple(item[column] for column in _HISTORICAL_ASSOCIATION_COLUMNS),
         )
         connection.execute(
             "INSERT INTO managed_output_lifecycle(association_id, state, version, expires_at, pinned_at, lease_id, lease_owner, lease_expires_at, updated_at, created_at) VALUES (?, ?, 1, NULL, NULL, NULL, NULL, NULL, ?, ?)",
