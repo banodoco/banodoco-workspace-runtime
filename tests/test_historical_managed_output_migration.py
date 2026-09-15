@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+
+def test_filename_uses_pinned_timeline_output():
+    from runtime_protocol.upgrade import _historical_filename
+    spec = {"spec": {"inputs": {"timeline_snapshot": {"config": {"output": {"file": "intro.mp4"}}}}}}
+    assert _historical_filename(spec, {}) == "intro.mp4"
+    spec["spec"]["inputs"]["timeline_snapshot"]["config"]["output"]["file"] = "../outside.mp4"
+    assert _historical_filename(spec, {}) is None
+
 import hashlib
 import json
 import sqlite3
@@ -11,7 +19,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.upgrade import migrate_historical_managed_outputs
 
 
-def _historical_realm(root):
+def _historical_realm(root, *, register_indexes=True):
     store = RealmStore.initialize(root, realm_id="realm-history")
     store.close()
     payload = b"historical-video-bytes"
@@ -30,14 +38,15 @@ def _historical_realm(root):
             "INSERT INTO runs(id, project_id, capability, spec_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("run-history", "project-history", "rendering.render", "{}", "completed", timestamp, timestamp),
         )
-        connection.execute(
-            "INSERT INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
-            (digest, len(payload), "clip/visual", "video", timestamp),
-        )
-        connection.execute(
-            "INSERT INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, ?, ?)",
-            ("project-history", digest, "managed", timestamp),
-        )
+        if register_indexes:
+            connection.execute(
+                "INSERT INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                (digest, len(payload), "clip/visual", "video", timestamp),
+            )
+            connection.execute(
+                "INSERT INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, ?, ?)",
+                ("project-history", digest, "managed", timestamp),
+            )
         connection.execute(
             "INSERT INTO tasks(id, run_id, capability, spec_json, status, attempt, lease_fence, attempt_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)",
             (
@@ -113,5 +122,52 @@ def test_historical_output_migration_rejects_unrelated_attempt(tmp_path):
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         assert connection.execute("SELECT COUNT(*) FROM managed_output_associations").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_historical_output_migration_repairs_missing_object_indexes(tmp_path):
+    root = tmp_path / "realm"
+    digest = _historical_realm(root, register_indexes=False)
+    result = migrate_historical_managed_outputs(
+        root, project_id="project-history", task_id="task-history",
+        confirmation="MIGRATE MANAGED OUTPUTS realm-history",
+    )
+    assert result["migrated"] == 1
+    connection = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        assert connection.execute(
+            "SELECT size, media_type, original_name FROM objects WHERE digest=?", (digest,)
+        ).fetchone() == (len(b"historical-video-bytes"), "clip/visual", "historical.mp4")
+        assert connection.execute(
+            "SELECT relation FROM project_objects WHERE project_id=? AND digest=?", ("project-history", digest)
+        ).fetchone()[0] == "managed"
+    finally:
+        connection.close()
+
+
+def test_historical_output_migration_refuses_conflicting_object_metadata(tmp_path):
+    root = tmp_path / "realm"
+    digest = _historical_realm(root, register_indexes=False)
+    connection = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        timestamp = "2026-09-15T00:00:00Z"
+        connection.execute(
+            "INSERT INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+            (digest, len(b"historical-video-bytes") + 1, "clip/visual", "wrong.mp4", timestamp),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    result = migrate_historical_managed_outputs(
+        root, project_id="project-history", task_id="task-history",
+        confirmation="MIGRATE MANAGED OUTPUTS realm-history",
+    )
+    assert result["migrated"] == 0
+    assert result["skipped"] == [{"task_id": "task-history", "reason": "object_metadata_conflict", "ordinal": 0}]
+    connection = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM managed_output_associations").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM project_objects").fetchone()[0] == 0
     finally:
         connection.close()

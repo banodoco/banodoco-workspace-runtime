@@ -11,7 +11,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.upgrade import upgrade_realm
 
 
-def _legacy_realm(root):
+def _legacy_realm(root, *, register_indexes=True):
     store = RealmStore.initialize(root)
     realm_id = store.realm["id"]
     timestamp = "2026-09-15T00:00:00Z"
@@ -67,14 +67,15 @@ def _legacy_realm(root):
             "INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, 1, ?, ?, 1, 1)",
             ("attempt-1", "task-1", "lease-1", "fixture", timestamp),
         )
-        connection.execute(
-            "INSERT INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
-            (digest, len(payload), "clip/visual", "video", timestamp),
-        )
-        connection.execute(
-            "INSERT INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, ?, ?)",
-            ("project-1", digest, "managed", timestamp),
-        )
+        if register_indexes:
+            connection.execute(
+                "INSERT INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                (digest, len(payload), "clip/visual", "video", timestamp),
+            )
+            connection.execute(
+                "INSERT INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, ?, ?)",
+                ("project-1", digest, "managed", timestamp),
+            )
         connection.execute(
             "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("generation-1", "project-1", "task-1", "generation", "succeeded", "{}", 1, timestamp, timestamp),
@@ -143,6 +144,22 @@ def test_upgrade_refuses_unknown_shape_without_touching_source(tmp_path):
         if (root / name).exists()
     }
     assert after == before
+
+
+def test_upgrade_repairs_missing_historical_object_indexes(tmp_path):
+    root = tmp_path / "realm"
+    realm_id = _legacy_realm(root, register_indexes=False)
+    result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    assert result["historical_managed_outputs"]["migrated"] == 1
+    reopened = RealmStore(root)
+    try:
+        digest = reopened.conn.execute("SELECT object_digest FROM managed_output_associations").fetchone()[0]
+        assert reopened.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()[0] == len(b"legacy-video")
+        assert reopened.conn.execute(
+            "SELECT relation FROM project_objects WHERE project_id='project-1' AND digest=?", (digest,)
+        ).fetchone()[0] == "managed"
+    finally:
+        reopened.close()
 
 
 def test_upgrade_is_not_repeatable_and_refuses_live_owner(tmp_path):
