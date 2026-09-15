@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import sqlite3
@@ -16,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
+from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
+from .dirfd import remove_tree_at
 from .util import canonical_json, new_id, now
 
 try:
@@ -24,7 +27,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -32,18 +35,20 @@ OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 # JSON clients (including TypeScript) must be able to preserve the exact byte
 # count used in the admission hash.  Stay within IEEE-754's safe integer range.
 MAX_STORAGE_ESTIMATE_BYTES = (1 << 53) - 1
+GENERATION_INTENT_STORAGE_KEY = "__runtime_generation_intent"
+LEGACY_GENERATION_INTENT_STORAGE_KEY = "generation_intent"
 FACT_EXACT_KEYS = frozenset({
     "interpreter", "runtime_lock", "engine_lock", "model_digest",
     "custom_node_digest", "driver", "root", "port",
 })
 FACT_MINIMUM_KEYS = frozenset({"vram_bytes", "scratch_bytes"})
-# Admission checks the complete current schema shape after any upgrade has run
-# against the isolated snapshot.  Keeping this contract explicit prevents a
-# current-version database with a missing runtime column from being opened and
-# then partially mutated before the first query discovers the damage.
+# Admission checks the complete canonical shape against an isolated snapshot.
+# This list is the canonical contract and is intentionally independent of
+# any historical schema artifacts:
+# an existing database must already have this shape and is never upgraded on
+# open or verify.
 REQUIRED_SCHEMA_COLUMNS = {
     "attempts": frozenset("id task_id lease_id fence executor_id lease_expires_at settled runtime_epoch recovery_nonce recovery_nonce_expires_at recovery_nonce_used".split()),
-    "canonical_receipt_backfills": frozenset("id source_schema_version backfilled_count completed_at".split()),
     "capabilities": frozenset("id definition_digest status required_resource_keys_json estimated_scratch_bytes estimated_output_bytes unavailable_reason created_at updated_at".split()),
     "command_idempotency": frozenset("command_kind aggregate_id idempotency_key request_hash result_json created_at txn_id primary_stream_id resulting_stream_seq first_project_seq last_project_seq event_ids_json".split()),
     "continuation_admissions": frozenset("continuation_task_id dependency_snapshot_json admitted_at".split()),
@@ -53,9 +58,8 @@ REQUIRED_SCHEMA_COLUMNS = {
     "generations": frozenset("id project_id source_task_id type status metadata_json version created_at updated_at".split()),
     "media_references": frozenset("id reference_id media_id role ordinal is_primary metadata_json created_at".split()),
     "media_relations": frozenset("project_id from_digest to_digest kind ordinal metadata_json created_at".split()),
-    "migration_event_streams": frozenset("source_stream_id destination_stream_id project_id stream_type aggregate_id head_seq source_ordinal source_created_at created_at".split()),
-    "migration_events": frozenset("source_event_id destination_event_id source_stream_id destination_stream_id project_id project_seq seq source_ordinal subject_type subject_id changes_json kind schema_version idempotency_key txn_id actor_kind payload_json source_created_at created_at".split()),
-    "migration_owner_records": frozenset("source_table source_key source_ordinal row_json row_sha256 created_at".split()),
+    "managed_output_associations": frozenset("association_id task_id attempt_id project_id output_port group_key generation_id variant_key object_digest manifest_digest size filename media_type ordinal role producer_json provenance_json durability regeneration_json coverage_json created_at".split()),
+    "managed_output_lifecycle": frozenset("association_id state version expires_at pinned_at lease_id lease_owner lease_expires_at updated_at created_at".split()),
     "objects": frozenset("digest size media_type original_name created_at".split()),
     "project_documents": frozenset("id project_id kind content_json version created_at updated_at".split()),
     "project_objects": frozenset("project_id digest relation created_at".split()),
@@ -71,7 +75,6 @@ REQUIRED_SCHEMA_COLUMNS = {
     "reservations": frozenset("task_id resource_key lease_token created_at released_at executor_id fence lease_expires_at runtime_epoch".split()),
     "runs": frozenset("id project_id capability spec_json status idempotency_key created_at updated_at".split()),
     "runtime_lifecycle": frozenset("id runtime_epoch boot_id previous_boot_id started_at recovered_task_count".split()),
-    "schema_migrations": frozenset("version applied_at".split()),
     "shot_items": frozenset("id shot_id media_id sort_key source_frame metadata_json created_at".split()),
     "shot_text_binding_events": frozenset("event_id binding_id project_id seq kind payload_json previous_hash event_hash created_at".split()),
     "shot_text_bindings": frozenset("id project_id shot_id kind slot media_digest event_stream_id head_seq created_at updated_at".split()),
@@ -85,13 +88,10 @@ REQUIRED_SCHEMA_COLUMNS = {
     "timeline_shot_state": frozenset("id version archived_at".split()),
     "timeline_shots": frozenset("id timeline_id start_ms duration_ms reference_ids_json".split()),
     "timelines": frozenset("id project_id version created_at archived_at".split()),
+    "runtime_schema": frozenset("id format_id version created_at".split()),
 }
 REQUIRED_SCHEMA_TABLES = frozenset(REQUIRED_SCHEMA_COLUMNS)
-_REALM_METADATA_TABLES = frozenset({
-    "schema_migrations", "canonical_receipt_backfills", "realm_lifecycle",
-    "runtime_lifecycle", "migration_event_streams", "migration_events",
-    "migration_owner_records",
-})
+_REALM_METADATA_TABLES = frozenset({"runtime_schema", "realm_lifecycle", "runtime_lifecycle"})
 
 
 def normalize_execution_facts(value, *, field="execution facts"):
@@ -131,6 +131,33 @@ def normalize_execution_facts(value, *, field="execution facts"):
     return {"exact": normalized_exact, "minimum": normalized_minimum}
 
 
+def public_task_spec(spec):
+    """Split internal generation intent from the public task spec."""
+    public = dict(spec or {})
+    intent = public.pop(GENERATION_INTENT_STORAGE_KEY, None)
+    if intent is None and LEGACY_GENERATION_INTENT_STORAGE_KEY in public:
+        intent = public.pop(LEGACY_GENERATION_INTENT_STORAGE_KEY)
+    else:
+        public.pop(LEGACY_GENERATION_INTENT_STORAGE_KEY, None)
+    return public, intent
+
+
+def canonical_task_spec_for_compare(spec):
+    """Canonicalize legacy/current intent storage for idempotency comparison."""
+    public, intent = public_task_spec(spec)
+    if intent is not None:
+        public[GENERATION_INTENT_STORAGE_KEY] = intent
+    return public
+
+
+def task_spec_for_request_hash(spec):
+    """Keep the pre-fix request hash stable across the storage-key change."""
+    public, intent = public_task_spec(spec)
+    if intent is not None:
+        public[LEGACY_GENERATION_INTENT_STORAGE_KEY] = intent
+    return public
+
+
 def execution_facts_match(required, verified):
     """Return whether verified facts satisfy every task-selected fact."""
     required = normalize_execution_facts(required, field="required_facts")
@@ -154,11 +181,121 @@ class RealmStore:
     process lock and a SQLite transaction.
     """
 
-    def __init__(self, root: str | Path, *, create: bool = True, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS, strict_admission: bool = False):
+    @classmethod
+    def initialize(cls, root: str | Path, *, display_name: str = "Workspace", realm_id: str | None = None):
+        """Explicitly create and verify one fresh canonical realm.
+
+        Normal open never creates a root, schema, identity, lock directory, or
+        CAS directory.  Creation is a separate operation so a missing path is
+        an admission failure rather than an implicit bootstrap.
+        """
+        root = Path(root).expanduser().resolve()
+        # Validate the complete identity before touching the requested root.
+        # Creation is a sibling build followed by one directory publication;
+        # the final name must never expose the schema without its identity.
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValidationError("fresh realm identity is invalid")
+        rid = str(realm_id or new_id())
+        if not rid.strip():
+            raise ValidationError("fresh realm identity is invalid")
+        if root.exists():
+            if root.is_symlink() or not root.is_dir():
+                raise RealmAdmissionError("fresh realm root is not a directory")
+            if any(root.iterdir()):
+                raise RealmAdmissionError("fresh realm root must be absent or empty")
+        else:
+            root.parent.mkdir(parents=True, exist_ok=True)
+        staged_root = Path(tempfile.mkdtemp(prefix=f".{root.name}.create-", dir=str(root.parent)))
+        staged_root.chmod(0o700)
+        store = cls.__new__(cls)
+        store.root = staged_root
+        store.lock_path = staged_root / "owner.lock"
+        store.db_path = staged_root / "realm.sqlite3"
+        store.cas_root = staged_root / "cas" / "sha256"
+        store.staging_root = staged_root / "staging"
+        store._lock_file = None
+        store._mutex = threading.RLock()
+        store.conn = None
+        parent_fd = -1
+        published = False
+        root_was_present = root.exists()
+        try:
+            store._acquire_owner()
+            store._open(fresh=True)
+            timestamp = now()
+            with store._transaction():
+                store.conn.execute(
+                    "INSERT INTO realm(id, display_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (rid, display_name, timestamp, timestamp),
+                )
+                store.conn.execute(
+                    "INSERT INTO realm_lifecycle(realm_id, state, version) VALUES (?, 'active', 1)",
+                    (rid,),
+                )
+            store.admission_report = store.integrity_report()
+            if not store.admission_report.get("ok"):
+                raise RealmAdmissionError("fresh realm failed canonical admission", details=store.admission_report)
+            staged_fd = os.open(staged_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(staged_fd)
+            finally:
+                os.close(staged_fd)
+            parent_fd = os.open(root.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            os.rename(staged_root.name, root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            published = True
+            os.fsync(parent_fd)
+            # Keep the staged owner lock held through publication and final
+            # admission. Reopening here would create an ownership race in
+            # which another opener can acquire the just-published root before
+            # the creator's second admission completes.
+            store.root = root
+            store.lock_path = root / "owner.lock"
+            store.db_path = root / "realm.sqlite3"
+            store.cas_root = root / "cas" / "sha256"
+            store.staging_root = root / "staging"
+            return store
+        except Exception:
+            rollback_error = None
+            if published and parent_fd >= 0:
+                # The final name may already be visible when durability or
+                # post-publication admission fails.  Remove it below the
+                # retained parent descriptor so a retry cannot admit a
+                # partially published tree or follow a swapped path.
+                try:
+                    remove_tree_at(parent_fd, root.name)
+                    if root_was_present:
+                        os.mkdir(root.name, 0o700, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except Exception as exc:
+                    rollback_error = exc
+            elif staged_root.exists():
+                try:
+                    shutil.rmtree(staged_root)
+                except Exception as exc:
+                    rollback_error = exc
+            try:
+                store.close()
+            except Exception as exc:
+                rollback_error = rollback_error or exc
+            if rollback_error is not None:
+                raise RealmAdmissionError(
+                    "fresh realm publication rollback failed; manual recovery is required",
+                    details={"root": str(root), "rollback_error": str(rollback_error)},
+                ) from rollback_error
+            raise
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+
+    def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         self.root = Path(root).expanduser().resolve()
         if create:
-            self.root.mkdir(parents=True, exist_ok=True)
-            self.root.chmod(0o700)
+            raise ValidationError("implicit realm creation is disabled; use RealmStore.initialize")
+        if self.root.is_symlink() or not self.root.exists() or not self.root.is_dir():
+            raise RealmAdmissionError(
+                "realm root is missing or is not a directory",
+                details=self._integrity_failure("missing_root", "realm root does not exist or is not a directory"),
+            )
         self.lock_path = self.root / "owner.lock"
         self.db_path = self.root / "realm.sqlite3"
         self.cas_root = self.root / "cas" / "sha256"
@@ -166,33 +303,26 @@ class RealmStore:
         self._lock_file = None
         self._mutex = threading.RLock()
         self.conn = None
-        if acquire_owner:
-            self._acquire_owner()
         try:
             sqlite_components = [
                 self.db_path,
                 *(Path(str(self.db_path) + suffix) for suffix in ("-wal", "-shm", "-journal")),
             ]
-            if acquire_owner and any(path.exists() or path.is_symlink() for path in sqlite_components):
-                self.admission_report = self.inspect_realm(
-                    self.root,
-                    timeout_seconds=admission_timeout,
-                    allow_migration=True,
-                )
-                # A low-level store is also used to finish migrations for
-                # legacy schema-only databases. It may open an otherwise
-                # readable identity-only legacy state so the migration can
-                # complete. RuntimeService opts into strict admission and
-                # rejects that state before _open or _migrate can touch it.
-                identity_only_legacy = set(self.admission_report.get("issues", [])) == {"realm_identity"}
-                if not self.admission_report.get("ok") and (strict_admission or not identity_only_legacy):
-                    raise RealmAdmissionError(
-                        "realm failed startup admission",
-                        details=self.admission_report,
-                    )
-            else:
-                self.admission_report = {"state": "uninitialized", "ok": True}
-            self._open()
+            if not any(path.exists() or path.is_symlink() for path in sqlite_components):
+                self.admission_report = self._integrity_failure("missing_database", "realm.sqlite3 is missing")
+                raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
+            # Inspect before creating owner.lock so malformed or unsupported
+            # roots fail without changing their source tree.  Reinspect under
+            # the lock to close the race with a concurrent writer.
+            self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout)
+            if not self.admission_report.get("ok"):
+                raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
+            if acquire_owner:
+                self._acquire_owner()
+                self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout)
+                if not self.admission_report.get("ok"):
+                    raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
+            self._open(fresh=False)
         except Exception:
             self.close()
             raise
@@ -226,8 +356,10 @@ class RealmStore:
             self.conn.commit()
 
     def _acquire_owner(self):
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self.lock_path.parent.chmod(0o700)
+        if not self.root.exists() or not self.root.is_dir() or self.root.is_symlink():
+            raise RealmAdmissionError("realm root is unavailable before owner admission")
+        if self.lock_path.is_symlink():
+            raise RealmAdmissionError("owner lock must not be a symlink")
         self._lock_file = open(self.lock_path, "a+")
         self.lock_path.chmod(0o600)
         if fcntl is not None:
@@ -259,7 +391,7 @@ class RealmStore:
             os.close(source_fd)
 
     @classmethod
-    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, allow_migration: bool = False):
+    def inspect_realm(cls, root: str | Path, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         """Inspect a WAL-aware isolated snapshot without opening the source DB.
 
         Startup calls this only after acquiring the realm owner lock, so the
@@ -317,48 +449,10 @@ class RealmStore:
                 inspector.conn = connection
                 inspector._mutex = threading.RLock()
                 try:
-                    if allow_migration:
-                        migration_tables = {
-                            str(row[0])
-                            for row in connection.execute(
-                                "SELECT name FROM sqlite_master WHERE type='table'"
-                            )
-                        }
-                        migration_version = 0
-                        if "schema_migrations" in migration_tables:
-                            row = connection.execute(
-                                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-                            ).fetchone()
-                            migration_version = int(row[0] or 0)
-                        if not 1 <= migration_version <= SCHEMA_VERSION:
-                            connection.execute("PRAGMA query_only=ON")
-                            return inspector.integrity_report(
-                                catalog_path=catalog_path,
-                                timeout_seconds=max(0.001, deadline - time.monotonic()),
-                                allow_migration=False,
-                            )
-                        migration_timed_out = False
-
-                        def migration_progress():
-                            nonlocal migration_timed_out
-                            migration_timed_out = time.monotonic() >= deadline
-                            return 1 if migration_timed_out else 0
-
-                        connection.set_progress_handler(migration_progress, 1000)
-                        try:
-                            connection.execute("PRAGMA foreign_keys=ON")
-                            inspector._migrate()
-                        except sqlite3.DatabaseError as exc:
-                            if migration_timed_out:
-                                raise TimeoutError("realm inspection timed out") from exc
-                            raise
-                        finally:
-                            connection.set_progress_handler(None, 0)
                     connection.execute("PRAGMA query_only=ON")
                     return inspector.integrity_report(
                         catalog_path=catalog_path,
                         timeout_seconds=max(0.001, deadline - time.monotonic()),
-                        allow_migration=False,
                     )
                 finally:
                     connection.close()
@@ -392,23 +486,38 @@ class RealmStore:
             },
         }
 
-    def _open(self):
-        self.root.mkdir(parents=True, exist_ok=True)
+    def _open(self, *, fresh=False):
+        if not self.root.exists() or not self.root.is_dir():
+            raise RealmAdmissionError("realm root is unavailable")
         if any(path.is_symlink() for path in (self.cas_root.parent, self.cas_root, self.staging_root)):
             raise ValidationError("runtime storage roots must not be symlinks")
-        self.cas_root.parent.mkdir(parents=True, exist_ok=True)
-        self.cas_root.mkdir(parents=True, exist_ok=True)
-        self.cas_root.parent.chmod(0o700)
-        self.cas_root.chmod(0o700)
-        self.staging_root.mkdir(parents=True, exist_ok=True)
-        self.staging_root.chmod(0o700)
-        self.conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None, check_same_thread=False)
+        if fresh:
+            self.cas_root.parent.mkdir(parents=True, exist_ok=False)
+            self.cas_root.mkdir(parents=True, exist_ok=False)
+            self.cas_root.parent.chmod(0o700)
+            self.cas_root.chmod(0o700)
+            self.staging_root.mkdir(parents=True, exist_ok=False)
+            self.staging_root.chmod(0o700)
+            self.conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None, check_same_thread=False)
+        else:
+            for path in (self.cas_root.parent, self.cas_root, self.staging_root):
+                if not path.exists() or not path.is_dir():
+                    raise RealmAdmissionError("realm storage roots are incomplete")
+            self.conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=rw", uri=True, timeout=10,
+                isolation_level=None, check_same_thread=False,
+            )
         self.db_path.chmod(0o600)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        if fresh:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.executescript(CANONICAL_SCHEMA_SQL)
+            self.conn.execute(
+                "INSERT INTO runtime_schema(id, format_id, version, created_at) VALUES (1, ?, ?, ?)",
+                (CANONICAL_FORMAT_ID, SCHEMA_VERSION, now()),
+            )
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=10000")
-        self._migrate()
 
     def attempt_staging_dir(self, attempt_id):
         """Return the private staging directory for one persisted attempt."""
@@ -421,188 +530,7 @@ class RealmStore:
         settlements_root.chmod(0o700)
         return settlements_root / attempt_id
 
-    def _migrate(self):
-        self.conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
-        version = self.conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
-        if version > SCHEMA_VERSION:
-            raise ValidationError(f"database schema {version} is newer than runtime {SCHEMA_VERSION}")
-        # Some identity-free migration fixtures were assembled from the SQL
-        # files and therefore missed the schema-3 compatibility ALTER that is
-        # performed in code. Preserve that narrow low-level upgrade path, but
-        # never repair a database already claiming the current schema.
-        if 3 <= version < SCHEMA_VERSION and self._table_exists("tasks") and "attempt_id" not in self._table_columns("tasks"):
-            self.conn.execute("ALTER TABLE tasks ADD COLUMN attempt_id TEXT")
-        if version < 1:
-            self._run_migration(1)
-            version = 1
-        if version < 2:
-            # A short-lived convergence build created ``capabilities`` before
-            # this migration with seven columns. Upgrade that shape explicitly
-            # so old realms remain readable; the ALTER is part of migration 2,
-            # never a swallowed startup repair.
-            capability_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(capabilities)")}
-            if capability_columns:
-                missing = [column for column in ("created_at", "updated_at") if column not in capability_columns]
-                if missing:
-                    statements = ["BEGIN IMMEDIATE"]
-                    statements.extend(f"ALTER TABLE capabilities ADD COLUMN {column} TEXT" for column in missing)
-                    statements.append("COMMIT")
-                    self.conn.executescript(";\n".join(statements) + ";")
-            self._run_migration(2)
-            self.conn.execute("UPDATE capabilities SET created_at=COALESCE(created_at, ?), updated_at=COALESCE(updated_at, ?)", (now(), now()))
-            version = 2
-        if version < 3:
-            task_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(tasks)")}
-            statements = ["BEGIN IMMEDIATE"]
-            if "attempt_id" not in task_columns:
-                statements.append("ALTER TABLE tasks ADD COLUMN attempt_id TEXT")
-            statements.append((Path(__file__).parent / "migrations" / "003_domains.sql").read_text(encoding="utf-8"))
-            statements.append("INSERT INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'))")
-            statements.append("COMMIT")
-            self.conn.executescript(";\n".join(statements) + ";")
-            version = 3
-        if version < 4:
-            self._run_migration(4)
-            version = 4
-        if version < 5:
-            self._run_migration(5)
-            version = 5
-        if version < 6:
-            self._run_migration(6)
-            version = 6
-        if version < 7:
-            self._run_migration(7)
-            version = 7
-        if version < 8:
-            self._run_migration(8)
-            version = 8
-        if version < 9:
-            self._run_migration(9)
-            version = 9
-        if version < 10:
-            self._run_migration(10)
-            version = 10
-        if version < 11:
-            self._run_migration(11)
-            version = 11
-        if version < 12:
-            self._run_migration(12)
-            version = 12
-        if version < 13:
-            self._run_migration(13)
-            version = 13
-        if version < 14:
-            self._run_migration(14)
-            version = 14
-        if version < 15:
-            self._run_migration(15)
-            version = 15
-        if version < 16:
-            self._run_migration(16)
-            version = 16
-        if version < 17:
-            self._run_receipt_backfill_migration()
-            version = 17
-        if version < 18:
-            self._run_migration(18)
-            version = 18
-        if version < 19:
-            self._run_migration(19)
-            version = 19
-        if version < 20:
-            self._run_migration(20)
-            version = 20
-        if version < 21:
-            self._run_executor_identity_migration()
-            version = 21
-        if version < 22:
-            self._run_migration(22)
-            version = 22
-        if version < 23:
-            self._run_migration(23)
-            version = 23
-
-    def _run_receipt_backfill_migration(self):
-        """Backfill pre-016 rows inside one retryable migration transaction."""
-        migration = Path(__file__).parent / "migrations" / "017_backfill_canonical_receipts.sql"
-        statements = [statement.strip() for statement in migration.read_text(encoding="utf-8").split(";") if statement.strip()]
-        with self._transaction():
-            for statement in statements:
-                self.conn.execute(statement)
-            rows = self.conn.execute(
-                "SELECT command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at "
-                "FROM command_idempotency WHERE txn_id IS NULL "
-                "ORDER BY created_at, command_kind, aggregate_id, idempotency_key"
-            ).fetchall()
-            # Existing post-016 rows, if any, already own canonical sequence
-            # numbers. Historical rows continue after those numbers.
-            next_seq = defaultdict(int)
-            for row in self.conn.execute(
-                "SELECT command_kind, aggregate_id, result_json, last_project_seq "
-                "FROM command_idempotency WHERE txn_id IS NOT NULL"
-            ):
-                existing_result = json.loads(row["result_json"])
-                existing_project = str(self._legacy_receipt_project(row["command_kind"], row["aggregate_id"], existing_result) or "unscoped")
-                next_seq[existing_project] = max(next_seq[existing_project], int(row["last_project_seq"] or 0))
-            for row in rows:
-                result = json.loads(row["result_json"])
-                project_id = self._legacy_receipt_project(row["command_kind"], row["aggregate_id"], result)
-                project_id = str(project_id or "unscoped")
-                next_seq[project_id] += 1
-                project_seq = next_seq[project_id]
-                event_ids, stream_id, stream_seq = self._legacy_receipt_events(row, result)
-                txn_material = {
-                    "command_kind": row["command_kind"],
-                    "aggregate_id": row["aggregate_id"],
-                    "idempotency_key": row["idempotency_key"],
-                    "request_hash": row["request_hash"],
-                    "created_at": row["created_at"],
-                }
-                txn_id = "txn-legacy-" + hashlib.sha256(canonical_json(txn_material).encode()).hexdigest()
-                self.conn.execute(
-                    "UPDATE command_idempotency SET txn_id=?, primary_stream_id=?, resulting_stream_seq=?, "
-                    "first_project_seq=?, last_project_seq=?, event_ids_json=? "
-                    "WHERE command_kind=? AND aggregate_id=? AND idempotency_key=? AND txn_id IS NULL",
-                    (txn_id, stream_id, stream_seq, project_seq, project_seq,
-                     canonical_json(event_ids), row["command_kind"], row["aggregate_id"], row["idempotency_key"]),
-                )
-            self.conn.execute(
-                "INSERT INTO canonical_receipt_backfills(id, source_schema_version, backfilled_count, completed_at) "
-                "VALUES (1, 16, ?, ?) ON CONFLICT(id) DO NOTHING",
-                (len(rows), now()),
-            )
-            self.conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (17, datetime('now'))"
-            )
-
-    def _legacy_receipt_project(self, command_kind, aggregate_id, result):
-        """Resolve project identity from facts persisted before receipt fields."""
-        if command_kind == "project.create":
-            return result.get("id") or aggregate_id
-        if command_kind == "project.select":
-            return (result.get("project") or {}).get("id")
-        if command_kind in {"run.cancel", "run.retry"}:
-            row = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (aggregate_id,)).fetchone()
-            return row[0] if row and row[0] else "unscoped"
-        return result.get("project_id") or (result.get("project") or {}).get("id") or aggregate_id
-
-    def _legacy_receipt_events(self, row, result):
-        """Recover only event identities provably linked to the old result."""
-        if row["command_kind"] == "task.create":
-            run_id = (result.get("run") or {}).get("id")
-            events = self.conn.execute(
-                "SELECT id FROM events WHERE run_id=? AND kind='task.admitted' ORDER BY id",
-                (run_id,),
-            ).fetchall()
-            if len(events) != 1:
-                raise ValidationError(
-                    "historical task.create receipt requires exactly one committed task.admitted event"
-                )
-            count = self.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (run_id,)).fetchone()[0]
-            return [str(events[0][0])], str(run_id), int(count)
-        return [], None, None
-
-    def begin_runtime_session(self, boot_id):
+    def begin_runtime_session(self, boot_id, *, epoch_floor: int | None = None):
         """Open a durable boot session and recover work owned by old boots.
 
         The monotonically increasing epoch lives in SQLite and is advanced
@@ -617,7 +545,14 @@ class RealmStore:
                 row = self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone()
                 previous_epoch = int(row["runtime_epoch"]) if row else 0
                 previous_boot = row["boot_id"] if row else None
-                epoch = previous_epoch + 1
+                if epoch_floor is not None:
+                    try:
+                        epoch_floor = int(epoch_floor)
+                    except (TypeError, ValueError) as exc:
+                        raise ValidationError("runtime epoch floor is invalid") from exc
+                    if epoch_floor < 0:
+                        raise ValidationError("runtime epoch floor must be non-negative")
+                epoch = max(previous_epoch, int(epoch_floor or 0)) + 1
                 started_at = now()
                 self.conn.execute(
                     "INSERT INTO runtime_lifecycle(id, runtime_epoch, boot_id, previous_boot_id, started_at, recovered_task_count) VALUES (1, ?, ?, ?, ?, 0) ON CONFLICT(id) DO UPDATE SET runtime_epoch=excluded.runtime_epoch, boot_id=excluded.boot_id, previous_boot_id=excluded.previous_boot_id, started_at=excluded.started_at, recovered_task_count=0",
@@ -659,97 +594,8 @@ class RealmStore:
             row = self.conn.execute("SELECT * FROM runtime_lifecycle WHERE id=1").fetchone()
             return dict(row) if row else None
 
-    def _run_migration(self, version):
-        migration = (Path(__file__).parent / "migrations" / f"{version:03d}_*.sql")
-        matches = list(migration.parent.glob(migration.name))
-        if len(matches) != 1:
-            raise ValidationError(f"migration {version} is missing or ambiguous")
-        if version == 19:
-            self._run_executor_authority_migration()
-            return
-        script = matches[0].read_text(encoding="utf-8")
-        self.conn.executescript("BEGIN IMMEDIATE;\n" + script + f"\nINSERT INTO schema_migrations(version, applied_at) VALUES ({version}, datetime('now'));\nCOMMIT;")
-
     def _table_columns(self, table):
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
-
-    def _table_exists(self, table):
-        return self.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        ).fetchone() is not None
-
-    def _run_executor_authority_migration(self):
-        """Apply schema 19 across both transitional and partially-upgraded realms.
-
-        SQLite has no ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS``.  Some
-        historical receipt fixtures (and a process interrupted after the
-        structural part of schema 19) can therefore have the new executor
-        columns while still advertising a pre-19 migration marker.  Build the
-        small set of DDL/DML steps from the live shape under one transaction so
-        startup is retryable and never leaves a second authority behind.
-        """
-        with self._transaction():
-            executor_columns = self._table_columns("executors")
-            for column, definition in (
-                ("readiness", "TEXT NOT NULL DEFAULT 'ready'"),
-                ("readiness_reason", "TEXT"),
-                ("last_seen_at", "TEXT"),
-            ):
-                if column not in executor_columns:
-                    self.conn.execute(f"ALTER TABLE executors ADD COLUMN {column} {definition}")
-
-            workers_exists = self._table_exists("workers")
-            if workers_exists:
-                self.conn.execute(
-                    """INSERT INTO executors(
-                        id, max_concurrency, resource_keys_json, capabilities_json,
-                        protocol, created_at, runtime_epoch, readiness,
-                        readiness_reason, last_seen_at
-                    )
-                    SELECT
-                        w.id, w.max_concurrency, w.resource_keys_json,
-                        w.capabilities_json, 'workspace.v1', w.created_at,
-                        w.runtime_epoch, w.readiness, w.readiness_reason,
-                        w.last_seen_at
-                    FROM workers AS w
-                    WHERE NOT EXISTS (SELECT 1 FROM executors AS e WHERE e.id = w.id)"""
-                )
-
-            for table in ("tasks", "reservations"):
-                columns = self._table_columns(table)
-                if "worker_id" in columns and "executor_id" in columns:
-                    raise ValidationError(
-                        f"schema 19 found both worker_id and executor_id in {table}"
-                    )
-                if "worker_id" in columns:
-                    self.conn.execute(
-                        f"ALTER TABLE {table} RENAME COLUMN worker_id TO executor_id"
-                    )
-
-            self.conn.execute("DROP INDEX IF EXISTS idx_tasks_worker_status")
-            self.conn.execute("DROP INDEX IF EXISTS idx_reservations_active")
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_tasks_executor_status ON tasks(executor_id, status)"
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_reservations_active ON reservations(executor_id, resource_key, released_at)"
-            )
-            if workers_exists:
-                self.conn.execute("DROP TABLE workers")
-            self.conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (19, datetime('now'))"
-            )
-
-    def _run_executor_identity_migration(self):
-        """Apply schema 21 safely after an interrupted structural upgrade."""
-        with self._transaction():
-            columns = self._table_columns("executors")
-            for column in ("source_digest", "dependency_digest", "source_epoch"):
-                if column not in columns:
-                    self.conn.execute(f"ALTER TABLE executors ADD COLUMN {column} TEXT")
-            self.conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (21, datetime('now'))"
-            )
 
     def close(self):
         with self._mutex:
@@ -777,11 +623,16 @@ class RealmStore:
         with self._mutex:
             row = self.realm
             if row:
+                if realm_id is not None and str(realm_id) != row["id"]:
+                    raise ConflictError(
+                        "requested realm identity does not match the admitted realm",
+                        details={"expected": row["id"], "actual": str(realm_id)},
+                    )
                 return row
-            rid, timestamp = realm_id or new_id(), now()
-            self.conn.execute("INSERT INTO realm VALUES (?, ?, ?, ?)", (rid, display_name, timestamp, timestamp))
-            self.conn.execute("INSERT OR IGNORE INTO realm_lifecycle(realm_id, state, version) VALUES (?, 'active', 1)", (rid,))
-            return dict(self.conn.execute("SELECT * FROM realm WHERE id=?", (rid,)).fetchone())
+            raise RealmAdmissionError(
+                "realm identity is missing; implicit identity creation is disabled",
+                details={"reason": "realm_identity_missing"},
+            )
 
     def realm_lifecycle(self):
         row = self.conn.execute("SELECT * FROM realm_lifecycle WHERE realm_id=?", (self.realm["id"],)).fetchone()
@@ -832,7 +683,7 @@ class RealmStore:
                     if receipt:
                         if receipt["request_hash"] != request_hash:
                             raise ConflictError("idempotency key was already used with different input")
-                        return json.loads(receipt["result_json"])
+                        return self._public_task_result(json.loads(receipt["result_json"]))
                     prior = self.conn.execute("SELECT * FROM projects WHERE realm_id=? AND idempotency_key=?", (realm["id"], idempotency_key)).fetchone()
                     if prior:
                         if prior["slug"] != slug or prior["name"] != name or json.loads(prior["metadata_json"]) != (metadata or {}):
@@ -1019,6 +870,295 @@ class RealmStore:
                     details={"project_id": project_id, "object_id": object_id},
                 )
 
+    def _freeze_managed_render_inputs(self, project_id, spec, supplied_input_object_ids):
+        """Freeze a managed ``rendering.render`` timeline at admission.
+
+        Some consumers submit the HC-04 shape directly instead of going
+        through Astrid's managed-render helper.  Runtime is the authenticated
+        project/timeline authority, so it may resolve that reference once and
+        carry the resulting immutable snapshot into the claimed task.  The
+        generic host still receives only the snapshot and never gets project
+        or timeline read scope.
+        """
+        if not isinstance(spec, dict):
+            raise ValidationError("task spec must be an object")
+        params = spec.get("params")
+        if not isinstance(params, dict) or "timeline_ref" not in params:
+            return spec, supplied_input_object_ids
+        frozen = json.loads(canonical_json(spec))
+        params = frozen["params"]
+        timeline_ref = params.get("timeline_ref")
+        if not isinstance(timeline_ref, str) or not timeline_ref.strip():
+            raise ValidationError("rendering.render timeline_ref must be a non-empty project-scoped selector")
+        timeline_ref = timeline_ref.strip()
+        params["timeline_ref"] = timeline_ref
+        if project_id is None:
+            raise ValidationError("rendering.render timeline_ref requires a project")
+        inputs = frozen.get("inputs")
+        if inputs is None:
+            inputs = {}
+            frozen["inputs"] = inputs
+        if not isinstance(inputs, dict):
+            raise ValidationError("rendering.render inputs must be an object")
+        for field, message in (
+            ("timeline", "managed rendering does not accept a caller-supplied timeline path"),
+            ("assets_registry", "managed rendering does not accept a caller-supplied assets registry path"),
+            ("materialized_root", "managed rendering materialization is host-owned"),
+            ("materialized_objects", "managed rendering materialization is host-owned"),
+            ("timeline_snapshot", "managed rendering timeline_snapshot is Runtime-owned"),
+            ("timeline_authority", "managed rendering timeline_authority is Runtime-owned"),
+        ):
+            if inputs.get(field) not in (None, ""):
+                raise ValidationError(message)
+        supplied_input_ref = inputs.get("timeline_ref")
+        if supplied_input_ref not in (None, "", timeline_ref):
+            raise ConflictError("render timeline_ref bindings conflict")
+        supplied_version = params.get("expected_version")
+        if supplied_version is not None and (
+            isinstance(supplied_version, bool)
+            or not isinstance(supplied_version, int)
+            or supplied_version < 1
+        ):
+            raise ValidationError("render expected_version must be a positive integer")
+        selector = params.get("selector")
+        if selector is not None and (not isinstance(selector, str) or not selector.strip()):
+            raise ValidationError("render selector must be a non-empty string")
+        output_policy = params.get("output_policy")
+        if output_policy is not None and not isinstance(output_policy, dict):
+            raise ValidationError("render output_policy must be an object")
+
+        rows = self.conn.execute(
+            "SELECT id, archived_at FROM timelines WHERE project_id=? ORDER BY created_at, id",
+            (project_id,),
+        ).fetchall()
+        matches = []
+        for row in rows:
+            document = self.conn.execute(
+                "SELECT content_json, version FROM project_documents WHERE id=? AND project_id=?",
+                (f"timeline:{row['id']}", project_id),
+            ).fetchone()
+            content = json.loads(document["content_json"]) if document else {}
+            slug = content.get("slug") if isinstance(content, dict) else None
+            if timeline_ref in {str(row["id"]), str(slug or "")}:
+                matches.append((row, document, content))
+        if not matches:
+            raise NotFoundError(
+                "timeline_ref is not in the selected project",
+                details={"project_id": project_id, "timeline_ref": timeline_ref},
+            )
+        if len(matches) != 1:
+            raise ConflictError("timeline_ref is ambiguous within the selected project")
+        row, document, content = matches[0]
+        if row["archived_at"]:
+            raise ConflictError(
+                "timeline_ref identifies an archived timeline",
+                details={"timeline_id": row["id"], "timeline_ref": timeline_ref},
+            )
+        if not isinstance(content, dict) or not isinstance(content.get("config"), dict) or not isinstance(content.get("registry"), dict):
+            raise ValidationError("canonical timeline config and registry must be objects")
+        config = content["config"]
+        registry = content["registry"]
+        assets = registry.get("assets", {})
+        if not isinstance(assets, dict):
+            raise ValidationError("canonical timeline registry assets must be an object")
+        ordered_input_ids = []
+        managed_media = {}
+        for asset_name, asset in assets.items():
+            if not isinstance(asset, dict):
+                raise ValidationError("canonical timeline registry assets must contain objects")
+            media_id = asset.get("media_id") or asset.get("object_id")
+            if not isinstance(media_id, str) or not media_id.strip():
+                raise ValidationError(
+                    f"canonical timeline asset {asset_name!r} has no runtime media identity"
+                )
+            digest = next(
+                (
+                    value
+                    for key in ("content_sha256", "object_id", "digest", "sha256", "hash")
+                    for value in (asset.get(key),)
+                    if isinstance(value, str) and OBJECT_ID_RE.fullmatch(value)
+                ),
+                None,
+            )
+            if digest is None:
+                raise ValidationError(
+                    f"canonical timeline asset {asset_name!r} has no runtime content digest"
+                )
+            normalized = "sha256:" + OBJECT_ID_RE.fullmatch(digest).group(1)
+            if normalized not in ordered_input_ids:
+                ordered_input_ids.append(normalized)
+            managed_media[media_id] = normalized
+        supplied = list(supplied_input_object_ids or [])
+        if supplied:
+            normalized_supplied = []
+            for value in supplied:
+                match = OBJECT_ID_RE.fullmatch(value) if isinstance(value, str) else None
+                if match is None:
+                    raise ValidationError("input_object_ids must contain sha256 object IDs")
+                normalized_supplied.append("sha256:" + match.group(1))
+            if normalized_supplied != ordered_input_ids:
+                raise ConflictError(
+                    "render input_object_ids do not match the canonical timeline registry",
+                    details={"expected": ordered_input_ids, "actual": normalized_supplied},
+                )
+
+        config_version = int(document["version"] if document else row["version"])
+        if supplied_version is not None and supplied_version != config_version:
+            raise ConflictError(
+                "render expected_version does not match the canonical timeline",
+                details={"expected": supplied_version, "actual": config_version},
+            )
+        config_hash = hashlib.sha256(canonical_json(config).encode()).hexdigest()
+        registry_hash = hashlib.sha256(canonical_json(registry).encode()).hexdigest()
+        event = self.conn.execute(
+            "SELECT id, event_hash FROM timeline_events WHERE timeline_id=? ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        authority = {
+            "authority": "kernel",
+            "project_id": project_id,
+            "project_slug": self._project(project_id)["slug"],
+            "timeline_id": row["id"],
+            "timeline_ulid": row["id"],
+            "timeline_slug": content.get("slug", row["id"]),
+            "config_version": config_version,
+            "head_event_id": str(event["id"] if event else f"timeline:{row['id']}:{config_version}"),
+            "head_hash": event["event_hash"] if event else config_hash,
+            "config_hash": config_hash,
+            "registry_hash": registry_hash,
+            "materialized_registry_hash": registry_hash,
+            "managed_media_admissions": managed_media,
+        }
+        frozen["timeline_snapshot"] = {"config": config, "registry": registry}
+        inputs["timeline_ref"] = timeline_ref
+        inputs["timeline_authority"] = authority
+        for field in ("selector", "profile", "output_name"):
+            if field in params:
+                if field in inputs and inputs[field] != params[field]:
+                    raise ConflictError(f"render {field} bindings conflict")
+                inputs[field] = params[field]
+        return frozen, ordered_input_ids
+
+    def _derive_managed_render_storage_estimate(self, config, registry, ordered_input_ids, profile=None):
+        """Derive a conservative whole-task budget from Runtime-owned inputs.
+
+        This is deliberately engine-neutral.  Runtime owns the exact CAS
+        object sizes and the immutable snapshot bytes; renderer-specific
+        profile validation remains a host concern, but the admission budget
+        must still cover the host's attempt-local materialization before a
+        worker can claim the task.
+        """
+        if profile is not None and not isinstance(profile, dict):
+            raise ValidationError("render profile must be an object")
+        profile = profile or {}
+        if profile:
+            required_profile = {
+                "width", "height", "fps_rational", "time_base", "container",
+                "video_codec", "video_profile", "video_level", "pixel_format",
+                "duration_tolerance",
+            }
+            optional_profile = {"audio_codec", "audio_sample_rate", "audio_channel_layout"}
+            unknown = set(profile) - required_profile - optional_profile
+            missing = required_profile - set(profile)
+            if unknown or missing:
+                raise ValidationError(
+                    "render profile has invalid fields",
+                    details={"missing": sorted(missing), "unknown": sorted(unknown)},
+                )
+            audio_fields = optional_profile.intersection(profile)
+            if audio_fields and audio_fields != optional_profile:
+                raise ValidationError("render profile audio fields must be supplied together")
+            for field in ("container", "video_codec", "pixel_format"):
+                if not isinstance(profile[field], str) or not profile[field]:
+                    raise ValidationError(f"render profile {field} must be a non-empty string")
+            if isinstance(profile["duration_tolerance"], bool) or not isinstance(profile["duration_tolerance"], int) or profile["duration_tolerance"] < 0:
+                raise ValidationError("render profile duration_tolerance must be a non-negative integer")
+        width = profile.get("width", 1920)
+        height = profile.get("height", 1080)
+        if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+            raise ValidationError("render profile width must be a positive integer")
+        if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+            raise ValidationError("render profile height must be a positive integer")
+        fps_rational = profile.get("fps_rational", [30, 1])
+        if (
+            not isinstance(fps_rational, list)
+            or len(fps_rational) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in fps_rational)
+        ):
+            raise ValidationError("render profile fps_rational must be [positive numerator, positive denominator]")
+        if profile:
+            time_base = profile.get("time_base")
+            if (
+                not isinstance(time_base, list)
+                or len(time_base) != 2
+                or any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in time_base)
+            ):
+                raise ValidationError("render profile time_base must be [positive numerator, positive denominator]")
+        fps = fps_rational[0] / fps_rational[1]
+        canvas = ((config.get("theme_overrides") or {}).get("visual") or {}).get("canvas", {})
+        if not profile:
+            if isinstance(canvas, dict):
+                width = canvas.get("width", width)
+                height = canvas.get("height", height)
+                raw_fps = canvas.get("fps", fps)
+                if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+                    raise ValidationError("canonical timeline canvas width must be a positive integer")
+                if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+                    raise ValidationError("canonical timeline canvas height must be a positive integer")
+                if isinstance(raw_fps, (int, float)) and raw_fps > 0:
+                    fps = float(raw_fps)
+
+        object_sizes = {}
+        for object_id in ordered_input_ids:
+            digest = OBJECT_ID_RE.fullmatch(object_id).group(1)
+            row = self.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+            if not row:
+                raise ConflictError(
+                    "canonical timeline media object is not available in Runtime CAS",
+                    details={"object_id": object_id},
+                )
+            object_sizes[digest] = int(row["size"])
+        managed_input_bytes = sum(object_sizes.values())
+        assets = registry.get("assets", {}) if isinstance(registry, dict) else {}
+        managed_entry_bytes = 0
+        for asset in assets.values() if isinstance(assets, dict) else ():
+            if not isinstance(asset, dict):
+                continue
+            digest = next((value for key in ("content_sha256", "object_id", "digest", "sha256", "hash") if isinstance((value := asset.get(key)), str) and OBJECT_ID_RE.fullmatch(value)), None)
+            if digest is not None:
+                managed_entry_bytes += object_sizes[OBJECT_ID_RE.fullmatch(digest).group(1)]
+        snapshot_bytes = len(canonical_json(config).encode()) + len(canonical_json(registry).encode())
+        duration_seconds = 1.0
+        clips = config.get("clips", []) if isinstance(config, dict) else []
+        if isinstance(clips, list):
+            for clip in clips:
+                if not isinstance(clip, dict):
+                    continue
+                at = clip.get("at", clip.get("start", 0))
+                duration = clip.get("duration", clip.get("hold", 0))
+                end = clip.get("to", clip.get("end"))
+                candidates = []
+                if isinstance(end, (int, float)):
+                    candidates.append(float(end))
+                if isinstance(at, (int, float)) and isinstance(duration, (int, float)):
+                    candidates.append(float(at) + max(0.0, float(duration)))
+                if candidates:
+                    duration_seconds = max(duration_seconds, max(candidates))
+        duration_seconds = min(max(duration_seconds, 1.0), 24 * 60 * 60)
+        video_bitrate = max(4_000_000, math.ceil(width * height * fps / 4 / 1000) * 1000)
+        encoded_payload = math.ceil(duration_seconds * (video_bitrate + 320_000) / 8)
+        output_bytes = max(1024 * 1024, math.ceil(encoded_payload * 1.03) + 1024 * 1024)
+        materialization_bytes = (
+            managed_input_bytes
+            + (managed_entry_bytes * 2)
+            + (snapshot_bytes * 2)
+        )
+        scratch_bytes = max(
+            256 * 1024 * 1024,
+            materialization_bytes + output_bytes + 2 * 1024 * 1024,
+        )
+        return {"scratch_bytes": int(scratch_bytes), "output_bytes": int(output_bytes)}
+
     @staticmethod
     def _validate_storage_estimate(storage_estimate):
         """Validate an optional immutable, request-specific disk estimate.
@@ -1064,12 +1204,49 @@ class RealmStore:
         if isinstance(spec, dict) and "required_facts" in spec:
             spec = dict(spec)
             spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
-        predecessors = self._continuation_predecessors(spec)
         with self._mutex:
             project_id = self._project(project)["id"] if project else None
+            if capability == "rendering.render":
+                admitted_spec = spec.get("spec") if isinstance(spec, dict) else None
+                admitted_spec, frozen_inputs = self._freeze_managed_render_inputs(
+                    project_id, admitted_spec, spec.get("input_object_ids", []) if isinstance(spec, dict) else [],
+                )
+                spec = dict(spec)
+                spec["spec"] = admitted_spec
+                spec["input_object_ids"] = frozen_inputs
+                if isinstance(admitted_spec, dict) and isinstance(admitted_spec.get("timeline_snapshot"), dict):
+                    admitted_inputs = admitted_spec.get("inputs", {})
+                    profile = admitted_inputs.get("profile") if isinstance(admitted_inputs, dict) else None
+                    derived_storage = self._derive_managed_render_storage_estimate(
+                        admitted_spec["timeline_snapshot"]["config"],
+                        admitted_spec["timeline_snapshot"]["registry"],
+                        frozen_inputs,
+                        profile=profile,
+                    )
+                    supplied_storage = spec.get("storage_estimate")
+                    if supplied_storage is not None:
+                        supplied_storage = self._validate_storage_estimate(supplied_storage)
+                        if supplied_storage["scratch_bytes"] or supplied_storage["output_bytes"]:
+                            if any(supplied_storage[key] < derived_storage[key] for key in ("scratch_bytes", "output_bytes")):
+                                raise ConflictError(
+                                    "render storage_estimate understates the Runtime-owned canonical render budget",
+                                    details={"required": derived_storage, "actual": supplied_storage},
+                                )
+                            derived_storage = supplied_storage
+                    admitted_spec["inputs"]["timeline_authority"]["storage_estimate"] = derived_storage
+                    spec["storage_estimate"] = derived_storage
+            predecessors = self._continuation_predecessors(spec)
+            if isinstance(expected_effect, dict) and expected_effect.get("effect_type") == "generation.publish_v1":
+                # The typed GEN publication plan is admitted against the task
+                # project before any durable task/run rows are created. Its
+                # output/member semantics are rechecked against staged bytes
+                # inside the fenced settlement transaction.
+                self._validate_settlement_effect(expected_effect, project_id=project_id)
+                if project_id is None:
+                    raise ConflictError("generation.publish_v1 requires a project-scoped task")
             self._validate_task_inputs(project_id, spec)
             with self._transaction():
-                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": spec, "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
+                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
                 aggregate_id = project_id or "unscoped"
                 if idempotency_key:
                     receipt = self.conn.execute(
@@ -1083,7 +1260,8 @@ class RealmStore:
                 if idempotency_key:
                     old = self.conn.execute("SELECT * FROM runs WHERE project_id IS ? AND idempotency_key=?", (project_id, idempotency_key)).fetchone()
                     if old:
-                        if old["spec_json"] != canonical_json(spec) or old["capability"] != capability:
+                        old_spec = json.loads(old["spec_json"])
+                        if canonical_task_spec_for_compare(old_spec) != canonical_task_spec_for_compare(spec) or old["capability"] != capability:
                             raise ConflictError("idempotency key was already used with different input")
                         task = self.conn.execute("SELECT * FROM tasks WHERE run_id=?", (old["id"],)).fetchone()
                         result = self._task_result(old, task)
@@ -1340,7 +1518,11 @@ class RealmStore:
 
     def _task_result(self, run, task):
         result = dict(task)
-        result["spec"] = json.loads(result.pop("spec_json"))
+        result["spec"], generation_intent = public_task_spec(json.loads(result.pop("spec_json")))
+        if generation_intent is not None:
+            # The producer intent is part of the immutable admission payload;
+            # expose the same opaque value on canonical task readback.
+            result["generation_intent"] = generation_intent
         if "required_facts" in result["spec"]:
             result["required_facts"] = dict(result["spec"]["required_facts"])
         if result.get("expected_effect_json"):
@@ -1351,7 +1533,23 @@ class RealmStore:
             result["result"] = json.loads(result["result_json"])
         if result.get("waiting_reason"):
             result["blocked_reason"] = result["waiting_reason"]
-        return {"run": dict(run), "task": result}
+        return self._public_task_result({"run": dict(run), "task": result})
+
+    def _public_task_result(self, value):
+        """Remove internal/legacy intent keys from a stored task result."""
+        result = dict(value)
+        task = result.get("task")
+        if isinstance(task, dict):
+            task = dict(task)
+            task["spec"], generation_intent = public_task_spec(task.get("spec") or {})
+            if generation_intent is None and task.get("generation_intent") is not None:
+                generation_intent = task["generation_intent"]
+            if generation_intent is None:
+                task.pop("generation_intent", None)
+            else:
+                task["generation_intent"] = generation_intent
+            result["task"] = task
+        return result
 
     def get_task(self, task_id):
         row = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -1559,7 +1757,26 @@ class RealmStore:
                 elif verified_facts != candidate:
                     raise ValidationError("executor capability facts are inconsistent")
                 value = {key: fact for key, fact in value.items() if key != "verified_facts"}
-            capabilities.append(value)
+            capability_id = value if isinstance(value, str) else value.get("capability_id", value.get("id"))
+            if not isinstance(capability_id, str) or not capability_id:
+                raise ValidationError("executor capability must identify a capability")
+            capability = self.conn.execute(
+                "SELECT id, definition_digest, status, required_resource_keys_json, "
+                "estimated_scratch_bytes, estimated_output_bytes, unavailable_reason "
+                "FROM capabilities WHERE id=?",
+                (capability_id,),
+            ).fetchone()
+            if not capability:
+                raise ValidationError("executor capability is not registered")
+            capabilities.append({
+                "capability_id": capability["id"],
+                "definition_digest": capability["definition_digest"],
+                "status": capability["status"],
+                "required_resource_keys": json.loads(capability["required_resource_keys_json"]),
+                "estimated_scratch_bytes": capability["estimated_scratch_bytes"],
+                "estimated_output_bytes": capability["estimated_output_bytes"],
+                "unavailable_reason": capability["unavailable_reason"],
+            })
         result["capabilities"] = capabilities
         result["resource_keys"] = json.loads(result.pop("resource_keys_json"))
         result.setdefault("readiness", "ready")
@@ -1783,18 +2000,42 @@ class RealmStore:
             row = self.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
             return self._executor_result(row)
 
-    def _validate_settlement_effect(self, effect):
+    def _validate_settlement_effect(self, effect, *, project_id=None, result=None, input_object_ids=None):
         if not isinstance(effect, dict):
             raise ValidationError("settlement effect must be an object")
         kind = effect.get("effect_type")
+        if kind == "generation.publish_v1":
+            return self._validate_generation_publish_v1_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+            )
+        if kind == "generation.create_with_variant":
+            self._validate_generation_create_with_variant_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
+            return
         target = effect.get("target_id")
         expected = effect.get("expected_version")
         try:
             expected_version = int(expected)
         except (TypeError, ValueError) as exc:
             raise ValidationError("settlement effect expected_version must be a positive integer") from exc
-        if kind != "project.update" or not target or expected is None or expected_version < 1:
-            raise ValidationError("settlement effect requires effect_type=project.update, target_id, and positive expected_version")
+        if not target or expected is None or expected_version < 1:
+            raise ValidationError("settlement effect requires target_id and positive expected_version")
+        if kind == "generation.variant.append":
+            self._validate_generation_variant_append_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
+            return
+        if kind != "project.update":
+            raise ValidationError("unsupported settlement effect_type")
         try:
             current = self._project(str(target))
         except NotFoundError as exc:
@@ -1802,10 +2043,617 @@ class RealmStore:
         if current is not None and int(current["version"]) != expected_version:
             raise ConflictError("stale settlement effect target version", details={"target": target, "expected": expected_version, "actual": int(current["version"])})
 
-    def _apply_settlement_effect(self, effect):
+    @staticmethod
+    def _generation_publish_output_key(output):
+        ordinal = output.get("ordinal", 0)
+        return (
+            output.get("output_port", output.get("name", "output")),
+            output.get("group_key", "default"),
+            output.get("variant_key", str(ordinal)),
+            int(ordinal),
+        )
+
+    def _validate_generation_publish_v1_effect(self, effect, *, project_id=None, result=None):
+        """Validate the exact GEN D1 multi-output publication effect."""
+        if set(effect) != {"effect_type", "target_id", "payload"}:
+            raise ValidationError(
+                "generation.publish_v1 effect has the wrong fields",
+                details={
+                    "required": ["effect_type", "target_id", "payload"],
+                    "unexpected": sorted(set(effect) - {"effect_type", "target_id", "payload"}),
+                },
+            )
+        if effect["effect_type"] != "generation.publish_v1":
+            raise ValidationError("generation.publish_v1 effect_type is invalid")
+        target_id = effect["target_id"]
+        if not isinstance(target_id, str) or not target_id:
+            raise ValidationError("generation.publish_v1 target_id must be a non-empty string")
+        payload = effect["payload"]
+        if not isinstance(payload, dict):
+            raise ValidationError("generation.publish_v1 payload must be an object")
+        required_payload = {
+            "version", "modality", "generation_type", "metadata",
+            "partial_success_policy", "groups",
+        }
+        if set(payload) != required_payload:
+            raise ValidationError(
+                "generation.publish_v1 payload has the wrong fields",
+                details={
+                    "required": sorted(required_payload),
+                    "unexpected": sorted(set(payload) - required_payload),
+                },
+            )
+        if isinstance(payload["version"], bool) or payload["version"] != 1:
+            raise ValidationError("generation.publish_v1 payload.version must be 1")
+        if not isinstance(payload["modality"], str) or payload["modality"] not in {"image", "video", "audio"}:
+            raise ValidationError("generation.publish_v1 payload.modality is invalid")
+        if not isinstance(payload["generation_type"], str) or not payload["generation_type"] or len(payload["generation_type"]) > 128:
+            raise ValidationError("generation.publish_v1 generation_type must be a non-empty string of at most 128 characters")
+        if not isinstance(payload["metadata"], dict):
+            raise ValidationError("generation.publish_v1 metadata must be an object")
+        if not isinstance(payload["partial_success_policy"], str) or payload["partial_success_policy"] not in {"reject", "allow"}:
+            raise ValidationError("generation.publish_v1 partial_success_policy is invalid")
+        groups = payload["groups"]
+        if not isinstance(groups, list) or not groups:
+            raise ValidationError("generation.publish_v1 groups must be a non-empty list")
+
+        declared = []
+        seen_groups = set()
+        seen_selectors = set()
+        for group in groups:
+            if not isinstance(group, dict) or set(group) != {"group_key", "selectors"}:
+                raise ValidationError("generation.publish_v1 group requires exactly group_key and selectors")
+            group_key = group["group_key"]
+            if not isinstance(group_key, str) or not group_key or len(group_key) > 255:
+                raise ValidationError("generation.publish_v1 group_key must be a non-empty string")
+            if group_key in seen_groups:
+                raise ValidationError("generation.publish_v1 groups must not contain duplicate group_key")
+            seen_groups.add(group_key)
+            selectors = group["selectors"]
+            if not isinstance(selectors, list) or not selectors:
+                raise ValidationError("generation.publish_v1 selectors must be a non-empty list")
+            group_declarations = []
+            seen_group_variants = set()
+            for selector in selectors:
+                if not isinstance(selector, dict) or set(selector) != {"selector", "ordinal", "variant_key", "output_port"}:
+                    raise ValidationError(
+                        "generation.publish_v1 selector requires exactly selector, ordinal, variant_key, and output_port"
+                    )
+                label = selector["selector"]
+                output_port = selector["output_port"]
+                variant_key = selector["variant_key"]
+                ordinal = selector["ordinal"]
+                if not isinstance(label, str) or not label or len(label) > 255:
+                    raise ValidationError("generation.publish_v1 selector must be a non-empty string")
+                if not isinstance(output_port, str) or not output_port or len(output_port) > 255:
+                    raise ValidationError("generation.publish_v1 output_port must be a non-empty string")
+                if not isinstance(variant_key, str) or not variant_key or len(variant_key) > 255:
+                    raise ValidationError("generation.publish_v1 variant_key must be a non-empty string")
+                if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+                    raise ValidationError("generation.publish_v1 ordinal must be a non-negative integer")
+                key = (output_port, group_key, variant_key, ordinal)
+                if key in seen_selectors:
+                    raise ValidationError("generation.publish_v1 selectors must not contain duplicates")
+                seen_selectors.add(key)
+                group_variant = (ordinal, variant_key)
+                if group_variant in seen_group_variants:
+                    raise ValidationError("generation.publish_v1 group selectors must not duplicate ordinal and variant_key")
+                seen_group_variants.add(group_variant)
+                declaration = {
+                    "selector": label,
+                    "ordinal": ordinal,
+                    "variant_key": variant_key,
+                    "output_port": output_port,
+                }
+                group_declarations.append((key, declaration))
+            declared.append((group_key, group_declarations))
+
+        if project_id is not None:
+            if not project_id:
+                raise ConflictError("generation.publish_v1 requires a project-scoped task")
+            if target_id != str(project_id):
+                raise ConflictError(
+                    "generation.publish_v1 target project does not match the task project",
+                    details={"target_id": target_id, "project_id": project_id},
+                )
+            target_project = self._project(target_id)
+            if target_project["id"] != str(project_id):
+                raise ConflictError(
+                    "generation.publish_v1 target project does not match the task project",
+                    details={"target_id": target_id, "project_id": project_id},
+                )
+        if result is None:
+            return None
+
+        outputs = result.get("outputs") if isinstance(result, dict) else None
+        if not isinstance(outputs, list):
+            raise ValidationError("generation.publish_v1 settlement requires an outputs list")
+        output_matches = defaultdict(list)
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            key = self._generation_publish_output_key(output)
+            if any(key == declared_key for _group_key, selectors in declared for declared_key, _selector in selectors):
+                output_matches[key].append(output)
+
+        plan = []
+        selected_count = 0
+        for group_key, selectors in declared:
+            selected = []
+            missing = []
+            for key, declaration in selectors:
+                matches = output_matches.get(key, [])
+                if len(matches) > 1:
+                    raise ValidationError(
+                        "generation.publish_v1 selector matched duplicate outputs",
+                        details={"selector": declaration["selector"], "output_port": declaration["output_port"], "ordinal": declaration["ordinal"]},
+                    )
+                if not matches:
+                    missing.append(declaration)
+                    continue
+                output = matches[0]
+                if output.get("kind") != "object":
+                    raise ValidationError("generation.publish_v1 selectors must resolve verified object outputs")
+                selected.append((key, declaration, output))
+            if payload["partial_success_policy"] == "reject" and missing:
+                raise ValidationError(
+                    "generation.publish_v1 reject policy requires every declared selector",
+                    details={"group_key": group_key, "missing": missing},
+                )
+            selected_count += len(selected)
+            plan.append({"group_key": group_key, "selected": selected, "missing": missing})
+        if selected_count == 0:
+            raise ValidationError("generation.publish_v1 requires at least one successful declared output")
+        return plan
+
+    def _validate_generation_create_with_variant_effect(
+        self,
+        effect,
+        *,
+        project_id=None,
+        result=None,
+        input_object_ids=None,
+    ):
+        """Validate Runtime-owned creation of a generation and first variant.
+
+        This is the new-generation counterpart to ``generation.variant.append``.
+        The task project is the sole target authority; Runtime derives stable
+        generation/variant identities from the admitted task at settlement.
+        That lets upload-driven producers publish into the gallery atomically
+        without a browser-side generation-create mutation.
+        """
+        if not isinstance(effect.get("target_id"), str) or not effect["target_id"]:
+            raise ValidationError("generation.create_with_variant target_id must be a non-empty string")
+        payload = effect.get("payload")
+        if not isinstance(payload, dict):
+            raise ValidationError("generation.create_with_variant payload must be an object")
+        required = {
+            "generation_type", "metadata", "variant_type",
+            "output_name", "output_ordinal", "primary_policy",
+        }
+        unknown = sorted(set(payload) - required)
+        missing = sorted(required - set(payload))
+        if missing or unknown:
+            raise ValidationError(
+                "generation.create_with_variant payload has the wrong fields",
+                details={"missing": missing, "unexpected": unknown},
+            )
+        generation_type = payload["generation_type"]
+        if not isinstance(generation_type, str) or not generation_type or len(generation_type) > 128:
+            raise ValidationError("generation_type must be a non-empty string of at most 128 characters")
+        metadata = payload["metadata"]
+        if not isinstance(metadata, dict):
+            raise ValidationError("generation metadata must be an object")
+        if "params" in metadata and not isinstance(metadata["params"], dict):
+            raise ValidationError("generation.create_with_variant metadata.params must be an object")
+        variant_type = payload["variant_type"]
+        if not isinstance(variant_type, str) or not variant_type or len(variant_type) > 128:
+            raise ValidationError("variant_type must be a non-empty string of at most 128 characters")
+        output_name = payload["output_name"]
+        if not isinstance(output_name, str) or not output_name or len(output_name) > 512:
+            raise ValidationError("output_name must be a non-empty string of at most 512 characters")
+        if isinstance(payload["output_ordinal"], bool) or payload["output_ordinal"] != 0:
+            raise ValidationError("output_ordinal must be zero for generation.create_with_variant")
+        if payload["primary_policy"] != "preserve":
+            raise ValidationError("primary_policy must be preserve")
+
+        # Shape-only validation is used before output staging. Project and
+        # input custody checks run again inside the fenced settlement.
+        if project_id is None and result is None:
+            return
+        if not project_id:
+            raise ConflictError("generation.create_with_variant requires a project-scoped task")
+        target_project = self._project(str(effect["target_id"]))
+        if target_project["id"] != str(project_id):
+            raise ConflictError(
+                "generation.create_with_variant target project does not match the task project",
+                details={"target_id": effect["target_id"], "project_id": project_id},
+            )
+        # The producer-facing contract admits either the Runtime project ID or
+        # its canonical slug.  Settlement remains Runtime-owned: the resolved
+        # project ID is used for the generation row below.
+        if not isinstance(input_object_ids, list) or not input_object_ids:
+            raise ConflictError("generation.create_with_variant requires admitted task inputs")
+        if result is None:
+            return
+        outputs = result.get("outputs") if isinstance(result, dict) else None
+        if not isinstance(outputs, list) or len(outputs) != 1:
+            raise ValidationError("generation.create_with_variant requires exactly one settlement output")
+        selected = outputs[0]
+        if (
+            not isinstance(selected, dict)
+            or selected.get("name") != output_name
+            or selected.get("kind") != "object"
+            or not isinstance(selected.get("digest"), str)
+            or not OBJECT_ID_RE.fullmatch(selected["digest"])
+        ):
+            raise ValidationError(
+                "generation.create_with_variant output selector did not resolve exactly one object",
+                details={"output_name": output_name, "output_ordinal": 0},
+            )
+
+    def _validate_generation_variant_append_effect(
+        self,
+        effect,
+        *,
+        project_id=None,
+        result=None,
+        input_object_ids=None,
+    ):
+        """Validate the narrow, Runtime-owned generation append contract.
+
+        This is intentionally stricter than the legacy project update effect.
+        The generation, source variant, source object, and selected output are
+        all bound before any variant row or generation version is changed.
+        """
+        if not isinstance(effect.get("target_id"), str) or not effect["target_id"]:
+            raise ValidationError("generation.variant.append target_id must be a non-empty string")
+        expected_version = effect.get("expected_version")
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError("generation.variant.append expected_version must be a positive integer")
+        payload = effect.get("payload")
+        if not isinstance(payload, dict):
+            raise ValidationError("generation.variant.append payload must be an object")
+        required = {
+            "source_variant_id", "source_object_id", "variant_type",
+            "output_name", "output_ordinal", "primary_policy",
+        }
+        unknown = sorted(set(payload) - required)
+        missing = sorted(required - set(payload))
+        if missing or unknown:
+            raise ValidationError(
+                "generation.variant.append payload has the wrong fields",
+                details={"missing": missing, "unexpected": unknown},
+            )
+        source_variant_id = payload["source_variant_id"]
+        if not isinstance(source_variant_id, str) or not source_variant_id:
+            raise ValidationError("source_variant_id must be a non-empty string")
+        source_object_id = payload["source_object_id"]
+        if not isinstance(source_object_id, str) or not OBJECT_ID_RE.fullmatch(source_object_id):
+            raise ValidationError("source_object_id must be a canonical sha256 object id")
+        if not source_object_id.startswith("sha256:"):
+            raise ValidationError("source_object_id must include the sha256 prefix")
+        source_digest = source_object_id.removeprefix("sha256:")
+        variant_type = payload["variant_type"]
+        if not isinstance(variant_type, str) or not variant_type or len(variant_type) > 128:
+            raise ValidationError("variant_type must be a non-empty string of at most 128 characters")
+        output_name = payload["output_name"]
+        if not isinstance(output_name, str) or not output_name or len(output_name) > 512:
+            raise ValidationError("output_name must be a non-empty string of at most 512 characters")
+        output_ordinal = payload["output_ordinal"]
+        if isinstance(output_ordinal, bool) or not isinstance(output_ordinal, int) or output_ordinal != 0:
+            raise ValidationError("output_ordinal must be zero for generation.variant.append")
+        if payload["primary_policy"] != "preserve":
+            raise ValidationError("primary_policy must be preserve")
+
+        # Shape-only validation is used at admission/settlement request
+        # parsing. The ownership and custody checks require the task project
+        # and the normalized staged result, and therefore run again below.
+        if project_id is None and result is None:
+            return
+        if not project_id:
+            raise ConflictError("generation.variant.append requires a project-scoped task")
+        generation = self.conn.execute(
+            "SELECT * FROM generations WHERE id=?", (str(effect["target_id"]),)
+        ).fetchone()
+        if not generation:
+            raise NotFoundError("settlement effect target generation not found", details={"target_id": effect["target_id"]})
+        if generation["project_id"] != str(project_id):
+            raise ConflictError(
+                "settlement effect generation is outside the task project",
+                details={"target_id": effect["target_id"], "project_id": project_id},
+            )
+        if int(generation["version"]) != int(effect["expected_version"]):
+            raise ConflictError(
+                "stale settlement effect target generation version",
+                details={"target": effect["target_id"], "expected": int(effect["expected_version"]), "actual": int(generation["version"])},
+            )
+        source_variant = self.conn.execute(
+            "SELECT * FROM generation_variants WHERE id=?", (source_variant_id,)
+        ).fetchone()
+        if not source_variant or source_variant["generation_id"] != generation["id"]:
+            raise ConflictError(
+                "source variant does not belong to the target generation",
+                details={"source_variant_id": source_variant_id, "target_id": generation["id"]},
+            )
+        if source_variant["object_id"] != source_digest:
+            raise ConflictError(
+                "source variant object does not match source_object_id",
+                details={"source_variant_id": source_variant_id, "expected": source_variant["object_id"], "actual": source_digest},
+            )
+        if not self.conn.execute("SELECT 1 FROM objects WHERE digest=?", (source_digest,)).fetchone():
+            raise ConflictError("source object is not present in Runtime CAS", details={"source_object_id": source_object_id})
+        if not self.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+            (str(project_id), source_digest),
+        ).fetchone():
+            raise ConflictError(
+                "source object is outside the task project",
+                details={"project_id": project_id, "source_object_id": source_object_id},
+            )
+        if not isinstance(input_object_ids, list) or source_object_id not in input_object_ids:
+            raise ConflictError(
+                "source object is not an admitted task input",
+                details={"source_object_id": source_object_id},
+            )
+        if result is None:
+            return
+        outputs = result.get("outputs") if isinstance(result, dict) else None
+        if not isinstance(outputs, list) or len(outputs) != 1:
+            raise ValidationError("generation.variant.append requires exactly one settlement output")
+        selected = outputs[0]
+        if (
+            not isinstance(selected, dict)
+            or selected.get("name") != output_name
+            or output_ordinal != 0
+            or selected.get("kind") != "object"
+            or not isinstance(selected.get("digest"), str)
+            or not OBJECT_ID_RE.fullmatch(selected["digest"])
+        ):
+            raise ValidationError(
+                "generation.variant.append output selector did not resolve exactly one object",
+                details={"output_name": output_name, "output_ordinal": output_ordinal},
+            )
+
+    def _apply_settlement_effect(
+        self,
+        effect,
+        *,
+        project_id=None,
+        result=None,
+        task_id=None,
+        input_object_ids=None,
+    ):
         kind = effect.get("effect_type")
+        if kind == "generation.publish_v1":
+            plan = self._validate_settlement_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+            )
+            payload = effect["payload"]
+            publications = []
+            association_overrides = {}
+            for group in plan:
+                group_key = group["group_key"]
+                missing = list(group["missing"])
+                if not group["selected"]:
+                    publications.append({
+                        "group_key": group_key,
+                        "published": [],
+                        "missing_selectors": missing,
+                    })
+                    continue
+                generation_id = "generation-" + hashlib.sha256(
+                    canonical_json({"task_id": str(task_id), "group_key": group_key}).encode()
+                ).hexdigest()
+                timestamp = now()
+                self.conn.execute(
+                    "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 'completed', ?, 1, ?, ?)",
+                    (
+                        generation_id,
+                        str(project_id),
+                        str(task_id),
+                        payload["generation_type"],
+                        canonical_json(payload["metadata"]),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                variants = []
+                for key, declaration, output in group["selected"]:
+                    variant_id = "variant-" + hashlib.sha256(
+                        canonical_json({
+                            "generation_id": generation_id,
+                            "ordinal": declaration["ordinal"],
+                            "variant_key": declaration["variant_key"],
+                        }).encode()
+                    ).hexdigest()
+                    output_digest = output["digest"].removeprefix("sha256:")
+                    variant_metadata = {
+                        "selector": declaration["selector"],
+                        "output_port": declaration["output_port"],
+                        "group_key": group_key,
+                        "variant_key": declaration["variant_key"],
+                        "ordinal": declaration["ordinal"],
+                        "filename": output.get("filename", output.get("name", "output")),
+                        "media_type": output.get("media_type", "application/octet-stream"),
+                        "size": int(output["size"]),
+                        "role": output.get("role") or "output",
+                        "producer": dict(output.get("producer") or {}),
+                        "provenance": dict(output.get("provenance") or {}),
+                        "durability": output.get("durability", "durable"),
+                        "regeneration": output.get("regeneration"),
+                        "coverage": output.get("coverage"),
+                    }
+                    self.conn.execute(
+                        "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            variant_id,
+                            generation_id,
+                            output_digest,
+                            declaration["variant_key"],
+                            canonical_json(variant_metadata),
+                            timestamp,
+                        ),
+                    )
+                    association_overrides[key] = {
+                        "generation_id": generation_id,
+                        "variant_id": variant_id,
+                        "selector": declaration["selector"],
+                    }
+                    variants.append({
+                        "variant_id": variant_id,
+                        "generation_id": generation_id,
+                        "object_id": output["digest"],
+                        "variant_key": declaration["variant_key"],
+                        "ordinal": declaration["ordinal"],
+                        "output_port": declaration["output_port"],
+                    })
+                publications.append({
+                    "group_key": group_key,
+                    "generation_id": generation_id,
+                    "variants": variants,
+                    "missing_selectors": missing,
+                })
+            return {
+                "effect_type": "generation.publish_v1",
+                "publications": publications,
+                "_association_overrides": association_overrides,
+            }
+        if kind == "generation.create_with_variant":
+            self._validate_settlement_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
+            payload = effect["payload"]
+            output = result["outputs"][payload["output_ordinal"]]
+            output_digest = output["digest"].removeprefix("sha256:")
+            generation_id = "generation-task-" + str(task_id)
+            identity = {
+                "generation_id": generation_id,
+                "variant_type": payload["variant_type"],
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "output_digest": output["digest"],
+                "task_id": str(task_id),
+            }
+            variant_id = "initial-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+            timestamp = now()
+            generation_metadata = dict(payload["metadata"])
+            params = generation_metadata.get("params", {})
+            if not isinstance(params, dict):
+                raise ValidationError("generation.create_with_variant metadata.params must be an object")
+            params = dict(params)
+            params["source_task_id"] = str(task_id)
+            params["input_object_ids"] = list(input_object_ids or [])
+            params["output_name"] = payload["output_name"]
+            params.setdefault("content_type", "video" if "video" in payload["generation_type"].lower() else "image")
+            generation_metadata["params"] = params
+            generation_metadata["source_task_id"] = str(task_id)
+            generation_metadata["input_object_ids"] = list(input_object_ids or [])
+            generation_metadata["output_name"] = payload["output_name"]
+            generation_metadata["output_ordinal"] = payload["output_ordinal"]
+            generation_metadata["primary_policy"] = payload["primary_policy"]
+            self.conn.execute(
+                "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 'completed', ?, 1, ?, ?)",
+                (
+                    generation_id,
+                    str(project_id),
+                    str(task_id),
+                    payload["generation_type"],
+                    canonical_json(generation_metadata),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            variant_metadata = {
+                "is_primary": True,
+                "source_task_id": str(task_id),
+                "input_object_ids": list(input_object_ids or []),
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "primary_policy": payload["primary_policy"],
+                "media_type": output.get("media_type"),
+                "size": output.get("size"),
+            }
+            self.conn.execute(
+                "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    variant_id,
+                    generation_id,
+                    output_digest,
+                    payload["variant_type"],
+                    canonical_json(variant_metadata),
+                    timestamp,
+                ),
+            )
+            return {
+                "variant_id": variant_id,
+                "generation_id": generation_id,
+                "object_id": output["digest"],
+                "variant_type": payload["variant_type"],
+                "metadata": variant_metadata,
+                "created_at": timestamp,
+            }
         if kind != "project.update":
-            raise ValidationError("unsupported settlement effect_type")
+            if kind != "generation.variant.append":
+                raise ValidationError("unsupported settlement effect_type")
+            self._validate_settlement_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
+            payload = effect["payload"]
+            output = result["outputs"][payload["output_ordinal"]]
+            output_digest = output["digest"].removeprefix("sha256:")
+            identity = {
+                "generation_id": str(effect["target_id"]),
+                "source_variant_id": payload["source_variant_id"],
+                "source_object_id": payload["source_object_id"],
+                "variant_type": payload["variant_type"],
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "output_digest": output["digest"],
+                "task_id": str(task_id),
+            }
+            variant_id = "append-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
+            timestamp = now()
+            changed = self.conn.execute(
+                "UPDATE generations SET version=version+1, updated_at=? WHERE id=? AND project_id=? AND version=?",
+                (timestamp, str(effect["target_id"]), str(project_id), int(effect["expected_version"])),
+            )
+            if changed.rowcount != 1:
+                raise ConflictError("stale settlement effect target generation version")
+            metadata = {
+                "source_task_id": str(task_id),
+                "source_variant_id": payload["source_variant_id"],
+                "source_object_id": payload["source_object_id"],
+                "output_name": payload["output_name"],
+                "output_ordinal": payload["output_ordinal"],
+                "primary_policy": payload["primary_policy"],
+            }
+            try:
+                self.conn.execute(
+                    "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (variant_id, str(effect["target_id"]), output_digest, payload["variant_type"], canonical_json(metadata), timestamp),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError(
+                    "generation variant append conflicts with an existing variant",
+                    details={"variant_id": variant_id},
+                ) from exc
+            return {
+                "variant_id": variant_id,
+                "generation_id": str(effect["target_id"]),
+                "object_id": output["digest"],
+                "variant_type": payload["variant_type"],
+                "metadata": metadata,
+                "created_at": timestamp,
+            }
         target = effect.get("target_id")
         current = self._project(str(target))
         payload = effect.get("payload") or {}
@@ -1818,6 +2666,289 @@ class RealmStore:
         changed = self.conn.execute("UPDATE projects SET name=?, metadata_json=?, version=version+1, updated_at=? WHERE id=? AND version=?", (name, canonical_json(metadata), now(), current["id"], int(effect["expected_version"])))
         if changed.rowcount != 1:
             raise ConflictError("stale settlement effect target version")
+
+    def _validated_manifest_digest(self, result, *, project_id=None):
+        """Validate an optional managed-manifest reference before publication."""
+        reference = result.get("manifest_ref") if isinstance(result, dict) else None
+        if reference is None:
+            return None
+        if not isinstance(reference, dict):
+            raise ValidationError("manifest_ref must be an object")
+        unknown = set(reference) - {"object_id", "digest", "size"}
+        if unknown:
+            raise ValidationError("manifest_ref contains unsupported fields", details={"fields": sorted(unknown)})
+        object_id = reference.get("object_id", reference.get("digest"))
+        if not isinstance(object_id, str) or not OBJECT_ID_RE.fullmatch(object_id) or not object_id.startswith("sha256:"):
+            raise ValidationError("manifest_ref requires a canonical sha256 object_id")
+        digest = object_id.removeprefix("sha256:")
+        size = reference.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValidationError("manifest_ref size must be a non-negative integer")
+        matching_output = next(
+            (output for output in result.get("outputs", [])
+             if isinstance(output, dict) and output.get("digest") == object_id),
+            None,
+        )
+        if matching_output is not None:
+            if int(matching_output["size"]) != size:
+                raise ConflictError("manifest_ref size does not match settled output")
+        else:
+            row = self.conn.execute("SELECT size FROM objects WHERE digest=?", (digest,)).fetchone()
+            if not row or int(row["size"]) != size:
+                raise ConflictError("manifest_ref is not a verified managed object")
+            if project_id and not self.conn.execute(
+                "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+                (project_id, digest),
+            ).fetchone():
+                raise ConflictError("manifest_ref is outside the task project")
+        return digest
+
+    def _managed_output_value(self, row):
+        value = dict(row)
+        for field in ("producer_json", "provenance_json", "regeneration_json", "coverage_json"):
+            value[field.removesuffix("_json")] = json.loads(value[field]) if value[field] is not None else None
+            value.pop(field)
+        value["object_id"] = "sha256:" + value.pop("object_digest")
+        value["digest"] = value["object_id"]
+        if value.get("manifest_digest"):
+            value["manifest_ref"] = "sha256:" + value.pop("manifest_digest")
+        else:
+            value.pop("manifest_digest", None)
+            value["manifest_ref"] = None
+        value["selector"] = {"group_key": value["group_key"], "variant_key": value["variant_key"]}
+        value["lifecycle"] = {
+            "state": value["state"], "version": int(value["version"]),
+            "expires_at": value["expires_at"], "pinned_at": value["pinned_at"],
+            "lease_id": value.get("lease_id"), "lease_owner": value.get("lease_owner"),
+            "lease_expires_at": value.get("lease_expires_at"),
+            "updated_at": value["lifecycle_updated_at"],
+        }
+        return value
+
+    @staticmethod
+    def _managed_output_select():
+        return (
+            "SELECT a.*, t.run_id AS run_id, l.state, l.version, l.expires_at, l.pinned_at, "
+            "l.lease_id, l.lease_owner, l.lease_expires_at, l.updated_at AS lifecycle_updated_at "
+            "FROM managed_output_associations a "
+            "JOIN managed_output_lifecycle l ON l.association_id=a.association_id "
+            "JOIN tasks t ON t.id=a.task_id "
+        )
+
+    def _associate_managed_outputs(self, result, *, task_id, attempt_id, project_id, applied_effect=None):
+        """Persist immutable output identity and initial Runtime lifecycle atomically."""
+        manifest_digest = self._validated_manifest_digest(result, project_id=project_id)
+        if manifest_digest is None:
+            manifest_output = next(
+                (output for output in result.get("outputs", [])
+                 if isinstance(output, dict) and output.get("role") == "manifest"),
+                None,
+            )
+            if manifest_output is not None:
+                manifest_digest = str(manifest_output["digest"]).removeprefix("sha256:")
+        associations = []
+        publish_overrides = {}
+        if isinstance(applied_effect, dict) and applied_effect.get("effect_type") == "generation.publish_v1":
+            publish_overrides = applied_effect.get("_association_overrides") or {}
+        for output in result.get("outputs", []):
+            if not isinstance(output, dict) or output.get("kind") != "object":
+                continue
+            digest = str(output["digest"]).removeprefix("sha256:")
+            output_port = output.get("output_port", output.get("name", "output"))
+            group_key = output.get("group_key", "default")
+            variant_key = output.get("variant_key", str(output.get("ordinal", 0)))
+            ordinal = int(output.get("ordinal", 0))
+            publish_key = (output_port, group_key, variant_key, ordinal)
+            if isinstance(applied_effect, dict) and applied_effect.get("effect_type") == "generation.publish_v1":
+                publish_override = publish_overrides.get(publish_key) or {}
+                generation_id = publish_override.get("generation_id")
+            elif isinstance(applied_effect, dict):
+                publish_override = {}
+                generation_id = applied_effect.get("generation_id")
+            else:
+                # Producer-supplied generation IDs are never authoritative;
+                # generic managed outputs stay outside the generation domain.
+                publish_override = {}
+                generation_id = None
+            role = output.get("role") or "output"
+            durability = output.get("durability", "durable")
+            producer = dict(output.get("producer") or {})
+            provenance = dict(output.get("provenance") or {})
+            if publish_override.get("selector") is not None:
+                # The managed association schema already has an extensible
+                # provenance object; retain GEN's selector label there rather
+                # than adding a second association column.
+                provenance["selector"] = publish_override["selector"]
+            task_row = self.conn.execute("SELECT capability FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+            attempt_row = self.conn.execute(
+                "SELECT executor_id, fence, runtime_epoch FROM attempts WHERE id=?",
+                (str(attempt_id),),
+            ).fetchone()
+            if task_row:
+                producer.setdefault("capability_id", task_row["capability"])
+            provenance.setdefault("task_id", str(task_id))
+            provenance.setdefault("attempt_id", str(attempt_id))
+            if task_row:
+                provenance.setdefault("capability_id", task_row["capability"])
+            if attempt_row:
+                provenance.setdefault("executor_id", attempt_row["executor_id"])
+                provenance.setdefault("fence", int(attempt_row["fence"]))
+                provenance.setdefault("runtime_epoch", int(attempt_row["runtime_epoch"]))
+            else:
+                provenance.setdefault("runtime_epoch", self._current_runtime_epoch())
+            identity = {
+                "task_id": str(task_id), "output_port": output_port,
+                "group_key": group_key, "generation_id": generation_id,
+                "variant_key": variant_key, "ordinal": ordinal,
+            }
+            association_id = "managed-output-" + hashlib.sha256(
+                canonical_json(identity).encode()
+            ).hexdigest()
+            self.conn.execute(
+                "INSERT OR IGNORE INTO managed_output_associations("
+                "association_id, task_id, attempt_id, project_id, output_port, group_key, "
+                "generation_id, variant_key, object_digest, manifest_digest, size, filename, "
+                "media_type, ordinal, role, producer_json, provenance_json, durability, "
+                "regeneration_json, coverage_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    association_id, str(task_id), str(attempt_id), project_id, output_port,
+                    group_key, generation_id, variant_key, digest, manifest_digest,
+                    int(output["size"]), output.get("filename", output.get("name", "output")),
+                    output.get("media_type", "application/octet-stream"), ordinal, role,
+                    canonical_json(producer), canonical_json(provenance), durability,
+                    canonical_json(output["regeneration"]) if output.get("regeneration") is not None else None,
+                    canonical_json(output["coverage"]) if output.get("coverage") is not None else None,
+                    now(),
+                ),
+            )
+            lifecycle_state = "temporary" if durability == "temporary" else "available"
+            self.conn.execute(
+                "INSERT OR IGNORE INTO managed_output_lifecycle(association_id, state, version, expires_at, pinned_at, lease_id, lease_owner, lease_expires_at, updated_at, created_at) VALUES (?, ?, 1, NULL, NULL, NULL, NULL, NULL, ?, ?)",
+                (association_id, lifecycle_state, now(), now()),
+            )
+            row = self.conn.execute(
+                self._managed_output_select() +
+                "WHERE a.association_id=?",
+                (association_id,),
+            ).fetchone()
+            associations.append(self._managed_output_value(row))
+        return associations
+
+    def list_managed_outputs(self, task_id):
+        with self._mutex:
+            rows = self.conn.execute(
+                self._managed_output_select() +
+                "WHERE a.task_id=? ORDER BY a.created_at, a.association_id",
+                (str(task_id),),
+            ).fetchall()
+            return [self._managed_output_value(row) for row in rows]
+
+    def get_managed_output(self, association_id):
+        with self._mutex:
+            row = self.conn.execute(
+                self._managed_output_select() + "WHERE a.association_id=?",
+                (str(association_id),),
+            ).fetchone()
+        if not row:
+            raise NotFoundError("managed output not found")
+        return self._managed_output_value(row)
+
+    def update_managed_output_lifecycle(
+        self, association_id, operation, *, expected_version, lease_id=None,
+        lease_owner=None, lease_seconds=None,
+    ):
+        """Apply one Runtime-owned lifecycle transition in the caller's transaction."""
+        row = self.conn.execute(
+            self._managed_output_select() + "WHERE a.association_id=?",
+            (str(association_id),),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("managed output not found")
+        try:
+            expected = int(expected_version)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("managed output expected_version must be a positive integer") from exc
+        if expected < 1:
+            raise ValidationError("managed output expected_version must be a positive integer")
+        actual = int(row["version"])
+        if expected != actual:
+            raise ConflictError(
+                "managed output lifecycle version conflict",
+                details={"expected": expected, "actual": actual},
+            )
+        if operation not in {"lease", "release", "pin", "unpin", "expire", "reclaim", "promote"}:
+            raise ValidationError("unsupported managed output lifecycle operation")
+
+        state = row["state"]
+        pinned_at = row["pinned_at"]
+        current_lease_id = row["lease_id"]
+        current_lease_owner = row["lease_owner"]
+        current_lease_expires = row["lease_expires_at"]
+        timestamp = now()
+        active_lease = bool(current_lease_id and current_lease_expires and current_lease_expires > timestamp)
+        next_state = state
+        next_expires = row["expires_at"]
+        next_lease_id = current_lease_id
+        next_lease_owner = current_lease_owner
+        next_lease_expires = current_lease_expires
+        if operation == "lease":
+            if state in {"expired", "reclaimed"}:
+                raise ConflictError("managed output is not leaseable", details={"state": state})
+            if active_lease and lease_id and str(lease_id) != str(current_lease_id):
+                raise ConflictError("managed output lease is held by another owner")
+            if lease_seconds is None:
+                raise ValidationError("managed output lease_seconds is required")
+            if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or lease_seconds <= 0:
+                raise ValidationError("managed output lease_seconds must be a positive integer")
+            next_lease_id = str(lease_id or current_lease_id or "managed-lease-" + new_id())
+            next_lease_owner = str(lease_owner or current_lease_owner or "managed-output-client")
+            next_lease_expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        elif operation == "release":
+            if active_lease and lease_id and str(lease_id) != str(current_lease_id):
+                raise ConflictError("managed output lease does not belong to caller")
+            next_lease_id = next_lease_owner = next_lease_expires = None
+        elif operation == "pin":
+            if state in {"expired", "reclaimed"}:
+                raise ConflictError("managed output cannot be pinned", details={"state": state})
+            pinned_at = pinned_at or timestamp
+        elif operation == "unpin":
+            pinned_at = None
+        elif operation == "expire":
+            if state != "temporary":
+                raise ConflictError("only temporary managed outputs can expire", details={"state": state})
+            if pinned_at or active_lease:
+                raise ConflictError("managed output is protected from expiry")
+            next_state = "expired"
+            next_expires = next_expires or timestamp
+        elif operation == "reclaim":
+            if state != "expired":
+                raise ConflictError("only expired managed outputs can be reclaimed", details={"state": state})
+            if pinned_at or active_lease:
+                raise ConflictError("managed output is protected from reclaim")
+            next_state = "reclaimed"
+            next_lease_id = next_lease_owner = next_lease_expires = None
+        elif operation == "promote":
+            if state not in {"available", "temporary"}:
+                raise ConflictError("managed output cannot be promoted", details={"state": state})
+            if row["project_id"] is None:
+                raise ConflictError("managed output promotion requires a project association")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'promoted', ?)",
+                (row["project_id"], row["object_digest"], timestamp),
+            )
+            next_state = "promoted"
+            next_expires = None
+            next_lease_id = next_lease_owner = next_lease_expires = None
+        changed = self.conn.execute(
+            "UPDATE managed_output_lifecycle SET state=?, version=?, expires_at=?, pinned_at=?, lease_id=?, lease_owner=?, lease_expires_at=?, updated_at=? WHERE association_id=? AND version=?",
+            (
+                next_state, actual + 1, next_expires, pinned_at, next_lease_id,
+                next_lease_owner, next_lease_expires, timestamp, str(association_id), actual,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise ConflictError("managed output lifecycle changed during update")
+        return self.get_managed_output(association_id)
 
     def _settle_attempt(self, task_id, lease_token, result, *, effect=None, fence=None, attempt_id, publish=None, record=None):
         with self._mutex:
@@ -1835,21 +2966,69 @@ class RealmStore:
                 except ValueError as exc:
                     raise LeaseError("attempt lease deadline is invalid") from exc
             declared = json.loads(task["expected_effect_json"]) if task["expected_effect_json"] else None
+            task_spec = json.loads(task["spec_json"] or "{}")
+            input_object_ids = task_spec.get("input_object_ids", [])
             if effect is not None and declared != effect:
                 raise ValidationError("settlement effect was not predeclared", details={"declared": declared})
             if declared is not None and effect is None:
                 raise ValidationError("declared settlement effect is required")
-            if effect is not None:
-                self._validate_settlement_effect(effect)
+            run = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()
+            task_project_id = run["project_id"] if run else None
+            if effect is not None and effect.get("effect_type") == "generation.publish_v1" and not task_project_id:
+                raise ConflictError("generation.publish_v1 requires a project-scoped task")
             with self._transaction():
                 timestamp = now()
-                if effect is not None:
-                    self._apply_settlement_effect(effect)
                 # The service stages output bytes before entering this fenced
                 # transaction.  Publication and object/project metadata are
                 # performed only after all lease/effect checks succeeded.
+                if effect is not None:
+                    self._validate_settlement_effect(
+                        effect,
+                        project_id=task_project_id,
+                        result=result,
+                        input_object_ids=input_object_ids,
+                    )
+                self._validated_manifest_digest(result, project_id=task_project_id)
+                applied_effect = None
+                append_effect = effect is not None and effect.get("effect_type") in {
+                    "generation.variant.append",
+                    "generation.create_with_variant",
+                    "generation.publish_v1",
+                }
                 if publish is not None:
+                    if append_effect:
+                        # Variant rows reference CAS objects.  Publish first
+                        # inside this transaction, then append the variant;
+                        # rollback plus staged cleanup removes all new bytes
+                        # if the append or receipt fails. project.update keeps
+                        # its historical effect-before-publication ordering.
+                        publish()
+                if effect is not None:
+                    applied_effect = self._apply_settlement_effect(
+                        effect,
+                        project_id=task_project_id,
+                        result=result,
+                        task_id=task_id,
+                        input_object_ids=input_object_ids,
+                    )
+                if publish is not None and not append_effect:
                     publish()
+                if applied_effect is not None:
+                    if effect.get("effect_type") == "generation.publish_v1":
+                        result["generation_publish_v1"] = {
+                            key: value
+                            for key, value in applied_effect.items()
+                            if not key.startswith("_")
+                        }
+                    else:
+                        result["generation_variant"] = applied_effect
+                managed_outputs = self._associate_managed_outputs(
+                    result,
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    project_id=task_project_id,
+                    applied_effect=applied_effect,
+                )
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
@@ -2030,7 +3209,7 @@ class RealmStore:
         """
         return self.integrity_report(catalog_path=catalog_path)
 
-    def integrity_report(self, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS, allow_migration: bool = False):
+    def integrity_report(self, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         """Return a bounded report even when SQLite metadata is malformed."""
         if timeout_seconds <= 0:
             return self._integrity_failure("timeout", "realm inspection timed out")
@@ -2045,7 +3224,7 @@ class RealmStore:
         with self._mutex:
             self.conn.set_progress_handler(progress, 1000)
             try:
-                return self._integrity_report(catalog_path=catalog_path, allow_migration=allow_migration, deadline=deadline)
+                return self._integrity_report(catalog_path=catalog_path, deadline=deadline)
             except TimeoutError as exc:
                 return self._integrity_failure("timeout", str(exc))
             except (sqlite3.DatabaseError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -2053,7 +3232,7 @@ class RealmStore:
             finally:
                 self.conn.set_progress_handler(None, 0)
 
-    def _integrity_report(self, *, catalog_path=None, allow_migration=False, deadline=None):
+    def _integrity_report(self, *, catalog_path=None, deadline=None):
         try:
             quick_rows = [str(row[0]) for row in self.conn.execute("PRAGMA quick_check").fetchall()]
             quick = "ok" if quick_rows == ["ok"] else quick_rows
@@ -2067,21 +3246,37 @@ class RealmStore:
         actual_tables = {row[0] for row in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         missing_tables = sorted(REQUIRED_SCHEMA_TABLES - actual_tables)
         missing_columns = {}
+        extra_columns = {}
         for table, required in REQUIRED_SCHEMA_COLUMNS.items():
             if table in actual_tables:
-                missing = sorted(required - self._table_columns(table))
+                actual_columns = self._table_columns(table)
+                missing = sorted(required - actual_columns)
+                extra = sorted(actual_columns - required)
                 if missing:
                     missing_columns[table] = missing
+                if extra:
+                    extra_columns[table] = extra
         actual_schema = None
-        if "schema_migrations" in actual_tables:
-            schema_row = self.conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()
-            actual_schema = int(schema_row[0] or 0)
-        schema_compatible = (
-            actual_schema is not None
-            and 1 <= actual_schema <= SCHEMA_VERSION
-            and {"realm", "schema_migrations"}.issubset(actual_tables)
+        actual_format = None
+        if "runtime_schema" in actual_tables:
+            schema_row = self.conn.execute(
+                "SELECT format_id, version FROM runtime_schema WHERE id=1"
+            ).fetchone()
+            if schema_row:
+                actual_format = schema_row["format_id"]
+                actual_schema = int(schema_row["version"])
+        unexpected_tables = sorted(
+            table for table in actual_tables
+            if not str(table).startswith("sqlite_") and table not in REQUIRED_SCHEMA_TABLES
         )
-        schema_ok = schema_compatible if allow_migration else actual_schema == SCHEMA_VERSION and not missing_tables and not missing_columns
+        schema_ok = (
+            actual_schema == SCHEMA_VERSION
+            and actual_format == CANONICAL_FORMAT_ID
+            and not missing_tables
+            and not missing_columns
+            and not extra_columns
+            and not unexpected_tables
+        )
         realm_identity = {"ok": False, "realm_id": None, "row_count": None, "reason": "realm_table_missing"}
         if "realm" in actual_tables:
             realm_rows = self.conn.execute("SELECT id FROM realm LIMIT 2").fetchall()
@@ -2096,40 +3291,29 @@ class RealmStore:
                     realm_identity = {"ok": True, "realm_id": realm_id, "row_count": 1, "reason": None}
                 else:
                     realm_identity["reason"] = "realm_identity_invalid"
-        # A freshly created schema is intentionally identity-free until the
-        # service performs its first initialization.  Preserve that narrow
-        # bootstrap state, but never treat a previously-used realm as valid
-        # without exactly one identity.  Lifecycle rows or any durable domain
-        # content make an identity-less realm an admission failure.
         uninitialized = False
-        if not realm_identity["ok"] and realm_identity["reason"] == "realm_identity_missing":
-            lifecycle_tables_empty = all(
-                not self.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                for table in ("realm_lifecycle", "runtime_lifecycle")
-                if table in actual_tables
-            )
-            content_tables_empty = all(
-                not self.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-                for table in sorted(REQUIRED_SCHEMA_TABLES - _REALM_METADATA_TABLES - {"realm"})
-                if table in actual_tables
-            )
-            uninitialized = lifecycle_tables_empty and content_tables_empty
-            if uninitialized:
-                realm_identity = {"ok": True, "realm_id": None, "row_count": 0, "reason": "uninitialized"}
-        objects = self.conn.execute("SELECT digest FROM objects").fetchall() if "objects" in actual_tables else []
+        objects = self.conn.execute("SELECT digest, size FROM objects").fetchall() if "objects" in actual_tables else []
         reachable = {str(row[0]) for row in objects}
         missing = []
         corrupt = []
-        for digest in sorted(reachable):
+        for object_row in objects:
+            digest = str(object_row["digest"])
             try:
                 actual = self._cas_digest(digest, deadline=deadline)
+                actual_size = self._cas_size(digest)
             except TimeoutError:
                 raise
             except OSError:
                 missing.append(digest)
                 continue
-            if actual != digest:
-                corrupt.append({"digest": digest, "actual_sha256": actual})
+            if actual != digest or actual_size != int(object_row["size"]):
+                corrupt.append({
+                    "digest": digest,
+                    "reason": "digest_mismatch" if actual != digest else "size_mismatch",
+                    "actual_sha256": actual,
+                    "expected_size": int(object_row["size"]),
+                    "actual_size": actual_size,
+                })
         orphaned = self._cas_orphans(reachable, deadline=deadline)
         cas_ok = not missing and not corrupt
         event_errors = []
@@ -2143,6 +3327,45 @@ class RealmStore:
                     if expected != event["event_hash"]:
                         event_errors.append({"run_id": run[0], "event_id": event["id"], "reason": "hash_mismatch"})
                     previous = event["event_hash"]
+        relational_errors = []
+        if realm_identity["ok"] and {"realm", "realm_lifecycle"}.issubset(actual_tables):
+            lifecycle_rows = self.conn.execute(
+                "SELECT realm_id, state FROM realm_lifecycle"
+            ).fetchall()
+            if len(lifecycle_rows) != 1 or lifecycle_rows[0]["realm_id"] != realm_identity["realm_id"]:
+                relational_errors.append({"table": "realm_lifecycle", "reason": "realm_lifecycle_identity"})
+        if {"managed_output_associations", "managed_output_lifecycle", "objects", "attempts", "tasks"}.issubset(actual_tables):
+            association_rows = self.conn.execute("SELECT * FROM managed_output_associations").fetchall()
+            for association in association_rows:
+                object_row = self.conn.execute(
+                    "SELECT size, media_type FROM objects WHERE digest=?",
+                    (association["object_digest"],),
+                ).fetchone()
+                if not object_row or int(object_row["size"]) != int(association["size"]) or object_row["media_type"] != association["media_type"]:
+                    relational_errors.append({"association_id": association["association_id"], "reason": "object_metadata"})
+                attempt = self.conn.execute(
+                    "SELECT task_id FROM attempts WHERE id=?", (association["attempt_id"],)
+                ).fetchone()
+                if not attempt or attempt["task_id"] != association["task_id"]:
+                    relational_errors.append({"association_id": association["association_id"], "reason": "attempt_task_identity"})
+                if association["manifest_digest"] is not None and not self.conn.execute(
+                    "SELECT 1 FROM objects WHERE digest=?", (association["manifest_digest"],)
+                ).fetchone():
+                    relational_errors.append({"association_id": association["association_id"], "reason": "manifest_object_missing"})
+                lifecycle_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM managed_output_lifecycle WHERE association_id=?",
+                    (association["association_id"],),
+                ).fetchone()[0]
+                if lifecycle_count != 1:
+                    relational_errors.append({"association_id": association["association_id"], "reason": "lifecycle_missing"})
+        if {"managed_output_associations", "managed_output_lifecycle"}.issubset(actual_tables):
+            orphan_lifecycle = self.conn.execute(
+                "SELECT association_id FROM managed_output_lifecycle WHERE association_id NOT IN (SELECT association_id FROM managed_output_associations)"
+            ).fetchall()
+            relational_errors.extend(
+                {"association_id": row["association_id"], "reason": "lifecycle_orphan"}
+                for row in orphan_lifecycle
+            )
         sqlite_ok = quick == "ok"
         catalog_check = {"status": "not_configured", "ok": True, "issues": []}
         activation_check = {"status": "not_configured", "ok": True, "issues": []}
@@ -2153,7 +3376,7 @@ class RealmStore:
             catalog_check = {"status": "blocked", "ok": False, "issues": ["catalog_realm_unavailable"], "path": str(catalog_path)}
             activation_check = {"status": "blocked", "ok": False, "issues": ["activation_catalog_unavailable"]}
         identity_ok = realm_identity["ok"]
-        healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and catalog_check["ok"] and activation_check["ok"]
+        healthy = sqlite_ok and not fk and schema_ok and identity_ok and cas_ok and not event_errors and not relational_errors and catalog_check["ok"] and activation_check["ok"]
         issues = []
         if not sqlite_ok: issues.append("sqlite_integrity")
         if fk: issues.append("foreign_keys")
@@ -2162,6 +3385,7 @@ class RealmStore:
         if missing: issues.append("reachable_cas")
         if corrupt: issues.append("corrupt_cas")
         if event_errors: issues.append("event_chain")
+        if relational_errors: issues.append("relational")
         issues.extend(catalog_check.get("issues", [])); issues.extend(activation_check.get("issues", []))
         recovery = "No recovery action required." if healthy else "Restore the realm from a verified backup, then re-run doctor."
         if (catalog_check["ok"] is False or activation_check["ok"] is False) and sqlite_ok and not fk and schema_ok and identity_ok and cas_ok:
@@ -2176,12 +3400,23 @@ class RealmStore:
                 "sqlite_quick_check": quick,
                 "foreign_keys": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
                 "foreign_key": {"ok": not bool(fk), "violations": [list(row) for row in fk]},
-                "schema": {"ok": schema_ok, "expected_version": SCHEMA_VERSION, "actual_version": actual_schema, "missing_tables": missing_tables, "missing_columns": missing_columns},
+                "schema": {
+                    "ok": schema_ok,
+                    "expected_format_id": CANONICAL_FORMAT_ID,
+                    "actual_format_id": actual_format,
+                    "expected_version": SCHEMA_VERSION,
+                    "actual_version": actual_schema,
+                    "missing_tables": missing_tables,
+                    "missing_columns": missing_columns,
+                    "extra_columns": extra_columns,
+                    "unexpected_tables": unexpected_tables,
+                },
                 "realm_identity": realm_identity,
                 "reachable_cas": {"ok": cas_ok, "missing": missing, "corrupt": corrupt, "orphaned": sorted(orphaned)},
                 "cas_missing": missing,
                 "event_chain": {"ok": not bool(event_errors), "errors": event_errors},
                 "event_chain_errors": event_errors,
+                "relational": {"ok": not bool(relational_errors), "errors": relational_errors},
                 "catalog": catalog_check,
                 "activation": activation_check,
                 "catalog_activation": {"ok": catalog_check["ok"] and activation_check["ok"], "catalog": catalog_check, "activation": activation_check},
@@ -2232,6 +3467,36 @@ class RealmStore:
                 if not block:
                     return digest_value.hexdigest()
                 digest_value.update(block)
+
+    def _cas_size(self, digest):
+        """Read the verified CAS entry size without following a link."""
+        cas_root_fd = getattr(self, "_cas_root_fd", None)
+        if cas_root_fd is not None:
+            if cas_root_fd < 0:
+                raise FileNotFoundError(digest)
+            prefix_fd = os.open(
+                digest[:2],
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=cas_root_fd,
+            )
+            try:
+                fd = os.open(digest[2:], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=prefix_fd)
+            finally:
+                os.close(prefix_fd)
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError("CAS entry is not a regular file")
+                return int(metadata.st_size)
+            finally:
+                os.close(fd)
+        path = self.cas_root / digest[:2] / digest[2:]
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(digest)
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("CAS entry is not a regular file")
+        return int(metadata.st_size)
 
     def _cas_orphans(self, reachable, *, deadline=None):
         cas_root_fd = getattr(self, "_cas_root_fd", None)

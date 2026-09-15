@@ -11,6 +11,7 @@ import pytest
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def _digest(value: str) -> str:
@@ -20,6 +21,7 @@ def _digest(value: str) -> str:
 def test_actor_project_selection_is_runtime_owned_and_persistent(tmp_path):
     realm = tmp_path / "realm"
     support = tmp_path / "support"
+    RealmStore.initialize(realm).close()
     daemon = RuntimeDaemon(realm, support_root=support).start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -42,6 +44,7 @@ def test_actor_project_selection_is_runtime_owned_and_persistent(tmp_path):
 def test_receipts_are_identical_across_concurrent_replay_and_restart(tmp_path):
     realm = tmp_path / "realm"
     support = tmp_path / "support"
+    RealmStore.initialize(realm).close()
     daemon = RuntimeDaemon(realm, support_root=support).start()
     try:
         def create_once():
@@ -78,6 +81,7 @@ def test_receipts_are_identical_across_concurrent_replay_and_restart(tmp_path):
 
 
 def test_task_receipt_binds_committed_admission_event_and_canonical_sequence(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -103,6 +107,7 @@ def test_task_receipt_binds_committed_admission_event_and_canonical_sequence(tmp
 
 
 def test_unready_capability_rejected_before_any_ledger_rows(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -139,6 +144,7 @@ def test_unready_capability_rejected_before_any_ledger_rows(tmp_path):
     ],
 )
 def test_project_shot_reference_routes_reject_non_object_json_as_typed_400(tmp_path, route, method):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -164,6 +170,7 @@ def test_project_shot_reference_routes_reject_non_object_json_as_typed_400(tmp_p
 
 
 def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -190,12 +197,15 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         assert stale_timeline.value.status == 409
 
         object_row = client.ingest_object(b"variant", media_type="application/octet-stream", idempotency_key="variant-object")
-        generation = client.create_generation(project.project_id, "generation-1", idempotency_key="generation-1", metadata={"prompt": "neutral"})
-        assert generation.project_id == project.project_id
-        variant = client.create_variant(generation.generation_id, "variant-1", idempotency_key="variant-1", object_id=object_row.object_id, metadata={"seed": 1})
-        assert variant.object_id == object_row.object_id
-        variants, _ = client.list_variants(generation.generation_id)
-        assert [item.variant_id for item in variants] == ["variant-1"]
+        # Generated clients retain these wire methods, but publication now
+        # requires an admitted settlement effect rather than direct mutation.
+        with pytest.raises(ApiError) as direct_generation:
+            client.create_generation(project.project_id, "generation-1", idempotency_key="generation-1", metadata={"prompt": "neutral"})
+        assert direct_generation.value.status == 409
+        with pytest.raises(ApiError) as direct_variant:
+            client.create_variant("generation-1", "variant-1", idempotency_key="variant-1", object_id=object_row.object_id, metadata={"seed": 1})
+        assert direct_variant.value.status == 409
+        assert client.list_generations(project.project_id)[0] == []
 
         task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="domain-task")
         run = client.get_run(task.run_id)
@@ -219,6 +229,7 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
 
 
 def test_timeline_document_is_one_atomic_runtime_command(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -262,6 +273,7 @@ def test_timeline_document_is_one_atomic_runtime_command(tmp_path, monkeypatch):
 
 def test_timeline_document_replay_survives_runtime_restart(tmp_path):
     root, support = tmp_path / "realm", tmp_path / "support"
+    RealmStore.initialize(root).close()
     first = RuntimeDaemon(root, support_root=support).start()
     client = WorkspaceClient(first.endpoint, first.token)
     project = client.create_project("Restart", idempotency_key="restart-project")
@@ -277,6 +289,7 @@ def test_timeline_document_replay_survives_runtime_restart(tmp_path):
 
 
 def test_project_media_mutations_roll_back_before_idempotency_replay(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     project = service.create_project({"slug": "atomic", "name": "Atomic"})
     service.store.record_object("a" * 64, 1, "application/octet-stream")
@@ -300,6 +313,7 @@ def test_project_media_mutations_roll_back_before_idempotency_replay(tmp_path, m
 
 
 def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -343,9 +357,13 @@ def test_generated_domains_preserve_project_media_and_timeline_recovery(tmp_path
         relations, _ = client.list_media_relations(project.project_id)
         assert relation["kind"] == "derived_from" and relations[0]["to_object_id"] == second_object.object_id
 
-        generation = client.create_generation(project.project_id, "generation", idempotency_key="generation")
-        client.create_variant(generation.generation_id, "variant", idempotency_key="variant")
-        assert client.get_variant("variant").generation_id == generation.generation_id
+        with pytest.raises(ApiError) as direct_generation:
+            client.create_generation(project.project_id, "generation", idempotency_key="generation")
+        assert direct_generation.value.status == 409
+        with pytest.raises(ApiError) as direct_variant:
+            client.create_variant("generation", "variant", idempotency_key="variant")
+        assert direct_variant.value.status == 409
+        assert client.list_generations(project.project_id)[0] == []
 
         client.register_capability("render.basic", _digest("render.basic"), idempotency_key="listed-capability")
         task = client.admit_task(capability_id="render.basic", capability_digest=_digest("render.basic"), input_object_ids=[], idempotency_key="listed-task", project_id=project.project_id, spec={"prompt": "listed"})

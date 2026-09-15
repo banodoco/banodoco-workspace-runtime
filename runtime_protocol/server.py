@@ -171,6 +171,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if not body.get("backup") or not body.get("destination"):
                 raise ProtocolError("backup and destination are required")
             return self._send(201, self.runtime.restore(body["backup"], body["destination"]))
+        if path == ["v1", "replace"] and method == "POST":
+            self._identity("admin")
+            body = self._body()
+            if not body.get("candidate"):
+                raise ProtocolError("candidate is required")
+            daemon = getattr(self.server, "daemon_runtime", None)
+            if daemon is None:
+                raise ProtocolError("replacement is unavailable outside the owning daemon")
+            return self._send(200, daemon.activate_candidate(body["candidate"]))
         if path == ["v1", "projects", "selection"] and method in ("GET", "PUT"):
             identity = self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
@@ -396,10 +405,17 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     return self._send(200, self.runtime.list_media_relations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body(), idempotency_key=self._idempotency_key()))
         if path == ["v1", "objects"] and method == "POST":
-            self._identity("objects:write")
+            identity = self._identity("objects:write")
             key = self._idempotency_key()
             data = self._raw_body()
-            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key)
+            upload_binding = None
+            raw_binding = self.headers.get("X-Output-Binding")
+            if raw_binding:
+                try:
+                    upload_binding = json.loads(raw_binding)
+                except (TypeError, ValueError) as exc:
+                    raise ProtocolError("X-Output-Binding must contain valid JSON") from exc
+            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key, identity=identity, upload_binding=upload_binding)
             return self._send(201, value)
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")
@@ -414,9 +430,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     if unit != "bytes" or "," in spec:
                         raise ValueError
                     left, right = spec.split("-", 1)
-                    start = int(left) if left else max(0, total - int(right))
-                    end = int(right) if right else total - 1
-                    if start < 0 or end < start or end >= total:
+                    if not left:
+                        suffix_length = int(right)
+                        if suffix_length <= 0:
+                            raise ValueError
+                        start, end = max(0, total - suffix_length), total - 1
+                    else:
+                        start = int(left)
+                        end = int(right) if right else total - 1
+                        end = min(end, total - 1)
+                    if start < 0 or start >= total or end < start:
                         raise ValueError
                     status = 206
                 except ValueError as exc:
@@ -455,6 +478,24 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self._identity("tasks:read")
                 value = self.runtime.task(task_id)
                 return self._send(200, self.runtime._task_resource(value))
+        if len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "managed-outputs" and method == "GET":
+            self._identity("tasks:read")
+            return self._send(200, self.runtime.managed_output_page(path[2]))
+        if len(path) == 3 and path[:2] == ["v1", "managed-outputs"]:
+            if method == "GET":
+                self._identity("tasks:read")
+                return self._send(200, self.runtime.managed_output(path[2]))
+        if len(path) == 4 and path[:2] == ["v1", "managed-outputs"]:
+            association_id, action = path[2:]
+            if action == "adopt" and method == "POST":
+                self._identity("tasks:write")
+                return self._send(200, self.runtime.adopt_managed_output(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+            if action == "export" and method == "POST":
+                self._identity("tasks:write")
+                return self._send(200, self.runtime.export_managed_output(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+            if action == "lifecycle" and method == "POST":
+                self._identity("tasks:write")
+                return self._send(200, self.runtime.update_managed_output_lifecycle(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
             self._identity("tasks:write")

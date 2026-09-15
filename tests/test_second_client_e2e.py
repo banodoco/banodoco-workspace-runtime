@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR
+from runtime_protocol.store import RealmStore
 
 
 ROOT = Path(__file__).parents[1]
@@ -19,6 +20,7 @@ ACTOR = ROOT / "conformance" / "dist" / "conformance" / "fake-second-product.js"
 
 @pytest.fixture()
 def daemon(tmp_path: Path):
+    RealmStore.initialize(tmp_path / "realm").close()
     instance = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support", production_worker_credentials=True).start()
     try:
         yield instance

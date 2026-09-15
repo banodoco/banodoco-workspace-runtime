@@ -137,12 +137,41 @@ paths:
       description: Ingest bytes into runtime CAS and associate the resulting managed object with this project before task settlement.
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
-      responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+      responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectObjectMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/tasks:
     get:
       operationId: listProjectTasks
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Project tasks, content: { application/json: { schema: { $ref: '#/components/schemas/TaskPage' } } } } }
+  /v1/tasks/{task_id}/managed-outputs:
+    get:
+      operationId: listManagedOutputs
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      responses: { '200': { description: Runtime-owned managed output associations for a task, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputPage' } } } } }
+  /v1/managed-outputs/{association_id}:
+    get:
+      operationId: getManagedOutput
+      parameters: [ { $ref: '#/components/parameters/AssociationId' } ]
+      responses: { '200': { description: One immutable managed output association and mutable lifecycle readback, content: { application/json: { schema: { $ref: './schemas/managed-output.json' } } } } }
+  /v1/managed-outputs/{association_id}/adopt:
+    post:
+      operationId: adoptManagedOutput
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputAdoption' } } } }
+      responses: { '200': { description: Named managed association adoption with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/managed-outputs/{association_id}/export:
+    post:
+      operationId: exportManagedOutput
+      description: Materialize exact bytes for one completed durable managed output under the Runtime-configured authorized export root and record its historical provenance.
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputExportRequest' } } } }
+      responses: { '200': { description: Exact managed-output export with committed provenance receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/managed-outputs/{association_id}/lifecycle:
+    post:
+      operationId: updateManagedOutputLifecycle
+      parameters: [ { $ref: '#/components/parameters/AssociationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ManagedOutputLifecycle' } } } }
+      responses: { '200': { description: Runtime lifecycle mutation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/runs:
     get:
       operationId: listProjectRuns
@@ -407,7 +436,7 @@ paths:
   /v1/objects:
     post:
       operationId: ingestObject
-      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' }, { $ref: '#/components/parameters/OutputBinding' } ]
       requestBody:
         required: true
         content:
@@ -584,9 +613,11 @@ components:
     Cursor: { name: cursor, in: query, required: false, schema: { type: string, minLength: 1 } }
     Limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
     IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' } }
+    OutputBinding: { name: X-Output-Binding, in: header, required: false, description: Canonical JSON attempt/upload provenance for worker-owned output bytes, schema: { type: string, minLength: 2, maxLength: 8192 } }
     ProjectId: { name: project_id, in: path, required: true, schema: { type: string } }
     ObjectId: { name: object_id, in: path, required: true, schema: { type: string } }
     TaskId: { name: task_id, in: path, required: true, schema: { type: string } }
+    AssociationId: { name: association_id, in: path, required: true, schema: { type: string, minLength: 1 } }
     RunId: { name: run_id, in: path, required: true, schema: { type: string } }
     AttemptId: { name: attempt_id, in: path, required: true, schema: { type: string } }
     TimelineId: { name: timeline_id, in: path, required: true, schema: { type: string } }
@@ -669,7 +700,8 @@ components:
         required_facts: { $ref: './schemas/task.json#/definitions/RequiredFacts' }
         project: { type: string, description: Project selector whose managed-object associations authorize input_object_ids and output settlement. }
         spec: { type: object, additionalProperties: true }
-        settlement_effect: { type: object, additionalProperties: true }
+        generation_intent: { type: object, additionalProperties: true, description: Opaque producer intent; GEN owns its semantics. }
+        settlement_effect: { $ref: './schemas/worker.json#/definitions/Effect' }
         storage_estimate: { $ref: '#/components/schemas/StorageEstimate' }
     StorageEstimate:
       type: object
@@ -739,6 +771,45 @@ components:
       additionalProperties: false
       required: [items, next_cursor]
       properties: { items: { type: array, items: { $ref: './schemas/managed-object.json' } }, next_cursor: { type: [string, 'null'] } }
+    ManagedOutputPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties: { items: { type: array, items: { $ref: './schemas/managed-output.json' } }, next_cursor: { type: [string, 'null'] } }
+    ManagedOutputAdoption:
+      type: object
+      additionalProperties: false
+      properties:
+        association_id: { type: string, minLength: 1 }
+        manifest_ref: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        size: { type: integer, minimum: 0 }
+        filename: { type: string, minLength: 1 }
+        media_type: { type: string, minLength: 1 }
+        output_port: { type: string, minLength: 1 }
+        selector: { type: object, additionalProperties: true }
+        ordinal: { type: integer, minimum: 0 }
+        role: { type: string, minLength: 1 }
+        durability: { type: string, enum: [durable, temporary] }
+    ManagedOutputExportRequest:
+      type: object
+      additionalProperties: false
+      required: [destination_filename]
+      properties:
+        destination_filename: { type: string, minLength: 1, maxLength: 512 }
+        expected: { type: object, additionalProperties: true }
+    ManagedOutputLifecycle:
+      type: object
+      additionalProperties: false
+      required: [operation, expected_version]
+      properties:
+        operation: { type: string, enum: [lease, release, pin, unpin, expire, reclaim, promote] }
+        expected_version: { type: integer, minimum: 1 }
+        lease_id: { type: string, minLength: 1 }
+        lease_owner: { type: string, minLength: 1 }
+        lease_seconds: { type: integer, minimum: 1 }
+        provenance: { type: object, additionalProperties: true }
     TimelineRevisionPage:
       type: object
       additionalProperties: false
@@ -912,6 +983,13 @@ components:
           additionalProperties: false
           required: [receipt_id, command_kind, idempotency_key, request_hash, project_id, project_seq, event_ids, result, created_at]
           properties: { receipt_id: { type: string }, command_kind: { type: string }, idempotency_key: { type: string }, request_hash: { type: string }, project_id: { type: string }, project_seq: { type: array, minItems: 2, maxItems: 2, items: { type: integer, minimum: 1 } }, event_ids: { type: array, items: { type: string } }, result: {}, created_at: { type: string } }
+    ProjectObjectMutation:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: './schemas/managed-object.json' }
+        receipt: { $ref: '#/components/schemas/CommittedMutation/properties/receipt' }
     ProjectShotCreate:
       type: object
       additionalProperties: false

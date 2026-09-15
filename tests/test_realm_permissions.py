@@ -3,6 +3,7 @@ from __future__ import annotations
 import stat
 
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 
 
 def _mode(path):
@@ -12,6 +13,7 @@ def _mode(path):
 def test_realm_support_tree_is_owner_only(tmp_path):
     realm = tmp_path / "realm"
     support = tmp_path / "support"
+    RealmStore.initialize(realm).close()
     daemon = RuntimeDaemon(realm, support_root=support).start()
     try:
         assert _mode(realm) == 0o700

@@ -20,22 +20,34 @@ def _parser():
     start = sub.add_parser("start", help="start the loopback daemon")
     start.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     start.add_argument("--support-root")
+    start.add_argument("--export-root", help="existing absolute directory for exact managed-output exports")
     start.add_argument("--host", default="127.0.0.1")
     start.add_argument("--port", type=int, default=0)
     start.add_argument("--display-name", default="Workspace")
     start.add_argument("--realm-id")
     start.add_argument("--owner-lock")
     start.add_argument("--bootstrap-token-file")
+    create = sub.add_parser("create", help="explicitly create one fresh canonical realm")
+    create.add_argument("--root", required=True)
+    create.add_argument("--display-name", default="Workspace")
+    create.add_argument("--realm-id")
     doctor = sub.add_parser("doctor", help="read-only runtime health check")
     doctor.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--support-root")
     backup = sub.add_parser("backup", help="create a verified self-contained realm backup")
     backup.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    backup.add_argument("--support-root")
     backup.add_argument("--destination", required=True)
     restore = sub.add_parser("restore", help="restore a backup into a new inactive realm")
     restore.add_argument("--backup", required=True)
     restore.add_argument("--destination", required=True)
+    replace = sub.add_parser("replace", help="activate a verified backup as the running realm")
+    replace.add_argument("--root", required=True)
+    replace.add_argument("--backup", required=True)
+    replace.add_argument("--support-root")
+    replace.add_argument("--display-name", default="Workspace")
+    replace.add_argument("--realm-id")
     export = sub.add_parser("export", help="export structured realm state")
     export.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     export.add_argument("--destination")
@@ -86,15 +98,24 @@ def main(argv=None):
             catalog_path=(Path(args.support_root) / "catalog.json") if args.support_root else None,
         )
         if result.get("state") == "uninitialized":
-            result["next_action"] = "banodoco-runtime start"
+            result["next_action"] = "banodoco-runtime create --root <realm>"
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") else 1
+    if args.command == "create":
+        store = RealmStore.initialize(args.root, display_name=args.display_name, realm_id=args.realm_id)
+        try:
+            result = {"state": "created", "realm_id": store.realm["id"], "root": str(store.root)}
+        finally:
+            store.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "backup":
         # Online backup goes through the owning HTTP service. The CLI is an
         # offline surface and must acquire that same realm-owner fence.
         store = RealmStore(args.root)
         try:
-            result = create_backup(store, args.destination)
+            key_path = (Path(args.support_root).expanduser().resolve() / "backup-auth.key") if args.support_root else None
+            result = create_backup(store, args.destination, key_path=key_path)
         finally:
             store.close()
         print(json.dumps(result, sort_keys=True))
@@ -103,9 +124,20 @@ def main(argv=None):
         result = restore_backup(args.backup, args.destination)
         print(json.dumps(result, sort_keys=True))
         return 0
+    if args.command == "replace":
+        root = Path(args.root).expanduser().resolve()
+        daemon = RuntimeDaemon(root, support_root=args.support_root, display_name=args.display_name, realm_id=args.realm_id, production_worker_credentials=True)
+        try:
+            # Replacement is coordinated offline so a damaged active root is
+            # never admitted merely to reach the recovery command.
+            result = daemon.replace_from_backup(args.backup)
+        finally:
+            daemon.stop()
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "export":
         # Export is an offline surface; share the same owner fence as startup
-        # instead of opening a second migration-capable connection.
+        # instead of opening a second connection with a different authority.
         store = RealmStore(args.root)
         try:
             value = structured_export(store)
@@ -133,12 +165,12 @@ def main(argv=None):
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     try:
-        daemon = RuntimeDaemon(args.root, support_root=args.support_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file, production_worker_credentials=True).start()
+        daemon = RuntimeDaemon(args.root, support_root=args.support_root, export_root=args.export_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file, production_worker_credentials=True).start()
     except KeyboardInterrupt:
         raise
     except Exception as exc:
         # Installed operator entrypoints must fail as a stable JSON boundary;
-        # never leak a traceback for a missing migration or bad root.
+        # never leak a traceback for an unsupported format or bad root.
         error = exc.as_dict() if isinstance(exc, RuntimeErrorBase) else {"code": "startup_error", "message": str(exc)}
         print(json.dumps({"ok": False, "error": error}, sort_keys=True))
         return 1

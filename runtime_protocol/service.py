@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from .cas import ContentAddressedStore
 from .backup import create_backup, restore_backup, structured_export
-from .store import OBJECT_ID_RE, RealmStore, normalize_execution_facts
+from .store import (
+    GENERATION_INTENT_STORAGE_KEY,
+    OBJECT_ID_RE,
+    RealmStore,
+    normalize_execution_facts,
+    public_task_spec,
+)
 from .util import atomic_json_write
 from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
 import hashlib
@@ -32,11 +38,151 @@ REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
+MANAGED_COVERAGE_MODES = frozenset({"interval", "clips", "cuts", "shots"})
+MANAGED_COVERAGE_REASONS = frozenset({"interval", "before_cut", "after_cut", "clip_first", "shot_midpoint"})
+MANAGED_DURABILITIES = frozenset({"durable", "temporary"})
 TEXT_BINDING_KINDS = ("prompt", "voiceover_script", "transcript")
 TEXT_BINDING_MAX_BYTES = 1_048_576
 TEXT_BINDING_SLOT_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 TEXT_BINDING_IDENTITY_SCHEMA = "workspace.shot.text_binding.identity/v1"
 MEDIA_PROBE_TIMEOUT_SECONDS = 10
+
+
+LEGACY_MANAGED_OUTPUT_PREFIXES = frozenset({"images", "videos", "audio"})
+
+
+def _canonical_managed_output_filename(value):
+    """Return a flat export name for the known producer-relative namespaces."""
+    if not isinstance(value, str) or not value or len(value) > 512:
+        raise ValidationError("output filename is invalid")
+    if any(ord(char) < 32 for char in value):
+        raise ValidationError("output filename is invalid")
+    if value not in {".", ".."} and "/" not in value and "\\" not in value:
+        return value
+    prefix, separator, leaf = value.partition("/")
+    if separator and prefix in LEGACY_MANAGED_OUTPUT_PREFIXES:
+        if leaf and leaf not in {".", ".."} and "/" not in leaf and "\\" not in leaf:
+            return leaf
+    raise ValidationError("output filename must be a direct safe file name or a known producer namespace/<direct safe file name>")
+
+
+def _validate_rational(value, field):
+    """Validate the V1 exact rational wire form without floating-point loss."""
+    if isinstance(value, str):
+        match = re.fullmatch(r"([0-9]+)/([1-9][0-9]*)", value)
+        if match:
+            return value
+    elif isinstance(value, dict) and set(value) == {"numerator", "denominator"}:
+        numerator, denominator = value["numerator"], value["denominator"]
+        if (
+            isinstance(numerator, int) and not isinstance(numerator, bool) and numerator >= 0
+            and isinstance(denominator, int) and not isinstance(denominator, bool) and denominator > 0
+        ):
+            return {"numerator": numerator, "denominator": denominator}
+    raise ValidationError(f"{field} must be a non-negative rational")
+
+
+def _validate_coverage(value):
+    """Validate the V1 sampling evidence carried by a managed output."""
+    if not isinstance(value, dict) or set(value) != {"sampling"}:
+        raise ValidationError(
+            "output coverage must contain only V1 sampling evidence",
+            details={"required": "sampling", "modes": sorted(MANAGED_COVERAGE_MODES)},
+        )
+    sampling = value["sampling"]
+    if not isinstance(sampling, dict):
+        raise ValidationError("output coverage.sampling must be an object")
+    allowed = {"mode", "range", "step_frames_rational", "every", "every_frames", "cards"}
+    unknown = set(sampling) - allowed
+    if unknown:
+        raise ValidationError("output coverage.sampling contains unsupported fields", details={"fields": sorted(unknown)})
+    mode = sampling.get("mode")
+    if mode not in MANAGED_COVERAGE_MODES:
+        raise ValidationError("output coverage.sampling.mode is invalid", details={"modes": sorted(MANAGED_COVERAGE_MODES)})
+    rendered_range = sampling.get("range")
+    if not isinstance(rendered_range, dict) or set(rendered_range) != {"start", "end"}:
+        raise ValidationError("output coverage.sampling.range must be a half-open object")
+    start, end = rendered_range["start"], rendered_range["end"]
+    if (
+        isinstance(start, bool) or not isinstance(start, int) or start < 0
+        or isinstance(end, bool) or not isinstance(end, int) or end <= start
+    ):
+        raise ValidationError("output coverage.sampling.range must satisfy 0 <= start < end")
+    if "step_frames_rational" in sampling:
+        _validate_rational(sampling["step_frames_rational"], "output coverage.sampling.step_frames_rational")
+    if "every" in sampling and "every_frames" in sampling:
+        raise ValidationError("output coverage.sampling.every and every_frames are mutually exclusive")
+    if ("every" in sampling or "every_frames" in sampling) and mode != "interval":
+        raise ValidationError("output coverage.sampling.every/every_frames are valid only for interval mode")
+    if "every" in sampling and (
+        isinstance(sampling["every"], bool) or not isinstance(sampling["every"], (int, float))
+        or not math.isfinite(float(sampling["every"])) or float(sampling["every"]) <= 0
+    ):
+        raise ValidationError("output coverage.sampling.every must be a positive finite number")
+    if "every_frames" in sampling and (
+        isinstance(sampling["every_frames"], bool) or not isinstance(sampling["every_frames"], int)
+        or sampling["every_frames"] <= 0
+    ):
+        raise ValidationError("output coverage.sampling.every_frames must be a positive integer")
+    cards = sampling.get("cards", [])
+    if not isinstance(cards, list):
+        raise ValidationError("output coverage.sampling.cards must be a list")
+    for card in cards:
+        if not isinstance(card, dict) or set(card) != {"frame", "time_seconds", "time_rational", "sample_reasons"}:
+            raise ValidationError("each coverage card requires frame, time_seconds, time_rational, and sample_reasons")
+        if isinstance(card["frame"], bool) or not isinstance(card["frame"], int) or card["frame"] < 0:
+            raise ValidationError("coverage card frame must be a non-negative integer")
+        if (
+            isinstance(card["time_seconds"], bool) or not isinstance(card["time_seconds"], (int, float))
+            or not math.isfinite(float(card["time_seconds"])) or float(card["time_seconds"]) < 0
+        ):
+            raise ValidationError("coverage card time_seconds must be a non-negative finite number")
+        _validate_rational(card["time_rational"], "coverage card time_rational")
+        reasons = card["sample_reasons"]
+        if not isinstance(reasons, list) or not reasons or any(reason not in MANAGED_COVERAGE_REASONS for reason in reasons):
+            raise ValidationError("coverage card sample_reasons contains an invalid reason")
+    return value
+
+
+def _contains_latest(value):
+    if isinstance(value, str):
+        return value.lower() == "latest"
+    if isinstance(value, dict):
+        return any(_contains_latest(key) or _contains_latest(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_latest(item) for item in value)
+    return False
+
+
+def _validate_regeneration(value):
+    """Validate the immutable regeneration declaration, including unavailable."""
+    if not isinstance(value, dict) or set(value) != {"available", "capability_id", "source_refs", "recipe_digest", "exact_inputs"}:
+        raise ValidationError(
+            "output regeneration requires exactly available, capability_id, source_refs, recipe_digest, and exact_inputs"
+        )
+    available = value["available"]
+    if not isinstance(available, bool):
+        raise ValidationError("output regeneration.available must be a boolean")
+    capability_id = value["capability_id"]
+    if capability_id is not None and (not isinstance(capability_id, str) or not capability_id):
+        raise ValidationError("output regeneration.capability_id must be a non-empty string or null")
+    if available and capability_id is None:
+        raise ValidationError("available regeneration requires capability_id")
+    source_refs = value["source_refs"]
+    if not isinstance(source_refs, list) or any(
+        not isinstance(reference, str) or not OBJECT_ID_RE.fullmatch(reference) or not reference.startswith("sha256:")
+        for reference in source_refs
+    ):
+        raise ValidationError("output regeneration.source_refs must contain canonical sha256 object IDs")
+    recipe_digest = value["recipe_digest"]
+    if not isinstance(recipe_digest, str) or not OBJECT_ID_RE.fullmatch(recipe_digest) or not recipe_digest.startswith("sha256:"):
+        raise ValidationError("output regeneration.recipe_digest must be a canonical sha256 digest")
+    exact_inputs = value["exact_inputs"]
+    if not isinstance(exact_inputs, (dict, list)):
+        raise ValidationError("output regeneration.exact_inputs must be an object or list")
+    if _contains_latest(exact_inputs):
+        raise ValidationError("output regeneration.exact_inputs must never use latest")
+    return value
 
 
 def validate_idempotency_key(value):
@@ -77,6 +223,15 @@ def _wire_object(body, *, required=(), allowed=()):
     if unknown:
         raise ValidationError("request body contains unsupported fields", details={"fields": unknown})
     return body
+
+
+def _require_runtime_epoch_for_lease(body):
+    """Reject an omitted epoch as malformed request data before any lookup."""
+    if isinstance(body, dict) and "runtime_epoch" not in body:
+        raise ValidationError(
+            "request body is missing required fields",
+            details={"fields": ["runtime_epoch"]},
+        )
 
 
 def _probe_media_bytes(data):
@@ -161,7 +316,7 @@ def _page_cursor(scope, key):
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn):
+def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn, skip_after=None):
     limit, decoded = _page_args(cursor, limit)
     if decoded is not None and decoded.get("s") != scope:
         raise InvalidRequestError("cursor does not belong to this collection")
@@ -173,8 +328,8 @@ def _page_rows(rows, *, scope, cursor, limit, key_fn, resource_fn):
             if len(key) != len(after):
                 raise InvalidRequestError("cursor is invalid")
             try:
-                before = key <= after
-            except TypeError as exc:
+                before = skip_after(key, after) if skip_after is not None else key <= after
+            except (TypeError, IndexError) as exc:
                 raise InvalidRequestError("cursor is invalid") from exc
             if before:
                 continue
@@ -219,10 +374,15 @@ def _durable_mutation(function):
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, reboot_executor=None, reboot_allowlist=None):
-        self.store = RealmStore(root, strict_admission=True)
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None):
+        root_path = Path(root).expanduser().resolve()
+        # Service startup is an open/admission operation.  Realm creation is
+        # explicit through RealmStore.initialize; a missing path must fail
+        # before schema, identity, lock, or storage roots can be created.
+        self.store = RealmStore(root_path)
         self._verified = False
         self._admission_failure = None
+        self._readiness_callback = None
         try:
             if not self.store.admission_report.get("ok"):
                 raise RealmAdmissionError(
@@ -235,12 +395,20 @@ class RuntimeService:
             if not report.get("ok"):
                 raise RealmAdmissionError("realm is not usable after initialization", details=report)
             self.runtime_session_id = new_id()
-            self._runtime_state = self.store.begin_runtime_session(self.runtime_session_id)
+            self._runtime_state = self.store.begin_runtime_session(
+                self.runtime_session_id, epoch_floor=runtime_epoch_floor
+            )
             self._verified = True
         except Exception:
             self.store.close()
             raise
         self.support_root = Path(support_root).expanduser().resolve() if support_root else None
+        self.export_root = Path(export_root).expanduser().resolve() if export_root else None
+        if self.export_root is not None:
+            if self.export_root == self.store.root or self.export_root.is_relative_to(self.store.root) or self.store.root.is_relative_to(self.export_root):
+                raise ValidationError("managed-output export root must be outside the active realm root")
+            if self.export_root.is_symlink() or not self.export_root.is_dir():
+                raise ValidationError("managed-output export root must be an existing ordinary directory")
         self.reboot_executor = reboot_executor
         configured_allowlist = frozenset(reboot_allowlist or REBOOT_COMMAND_ALLOWLIST)
         if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
@@ -250,6 +418,32 @@ class RuntimeService:
 
     def close(self):
         self.store.close()
+
+    def set_readiness_callback(self, callback) -> None:
+        """Install the daemon-owned readiness revocation hook."""
+        self._readiness_callback = callback
+
+    def catalog_admission(self, instance_id):
+        """Return an unforgeable-in-practice proof for this live owner."""
+        return {
+            "realm_id": self.realm["id"],
+            "runtime_epoch": int(self.store._current_runtime_epoch()),
+            "runtime_session_id": self.runtime_session_id,
+            "runtime_instance_id": str(instance_id),
+        }
+
+    def validate_catalog_admission(self, proof) -> bool:
+        if not self._verified or not isinstance(proof, dict) or self.store._lock_file is None:
+            return False
+        try:
+            return (
+                proof.get("realm_id") == self.realm["id"]
+                and proof.get("runtime_session_id") == self.runtime_session_id
+                and proof.get("runtime_instance_id")
+                and int(proof.get("runtime_epoch")) == int(self.store._current_runtime_epoch())
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
 
     def backup(self, destination, *, binding=None, destination_identity=None):
         key_path = (self.support_root / "backup-auth.key") if self.support_root else (self.store.root / ".operator-backup-key")
@@ -278,6 +472,11 @@ class RuntimeService:
                 # silently resumes writes after observing damaged authority.
                 self._verified = False
                 self._admission_failure = report
+                if self._readiness_callback is not None:
+                    try:
+                        self._readiness_callback(report)
+                    except Exception:
+                        pass
             return report
 
     @_verified_mutation
@@ -1893,6 +2092,9 @@ class RuntimeService:
 
     @_durable_mutation
     def create_generation(self, project_id, body, *, idempotency_key=None):
+        raise ConflictError(
+            "direct generation publication is disabled; use an admitted GEN D1 settlement effect"
+        )
         self._require_object_body(body)
         project = self.store.get_project(project_id)
         generation_id = str(body.get("generation_id") or "")
@@ -1917,10 +2119,14 @@ class RuntimeService:
 
     def list_generations(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
+        rows = self.store.conn.execute("SELECT * FROM generations WHERE project_id=? ORDER BY created_at DESC, id ASC", (project["id"],)).fetchall()
         return _page_rows(rows, scope=f"generations:{project['id']}", cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
-                          resource_fn=self._generation_resource)
+                          resource_fn=self._generation_resource,
+                          skip_after=lambda key, after: (
+                              key[0] > after[0]
+                              or (key[0] == after[0] and key[1] <= after[1])
+                          ))
 
     def get_generation(self, generation_id):
         row = self.store.conn.execute("SELECT * FROM generations WHERE id=?", (generation_id,)).fetchone()
@@ -1930,6 +2136,9 @@ class RuntimeService:
 
     @_durable_mutation
     def create_variant(self, generation_id, body, *, idempotency_key=None):
+        raise ConflictError(
+            "direct variant publication is disabled; use an admitted GEN D1 settlement effect"
+        )
         self._require_object_body(body)
         generation = self.get_generation(generation_id)
         variant_id = str(body.get("variant_id") or "")
@@ -2079,11 +2288,10 @@ class RuntimeService:
                 (project_row["id"], obj["digest"], timestamp),
             )
             row = dict(self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (obj["digest"],)).fetchone())
-            result = self._object_resource(row) | {
-                "project": project_row["id"],
-                "relation": "managed",
-                "deduplicated": obj["deduplicated"],
-            }
+            # The durable result is the closed managed-object resource.  The
+            # project association and CAS deduplication state remain durable
+            # transaction facts, not extra fields in the public object wire.
+            result = self._object_resource(row) | {"relation": "managed"}
             return self._command_record("object.ingest", aggregate_id, idempotency_key, request_hash, result, project_id=project_row["id"])
         except Exception:
             # The CAS write precedes the SQLite transaction.  If the durable
@@ -2093,8 +2301,78 @@ class RuntimeService:
                 self._discard_published_digest(obj["digest"])
             raise
 
+    @staticmethod
+    def _generic_output_idempotency_key(binding):
+        return "output-" + hashlib.sha256(canonical_json(binding).encode()).hexdigest()
+
+    def _validate_generic_output_binding(self, binding, *, identity, digest, size, media_type, original_name, idempotency_key):
+        """Validate the explicit attempt identity carried by an output upload."""
+        if not isinstance(binding, dict):
+            raise ValidationError("output upload binding must be an object")
+        required = {
+            "project_id", "run_id", "task_id", "attempt_id", "executor_id",
+            "lease_id", "fence", "runtime_epoch", "output_key", "output_port",
+            "filename", "digest", "size", "media_type",
+        }
+        if set(binding) != required:
+            raise ValidationError("output upload binding has unsupported or missing fields")
+        if binding["project_id"] is not None and (not isinstance(binding["project_id"], str) or not binding["project_id"]):
+            raise ValidationError("output upload binding project_id is invalid")
+        for field in ("run_id", "task_id", "attempt_id", "executor_id", "lease_id", "output_key", "output_port", "filename", "media_type"):
+            if not isinstance(binding[field], str) or not binding[field]:
+                raise ValidationError(f"output upload binding {field} is invalid")
+        for field in ("fence", "runtime_epoch", "size"):
+            if isinstance(binding[field], bool) or not isinstance(binding[field], int) or binding[field] < 0:
+                raise ValidationError(f"output upload binding {field} is invalid")
+        if binding["runtime_epoch"] < 1 or binding["size"] > OBJECT_MAX_BYTES:
+            raise ValidationError("output upload binding numeric fields are invalid")
+        if binding["digest"] != "sha256:" + digest or binding["size"] != int(size) or binding["media_type"] != media_type:
+            raise ConflictError("output upload binding does not match object bytes")
+        if binding["filename"] != original_name:
+            raise ConflictError("output upload binding does not match object filename")
+        if idempotency_key != self._generic_output_idempotency_key(binding):
+            raise ConflictError("output upload idempotency key is not bound to its provenance")
+        if identity is not None and identity.get("actor") != binding["executor_id"]:
+            raise AuthorizationError("output upload worker is not bound to the upload executor")
+        row = self.store.conn.execute(
+            "SELECT a.id AS attempt_id, a.task_id, a.executor_id, a.lease_id, a.fence, a.runtime_epoch, a.settled, "
+            "t.run_id, t.status, t.attempt_id AS current_attempt_id, t.executor_id AS task_executor_id, "
+            "t.lease_token, t.lease_fence, t.runtime_epoch AS task_runtime_epoch, r.project_id "
+            "FROM attempts AS a JOIN tasks AS t ON t.id=a.task_id JOIN runs AS r ON r.id=t.run_id "
+            "WHERE a.id=?",
+            (binding["attempt_id"],),
+        ).fetchone()
+        if not row or row["settled"] != 0 or row["status"] != "running" or row["current_attempt_id"] != row["attempt_id"]:
+            raise LeaseError("output upload attempt is stale")
+        if (
+            row["task_id"] != binding["task_id"]
+            or row["run_id"] != binding["run_id"]
+            or row["project_id"] != binding["project_id"]
+            or row["executor_id"] != binding["executor_id"]
+            or row["task_executor_id"] != binding["executor_id"]
+            or row["lease_id"] != binding["lease_id"]
+            or int(row["fence"]) != int(binding["fence"])
+            or int(row["lease_fence"]) != int(binding["fence"])
+            or int(row["runtime_epoch"]) != int(binding["runtime_epoch"])
+            or int(row["task_runtime_epoch"]) != int(binding["runtime_epoch"])
+            or int(row["runtime_epoch"]) != int(self.store._current_runtime_epoch())
+        ):
+            raise LeaseError("output upload provenance does not match the live attempt")
+
+    @staticmethod
+    def _generic_output_request_hash(digest, media_type, original_name, expected_digest, binding):
+        request = {
+            "content_digest": digest,
+            "media_type": media_type,
+            "original_name": original_name,
+            "expected_digest": expected_digest,
+        }
+        if binding is not None:
+            request["publication_binding"] = binding
+        return hashlib.sha256(canonical_json(request).encode()).hexdigest()
+
     @_durable_mutation
-    def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None):
+    def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None, identity=None, upload_binding=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise InvalidRequestError("object body must be bytes")
@@ -2102,19 +2380,28 @@ class RuntimeService:
             raise ValidationError("object exceeds 64 MiB limit")
         data = bytes(data)
         expected = (expected_digest or "").removeprefix("sha256:") or None
-        request_hash = hashlib.sha256(canonical_json({
-            "content_digest": sha256_bytes(data),
-            "media_type": media_type,
-            "original_name": original_name,
-            "expected_digest": expected,
-        }).encode()).hexdigest()
+        digest = sha256_bytes(data)
+        binding = dict(upload_binding) if upload_binding is not None else None
+        request_hash = self._generic_output_request_hash(
+            digest, media_type, original_name, expected, binding,
+        )
         aggregate_id = "objects"
         replay = self._command_replay("object.ingest", aggregate_id, idempotency_key, request_hash, project_id="unscoped")
         if replay is not None:
             return replay
-        destination = self.cas.path_for(sha256_bytes(data))
+        if binding is not None:
+            self._validate_generic_output_binding(
+                binding,
+                identity=identity,
+                digest=digest,
+                size=len(data),
+                media_type=media_type,
+                original_name=original_name,
+                idempotency_key=idempotency_key,
+            )
+        destination = self.cas.path_for(digest)
         if not destination.exists():
-            self._begin_cas_publication_journal("ingest", [{"digest": sha256_bytes(data)}], project_id="unscoped")
+            self._begin_cas_publication_journal("ingest", [{"digest": digest}], project_id="unscoped")
         obj = self.cas.put(data, expected_digest=expected)
         try:
             timestamp = now()
@@ -2204,6 +2491,12 @@ class RuntimeService:
         capability = body.get("capability_id")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
+        if "generation_intent" in body:
+            if not isinstance(body["generation_intent"], dict):
+                raise ValidationError("generation_intent must be an object")
+            # Runtime owns transport and durability only. GEN owns the
+            # meaning of this opaque producer intent and its member fields.
+            task_spec[GENERATION_INTENT_STORAGE_KEY] = body["generation_intent"]
         if "required_facts" in body:
             task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
@@ -2214,19 +2507,256 @@ class RuntimeService:
     def task(self, task_id):
         return self.store.get_task(task_id)
 
+    def managed_outputs(self, task_id):
+        """Read Runtime-owned immutable output associations and lifecycle state."""
+        return self.store.list_managed_outputs(task_id)
+
+    def managed_output_page(self, task_id):
+        """Return the public task-scoped managed-output collection."""
+        self.store.get_task(str(task_id))
+        return {"items": self.store.list_managed_outputs(task_id), "next_cursor": None}
+
+    def managed_output(self, association_id):
+        """Read one named managed association without exposing CAS or SQLite."""
+        return self.store.get_managed_output(association_id)
+
+    def _export_source(self, association_id):
+        """Resolve one retained output and validate its historical fence facts."""
+        association = self.store.get_managed_output(association_id)
+        if association.get("durability") != "durable":
+            raise ConflictError("only durable managed outputs may be exported")
+        attempt = self.store.conn.execute(
+            "SELECT id, task_id, lease_id, fence, executor_id, runtime_epoch, settled FROM attempts WHERE id=?",
+            (str(association["attempt_id"]),),
+        ).fetchone()
+        if not attempt or str(attempt["task_id"]) != str(association["task_id"]):
+            raise ConflictError("managed output attempt provenance is unavailable")
+        if not int(attempt["settled"]):
+            raise ConflictError("managed output attempt is not completed")
+        run = self.store.conn.execute(
+            "SELECT id, project_id FROM runs WHERE id=?",
+            (str(association["run_id"]),),
+        ).fetchone()
+        if not run or run["project_id"] != association.get("project_id"):
+            raise ConflictError("managed output run/project provenance is inconsistent")
+        provenance = association.get("provenance") or {}
+        if not isinstance(provenance, dict):
+            raise ConflictError("managed output provenance is malformed")
+        for field, expected in (
+            ("task_id", association["task_id"]),
+            ("attempt_id", association["attempt_id"]),
+            ("executor_id", attempt["executor_id"]),
+            ("fence", int(attempt["fence"])),
+            ("runtime_epoch", int(attempt["runtime_epoch"])),
+        ):
+            if field in provenance and provenance[field] != expected:
+                raise ConflictError("managed output historical provenance is inconsistent", details={"field": field})
+        if not attempt["lease_id"] or not attempt["executor_id"] or int(attempt["fence"]) < 1 or int(attempt["runtime_epoch"]) < 1:
+            raise ConflictError("managed output attempt fence provenance is incomplete")
+        digest = str(association["digest"])
+        if not digest.startswith("sha256:"):
+            raise ConflictError("managed output digest is not canonical")
+        raw_digest = digest.removeprefix("sha256:")
+        object_row = self.store.conn.execute(
+            "SELECT size, media_type, original_name FROM objects WHERE digest=?",
+            (raw_digest,),
+        ).fetchone()
+        if not object_row:
+            raise ConflictError("managed output CAS object is unavailable")
+        data = self.cas.read(raw_digest)
+        if len(data) != int(association["size"]) or len(data) != int(object_row["size"]):
+            raise ConflictError("managed output CAS size does not match its association")
+        if str(object_row["media_type"]) != str(association["media_type"]):
+            raise ConflictError("managed output media type does not match its CAS object")
+        try:
+            export_filename = _canonical_managed_output_filename(str(association["filename"]))
+        except ValidationError as exc:
+            raise ConflictError("managed output filename is not a direct safe file name") from exc
+        return association, attempt, data, export_filename
+
+    def _materialize_export(self, filename, data):
+        if self.export_root is None:
+            raise ConflictError("managed-output export root is not configured")
+        identity, root_fd, _ = _pin_directory(self.export_root)
+        temporary = f".{filename}.{os.getpid()}-{uuid.uuid4().hex}.tmp"
+        fd = -1
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=root_fd)
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            try:
+                os.link(temporary, filename, src_dir_fd=root_fd, dst_dir_fd=root_fd, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise ConflictError("managed-output export destination already exists") from exc
+            os.unlink(temporary, dir_fd=root_fd)
+            os.fsync(root_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            _close_pinned(identity)
+
+    @_durable_mutation
+    def export_managed_output(self, association_id, body, *, idempotency_key=None):
+        """Materialize exact CAS bytes for one completed retained output."""
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = _wire_object(body, required=("destination_filename",), allowed=("destination_filename", "expected"))
+        destination_filename = _wire_string(body, "destination_filename")
+        expected = body.get("expected") or {}
+        if not isinstance(expected, dict):
+            raise ValidationError("expected export identity must be an object")
+        allowed_expected = {
+            "project_id", "run_id", "task_id", "attempt_id", "executor_id", "lease_id", "fence",
+            "runtime_epoch", "association_id", "output_port", "role", "object_id", "digest", "size",
+            "filename", "media_type",
+        }
+        unknown = sorted(set(expected) - allowed_expected)
+        if unknown:
+            raise ValidationError("expected export identity contains unsupported fields", details={"fields": unknown})
+        association, attempt, data, export_filename = self._export_source(association_id)
+        if destination_filename not in {association["filename"], export_filename}:
+            raise ConflictError("export destination filename must equal managed output filename")
+        source = {
+            "project_id": association.get("project_id"),
+            "run_id": association["run_id"], "task_id": association["task_id"],
+            "attempt_id": association["attempt_id"], "executor_id": attempt["executor_id"],
+            "lease_id": attempt["lease_id"], "fence": int(attempt["fence"]),
+            "runtime_epoch": int(attempt["runtime_epoch"]), "association_id": association["association_id"],
+            "output_port": association["output_port"], "role": association["role"],
+            "object_id": association["object_id"], "digest": association["digest"],
+            "size": int(association["size"]), "filename": association["filename"],
+            "media_type": association["media_type"],
+        }
+        for field, value in expected.items():
+            if field == "filename" and value == export_filename:
+                continue
+            if value != source[field]:
+                raise ConflictError("export identity assertion does not match", details={"field": field})
+        request_hash = hashlib.sha256(canonical_json({"association_id": str(association_id), "body": body}).encode()).hexdigest()
+        project_id = association.get("project_id") or "unscoped"
+        replay = self._command_replay("managed_output.export", str(association_id), idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        result = {
+            "export_id": "export-" + new_id(),
+            **source,
+            "producer": association.get("producer") or {},
+            "destination": {"root": str(self.export_root), "filename": export_filename},
+            "source_provenance": association.get("provenance") or {},
+            "exported_at": now(),
+        }
+        self._materialize_export(export_filename, data)
+        event_id = self.store._append_event(
+            association["run_id"], association["task_id"], "managed_output.exported", result,
+        )
+        event_seq = self.store.conn.execute("SELECT COUNT(*) FROM events WHERE run_id=?", (association["run_id"],)).fetchone()[0]
+        return self._command_record(
+            "managed_output.export", str(association_id), idempotency_key, request_hash,
+            result, project_id=project_id, event_ids=(event_id,), primary_stream_id=association["run_id"],
+            resulting_stream_seq=event_seq,
+        )
+
+    @_durable_mutation
+    def adopt_managed_output(self, association_id, body=None, *, idempotency_key=None):
+        """Acknowledge/adopt an existing immutable association by managed name.
+
+        Adoption never creates a second association or resolves a filesystem
+        path. Optional identity fields are equality assertions against the
+        Runtime-owned association, making a changed payload a conflict while
+        preserving the durable receipt for an exact retry.
+        """
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = {} if body is None else _wire_object(body, allowed=(
+            "association_id", "manifest_ref", "object_id", "digest", "size",
+            "filename", "media_type", "output_port", "selector", "ordinal",
+            "role", "durability",
+        ))
+        association = self.store.get_managed_output(association_id)
+        if body.get("association_id") is not None and str(body["association_id"]) != str(association_id):
+            raise ConflictError("association_id does not match the managed-output path")
+        for field in (
+            "manifest_ref", "object_id", "digest", "size", "filename", "media_type",
+            "output_port", "selector", "ordinal", "role", "durability",
+        ):
+            if field in body and body[field] != association.get(field):
+                raise ConflictError("managed-output adoption identity does not match", details={"field": field})
+        request_hash = hashlib.sha256(canonical_json({"association_id": str(association_id), "body": body}).encode()).hexdigest()
+        project_id = association.get("project_id") or "unscoped"
+        replay = self._command_replay("managed_output.adopt", str(association_id), idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        return self._command_record(
+            "managed_output.adopt", str(association_id), idempotency_key, request_hash,
+            association, project_id=project_id,
+        )
+
+    @_durable_mutation
+    def update_managed_output_lifecycle(self, association_id, body, *, idempotency_key=None):
+        """Mutate only Runtime lifecycle state for one immutable association."""
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = _wire_object(
+            body,
+            required=("operation", "expected_version"),
+            allowed=("operation", "expected_version", "lease_id", "lease_owner", "lease_seconds", "provenance"),
+        )
+        operation = _wire_string(body, "operation")
+        _wire_integer(body, "expected_version", positive=True)
+        if "lease_id" in body and (not isinstance(body["lease_id"], str) or not body["lease_id"]):
+            raise ValidationError("lease_id must be a non-empty string")
+        if "lease_owner" in body and (not isinstance(body["lease_owner"], str) or not body["lease_owner"]):
+            raise ValidationError("lease_owner must be a non-empty string")
+        if "lease_seconds" in body and (
+            isinstance(body["lease_seconds"], bool) or not isinstance(body["lease_seconds"], int)
+            or body["lease_seconds"] <= 0
+        ):
+            raise ValidationError("lease_seconds must be a positive integer")
+        if "provenance" in body and not isinstance(body["provenance"], dict):
+            raise ValidationError("lifecycle provenance must be an object")
+        association = self.store.get_managed_output(association_id)
+        project_id = association.get("project_id") or "unscoped"
+        request_hash = hashlib.sha256(canonical_json({"association_id": str(association_id), "body": body}).encode()).hexdigest()
+        replay = self._command_replay("managed_output.lifecycle", str(association_id), idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        result = self.store.update_managed_output_lifecycle(
+            association_id, operation, expected_version=body["expected_version"],
+            lease_id=body.get("lease_id"), lease_owner=body.get("lease_owner"),
+            lease_seconds=body.get("lease_seconds"),
+        )
+        if "provenance" in body:
+            result["lifecycle_provenance"] = dict(body["provenance"])
+        return self._command_record(
+            "managed_output.lifecycle", str(association_id), idempotency_key, request_hash,
+            result, project_id=project_id,
+        )
+
     def run(self, run_id):
         row = self.store.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if not row:
             raise NotFoundError("run not found")
         value = dict(row)
-        value["spec"] = json.loads(value.pop("spec_json"))
+        value["spec"], generation_intent = public_task_spec(json.loads(value.pop("spec_json")))
+        if generation_intent is not None:
+            value["generation_intent"] = generation_intent
         value["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (run_id,))]
         return value
 
     def _task_resource(self, value):
         task, run = value["task"], value["run"]
-        spec = task.get("spec", {})
+        spec, generation_intent = public_task_spec(task.get("spec", {}))
+        if task.get("generation_intent") is not None:
+            generation_intent = task["generation_intent"]
         resource = {"task_id": task["id"], "run_id": run["id"], "project_id": run.get("project_id"), "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "spec": spec, "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id"), "runtime_epoch": int(task.get("runtime_epoch") or self.store._current_runtime_epoch())}
+        if generation_intent is not None:
+            resource["generation_intent"] = generation_intent
         if "required_facts" in spec:
             resource["required_facts"] = dict(spec["required_facts"])
         if "storage_estimate" in spec:
@@ -2312,7 +2842,9 @@ class RuntimeService:
 
     def _run_resource(self, value):
         result = dict(value)
-        result["spec"] = json.loads(result.pop("spec_json"))
+        result["spec"], generation_intent = public_task_spec(json.loads(result.pop("spec_json")))
+        if generation_intent is not None:
+            result["generation_intent"] = generation_intent
         result["task_ids"] = [task["id"] for task in self.store.conn.execute("SELECT id FROM tasks WHERE run_id=? ORDER BY created_at, id", (result["id"],))]
         return result
 
@@ -2418,8 +2950,8 @@ class RuntimeService:
             body.get("runtime_epoch"), identity="executor",
             identity_id=body.get("executor_id"), required=existing is not None,
         )
-        self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts)
-        result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": capabilities, "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
+        registered = self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts)
+        result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": registered["capabilities"], "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
         if verified_facts is not None:
             result["verified_facts"] = verified_facts
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
@@ -2432,6 +2964,7 @@ class RuntimeService:
         claim namespace.  The request hash binds executor, capabilities, and
         runtime epoch; a replay can never consume a second queued task.
         """
+        _require_runtime_epoch_for_lease(body)
         body = _wire_object(
             body,
             required=("executor_id", "capability_ids", "runtime_epoch"),
@@ -2479,8 +3012,14 @@ class RuntimeService:
             self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, row["id"]))
             # Return the immutable admitted spec alongside the lease. Workers
             # must execute exactly what was claimed, without a racy second read.
-            admitted_spec = dict(task.get("spec") or {})
+            admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
+            if task.get("generation_intent") is not None:
+                generation_intent = task["generation_intent"]
             result = {"attempt_id": attempt_id, "task_id": row["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            if generation_intent is not None:
+                result["generation_intent"] = generation_intent
+            if task.get("expected_effect") is not None:
+                result["expected_effect"] = dict(task["expected_effect"])
             if "required_facts" in admitted_spec:
                 result["required_facts"] = dict(admitted_spec["required_facts"])
             if "storage_estimate" in admitted_spec:
@@ -2499,6 +3038,7 @@ class RuntimeService:
             raise ConflictError("attempt_id does not match the attempt path")
         body["attempt_id"] = str(attempt_id)
         _wire_string(body, "lease_id")
+        _require_runtime_epoch_for_lease(body)
         # Keep a numerically typed stale fence on the lease path. A worker
         # presenting fence 0 (or another old fence) is a fenced lease error,
         # not a request-shape error; this preserves one guard taxonomy.
@@ -2536,7 +3076,14 @@ class RuntimeService:
                 raise ValidationError("declared settlement effect is required")
             if effect is not None:
                 self.store._validate_settlement_effect(effect)
-            staged = self._stage_outputs(attempt_id, body.get("outputs", []), project_id=project_id)
+            staged = self._stage_outputs(
+                attempt_id,
+                body.get("outputs", []),
+                project_id=project_id,
+                attempt_row=row,
+                task_row=task,
+                lease_body=body,
+            )
             try:
                 # Persist one flat result object. Outputs are the only
                 # reserved field and are added atomically with user fields.
@@ -2732,7 +3279,76 @@ class RuntimeService:
                 )
                 return result
 
-    def _stage_outputs(self, attempt_id, outputs, *, project_id=None):
+    def _is_authorized_generic_output(
+        self, digest, size, media_type, *, name, output_port, filename,
+        recorded_filename, attempt_row, task_row, project_id, lease_body,
+    ):
+        """Recognize the worker's unscoped output upload receipt.
+
+        Generic producers cannot create a project association during their
+        upload. Settlement may adopt that exact object only when the
+        unscoped upload's request hash carries the current task/run/project,
+        attempt, executor, lease/fence, filename, and deterministic output
+        key, and its durable result matches the descriptor.
+        """
+        if attempt_row is None or task_row is None or lease_body is None:
+            return False
+        try:
+            canonical_recorded_filename = _canonical_managed_output_filename(recorded_filename)
+        except ValidationError:
+            return False
+        if canonical_recorded_filename != filename:
+            return False
+        binding = {
+            "project_id": project_id,
+            "run_id": task_row["run_id"],
+            "task_id": task_row["id"],
+            "attempt_id": attempt_row["id"],
+            "executor_id": attempt_row["executor_id"],
+            "lease_id": lease_body["lease_id"],
+            "fence": int(lease_body["fence"]),
+            "runtime_epoch": int(lease_body["runtime_epoch"]),
+            "output_key": name,
+            "output_port": output_port,
+            # Upload receipts are keyed by the producer's original name;
+            # settlement stores its canonical flat managed name.
+            "filename": recorded_filename,
+            "digest": "sha256:" + digest,
+            "size": int(size),
+            "media_type": media_type,
+        }
+        idempotency_key = self._generic_output_idempotency_key(binding)
+        row = self.store.conn.execute(
+            "SELECT request_hash, result_json FROM command_idempotency "
+            "WHERE command_kind='object.ingest' AND aggregate_id='objects' "
+            "AND idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            result = json.loads(row["result_json"])
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(result, dict):
+            return False
+        expected_hash = self._generic_output_request_hash(
+            digest, media_type, recorded_filename, None, binding,
+        )
+        if row["request_hash"] != expected_hash:
+            return False
+        try:
+            recorded_size = int(result.get("size", -1))
+        except (TypeError, ValueError):
+            return False
+        return (
+            result.get("object_id") == "sha256:" + digest
+            and result.get("digest") == "sha256:" + digest
+            and recorded_size == int(size)
+            and result.get("media_type") == media_type
+        )
+
+    def _stage_outputs(self, attempt_id, outputs, *, project_id=None, attempt_row=None, task_row=None, lease_body=None):
         """Validate and stage every output without making it globally reachable."""
         if not isinstance(outputs, list):
             raise ValidationError("outputs must be a list")
@@ -2747,7 +3363,12 @@ class RuntimeService:
             for index, output in enumerate(outputs):
                 if not isinstance(output, dict):
                     raise ValidationError("each output must be an object")
-                allowed = {"name", "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role", "is_primary", "duration_seconds"}
+                allowed = {
+                    "name", "filename", "output_port", "selector", "group_key", "variant_key", "generation_id",
+                    "kind", "digest", "media_type", "size", "data_base64", "ordinal", "role",
+                    "is_primary", "duration_seconds", "durability", "producer", "provenance",
+                    "regeneration", "coverage",
+                }
                 unknown = sorted(set(output) - allowed)
                 if unknown:
                     raise ValidationError("output contains unsupported fields", details={"fields": unknown})
@@ -2766,6 +3387,7 @@ class RuntimeService:
                 name = output.get("name", "output")
                 if not isinstance(name, str) or not name or len(name) > 512:
                     raise ValidationError("output name must be a non-empty string")
+                filename = _canonical_managed_output_filename(output.get("filename", name))
                 media_type = output.get("media_type", "application/octet-stream")
                 if not isinstance(media_type, str) or not media_type or len(media_type) > 255 or any(ord(char) < 32 for char in media_type):
                     raise ValidationError("output media_type is invalid")
@@ -2845,15 +3467,85 @@ class RuntimeService:
                     or float(duration_seconds) <= 0
                 ):
                     raise ValidationError("output duration_seconds must be a positive finite number")
-                existing = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+                output_port = output.get("output_port", name)
+                if not isinstance(output_port, str) or not output_port or len(output_port) > 255 or any(ord(char) < 32 for char in output_port):
+                    raise ValidationError("output_port is invalid")
+                selector = output.get("selector")
+                if selector is not None:
+                    if not isinstance(selector, dict) or set(selector) != {"group_key", "variant_key"}:
+                        raise ValidationError("output selector requires exactly group_key and variant_key")
+                    if "group_key" not in output:
+                        output["group_key"] = selector["group_key"]
+                    if "variant_key" not in output:
+                        output["variant_key"] = selector["variant_key"]
+                group_key = output.get("group_key", "default")
+                if not isinstance(group_key, str) or not group_key or len(group_key) > 255 or any(ord(char) < 32 for char in group_key):
+                    raise ValidationError("output group_key is invalid")
+                variant_key = output.get("variant_key", str(ordinal if ordinal is not None else 0))
+                if not isinstance(variant_key, str) or len(variant_key) > 255 or any(ord(char) < 32 for char in variant_key):
+                    raise ValidationError("output variant_key is invalid")
+                generation_id = output.get("generation_id")
+                if generation_id is not None and (not isinstance(generation_id, str) or not generation_id or len(generation_id) > 255):
+                    raise ValidationError("output generation_id is invalid")
+                durability = output.get("durability", "durable")
+                if durability not in MANAGED_DURABILITIES:
+                    raise ValidationError("output durability is invalid")
+                if durability == "temporary" and is_primary is True:
+                    raise ValidationError("primary outputs must be durable")
+                producer = output.get("producer", {})
+                provenance = output.get("provenance", {})
+                if not isinstance(producer, dict) or not isinstance(provenance, dict):
+                    raise ValidationError("output producer and provenance must be objects")
+                regeneration = output.get("regeneration")
+                if regeneration is not None:
+                    regeneration = _validate_regeneration(regeneration)
+                coverage = output.get("coverage")
+                if coverage is not None:
+                    coverage = _validate_coverage(coverage)
+                existing = self.store.conn.execute("SELECT size, media_type, original_name FROM objects WHERE digest=?", (digest,)).fetchone()
                 if existing:
                     if int(existing["size"]) != size or existing["media_type"] != media_type:
                         raise ConflictError("output metadata does not match existing object", details={"digest": digest_value})
                     if project_id and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
-                        raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
+                        has_project_owner = self.store.conn.execute(
+                            "SELECT 1 FROM project_objects WHERE digest=? LIMIT 1", (digest,)
+                        ).fetchone()
+                        if has_project_owner or not self._is_authorized_generic_output(
+                            digest,
+                            size,
+                            media_type,
+                            name=name,
+                            output_port=output_port,
+                            filename=filename,
+                            recorded_filename=existing["original_name"],
+                            attempt_row=attempt_row,
+                            task_row=task_row,
+                            project_id=project_id,
+                            lease_body=lease_body,
+                        ):
+                            raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
-                normalized = {"name": name, "kind": kind, "digest": digest_value, "media_type": media_type, "size": size}
+                normalized = {
+                    "name": name, "kind": kind, "digest": digest_value,
+                    "media_type": media_type, "size": size,
+                }
+                # Keep the established settlement result wire stable.  The
+                # association table/readback carries the defaulted filename,
+                # port, group, and variant identity; echo an extended field
+                # only when the producer explicitly supplied it.
+                if "filename" in output:
+                    normalized["filename"] = filename
+                if "output_port" in output:
+                    normalized["output_port"] = output_port
+                if selector is not None:
+                    normalized["selector"] = {"group_key": group_key, "variant_key": variant_key}
+                if "group_key" in output:
+                    normalized["group_key"] = group_key
+                if "variant_key" in output:
+                    normalized["variant_key"] = variant_key
+                if generation_id is not None:
+                    normalized["generation_id"] = generation_id
                 if ordinal is not None:
                     normalized["ordinal"] = ordinal
                 if role is not None:
@@ -2862,7 +3554,23 @@ class RuntimeService:
                     normalized["is_primary"] = is_primary
                 if duration_seconds is not None:
                     normalized["duration_seconds"] = duration_seconds
-                staged.append({"digest": digest, "path": stage_path, "size": size, "media_type": media_type, "name": name, "output": normalized})
+                if durability != "durable":
+                    normalized["durability"] = durability
+                if producer:
+                    normalized["producer"] = producer
+                if provenance:
+                    normalized["provenance"] = provenance
+                if regeneration is not None:
+                    normalized["regeneration"] = regeneration
+                if coverage is not None:
+                    normalized["coverage"] = coverage
+                staged.append({
+                    "digest": digest, "path": stage_path, "size": size, "media_type": media_type,
+                    "name": name, "filename": filename, "output": normalized,
+                    "output_port": output_port, "group_key": group_key, "variant_key": variant_key,
+                    "generation_id": generation_id, "durability": durability, "producer": producer,
+                    "provenance": provenance, "regeneration": regeneration, "coverage": coverage,
+                })
             return {"stage_dir": stage_dir, "attempt_id": attempt_id, "items": staged, "outputs": [item["output"] for item in staged]}
         except Exception:
             self._discard_staged_outputs({"stage_dir": stage_dir, "items": staged})
@@ -3244,8 +3952,10 @@ class RuntimeService:
     @_verified_mutation
     def prepare_reboot(self, body=None, *, identity=None):
         """Issue a one-shot nonce for an attempt's recovery handshake."""
+        raw_body = {} if body is None else body
+        _require_runtime_epoch_for_lease(raw_body)
         body = _wire_object(
-            {} if body is None else body,
+            raw_body,
             required=("attempt_id", "lease_id", "fence", "runtime_epoch"),
             allowed=("attempt_id", "lease_id", "fence", "runtime_epoch"),
         )
@@ -3432,8 +4142,10 @@ class RuntimeService:
                 _wire_string(body, field)
         def attempt_resource(attempt):
             task_value = self.store.get_task(attempt["task_id"])
-            admitted_spec = dict(task_value["task"].get("spec") or {})
-            return {
+            admitted_spec, generation_intent = public_task_spec(task_value["task"].get("spec") or {})
+            if task_value["task"].get("generation_intent") is not None:
+                generation_intent = task_value["task"]["generation_intent"]
+            resource = {
                 "attempt_id": attempt["id"],
                 "task_id": attempt["task_id"],
                 "project_id": task_value["run"].get("project_id"),
@@ -3444,6 +4156,9 @@ class RuntimeService:
                 "input_object_ids": list(admitted_spec.get("input_object_ids") or []),
                 "spec": admitted_spec,
             }
+            if generation_intent is not None:
+                resource["generation_intent"] = generation_intent
+            return resource
 
         with self.store._mutex:
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
@@ -3486,6 +4201,7 @@ class RuntimeService:
     @_verified_mutation
     def heartbeat_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
+        _require_runtime_epoch_for_lease(body)
         body = _wire_object(
             body,
             required=("lease_id", "fence", "runtime_epoch"),
@@ -3527,6 +4243,7 @@ class RuntimeService:
     @_verified_mutation
     def fail_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
         idempotency_key = require_idempotency_key(idempotency_key)
+        _require_runtime_epoch_for_lease(body)
         body = _wire_object(
             body,
             required=("lease_id", "fence", "runtime_epoch"),

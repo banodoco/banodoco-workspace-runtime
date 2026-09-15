@@ -9,6 +9,7 @@ import unittest
 
 from banodoco_local.bootstrap import (
     BootstrapConfig,
+    BootstrapError,
     CompatibilityError,
     DuplicateOwnerError,
     LegacyRootCollisionError,
@@ -46,7 +47,9 @@ class FakeConnection:
 
 class FakeBoundary:
     def __init__(self):
+        self.creates = []
         self.starts = []
+        self.calls = []
         self.connects = []
         self.provisions = []
         self.selections = []
@@ -57,6 +60,7 @@ class FakeBoundary:
         self.restart_calls = 0
 
     def start(self, **kwargs):
+        self.calls.append("start")
         self.starts.append(kwargs)
         realm_root = kwargs["realm_root"]
         realm_root.mkdir(parents=True, exist_ok=True)
@@ -73,6 +77,14 @@ class FakeBoundary:
             "schema_version": "workspace-schema-v1",
             "capability_digest": "caps-v1",
         }
+
+    def create(self, **kwargs):
+        self.calls.append("create")
+        self.creates.append(kwargs)
+        realm_root = kwargs["realm_root"]
+        realm_root.mkdir(parents=True, exist_ok=False)
+        (realm_root / "realm.sqlite3").touch()
+        return {"state": "created", "realm_id": kwargs["realm_id"], "root": str(realm_root)}
 
     def connect(self, **kwargs):
         self.connects.append(kwargs)
@@ -108,6 +120,9 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result.status, "started")
         self.assertEqual(result.credential_file, self.paths.credentials_dir / "astrid.json")
         self.assertEqual(len(self.boundary.starts), 1)
+        self.assertEqual(self.boundary.calls[:2], ["create", "start"])
+        self.assertEqual(len(self.boundary.creates), 1)
+        self.assertEqual(self.boundary.creates[0]["realm_id"], result.realm_id)
         self.assertEqual(result.realm_id, json.loads(self.paths.discovery_path.read_text())["active_realm"])
         catalog = json.loads(self.paths.catalog_path.read_text())
         self.assertEqual(catalog["selected_realm_id"], result.realm_id)
@@ -120,7 +135,6 @@ class BootstrapTests(unittest.TestCase):
         mode = stat.S_IMODE((self.paths.credentials_dir / "astrid.json").stat().st_mode)
         self.assertEqual(mode, 0o600)
         self.assertNotIn("activation_manifest", catalog["realms"][0])
-        self.assertEqual(tuple(self.paths.activations_dir.glob("*.json")), ())
         source_manifest = self.paths.source_profiles_dir / "astrid.json"
         self.assertEqual(json.loads(source_manifest.read_text()), PROFILE.as_dict())
         self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
@@ -166,7 +180,7 @@ class BootstrapTests(unittest.TestCase):
         legacy.mkdir(parents=True)
         with self.assertRaises(LegacyRootCollisionError) as caught:
             bootstrap(self.paths, self.boundary, self.config)
-        self.assertIn("banodoco-local migrate --profile astrid --source", str(caught.exception))
+        self.assertIn("Legacy realm roots are unsupported", str(caught.exception))
         self.assertEqual(len(self.boundary.starts), 0)
         self.assertFalse(self.paths.catalog_path.exists())
 
@@ -193,6 +207,48 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "banodoco-local up --profile astrid"):
             connect(self.paths, self.boundary, self.config)
         self.assertFalse(self.paths.runtime_support.exists())
+
+    def test_selected_missing_realm_never_uses_fresh_create(self):
+        self.paths.ensure_support_dirs()
+        self.paths.catalog_path.write_text(json.dumps({
+            "version": 1,
+            "selected_realm_id": "existing-realm",
+            "realms": [{
+                "realm_id": "existing-realm",
+                "display_name": "Existing",
+                "data_root": str((self.paths.realms_dir / "existing-realm").resolve()),
+            }],
+            "source_profiles": {},
+        }))
+
+        class ExistingBoundary(FakeBoundary):
+            def start(self, **kwargs):
+                self.calls.append("start")
+                raise BootstrapError("existing realm is missing")
+
+            def create(self, **kwargs):
+                raise AssertionError("selected existing realm was provisioned")
+
+        boundary = ExistingBoundary()
+        with self.assertRaisesRegex(BootstrapError, "existing realm is missing"):
+            bootstrap(self.paths, boundary, self.config)
+        self.assertEqual(boundary.calls, ["start"])
+        self.assertFalse(self.paths.realms_dir.joinpath("existing-realm").exists())
+
+    def test_fresh_realm_handoff_failure_rolls_back_created_realm(self):
+        class FailingHandoffBoundary(FakeBoundary):
+            def start(self, **kwargs):
+                super().start(**kwargs)
+                raise RuntimeError("admission handoff failed")
+
+        boundary = FailingHandoffBoundary()
+        with self.assertRaisesRegex(RuntimeError, "admission handoff failed"):
+            bootstrap(self.paths, boundary, self.config)
+        self.assertEqual(boundary.calls[:2], ["create", "start"])
+        self.assertFalse(list(self.paths.realms_dir.iterdir()) if self.paths.realms_dir.exists() else ())
+        self.assertFalse(self.paths.catalog_path.exists())
+        self.assertFalse(self.paths.discovery_path.exists())
+        self.assertFalse(self.paths.instance_lock_path.exists())
 
     def test_doctor_is_side_effect_free(self):
         report = doctor(self.paths, self.boundary)

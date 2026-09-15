@@ -6,10 +6,12 @@ import pytest
 
 from runtime_protocol.errors import LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 @pytest.fixture
 def service(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     value = RuntimeService(tmp_path / "realm")
     try:
         yield value

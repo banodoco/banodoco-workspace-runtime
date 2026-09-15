@@ -9,6 +9,7 @@ import pytest
 
 from banodoco_workspace_client import WorkspaceClient
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError
 from runtime_protocol.service import RuntimeService
 
@@ -46,6 +47,7 @@ def _composition(asset_id: str = "old") -> tuple[dict, dict]:
 
 
 def _service_fixture(tmp_path, *, clip_type: str | None = None):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     project = service.create_project({"slug": "replace", "name": "Replace"})
     config, registry = _composition()
@@ -195,6 +197,7 @@ def test_replace_timeline_clip_replays_after_intervening_edit_and_reopen(tmp_pat
 
 
 def test_replace_timeline_clip_public_http_route(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)

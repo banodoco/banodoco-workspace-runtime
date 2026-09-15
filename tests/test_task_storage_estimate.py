@@ -7,6 +7,7 @@ import pytest
 
 from runtime_protocol.errors import ConflictError, ValidationError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def _digest(value: str) -> str:
@@ -56,6 +57,7 @@ def _claim(service: RuntimeService, key: str):
 
 
 def test_task_estimate_overrides_capability_fallback_at_admission_and_claim(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         _register_render(service, scratch_bytes=800, output_bytes=200)
@@ -92,6 +94,7 @@ def test_task_estimate_overrides_capability_fallback_at_admission_and_claim(tmp_
 
 
 def test_missing_task_estimate_uses_capability_fallback(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         _register_render(service, scratch_bytes=400, output_bytes=200)
@@ -117,6 +120,7 @@ def test_missing_task_estimate_uses_capability_fallback(tmp_path, monkeypatch):
 
 
 def test_task_storage_failure_is_not_mislabeled_as_capability_unavailable(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         _register_render(service, scratch_bytes=1, output_bytes=1)
@@ -148,6 +152,7 @@ def test_task_storage_failure_is_not_mislabeled_as_capability_unavailable(tmp_pa
     [1, 2],
 ])
 def test_storage_estimate_is_strictly_validated_before_admission(tmp_path, estimate):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         with pytest.raises(ValidationError):
@@ -159,6 +164,7 @@ def test_storage_estimate_is_strictly_validated_before_admission(tmp_path, estim
 
 
 def test_explicit_null_storage_estimate_is_rejected(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         body = _admission(key="null-estimate")
@@ -171,6 +177,7 @@ def test_explicit_null_storage_estimate_is_rejected(tmp_path):
 
 
 def test_storage_estimate_is_bound_to_admission_idempotency(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         first = service.create_task(_admission(

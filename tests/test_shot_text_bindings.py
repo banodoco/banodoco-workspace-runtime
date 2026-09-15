@@ -6,10 +6,12 @@ import pytest
 
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 
 
 @pytest.fixture()
 def daemon(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     value = RuntimeDaemon(tmp_path / "realm").start()
     try:
         yield value

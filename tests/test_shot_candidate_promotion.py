@@ -6,6 +6,7 @@ import pytest
 
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 
 
 def _digest(data: bytes) -> str:
@@ -13,6 +14,7 @@ def _digest(data: bytes) -> str:
 
 
 def test_candidate_promotion_is_atomic_fixed_point_and_byte_stable_on_replay(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -48,6 +50,7 @@ def test_candidate_promotion_is_atomic_fixed_point_and_byte_stable_on_replay(tmp
 
 
 def test_candidate_provenance_is_verified_before_promotion(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)

@@ -11,11 +11,13 @@ from banodoco_local.bootstrap import BootstrapConfig, BootstrapError, SourceProf
 from banodoco_local.paths import RuntimePaths
 from runtime_protocol.errors import AuthorizationError, ConflictError, LeaseError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 from runtime_protocol.daemon import RuntimeDaemon
 from banodoco_workspace_client import WorkspaceClient
 
 
 def test_targeted_mutations_replay_the_same_committed_receipt(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         project = service.create_project({"slug": "contract", "name": "Contract"})
@@ -26,10 +28,13 @@ def test_targeted_mutations_replay_the_same_committed_receipt(tmp_path: Path) ->
         with pytest.raises(ConflictError):
             service.create_document(project["id"], {**document_body, "content": {"v": 2}}, idempotency_key="doc-create")
 
-        generation = service.create_generation(project["id"], {"generation_id": "generation", "metadata": {"seed": 1}}, idempotency_key="generation-create")
-        assert generation["receipt"]["project_id"] == project["id"]
-        variant = service.create_variant("generation", {"variant_id": "variant", "metadata": {}}, idempotency_key="variant-create")
-        assert variant["receipt"]["command_kind"] == "variant.create"
+        # Generations and variants are now published only by admitted
+        # settlement effects; direct calls must not create receipt-backed rows.
+        with pytest.raises(ConflictError, match="direct generation publication is disabled"):
+            service.create_generation(project["id"], {"generation_id": "generation", "metadata": {"seed": 1}}, idempotency_key="generation-create")
+        with pytest.raises(ConflictError, match="direct variant publication is disabled"):
+            service.create_variant("generation", {"variant_id": "variant", "metadata": {}}, idempotency_key="variant-create")
+        assert service.list_generations(project["id"])["items"] == []
 
         left = service.ingest(project["id"], b"left", idempotency_key="left-object")["data"]["digest"]
         right = service.ingest(project["id"], b"right", idempotency_key="right-object")["data"]["digest"]
@@ -50,6 +55,7 @@ def test_targeted_mutations_replay_the_same_committed_receipt(tmp_path: Path) ->
 
 
 def test_executor_reregistration_is_identity_and_epoch_fenced(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     identity = {"actor": "executor-a", "scopes": ["worker:register"]}
     try:
@@ -90,8 +96,16 @@ def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) ->
     class FailingBoundary:
         stopped = False
 
+        def create(self, **kwargs):
+            RealmStore.initialize(
+                kwargs["realm_root"],
+                realm_id=kwargs["realm_id"],
+                display_name=kwargs["display_name"],
+            ).close()
+            return {"state": "created", "realm_id": kwargs["realm_id"], "root": str(kwargs["realm_root"])}
+
         def start(self, **kwargs):
-            kwargs["realm_root"].mkdir(parents=True)
+            assert (kwargs["realm_root"] / "realm.sqlite3").is_file()
             return {"endpoint": "http://127.0.0.1:43100", "pid": 101, "runtime_instance_id": "instance", "protocol_version": "workspace.v1", "schema_version": "workspace-schema-v1"}
 
         def health(self, **kwargs):
@@ -114,6 +128,7 @@ def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) ->
 
 
 def test_http_target_mutations_require_idempotency_key(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)

@@ -5,11 +5,13 @@ import pytest
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 
 
 def test_executor_registration_requires_key_and_fences_stale_replay_after_restart(tmp_path):
     root = tmp_path / "realm"
     support = tmp_path / "support"
+    RealmStore.initialize(root).close()
     daemon = RuntimeDaemon(root, support_root=support).start()
     try:
         api = Api(daemon.endpoint, daemon.token)
@@ -45,6 +47,7 @@ def test_executor_registration_requires_key_and_fences_stale_replay_after_restar
 def test_timeline_shot_and_reference_creation_are_keyed_durable_and_non_overwriting(tmp_path):
     root = tmp_path / "realm"
     support = tmp_path / "support"
+    RealmStore.initialize(root).close()
     daemon = RuntimeDaemon(root, support_root=support).start()
     project_id = None
     try:

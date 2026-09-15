@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
-from banodoco_workspace_client import ApiError, ClaimWaiting, WorkspaceClient
+from banodoco_workspace_client import ApiError, Capability, ClaimWaiting, WorkspaceClient
+from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 
 
 def test_generated_client_smoke_and_scoped_handshake() -> None:
@@ -35,6 +37,137 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
     assert project.receipt["command_kind"] == "project.create"
     assert calls[-1][2]["Authorization"] == "Bearer token"
     assert calls[-1][2]["Idempotency-Key"] == "create-1"
+
+
+def test_connected_register_executor_response_uses_generated_capability_parser(tmp_path: Path) -> None:
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        registered = client.register_executor(
+            {
+                "executor_id": "ordinary-worker",
+                "max_concurrency": 1,
+                "resource_keys": [],
+                # Runtime keeps the existing ID-list registration input
+                # compatibility; the response must still satisfy the
+                # canonical generated Executor parser.
+                "capabilities": ["render.basic"],
+                "protocol": "workspace.v1",
+            },
+            idempotency_key="register-ordinary-worker",
+        )
+        capability = registered.capabilities[0]
+        assert isinstance(capability, Capability)
+        assert capability.capability_id == "render.basic"
+        assert capability.definition_digest.startswith("sha256:")
+        task = client.admit_task(
+            capability_id=capability.capability_id,
+            capability_digest=capability.definition_digest,
+            input_object_ids=[],
+            idempotency_key="admit-after-register",
+        )
+        assert task["capability_id"] == capability.capability_id
+    finally:
+        daemon.stop()
+
+
+def test_generation_intent_round_trips_through_admission_claim_and_terminal_readback(tmp_path: Path) -> None:
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support").start()
+    intent = {
+        "version": 1,
+        "modality": "video",
+        "partial_success_policy": "allow",
+        "groups": [
+            {
+                "group_key": "main",
+                "selectors": [
+                    {"selector": "video", "ordinal": 0, "variant_key": "original"},
+                ],
+            },
+        ],
+    }
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        registered = client.register_executor(
+            {
+                "executor_id": "generation-intent-worker",
+                "max_concurrency": 1,
+                "resource_keys": [],
+                "capabilities": ["generation.intent"],
+                "protocol": "workspace.v1",
+            },
+            idempotency_key="generation-intent-register",
+        )
+        capability = registered.capabilities[0]
+        admitted = client.admit_task(
+            capability_id=capability.capability_id,
+            capability_digest=capability.definition_digest,
+            input_object_ids=[],
+            idempotency_key="generation-intent-admit",
+            generation_intent=intent,
+        )
+        assert admitted["generation_intent"] == intent
+        assert "generation_intent" not in admitted["spec"]
+
+        task = client.get_task(admitted["task_id"])
+        assert task.generation_intent == intent
+        assert "generation_intent" not in task.spec
+        worker = WorkspaceClient(daemon.endpoint, daemon.worker_token)
+        attempt = worker.claim_task(
+            executor_id="generation-intent-worker",
+            capability_ids=[capability.capability_id],
+            idempotency_key="generation-intent-claim",
+            runtime_epoch=worker.health().runtime_epoch,
+        )
+        assert attempt.generation_intent == intent
+        assert "generation_intent" not in attempt.spec
+        settled = worker.settle_attempt(
+            attempt.attempt_id,
+            {
+                "lease_id": attempt.lease_id,
+                "fence": attempt.fence,
+                "runtime_epoch": attempt.runtime_epoch,
+                "outputs": [],
+                "effect": None,
+            },
+            idempotency_key="generation-intent-settle",
+        )
+        assert settled["state"] == "succeeded"
+        terminal = client.get_task(task.task_id)
+        assert terminal.state == "succeeded"
+        assert terminal.generation_intent == intent
+        assert "generation_intent" not in terminal.spec
+
+        # Read a row written by the pre-fix Runtime shape: the legacy key is
+        # accepted for compatibility but never leaks into public spec.
+        row = daemon.service.store.conn.execute(
+            "SELECT spec_json FROM tasks WHERE id=?", (task.task_id,)
+        ).fetchone()
+        legacy_spec = json.loads(row["spec_json"])
+        legacy_spec["generation_intent"] = legacy_spec.pop("__runtime_generation_intent")
+        daemon.service.store.conn.execute(
+            "UPDATE tasks SET spec_json=? WHERE id=?",
+            (json.dumps(legacy_spec, sort_keys=True, separators=(",", ":")), task.task_id),
+        )
+        daemon.service.store.conn.commit()
+        legacy = client.get_task(task.task_id)
+        assert legacy.generation_intent == intent
+        assert "generation_intent" not in legacy.spec
+
+        generic = client.admit_task(
+            capability_id=capability.capability_id,
+            capability_digest=capability.definition_digest,
+            input_object_ids=[],
+            idempotency_key="generation-intent-generic-admit",
+        )
+        assert "generation_intent" not in generic
+        assert client.get_task(generic["task_id"]).generation_intent is None
+    finally:
+        daemon.stop()
 
 
 def test_object_byte_range_etag_and_head_are_preserved() -> None:

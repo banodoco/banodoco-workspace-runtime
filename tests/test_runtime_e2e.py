@@ -15,6 +15,7 @@ import pytest
 
 from runtime_protocol.cas import ContentAddressedStore
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 from runtime_protocol.errors import ConflictError, OwnerBusyError, ValidationError
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from http_helpers import Api
@@ -22,6 +23,7 @@ from http_helpers import Api
 
 @pytest.fixture()
 def daemon(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     instance = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         yield instance
@@ -260,6 +262,7 @@ def test_doctor_can_run_while_daemon_owns_realm(daemon, tmp_path):
 
 
 def test_concurrent_owner_refusal_and_reconnect(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     first = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         with pytest.raises(OwnerBusyError):
@@ -285,6 +288,7 @@ def test_cas_hash_and_path_safety(tmp_path):
 def test_offline_core_store_and_read_only_doctor(tmp_path):
     root = tmp_path / "realm"
     from runtime_protocol.service import RuntimeService
+    RealmStore.initialize(root).close()
     service = RuntimeService(root)
     project = service.create_project({"slug": "offline", "name": "Offline", "metadata": {}})
     service.close()

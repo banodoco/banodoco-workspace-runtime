@@ -7,10 +7,12 @@ import pytest
 
 from runtime_protocol.errors import LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 from runtime_protocol.util import durable_json_bytes
 
 
 def _setup(tmp_path, *, reboot_executor=None):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm", reboot_executor=reboot_executor)
     service.register_executor(
         {"executor_id": "worker", "capabilities": ["render.basic"]},
