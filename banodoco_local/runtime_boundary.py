@@ -28,6 +28,23 @@ PROTOCOL_VERSION = "workspace.v1"
 WIRE_PROTOCOL = PROTOCOL_VERSION
 SCHEMA_VERSION = "workspace-schema-v1"
 WAIT_SECONDS = 10.0
+ADMISSION_TIMEOUT_ENV = "BANODOCO_RUNTIME_ADMISSION_TIMEOUT_SECONDS"
+DEFAULT_ADMISSION_TIMEOUT_SECONDS = 120.0
+STARTUP_WAIT_MARGIN_SECONDS = 5.0
+
+
+def _admission_timeout_from_environment() -> float:
+    """Read the bounded startup integrity budget from the install environment."""
+    raw = os.environ.get(ADMISSION_TIMEOUT_ENV)
+    if raw in (None, ""):
+        return DEFAULT_ADMISSION_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise BootstrapError(f"{ADMISSION_TIMEOUT_ENV} must be a finite positive number.") from exc
+    if not (value > 0 and value != float("inf") and value == value):
+        raise BootstrapError(f"{ADMISSION_TIMEOUT_ENV} must be a finite positive number.")
+    return value
 
 
 class RuntimeConnection:
@@ -112,8 +129,12 @@ class LocalRuntimeBoundary:
     # bounded without making a normal, healthy runtime look stale.
     HEALTH_TIMEOUT_SECONDS = 5.0
 
-    def __init__(self, *, wait_seconds: float = WAIT_SECONDS):
-        self.wait_seconds = wait_seconds
+    def __init__(self, *, wait_seconds: float | None = None):
+        self.admission_timeout_seconds = _admission_timeout_from_environment()
+        requested_wait = WAIT_SECONDS if wait_seconds is None else float(wait_seconds)
+        if requested_wait <= 0 or requested_wait != requested_wait or requested_wait == float("inf"):
+            raise BootstrapError("wait_seconds must be a finite positive number.")
+        self.wait_seconds = max(requested_wait, self.admission_timeout_seconds + STARTUP_WAIT_MARGIN_SECONDS)
         self._process: subprocess.Popen[str] | None = None
         self._source: SourceProfile | None = None
         self._realm_root: Path | None = None
@@ -216,6 +237,8 @@ class LocalRuntimeBoundary:
             argv += ["--owner-lock", str(owner_lock)]
         if not any("--bootstrap-token-file" == part for part in argv):
             argv += ["--bootstrap-token-file", str(token_file)]
+        if not any("--admission-timeout" == part for part in argv):
+            argv += ["--admission-timeout", str(self.admission_timeout_seconds)]
         return argv
 
     def create(self, *, realm_id: str, realm_root: Path, display_name: str, source_profile: SourceProfile) -> Mapping[str, Any]:

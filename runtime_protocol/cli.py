@@ -12,6 +12,11 @@ from .daemon import RuntimeDaemon, WORKER_SCOPES
 from .backup import create_backup, restore_backup, structured_export
 from .errors import RuntimeErrorBase
 from .store import RealmStore
+from .upgrade import (
+    DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    migrate_historical_managed_outputs,
+    upgrade_realm,
+)
 
 
 def _parser():
@@ -27,6 +32,7 @@ def _parser():
     start.add_argument("--realm-id")
     start.add_argument("--owner-lock")
     start.add_argument("--bootstrap-token-file")
+    start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
     create = sub.add_parser("create", help="explicitly create one fresh canonical realm")
     create.add_argument("--root", required=True)
     create.add_argument("--display-name", default="Workspace")
@@ -35,6 +41,17 @@ def _parser():
     doctor.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--support-root")
+    upgrade = sub.add_parser("upgrade", help="offline upgrade one stopped v23 realm to the canonical format")
+    upgrade.add_argument("--root", required=True)
+    upgrade.add_argument("--archive-root")
+    upgrade.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    upgrade.add_argument("--confirm", required=True)
+    reconcile = sub.add_parser("migrate-managed-outputs", help="materialize verified associations for historical settled render outputs")
+    reconcile.add_argument("--root", required=True)
+    reconcile.add_argument("--project-id")
+    reconcile.add_argument("--task-id")
+    reconcile.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    reconcile.add_argument("--confirm", required=True)
     backup = sub.add_parser("backup", help="create a verified self-contained realm backup")
     backup.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     backup.add_argument("--support-root")
@@ -101,6 +118,33 @@ def main(argv=None):
             result["next_action"] = "banodoco-runtime create --root <realm>"
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") else 1
+    if args.command == "upgrade":
+        try:
+            result = upgrade_realm(
+                args.root,
+                archive_root=args.archive_root,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "migrate-managed-outputs":
+        try:
+            result = migrate_historical_managed_outputs(
+                args.root,
+                project_id=args.project_id,
+                task_id=args.task_id,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "create":
         store = RealmStore.initialize(args.root, display_name=args.display_name, realm_id=args.realm_id)
         try:
@@ -165,7 +209,7 @@ def main(argv=None):
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     try:
-        daemon = RuntimeDaemon(args.root, support_root=args.support_root, export_root=args.export_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file, production_worker_credentials=True).start()
+        daemon = RuntimeDaemon(args.root, support_root=args.support_root, export_root=args.export_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file, production_worker_credentials=True, admission_timeout=args.admission_timeout).start()
     except KeyboardInterrupt:
         raise
     except Exception as exc:

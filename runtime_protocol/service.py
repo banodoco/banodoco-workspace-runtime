@@ -374,12 +374,21 @@ def _durable_mutation(function):
 class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
-    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None):
+    def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None):
         root_path = Path(root).expanduser().resolve()
         # Service startup is an open/admission operation.  Realm creation is
         # explicit through RealmStore.initialize; a missing path must fail
         # before schema, identity, lock, or storage roots can be created.
-        self.store = RealmStore(root_path)
+        store_kwargs = {}
+        if admission_timeout is not None:
+            try:
+                admission_timeout = float(admission_timeout)
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("admission_timeout must be a finite positive number") from exc
+            if not math.isfinite(admission_timeout) or admission_timeout <= 0:
+                raise ValidationError("admission_timeout must be a finite positive number")
+            store_kwargs["admission_timeout"] = admission_timeout
+        self.store = RealmStore(root_path, **store_kwargs)
         self._verified = False
         self._admission_failure = None
         self._readiness_callback = None
@@ -391,9 +400,6 @@ class RuntimeService:
                 )
             self.cas = ContentAddressedStore(self.store.cas_root)
             self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
-            report = self.store.doctor()
-            if not report.get("ok"):
-                raise RealmAdmissionError("realm is not usable after initialization", details=report)
             self.runtime_session_id = new_id()
             self._runtime_state = self.store.begin_runtime_session(
                 self.runtime_session_id, epoch_floor=runtime_epoch_floor
@@ -517,8 +523,18 @@ class RuntimeService:
         raise ConflictError("whole-realm purge is offline-only; stop the runtime and use the purge command", details={"next_action": "banodoco-runtime purge --root <realm> --confirm 'PURGE <realm_id>'"})
 
     def health(self):
-        report = self.doctor()
-        return {"status": "ok" if self._verified and report.get("ok") else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
+        # ``doctor`` performs the full quick-check, foreign-key, event-chain,
+        # and CAS walk. Health is called frequently, so keep it to a cheap
+        # liveness query while retaining the cached startup admission state.
+        with self.store._mutex:
+            try:
+                row = self.store.conn.execute("SELECT 1").fetchone()
+                live = row is not None and int(row[0]) == 1
+            except (sqlite3.DatabaseError, OSError, ValueError, TypeError):
+                live = False
+                self._verified = False
+                self._admission_failure = {"reason": "runtime_liveness_failed"}
+        return {"status": "ok" if self._verified and live else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
 
     def _assert_mutation_admitted(self):
         if not self._verified:
