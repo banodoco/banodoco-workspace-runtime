@@ -545,6 +545,7 @@ class LocalRuntimeBoundary:
             raise BootstrapError("No runtime process is available to restart.")
         source, root, support, realm_id = self._source, self._realm_root, self._support_root, self._realm_id
         start_after_stop = bool(kwargs.get("start_after_stop", True))
+        require_health = bool(kwargs.get("require_health", True))
         endpoint = str(kwargs.get("endpoint", ""))
         expected_pid = int(kwargs.get("pid", 0))
         expected_instance = str(kwargs.get("instance_id", ""))
@@ -593,12 +594,16 @@ class LocalRuntimeBoundary:
             except OSError as exc:
                 raise BootstrapError("Runtime restart refused: owner process disappeared.") from exc
 
-        validate_before_signal()
+        # A stopped owner must still pass the birth/lock identity fence.  The
+        # operator upgrade path may explicitly disable only the health check
+        # here so an unhealthy daemon can be stopped without signaling a
+        # reused PID or unrelated process group.
+        validate_before_signal(require_health=require_health)
         if not self._process and getattr(self, "_detached_pid", None):
             detached = int(self._detached_pid)
             if detached != expected_pid:
                 raise BootstrapError("Runtime restart refused: adopted owner PID changed.")
-            validate_before_signal()
+            validate_before_signal(require_health=require_health)
             os.killpg(detached, signal.SIGTERM)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and self.is_pid_alive(detached):

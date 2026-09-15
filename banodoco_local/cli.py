@@ -26,6 +26,7 @@ from .bootstrap import (
 from .io import read_json
 from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
+from runtime_protocol.upgrade import DEFAULT_UPGRADE_TIMEOUT_SECONDS
 
 
 class UnconfiguredBoundary:
@@ -77,6 +78,11 @@ def parser() -> argparse.ArgumentParser:
     relocate.add_argument("--confirm", help="RELOCATE <selected-realm-id> to execute")
     relocate.add_argument("--plan", action="store_true", help="emit a read-only plan")
 
+    upgrade = sub.add_parser("upgrade", help="stop, upgrade/reconcile, verify, and optionally relocate the Astrid runtime")
+    _profile_args(upgrade, data_root_required=True)
+    upgrade.add_argument("--destination", type=Path, help="optional support root for the verified relocation cutover")
+    upgrade.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS, help="bounded offline upgrade/reconciliation budget in seconds")
+
     checkpoint = sub.add_parser("checkpoint", help="persist a nonce-bound recovery checkpoint")
     _read_args(checkpoint)
     _attempt_args(checkpoint)
@@ -108,11 +114,11 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def _profile_args(command: argparse.ArgumentParser) -> None:
+def _profile_args(command: argparse.ArgumentParser, *, data_root_required: bool = False) -> None:
     command.add_argument("--profile", default="astrid", choices=["astrid"])
     command.add_argument("--display-name", default="Astrid Workspace")
     command.add_argument("--source-manifest", type=Path)
-    command.add_argument("--data-root", type=Path, help=f"explicit support root (or {DATA_ROOT_ENV})")
+    command.add_argument("--data-root", type=Path, required=data_root_required, help=f"explicit support root (or {DATA_ROOT_ENV})")
     command.add_argument("--json", action="store_true")
 
 
@@ -283,6 +289,16 @@ def main(argv: list[str] | None = None) -> int:
             result = relocate(
                 paths, LocalRuntimeBoundary(), _config(args, paths), _client(paths),
                 destination=args.destination, backup=args.backup, confirmation=args.confirm,
+            )
+            _emit(result, json_mode=args.json)
+            return 0
+        if args.command == "upgrade":
+            from .operator_upgrade import upgrade_workspace
+
+            config = _config(args, paths)
+            result = upgrade_workspace(
+                paths, LocalRuntimeBoundary(), config,
+                destination=args.destination, timeout_seconds=args.timeout,
             )
             _emit(result, json_mode=args.json)
             return 0

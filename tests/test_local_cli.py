@@ -40,6 +40,9 @@ def test_parser_exposes_operator_lifecycle_without_legacy_verbs():
     }
     for command in ("up", "connect", "status", "restart", "backup", "restore", "checkpoint", "prepare-reboot", "reboot", "resume", "doctor", "recovery"):
         assert cli.parser().parse_args([command, *required.get(command, []), "--json"]).command == command
+    upgrade = cli.parser().parse_args(["upgrade", "--profile", "astrid", "--data-root", "/tmp/astrid", "--json"])
+    assert upgrade.command == "upgrade"
+    assert upgrade.data_root == Path("/tmp/astrid")
 
 
 def test_checkpoint_requires_and_forwards_exact_epoch_nonce_and_state(monkeypatch, tmp_path, capsys):
