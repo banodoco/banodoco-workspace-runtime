@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -194,14 +196,21 @@ def test_upgrade_is_not_repeatable_and_refuses_live_owner(tmp_path):
 def test_upgrade_archives_wal_before_activation(tmp_path):
     root = tmp_path / "realm"
     realm_id = _legacy_realm(root)
-    connection = sqlite3.connect(root / "realm.sqlite3")
-    try:
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA wal_autocheckpoint=0")
-        connection.execute("UPDATE realm SET display_name=?", ("WAL realm",))
-        connection.commit()
-    finally:
-        connection.close()
+    # Simulate an interrupted owner: a normal final connection.close() may
+    # checkpoint and delete the WAL, depending on the SQLite build.
+    subprocess.run(
+        [sys.executable, "-c", """
+import os, sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("UPDATE realm SET display_name=?", ("WAL realm",))
+connection.commit()
+os._exit(0)
+""", str(root / "realm.sqlite3")],
+        check=True,
+    )
+    assert (root / "realm.sqlite3-wal").is_file()
 
     result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     archive = root / "realm-upgrade-backups" / result["archive"].split("/")[-1]
