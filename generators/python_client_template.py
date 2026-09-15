@@ -241,6 +241,22 @@ class ManagedOutput:
 
 
 @dataclass(frozen=True)
+class ObjectLocation:
+    object_id: str
+    digest: str
+    size: int
+    media_type: str
+    local_path: str
+    storage: str
+    verified: bool
+    filename: str | None = None
+
+    @classmethod
+    def from_json(cls, value: Mapping[str, Any]) -> "ObjectLocation":
+        return cls(object_id=str(value["object_id"]), digest=str(value["digest"]), size=int(value["size"]), media_type=str(value["media_type"]), local_path=str(value["local_path"]), storage=str(value["storage"]), verified=bool(value["verified"]), filename=value.get("filename"))
+
+
+@dataclass(frozen=True)
 class ShotTextBinding:
     binding_id: str
     project_id: str
@@ -917,6 +933,10 @@ class WorkspaceClient:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/objects" + query)[2])
         items, next_cursor = self._page(value)
         return [ManagedObject.from_json(item) for item in items], next_cursor
+
+    def get_project_object_location(self, project_id: str, object_id: str) -> ObjectLocation:
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/objects/{_path_part(object_id)}/location")[2])
+        return ObjectLocation.from_json(value)
 
 
     def create_media_relation(self, project_id: str, from_object_id: str, to_object_id: str, kind: str, *, idempotency_key: str, metadata: Mapping[str, Any] | None = None, ordinal: int = 0) -> MutationResult:

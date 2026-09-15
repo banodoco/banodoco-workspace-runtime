@@ -24,7 +24,7 @@ from .bootstrap import (
     restart,
 )
 from .io import read_json
-from .paths import RuntimePaths
+from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
 
 
@@ -70,6 +70,13 @@ def parser() -> argparse.ArgumentParser:
     restore.add_argument("backup", type=Path)
     restore.add_argument("--destination", required=True, type=Path)
 
+    relocate = sub.add_parser("relocate", help="plan or execute a verified support-root relocation")
+    _profile_args(relocate)
+    relocate.add_argument("--backup", type=Path, help="optional backup destination recorded in the plan")
+    relocate.add_argument("--destination", required=True, type=Path)
+    relocate.add_argument("--confirm", help="RELOCATE <selected-realm-id> to execute")
+    relocate.add_argument("--plan", action="store_true", help="emit a read-only plan")
+
     checkpoint = sub.add_parser("checkpoint", help="persist a nonce-bound recovery checkpoint")
     _read_args(checkpoint)
     _attempt_args(checkpoint)
@@ -105,12 +112,14 @@ def _profile_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--profile", default="astrid", choices=["astrid"])
     command.add_argument("--display-name", default="Astrid Workspace")
     command.add_argument("--source-manifest", type=Path)
+    command.add_argument("--data-root", type=Path, help=f"explicit support root (or {DATA_ROOT_ENV})")
     command.add_argument("--json", action="store_true")
 
 
 def _read_args(command: argparse.ArgumentParser) -> None:
     command.add_argument("--json", action="store_true")
     command.add_argument("--home", type=Path, help="override the current-Mac support home (mainly for disposable roots)")
+    command.add_argument("--data-root", type=Path, help=f"explicit support root (or {DATA_ROOT_ENV})")
 
 
 def _attempt_args(command: argparse.ArgumentParser) -> None:
@@ -149,7 +158,7 @@ def _emit(value: Any, *, json_mode: bool) -> None:
 
 def _paths(args: argparse.Namespace) -> RuntimePaths:
     home = args.home if getattr(args, "home", None) else os.environ.get("BANODOCO_LOCAL_HOME")
-    return RuntimePaths.current_mac(home)
+    return RuntimePaths.current_mac(home, data_root=getattr(args, "data_root", None))
 
 
 def _config(args: argparse.Namespace, paths: RuntimePaths) -> BootstrapConfig:
@@ -264,6 +273,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "restore":
             _emit(_client(paths).restore_backup(str(args.backup.expanduser().resolve()), str(args.destination.expanduser().resolve())), json_mode=args.json)
+            return 0
+        if args.command == "relocate":
+            from .relocation import plan_relocation, relocate
+
+            if args.plan or not args.confirm:
+                _emit(plan_relocation(paths, args.destination, args.backup), json_mode=args.json)
+                return 0
+            result = relocate(
+                paths, LocalRuntimeBoundary(), _config(args, paths), _client(paths),
+                destination=args.destination, backup=args.backup, confirmation=args.confirm,
+            )
+            _emit(result, json_mode=args.json)
             return 0
         if args.command == "checkpoint":
             client = _client(paths)

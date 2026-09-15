@@ -20,7 +20,7 @@ from .bootstrap import (
     doctor,
     restart,
 )
-from .paths import RuntimePaths
+from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "LegacyRootCollisionError",
     "RuntimeBoundary",
     "RuntimePaths",
+    "DATA_ROOT_ENV",
     "LocalRuntimeBoundary",
     "SourceProfile",
     "UnsupportedRealmError",

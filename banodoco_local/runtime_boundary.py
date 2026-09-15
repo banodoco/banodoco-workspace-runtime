@@ -498,6 +498,10 @@ class LocalRuntimeBoundary:
             self._process = None
         self._bootstrap_credential = None
 
+    def stop_owner(self, **kwargs) -> Mapping[str, Any]:
+        """Stop an adopted owner using the same birth/lock fences as restart."""
+        return self.restart(**kwargs, start_after_stop=False)
+
     def prepare_restart(self, *, source_profile: SourceProfile, realm_id: str, realm_root: Path, support_root: Path, pid: int) -> None:
         """Adopt a detached daemon for an operator restart.
 
@@ -517,6 +521,7 @@ class LocalRuntimeBoundary:
         if not self._source or not self._realm_root or not self._support_root or not self._realm_id:
             raise BootstrapError("No runtime process is available to restart.")
         source, root, support, realm_id = self._source, self._realm_root, self._support_root, self._realm_id
+        start_after_stop = bool(kwargs.get("start_after_stop", True))
         endpoint = str(kwargs.get("endpoint", ""))
         expected_pid = int(kwargs.get("pid", 0))
         expected_instance = str(kwargs.get("instance_id", ""))
@@ -588,4 +593,7 @@ class LocalRuntimeBoundary:
             validate_before_signal()
             self._terminate(process)
             self._process = None
+        if not start_after_stop:
+            self._bootstrap_credential = None
+            return {"status": "stopped", "realm_id": realm_id, "pid": expected_pid}
         return self.start(realm_id=realm_id, realm_root=root, owner_lock=support / "instance.lock", source_profile=source)

@@ -12,6 +12,9 @@ from pathlib import Path
 import os
 
 
+DATA_ROOT_ENV = "BANODOCO_LOCAL_DATA_ROOT"
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     home: Path
@@ -26,9 +29,28 @@ class RuntimePaths:
     bootstrap_lock_path: Path
 
     @classmethod
-    def current_mac(cls, home: Path | str | None = None) -> "RuntimePaths":
+    def current_mac(
+        cls,
+        home: Path | str | None = None,
+        *,
+        data_root: Path | str | None = None,
+    ) -> "RuntimePaths":
+        """Resolve support paths without coupling them to the process cwd.
+
+        ``home`` retains its original meaning: a macOS home directory whose
+        support tree is ``Library/Application Support/Banodoco``.  A data
+        root is an explicit installation-owned support root and is used as
+        supplied, so passing ``Astrid/.astrid-data`` cannot create a nested
+        ``Library/Application Support`` tree below the checkout.
+        """
         home_path = Path(home or os.environ.get("HOME", "~")).expanduser()
-        app_support = home_path / "Library" / "Application Support" / "Banodoco"
+        configured_root = data_root if data_root is not None else os.environ.get(DATA_ROOT_ENV)
+        if configured_root:
+            app_support = Path(configured_root).expanduser()
+            if not app_support.is_absolute():
+                raise ValueError(f"{DATA_ROOT_ENV} must be an absolute path")
+        else:
+            app_support = home_path / "Library" / "Application Support" / "Banodoco"
         runtime = app_support / "runtime"
         return cls(
             home=home_path,
@@ -47,7 +69,8 @@ class RuntimePaths:
     def sandbox(cls, root: Path | str) -> "RuntimePaths":
         """An injectable current-Mac-shaped filesystem rooted at ``root``."""
 
-        return cls.current_mac(Path(root))
+        home = Path(root)
+        return cls.current_mac(home, data_root=home / "Library" / "Application Support" / "Banodoco")
 
     def ensure_support_dirs(self) -> None:
         for directory in (

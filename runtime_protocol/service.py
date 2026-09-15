@@ -2435,6 +2435,48 @@ class RuntimeService:
             raise NotFoundError("object not found")
         return dict(row), self.cas.read(digest)
 
+    def object_location(self, project, digest):
+        """Verify project-owned bytes and return their current local CAS path.
+
+        This separate local-host lookup is not a portable output receipt.
+        Verification describes the file at lookup time, not a path lease.
+        """
+        project_id = self.store.get_project(project)["id"]
+        match = OBJECT_ID_RE.fullmatch(str(digest))
+        if not match:
+            raise ValidationError("object_id must be a canonical SHA-256 object id")
+        normalized = match.group(1)
+        row = self.store.conn.execute(
+            "SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest "
+            "WHERE o.digest=? AND po.project_id=? AND po.relation='managed'",
+            (normalized, project_id),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("object is not owned by project")
+        root_fd = prefix_fd = file_fd = None
+        try:
+            root_fd, prefix_fd = self._cas_prefix_fds(normalized, create=False)
+            file_fd = os.open(
+                normalized[2:], os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=prefix_fd,
+            )
+            self._verify_open_file(file_fd, normalized, int(row["size"]), label="canonical CAS object")
+        except FileNotFoundError as exc:
+            raise NotFoundError("canonical object bytes are missing", details={"object_id": digest}) from exc
+        except OSError as exc:
+            raise ConflictError("canonical CAS object is not a regular accessible file") from exc
+        finally:
+            for fd in (file_fd, prefix_fd, root_fd):
+                if fd is not None:
+                    os.close(fd)
+        return {
+            "object_id": "sha256:" + normalized, "digest": "sha256:" + normalized,
+            "size": int(row["size"]), "media_type": row["media_type"],
+            "filename": row["original_name"] or None,
+            "local_path": str(self.cas.path_for(normalized)),
+            "storage": "runtime_cas", "verified": True,
+        }
+
     def objects(self, project):
         return self.store.list_project_objects(project)
 
