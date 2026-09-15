@@ -7,6 +7,7 @@ import pytest
 
 from runtime_protocol.errors import ConflictError, LeaseError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def _digest(value: str | bytes) -> str:
@@ -85,6 +86,7 @@ def _publication_body(attempt, render_digest):
 
 
 def test_publication_is_fenced_atomic_and_exactly_replayable(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         _, author, attempt, render_digest = _ready_authoring_attempt(service)
@@ -110,6 +112,7 @@ def test_publication_is_fenced_atomic_and_exactly_replayable(tmp_path):
 
 
 def test_prepared_checkpoint_cannot_publish_after_cancel_or_stale_fence(tmp_path, monkeypatch):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         _, author, attempt, render_digest = _ready_authoring_attempt(service)
@@ -136,6 +139,7 @@ def test_prepared_checkpoint_cannot_publish_after_cancel_or_stale_fence(tmp_path
 
 def test_prepared_checkpoint_resumes_on_retried_attempt_after_runtime_restart(tmp_path, monkeypatch):
     root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     service = RuntimeService(root)
     _, author, attempt, render_digest = _ready_authoring_attempt(service)
     body = _publication_body(attempt, render_digest)

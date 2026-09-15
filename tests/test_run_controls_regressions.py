@@ -7,6 +7,7 @@ import pytest
 
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 from runtime_protocol.errors import InvalidRequestError, LeaseError
 from runtime_protocol.service import RuntimeService
 
@@ -28,6 +29,7 @@ def _task(service: RuntimeService, key: str):
 
 
 def test_run_control_receipt_is_atomic_and_replayable_after_restart(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     project = service.create_project({"slug": "project", "name": "Project", "metadata": {}})
     service.store.conn.execute(
@@ -73,6 +75,7 @@ def test_run_control_receipt_is_atomic_and_replayable_after_restart(tmp_path):
 
 
 def test_cancelled_attempt_cannot_publish_late_outputs(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     service.register_executor(
         {
@@ -109,6 +112,7 @@ def test_cancelled_attempt_cannot_publish_late_outputs(tmp_path):
 
 
 def test_retry_run_rejects_invalid_selection_as_typed_bad_request(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)

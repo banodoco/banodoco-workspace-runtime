@@ -417,15 +417,13 @@ def _verify_backup_pinned(backup_dir: str | Path, *, key: bytes | None = None, k
             files = manifest.get("files")
             if not isinstance(realm_meta, dict) or not realm_meta.get("id") or not isinstance(schema_meta, dict) or not isinstance(schema_meta.get("version"), int) or not isinstance(files, dict):
                 raise ConflictError("backup manifest metadata is incomplete")
-            if manifest.get("realm_id") != realm_meta["id"] or manifest.get("schema_version") != schema_meta["version"]:
-                raise ConflictError("backup manifest metadata aliases mismatch")
             for name in ("realm.sqlite3", "cas-manifest.json"):
                 record = files.get(name)
                 actual_hash, actual_size = _sha256_at(backup_fd, name)
                 if not isinstance(record, dict) or record.get("sha256") != actual_hash or int(record.get("size", -1)) != actual_size:
                     raise ConflictError("backup file digest mismatch", details={"file": name})
         elif format_version == 1:
-            raise ConflictError("legacy backup format requires explicit migration")
+            raise ConflictError("legacy backup format is unsupported; create a fresh canonical backup")
         else:
             raise ConflictError("unsupported backup format", details={"format_version": format_version})
         if manifest.get("database_sha256") != _sha256_at(backup_fd, "realm.sqlite3")[0]:
@@ -438,7 +436,7 @@ def _verify_backup_pinned(backup_dir: str | Path, *, key: bytes | None = None, k
             raise ConflictError("backup CAS manifest hash mismatch")
         _verify_cas_manifest(backup_fd, cas)
         report, realm = _inspect_consolidated_realm(backup_fd)
-        if not realm or realm["id"] != manifest.get("realm_id"):
+        if not realm or realm["id"] != realm_meta["id"]:
             raise ConflictError("backup realm identity mismatch")
         validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
         return {"manifest": manifest, "cas_manifest": cas, "doctor": report}
@@ -482,7 +480,7 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
         verified = verify_backup(source_backup, directory_identity=source_identity)
         source_manifest = verified["manifest"]
         if handoff.get("format_version") != 2:
-            raise ConflictError("legacy restore handoff requires explicit migration")
+            raise ConflictError("legacy restore handoff is unsupported; create a fresh canonical restore candidate")
         handoff_digest = handoff.get("handoff_sha256")
         handoff_mac = handoff.get("handoff_hmac")
         auth_key = _resolve_key(source_manifest)
@@ -493,7 +491,7 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
         source_manifest_hash, _ = _sha256_at(source_fd, "manifest.json")
         if handoff.get("source_manifest_sha256") != source_manifest_hash:
             raise ConflictError("restore handoff source manifest mismatch")
-        if handoff.get("realm_id") != source_manifest.get("realm_id"):
+        if handoff.get("realm_id") != source_manifest.get("realm", {}).get("id"):
             raise ConflictError("restore candidate realm does not match its backup")
         if handoff.get("candidate_database_sha256") != candidate_db_hash or candidate_db_hash != source_manifest.get("database_sha256"):
             raise ConflictError("restore candidate SQLite bytes differ from its verified backup")
@@ -534,7 +532,7 @@ def verify_restore_candidate(candidate_dir: str | Path, *, directory_identity: M
             os.close(sha_fd)
             os.close(cas_fd)
         report, realm = _inspect_consolidated_realm(candidate_fd)
-        if not realm or realm["id"] != source_manifest.get("realm_id"):
+        if not realm or realm["id"] != source_manifest.get("realm", {}).get("id"):
             raise ConflictError("restore candidate realm identity mismatch")
         validate_parent(root, directory_identity, allow_parent_appeared=bool(directory_identity.get("parent_was_missing")))
         return {"handoff": handoff, "manifest": source_manifest, "doctor": report, "database_sha256": candidate_db_hash, "cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256")}
@@ -561,6 +559,7 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
     destination_name = None
     temporary_name = None
     temporary_fd = -1
+    published = False
     source_cas_fd = -1
     try:
         parent_fd, destination_name = ensure_parent_at(destination, destination_identity)
@@ -603,7 +602,9 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                     os.close(obj_dir)
             write_bytes_at(temporary_fd, "cas-manifest.json", (canonical_json(cas) + "\n").encode())
             realm = store.realm
-            schema_version = store.conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            schema_version = store.conn.execute(
+                "SELECT version FROM runtime_schema WHERE id=1"
+            ).fetchone()[0]
             auth_path = absolute_path(key_path or (store.root / ".operator-backup-key"))
             auth_key = bytes(key) if key is not None else _provision_key(auth_path)
             if len(auth_key) < 32:
@@ -614,11 +615,6 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
                 "realm": {"id": realm["id"], "display_name": realm["display_name"]},
                 "schema": {"version": schema_version},
                 "files": {"realm.sqlite3": _file_record_at(temporary_fd, "realm.sqlite3"), "cas-manifest.json": _file_record_at(temporary_fd, "cas-manifest.json")},
-                # Stable aliases make the transition readable to existing
-                # operators while the authenticated envelope is authoritative.
-                "schema_version": schema_version,
-                "realm_id": realm["id"],
-                "display_name": realm["display_name"],
                 "database_sha256": _file_record_at(temporary_fd, "realm.sqlite3")["sha256"],
                 "cas_manifest_sha256": cas["manifest_sha256"],
                 "authentication": {"algorithm": "hmac-sha256", "key_id": _key_id(auth_key), "key_path": str(auth_path)},
@@ -629,6 +625,19 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
             manifest["manifest_hmac"] = _manifest_mac(manifest, auth_key)
             write_bytes_at(temporary_fd, "manifest.json", (canonical_json(manifest) + "\n").encode())
             os.fsync(temporary_fd)
+            # Verify the complete private candidate while it is still
+            # unpublished. A rejected candidate must never acquire the
+            # accepted destination name.
+            private_path = Path(str(destination.parent)) / temporary_name
+            private_identity = capture_parent(private_path)
+            try:
+                verified = verify_backup(
+                    private_path,
+                    key=auth_key,
+                    directory_identity=private_identity,
+                )
+            finally:
+                close_pinned(private_identity)
         os.close(temporary_fd)
         temporary_fd = -1
         validate_created_parent(destination, destination_identity, parent_fd)
@@ -641,9 +650,10 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
         else:
             raise ConflictError("backup destination appeared before publication")
         os.rename(temporary_name, destination_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        published = True
         os.fsync(parent_fd)
         validate_created_parent(destination, destination_identity, parent_fd)
-        return verify_backup(destination, key=auth_key, directory_identity=destination_identity)
+        return verified
     except Exception:
         if temporary_fd >= 0:
             try:
@@ -653,6 +663,12 @@ def create_backup(store, destination: str | Path, *, binding: dict | None = None
         if temporary_name is not None and parent_fd >= 0:
             try:
                 remove_tree_at(parent_fd, temporary_name)
+            except OSError:
+                pass
+        if published and parent_fd >= 0 and destination_name is not None:
+            try:
+                remove_tree_at(parent_fd, destination_name)
+                os.fsync(parent_fd)
             except OSError:
                 pass
         raise
@@ -716,8 +732,10 @@ def restore_backup(
         temporary_name, temporary_fd = mkdir_temp_at(parent_fd, f".{destination.name}.")
         copy_file_at(source_fd, "realm.sqlite3", temporary_fd, "realm.sqlite3")
         copy_tree_at(source_fd, "cas", temporary_fd, "cas")
+        staging_fd = mkdir_chain_at(temporary_fd, "staging")
+        os.close(staging_fd)
         report, realm = _inspect_consolidated_realm(temporary_fd)
-        if not realm or realm["id"] != verified["manifest"].get("realm_id"):
+        if not realm or realm["id"] != verified["manifest"].get("realm", {}).get("id"):
             raise ConflictError("restored realm identity mismatch", details=report)
         source_manifest_sha256, _ = _sha256_at(source_fd, "manifest.json")
         handoff = {"format_version": 2, "state": "prepared", "realm_id": realm["id"], "display_name": realm["display_name"], "source_backup": str(source), "source_manifest_sha256": source_manifest_sha256, "source_database_sha256": verified["manifest"].get("database_sha256"), "source_cas_manifest_sha256": verified["manifest"].get("cas_manifest_sha256"), "candidate_database_sha256": _file_record_at(temporary_fd, "realm.sqlite3")["sha256"], "candidate_cas_manifest_sha256": verified["cas_manifest"].get("manifest_sha256"), "prepared_at": now()}
@@ -786,7 +804,4 @@ def structured_export(store) -> dict:
     shot_items = rows("SELECT * FROM shot_items ORDER BY shot_id, sort_key, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
     text_bindings = rows("SELECT * FROM shot_text_bindings ORDER BY project_id, id")
     text_binding_events = rows("SELECT * FROM shot_text_binding_events ORDER BY project_id, binding_id, seq", lambda value: value | {"payload": json.loads(value.pop("payload_json"))})
-    owner_records = rows("SELECT source_table, source_key, source_ordinal, row_json, row_sha256, created_at FROM migration_owner_records ORDER BY source_table, source_ordinal, source_key")
-    for record in owner_records:
-        record["row"] = json.loads(record.pop("row_json"))
-    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events, "migration_owner_records": owner_records}
+    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events}

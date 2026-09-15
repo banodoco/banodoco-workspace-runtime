@@ -5,7 +5,7 @@
   "type": "object", "additionalProperties": false,
   "required": ["object_id", "digest", "media_type", "size", "version", "created_at"],
   "properties": {
-    "object_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$" },
+    "object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "media_type": { "type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]{0,126}/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]{0,126}$" },
     "size": { "type": "integer", "minimum": 0 },

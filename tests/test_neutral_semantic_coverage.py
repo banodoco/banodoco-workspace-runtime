@@ -15,6 +15,7 @@ import pytest
 from banodoco_workspace_client import ApiError, WorkspaceClient
 from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 
 
 def _digest(value: str) -> str:
@@ -22,6 +23,7 @@ def _digest(value: str) -> str:
 
 
 def test_project_idempotency_mismatch_has_no_second_project(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -38,6 +40,7 @@ def test_project_idempotency_mismatch_has_no_second_project(tmp_path):
 
 
 def test_project_media_relation_rejects_foreign_object_without_relation(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -60,6 +63,7 @@ def test_project_media_relation_rejects_foreign_object_without_relation(tmp_path
 
 
 def test_concurrent_task_replay_fans_in_to_one_runtime_admission(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -89,6 +93,7 @@ def test_concurrent_task_replay_fans_in_to_one_runtime_admission(tmp_path):
 
 
 def test_http_digest_mismatch_fails_before_project_media_publication(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = Api(daemon.endpoint, daemon.token)

@@ -8,6 +8,7 @@ import pytest
 
 from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.store import RealmStore
 from runtime_protocol.errors import ConflictError, InvalidRequestError, LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
 
@@ -19,6 +20,7 @@ def _digest(value: bytes | str) -> str:
 
 
 def test_http_object_ingest_requires_key_and_replays_exact_result(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         api = Api(daemon.endpoint, daemon.token)
@@ -37,6 +39,7 @@ def test_http_object_ingest_requires_key_and_replays_exact_result(tmp_path: Path
 
 
 def test_task_transitions_and_attempt_settlement_replay_exactly(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         service.register_capability({"capability_id": "render.test", "definition_digest": _digest("render.test")})
@@ -64,6 +67,7 @@ def test_project_task_contract_scopes_inputs_and_outputs(tmp_path: Path) -> None
     digests cannot cross project boundaries, while bytes uploaded to the
     project's managed-object endpoint are associated before fenced settlement.
     """
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         capability_digest = _digest("render.project")
@@ -137,6 +141,7 @@ def test_project_task_contract_scopes_inputs_and_outputs(tmp_path: Path) -> None
 
 def test_claim_replay_is_fenced_after_runtime_restart(tmp_path: Path) -> None:
     root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
     first = RuntimeService(root)
     first.register_capability({"capability_id": "render.test", "definition_digest": _digest("render.test")})
     first.register_executor({"executor_id": "worker", "capabilities": ["render.test"]})
@@ -154,6 +159,7 @@ def test_claim_replay_is_fenced_after_runtime_restart(tmp_path: Path) -> None:
 
 
 def test_settlement_db_failure_removes_published_cas_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         service.register_executor({"executor_id": "worker", "capabilities": ["render.test"]})
@@ -176,6 +182,7 @@ def test_startup_reconciles_journaled_publication_after_crash_seam(tmp_path: Pat
     root = tmp_path / "realm"
     payload = b"crash-window-output"
     digest = _digest(payload).removeprefix("sha256:")
+    RealmStore.initialize(root).close()
     service = RuntimeService(root)
     service._begin_cas_publication_journal("ingest", [{"digest": digest}], project_id="unscoped")
     service.cas.put(payload)
@@ -190,6 +197,7 @@ def test_startup_reconciles_journaled_publication_after_crash_seam(tmp_path: Pat
 
 
 def test_project_updates_require_idempotency_keys_at_service_boundary(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         project = service.create_project({"slug": "p1", "name": "P1"}, idempotency_key="project")
@@ -220,6 +228,7 @@ def test_publication_journal_is_retained_when_cleanup_fails_then_retried(
     root = tmp_path / "realm"
     payload = b"retryable-cleanup-output"
     digest = _digest(payload).removeprefix("sha256:")
+    RealmStore.initialize(root).close()
     service = RuntimeService(root)
     service._begin_cas_publication_journal("ingest", [{"digest": digest}], project_id="unscoped")
     service.cas.put(payload)

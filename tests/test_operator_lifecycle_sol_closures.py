@@ -13,9 +13,11 @@ from banodoco_local.runtime_boundary import LocalRuntimeBoundary
 from runtime_protocol.backup import verify_backup
 from runtime_protocol.errors import ConflictError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def test_backup_tamper_with_recomputed_public_digest_still_requires_private_mac(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     service = RuntimeService(tmp_path / "realm")
     try:
         backup = tmp_path / "backup"

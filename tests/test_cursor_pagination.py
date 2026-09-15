@@ -7,10 +7,12 @@ import pytest
 
 from runtime_protocol.errors import InvalidRequestError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 from banodoco_workspace_client.generated import ApiError, WorkspaceClient
 
 
 def test_projects_and_events_are_complete_keyset_pages(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path).close()
     service = RuntimeService(tmp_path)
     for index in range(5):
         service.create_project({"name": f"Project {index}", "slug": f"project-{index}"}, idempotency_key=f"project-{index}")
@@ -41,6 +43,7 @@ def test_projects_and_events_are_complete_keyset_pages(tmp_path: Path) -> None:
 
 
 def test_project_objects_cursor_is_deterministic_when_created_at_ties(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path).close()
     service = RuntimeService(tmp_path)
     project = service.create_project({"name": "Objects", "slug": "objects"}, idempotency_key="objects-project")
     digests = ["c" * 64, "a" * 64, "b" * 64]
@@ -68,6 +71,7 @@ def test_project_objects_cursor_is_deterministic_when_created_at_ties(tmp_path: 
 
 
 def test_cursor_scope_and_shape_are_typed_400_errors(tmp_path: Path) -> None:
+    RealmStore.initialize(tmp_path).close()
     service = RuntimeService(tmp_path)
     service.create_project({"name": "Project", "slug": "project"}, idempotency_key="project")
     service.create_project({"name": "Project Two", "slug": "project-two"}, idempotency_key="project-two")

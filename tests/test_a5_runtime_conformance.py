@@ -9,6 +9,7 @@ import pytest
 
 from runtime_protocol.errors import LeaseError
 from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 CAPABILITY = "render.synthetic.cpu"
@@ -86,6 +87,7 @@ def _project(service: RuntimeService, name: str):
 
 def test_a5_crash_reclaim_fences_old_attempt_and_publishes_new_output(tmp_path):
     """A runtime crash requeues work; the old epoch can never publish."""
+    RealmStore.initialize(tmp_path / "realm").close()
     service = _service(tmp_path / "realm")
     project_id = _project(service, "a5-crash-reclaim")
     task = _task(service, project_id, "a5-crash-task")
@@ -125,6 +127,7 @@ def test_a5_crash_reclaim_fences_old_attempt_and_publishes_new_output(tmp_path):
 
 def test_a5_expired_attempt_is_reclaimed_and_stale_fence_is_rejected(tmp_path):
     """Lease expiry fences a worker before a replacement claim can settle."""
+    RealmStore.initialize(tmp_path / "realm").close()
     service = _service(tmp_path / "realm")
     try:
         project_id = _project(service, "a5-stale-attempt")
@@ -150,6 +153,7 @@ def test_a5_expired_attempt_is_reclaimed_and_stale_fence_is_rejected(tmp_path):
 
 def test_a5_duplicate_publish_is_single_writer_and_idempotent(tmp_path):
     """Concurrent fake workers may publish one digest, but CAS has one object."""
+    RealmStore.initialize(tmp_path / "realm").close()
     service = _service(tmp_path / "realm", max_concurrency=2)
     try:
         project_id = _project(service, "a5-duplicate-publish")
@@ -190,6 +194,7 @@ def test_a5_duplicate_publish_is_single_writer_and_idempotent(tmp_path):
 
 def test_a5_large_synthetic_output_is_hashed_staged_and_promoted(tmp_path):
     """A multi-megabyte CPU-generated output remains hash-verified in CAS."""
+    RealmStore.initialize(tmp_path / "realm").close()
     service = _service(tmp_path / "realm")
     try:
         project_id = _project(service, "a5-large-output")

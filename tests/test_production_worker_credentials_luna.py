@@ -8,11 +8,13 @@ import pytest
 
 from http_helpers import Api
 from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR, WORKER_SCOPES
+from runtime_protocol.store import RealmStore
 
 
 def test_pack_host_credential_is_scoped_distinct_and_persistent(tmp_path):
     root = tmp_path / "realm"
     support = tmp_path / "support"
+    RealmStore.initialize(root).close()
     first = RuntimeDaemon(
         root,
         support_root=support,
@@ -51,6 +53,7 @@ def test_pack_host_credential_is_scoped_distinct_and_persistent(tmp_path):
 
 
 def test_pack_host_cannot_mutate_control_plane_or_forge_settlement_effects(tmp_path):
+    RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(
         tmp_path / "realm",
         support_root=tmp_path / "support",
