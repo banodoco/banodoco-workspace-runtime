@@ -575,6 +575,14 @@ def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: 
 
 def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid") -> None:
     """Return neutral support state to its pre-launch shape after a failed handoff."""
+    # Rollback is allowed to remove only metadata emitted by this candidate.
+    # A concurrent/previous owner may still be serving even when its support
+    # advertisement is being repaired; deleting that owner's discovery here
+    # strands a healthy daemon and causes every following caller to start a
+    # duplicate candidate.  Capture the candidate PID before ``stop`` clears
+    # the boundary handle, then fence each support file by its owner marker.
+    candidate = getattr(boundary, "_process", None)
+    candidate_pid = getattr(candidate, "pid", None)
     stop = getattr(boundary, "stop", None)
     if callable(stop):
         try:
@@ -583,7 +591,14 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
             pass
     for path in (paths.discovery_path, paths.instance_lock_path):
         try:
-            remove_file(path)
+            current = _read_support_json(path)
+            if candidate_pid is not None and current is not None:
+                try:
+                    owned = int(current.get("pid", 0)) == int(candidate_pid)
+                except (TypeError, ValueError):
+                    owned = False
+                if owned:
+                    remove_file(path)
         except Exception:
             pass
     credential = paths.credentials_dir / "astrid.json"

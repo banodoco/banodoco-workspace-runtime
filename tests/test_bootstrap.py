@@ -14,6 +14,7 @@ from banodoco_local.bootstrap import (
     DuplicateOwnerError,
     LegacyRootCollisionError,
     SourceProfile,
+    _rollback_failed_bootstrap,
     bootstrap,
     connect,
     doctor,
@@ -249,6 +250,36 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(self.paths.catalog_path.exists())
         self.assertFalse(self.paths.discovery_path.exists())
         self.assertFalse(self.paths.instance_lock_path.exists())
+
+    def test_failed_candidate_rollback_preserves_incumbent_support_metadata(self):
+        self.paths.ensure_support_dirs()
+        incumbent = {
+            "pid": 99,
+            "runtime_instance_id": "incumbent",
+            "active_realm": "realm-1",
+        }
+        self.paths.discovery_path.write_text(json.dumps(incumbent))
+        self.paths.instance_lock_path.write_text(json.dumps(incumbent))
+
+        class CandidateBoundary:
+            class Process:
+                pid = 123
+
+            _process = Process()
+
+            def stop(self):
+                return None
+
+        _rollback_failed_bootstrap(
+            self.paths,
+            CandidateBoundary(),
+            realm_root=self.paths.realms_dir / "realm-1",
+            new_realm=False,
+            credential_before=None,
+        )
+
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), incumbent)
+        self.assertEqual(json.loads(self.paths.instance_lock_path.read_text()), incumbent)
 
     def test_doctor_is_side_effect_free(self):
         report = doctor(self.paths, self.boundary)

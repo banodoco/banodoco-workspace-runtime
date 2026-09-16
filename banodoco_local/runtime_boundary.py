@@ -402,6 +402,18 @@ class LocalRuntimeBoundary:
             if process.poll() is not None:
                 raise BootstrapError(f"Runtime daemon exited during startup (see {support_root / 'runtime.log'}).")
             discovery = self._read_discovery(support_root)
+            # A support root may still advertise a healthy incumbent while a
+            # replacement candidate is starting.  Never adopt that endpoint:
+            # doing so lets the candidate's rollback clear the incumbent's
+            # discovery and owner marker.  The daemon publishes its own PID
+            # atomically only after realm admission succeeds.
+            try:
+                advertised_pid = int(discovery.get("pid", 0))
+            except (TypeError, ValueError):
+                advertised_pid = 0
+            if advertised_pid and advertised_pid != process.pid:
+                time.sleep(0.05)
+                continue
             endpoint = str(discovery.get("endpoint", ""))
             if endpoint and self._http_health(endpoint):
                 return endpoint

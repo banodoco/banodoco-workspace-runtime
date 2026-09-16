@@ -107,3 +107,23 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path):
     assert "cwd" not in captured["kwargs"]
     assert "env" not in captured["kwargs"]
     assert "PYTHONPATH" not in captured["kwargs"]
+
+
+def test_wait_endpoint_does_not_adopt_incumbent_discovery(monkeypatch, tmp_path):
+    class Process:
+        pid = 123
+
+        def poll(self):
+            return None
+
+    boundary = LocalRuntimeBoundary()
+    observations = iter(
+        [
+            {"pid": 99, "endpoint": "http://127.0.0.1:43123"},
+            {"pid": 123, "endpoint": "http://127.0.0.1:43124"},
+        ]
+    )
+    monkeypatch.setattr(boundary, "_read_discovery", lambda _support: next(observations))
+    monkeypatch.setattr(boundary, "_http_health", lambda _endpoint: True)
+
+    assert boundary._wait_endpoint(tmp_path, Process()) == "http://127.0.0.1:43124"
