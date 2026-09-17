@@ -507,6 +507,12 @@ class LocalRuntimeBoundary:
         try:
             os.kill(pid, 0)
             return True
+        except PermissionError:
+            # EPERM means the kernel found a process but this sandbox/user is
+            # not permitted to signal it. Treat that as alive; callers use
+            # liveness to protect incumbent discovery and must not revoke a
+            # healthy owner merely because signaling is denied.
+            return True
         except OSError:
             return False
 

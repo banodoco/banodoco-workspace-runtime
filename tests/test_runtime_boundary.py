@@ -62,6 +62,15 @@ def test_invalid_startup_admission_budget_fails_closed(monkeypatch):
         LocalRuntimeBoundary()
 
 
+def test_pid_liveness_treats_permission_denied_as_alive(monkeypatch):
+    def deny_signal(_pid, _signal):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(os, "kill", deny_signal)
+
+    assert LocalRuntimeBoundary.is_pid_alive(12345)
+
+
 def test_slow_healthy_runtime_and_degraded_owner(tmp_path):
     class Handler(BaseHTTPRequestHandler):
         status = "ok"
