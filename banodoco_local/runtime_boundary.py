@@ -423,6 +423,11 @@ class LocalRuntimeBoundary:
 
     @staticmethod
     def _http_status(endpoint: str) -> str | None:
+        value = LocalRuntimeBoundary._http_health_payload(endpoint)
+        return value.get("status") if value else None
+
+    @staticmethod
+    def _http_health_payload(endpoint: str) -> dict[str, Any] | None:
         try:
             parsed = urlsplit(str(endpoint))
             if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
@@ -439,7 +444,7 @@ class LocalRuntimeBoundary:
             if isinstance(value, dict) and value.get("protocol") == WIRE_PROTOCOL:
                 status = value.get("status")
                 if status in ("ok", "degraded"):
-                    return status
+                    return value
             return None
         except (OSError, ValueError, json.JSONDecodeError):
             return None
@@ -494,7 +499,18 @@ class LocalRuntimeBoundary:
         if str(marker.get("pid")) != str(pid) or str(marker.get("runtime_instance_id")) != instance_id:
             return False
         expected_birth = process_birth_id or marker.get("process_birth_id")
-        if not expected_birth or expected_birth != self.process_birth_identity(pid):
+        if not expected_birth:
+            return False
+        actual_birth = self.process_birth_identity(pid)
+        if actual_birth is None:
+            # Restricted clients may be able to prove that a PID exists but
+            # not inspect its birth marker. Require the daemon itself to
+            # attest the durable runtime instance over its loopback health
+            # endpoint; health alone is never an identity proof.
+            health = self._http_health_payload(endpoint)
+            if not health or health.get("runtime_instance_id") != instance_id:
+                return False
+        elif expected_birth != actual_birth:
             return False
         # A degraded runtime can still be the correct owner. Keep health
         # admission separate so database failures are not called PID conflicts.

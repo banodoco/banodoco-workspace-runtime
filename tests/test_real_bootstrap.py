@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 
@@ -46,6 +47,27 @@ def test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client(tmp_
         assert second.status == "reconnected"
         assert second.realm_id == first.realm_id
         assert client.get_project(project.project_id).name == "real-bootstrap"
+    finally:
+        boundary.stop()
+
+
+def test_concurrent_reconnect_survives_restricted_pid_identity_probe(tmp_path, monkeypatch):
+    paths = RuntimePaths.sandbox(tmp_path)
+    boundary = LocalRuntimeBoundary()
+    try:
+        first = bootstrap(paths, boundary, _config())
+
+        def deny_signal(_pid, _signal):
+            raise PermissionError("operation not permitted")
+
+        monkeypatch.setattr(os, "kill", deny_signal)
+        monkeypatch.setattr(LocalRuntimeBoundary, "process_birth_identity", staticmethod(lambda _pid: None))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _index: bootstrap(paths, LocalRuntimeBoundary(), _config()), range(2)))
+
+        assert first.ready
+        assert [result.status for result in results] == ["reconnected", "reconnected"]
+        assert {result.endpoint for result in results} == {first.endpoint}
     finally:
         boundary.stop()
 

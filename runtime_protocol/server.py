@@ -119,7 +119,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
         method = self.command
         if path == ["v1", "health"]:
-            return self._send(200, self.runtime.health())
+            health = dict(self.runtime.health())
+            daemon = getattr(self.server, "daemon_runtime", None)
+            if daemon is not None:
+                health["runtime_instance_id"] = daemon.instance_id
+            return self._send(200, health)
         if path == ["v1", "credentials"] and method == "POST":
             self._identity("credentials:provision")
             body = self._body()

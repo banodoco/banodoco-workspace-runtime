@@ -71,6 +71,42 @@ def test_pid_liveness_treats_permission_denied_as_alive(monkeypatch):
     assert LocalRuntimeBoundary.is_pid_alive(12345)
 
 
+def test_validate_owner_uses_daemon_identity_when_birth_probe_is_unavailable(tmp_path, monkeypatch):
+    boundary = LocalRuntimeBoundary()
+    owner = tmp_path / "instance.lock"
+    owner.write_text(json.dumps({"pid": 12345, "runtime_instance_id": "instance", "process_birth_id": "birth"}))
+
+    def deny_signal(_pid, _signal):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr(os, "kill", deny_signal)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda _pid: None)
+    monkeypatch.setattr(
+        boundary,
+        "_http_health_payload",
+        lambda _endpoint: {"protocol": "workspace.v1", "status": "ok", "runtime_instance_id": "instance"},
+    )
+    monkeypatch.setattr(boundary, "_http_status", lambda _endpoint: "ok")
+
+    assert boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217",
+        pid=12345,
+        instance_id="instance",
+        owner_lock=owner,
+    )
+    monkeypatch.setattr(
+        boundary,
+        "_http_health_payload",
+        lambda _endpoint: {"protocol": "workspace.v1", "status": "ok", "runtime_instance_id": "other"},
+    )
+    assert not boundary.validate_owner(
+        endpoint="http://127.0.0.1:61217",
+        pid=12345,
+        instance_id="instance",
+        owner_lock=owner,
+    )
+
+
 def test_slow_healthy_runtime_and_degraded_owner(tmp_path):
     class Handler(BaseHTTPRequestHandler):
         status = "ok"
