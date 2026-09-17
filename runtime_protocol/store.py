@@ -214,6 +214,7 @@ class RealmStore:
         store.cas_root = staged_root / "cas" / "sha256"
         store.staging_root = staged_root / "staging"
         store._lock_file = None
+        store._admission_lock_file = None
         store._mutex = threading.RLock()
         store.conn = None
         parent_fd = -1
@@ -301,9 +302,15 @@ class RealmStore:
         self.cas_root = self.root / "cas" / "sha256"
         self.staging_root = self.root / "staging"
         self._lock_file = None
+        self._admission_lock_file = None
         self._mutex = threading.RLock()
         self.conn = None
         try:
+            # Serialize the complete admission transition without creating a
+            # persistent marker in the realm. This closes the gap between
+            # discovering owner.lock and taking it: two fresh openers must not
+            # both inspect/copy a database before either one becomes owner.
+            self._acquire_admission_lock()
             sqlite_components = [
                 self.db_path,
                 *(Path(str(self.db_path) + suffix) for suffix in ("-wal", "-shm", "-journal")),
@@ -311,21 +318,62 @@ class RealmStore:
             if not any(path.exists() or path.is_symlink() for path in sqlite_components):
                 self.admission_report = self._integrity_failure("missing_database", "realm.sqlite3 is missing")
                 raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
-            # Inspect before creating owner.lock so malformed or unsupported
-            # roots fail without changing their source tree.  Reinspect under
-            # the lock to close the race with a concurrent writer.
+            # If an owner marker already exists, take the owner lock before
+            # inspecting so a live daemon cannot write while the snapshot is
+            # copied. A malformed or unsupported root with no marker is still
+            # inspected first, preserving the no-side-effect admission
+            # contract; the directory lock serializes competing fresh opens.
+            owner_marker_present = self.lock_path.exists() or self.lock_path.is_symlink()
+            if acquire_owner and owner_marker_present:
+                self._acquire_owner()
             self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout)
             if not self.admission_report.get("ok"):
                 raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
-            if acquire_owner:
+            if acquire_owner and not owner_marker_present:
                 self._acquire_owner()
                 self.admission_report = self.inspect_realm(self.root, timeout_seconds=admission_timeout)
                 if not self.admission_report.get("ok"):
                     raise RealmAdmissionError("realm failed startup admission", details=self.admission_report)
             self._open(fresh=False)
+            self._release_admission_lock()
         except Exception:
             self.close()
             raise
+
+    def _acquire_admission_lock(self):
+        """Serialize startup admission without mutating the realm tree.
+
+        ``owner.lock`` cannot be used for the first inspection because
+        malformed roots must fail without creating it. An advisory flock on
+        the realm directory provides that short critical section while leaving
+        no marker behind. The daemon's owner.lock remains the lifetime lock.
+        """
+        if fcntl is None:
+            return
+        try:
+            descriptor = os.open(self.root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            if "descriptor" in locals():
+                os.close(descriptor)
+            raise RealmAdmissionError(
+                "realm admission lock is unavailable",
+                details=self._integrity_failure("unreadable", str(exc)),
+            ) from exc
+        self._admission_lock_file = descriptor
+
+    def _release_admission_lock(self):
+        descriptor = getattr(self, "_admission_lock_file", None)
+        if descriptor is None:
+            return
+        self._admission_lock_file = None
+        try:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
 
     @contextmanager
     def _transaction(self):
@@ -598,15 +646,18 @@ class RealmStore:
         return {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
 
     def close(self):
-        with self._mutex:
-            if self.conn is not None:
-                self.conn.close()
-                self.conn = None
-            if self._lock_file is not None:
-                if fcntl is not None:
-                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-                self._lock_file.close()
-                self._lock_file = None
+        try:
+            with self._mutex:
+                if self.conn is not None:
+                    self.conn.close()
+                    self.conn = None
+                if self._lock_file is not None:
+                    if fcntl is not None:
+                        fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+                    self._lock_file.close()
+                    self._lock_file = None
+        finally:
+            self._release_admission_lock()
 
     def __enter__(self):
         return self

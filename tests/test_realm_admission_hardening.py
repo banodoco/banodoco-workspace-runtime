@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import sqlite3
 import threading
@@ -13,7 +14,7 @@ import pytest
 from runtime_protocol.backup import verify_restore_candidate
 from runtime_protocol.cli import main as runtime_main
 from runtime_protocol.daemon import RuntimeDaemon
-from runtime_protocol.errors import ConflictError, RealmAdmissionError, ValidationError
+from runtime_protocol.errors import ConflictError, OwnerBusyError, RealmAdmissionError, ValidationError
 from runtime_protocol.canonical_schema import CANONICAL_FORMAT_ID
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import SCHEMA_VERSION, RealmStore
@@ -62,6 +63,31 @@ def test_corrupt_startup_fails_before_credentials_catalog_discovery_or_server(tm
     assert not (support / "credentials").exists()
     assert not (support / "catalog.json").exists()
     assert not (support / "discovery.json").exists()
+
+
+def test_existing_owner_is_rejected_before_sqlite_admission_snapshot(tmp_path, monkeypatch):
+    """A live owner must win before inspection can race its SQLite writes."""
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    owner = (root / "owner.lock").open("a+")
+    fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    inspected = False
+
+    def fail_inspection(cls, *_args, **_kwargs):
+        nonlocal inspected
+        inspected = True
+        raise AssertionError("owner contention must be detected before inspection")
+
+    monkeypatch.setattr(RealmStore, "inspect_realm", classmethod(fail_inspection))
+    try:
+        with pytest.raises(OwnerBusyError):
+            RealmStore(root)
+    finally:
+        fcntl.flock(owner.fileno(), fcntl.LOCK_UN)
+        owner.close()
+
+    assert not inspected
+    assert not (root / "admission.lock").exists()
 
 
 @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
