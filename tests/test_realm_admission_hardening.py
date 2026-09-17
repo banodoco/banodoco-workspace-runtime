@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import fcntl
 import json
+import multiprocessing
 import sqlite3
 import threading
 import urllib.error
@@ -39,6 +40,17 @@ def _new_service(root: Path, **kwargs):
 def _new_daemon(root: Path, support_root: Path):
     RealmStore.initialize(root).close()
     return RuntimeDaemon(root, support_root=support_root).start()
+
+
+def _admission_worker(root, release, results):
+    try:
+        store = RealmStore(root)
+    except Exception as exc:  # pragma: no cover - asserted by the parent
+        results.put((type(exc).__name__, getattr(exc, "code", None), str(exc)))
+        return
+    results.put(("ok", None, ""))
+    release.wait(10)
+    store.close()
 
 
 def test_corrupt_startup_fails_before_credentials_catalog_discovery_or_server(tmp_path):
@@ -88,6 +100,30 @@ def test_existing_owner_is_rejected_before_sqlite_admission_snapshot(tmp_path, m
 
     assert not inspected
     assert not (root / "admission.lock").exists()
+
+
+def test_concurrent_admission_serializes_owner_and_never_reports_sqlite_race(tmp_path):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    context = multiprocessing.get_context("fork")
+    release = context.Event()
+    results = context.Queue()
+    workers = [
+        context.Process(target=_admission_worker, args=(str(root), release, results))
+        for _ in range(10)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        observed = [results.get(timeout=10) for _ in workers]
+    finally:
+        release.set()
+        for worker in workers:
+            worker.join(timeout=10)
+    assert all(worker.exitcode == 0 for worker in workers)
+    assert sum(result[0] == "ok" for result in observed) == 1
+    assert all(result[1] == "owner_busy" for result in observed if result[0] != "ok")
+    assert not any("sqlite_integrity" in result[2] for result in observed)
 
 
 @pytest.mark.parametrize("suffix", ["-wal", "-shm", "-journal"])
