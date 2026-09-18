@@ -277,6 +277,9 @@ export class WorkspaceClient {
   async getProjectTimelineRevision(projectId: string, timelineId: string, revision: string): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("getProjectTimelineRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/revisions/" + encodeURIComponent(revision))).body);
   }
+  async getProjectParentCompositionRevision(projectId: string, timelineId: string, revision: string): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("getProjectParentCompositionRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/composition-revisions/" + encodeURIComponent(revision))).body);
+  }
   async updateTimelineDocument(projectId: string, timelineId: string, expectedVersion: number, idempotencyKey: string, config: Record<string, unknown>, registry: Record<string, unknown>): Promise<MutationResult<Record<string, unknown>>> {
     const body = { expected_version: expectedVersion, content: { config, registry } };
     return this.mutation<Record<string, unknown>>((await this.call("updateDocument", "PATCH", "/v1/projects/" + encodeURIComponent(projectId) + "/documents/timeline%3A" + encodeURIComponent(timelineId), new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);

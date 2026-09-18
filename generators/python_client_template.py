@@ -722,6 +722,9 @@ class WorkspaceClient:
     def get_project_timeline_revision(self, project_id: str, timeline_id: str, revision: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/revisions/{_path_part(revision)}")[2])
 
+    def get_project_parent_composition_revision(self, project_id: str, timeline_id: str, revision: str) -> Mapping[str, Any]:
+        return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/composition-revisions/{_path_part(revision)}")[2])
+
     def get_timeline(self, timeline_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/timelines/{_path_part(timeline_id)}")[2])
 

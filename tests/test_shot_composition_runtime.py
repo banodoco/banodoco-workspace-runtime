@@ -61,11 +61,42 @@ def test_historical_revision_is_exact_after_mutable_edits(tmp_path):
     service, project_id = _service(tmp_path)
     try:
         first = service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
-        service.update_project_shot(project_id, "shot-1", {"expected_version": 1, "name": "edited"}, idempotency_key="edit-shot")
+        updated = service.update_project_shot(project_id, "shot-1", {"expected_version": 1, "name": "edited"}, idempotency_key="edit-shot")
+        assert updated["data"]["revision_id"] != first["data"]["revision_id"]
+        assert service.store.conn.execute("SELECT revision_id FROM shot_revision_heads WHERE shot_id='shot-1'").fetchone()[0] == updated["data"]["revision_id"]
         reread = service.get_project_shot_revision(project_id, "shot-1", "shot-rev-1")
         assert reread["content_digest"] == first["data"]["content_digests"]["shot-rev-1"]
         assert reread["payload"]["metadata"] == {"title": "opening"}
         assert service.get_project_timeline_revision(project_id, "main", "timeline-rev-1")["payload"]["layout"] == {}
+    finally:
+        service.close()
+
+
+def test_parent_revision_and_head_reads_and_linked_reuse_do_not_regress_child_head(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        first = service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
+        parent = service.get_project_parent_composition_revision(project_id, "main", "parent-1")
+        assert parent["content_digest"] == first["data"]["content_digest"]
+        assert service._timeline_resource("main")["head_revision_id"] == "parent-1"
+
+        reused = _publication(project_id, expected_head="parent-1", parent_revision_id="parent-2")
+        second = service.publish_parent_composition(project_id, "main", reused, idempotency_key="publish-2")
+        assert second["data"]["new_head"] == "parent-2"
+        assert service.store.conn.execute("SELECT revision_id FROM shot_revision_heads WHERE shot_id='shot-1'").fetchone()[0] == "shot-rev-1"
+    finally:
+        service.close()
+
+
+def test_integrity_report_detects_revision_digest_tampering(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
+        service.store.conn.execute("UPDATE parent_composition_revisions SET content_digest='sha256:' || printf('%064d', 0) WHERE id='parent-1'")
+        report = service.store.integrity_report()
+        assert report["ok"] is False
+        assert "revisions" in report["issues"]
+        assert any(error["reason"] == "content_digest_mismatch" for error in report["checks"]["revisions"]["errors"])
     finally:
         service.close()
 
