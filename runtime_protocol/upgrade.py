@@ -1,4 +1,4 @@
-"""Explicit offline upgrade from the retired migration format to v24.
+"""Explicit offline upgrade from retired/current formats to the canonical format.
 
 Opening a realm never upgrades it.  This module is an operator-only boundary:
 it acquires the same owner fence as the daemon, archives the complete source
@@ -38,7 +38,17 @@ LEGACY_TABLES = frozenset(
         "workers",
     }
 )
-NEW_TABLES = frozenset({"runtime_schema", "managed_output_associations", "managed_output_lifecycle"})
+NEW_TABLES = frozenset({
+    "runtime_schema", "managed_output_associations", "managed_output_lifecycle",
+    "internal_timeline_revisions", "shot_revisions", "parent_composition_revisions",
+    "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences",
+    "composition_revision_dependencies",
+})
+REVISION_TABLES = frozenset({
+    "internal_timeline_revisions", "shot_revisions", "parent_composition_revisions",
+    "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences",
+    "composition_revision_dependencies",
+})
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 120.0
 HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION = "MIGRATE MANAGED OUTPUTS"
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv"})
@@ -206,12 +216,34 @@ def _open_readonly(db: Path) -> sqlite3.Connection:
 
 def _source_shape(connection: sqlite3.Connection) -> tuple[set[str], dict[str, list[str]], str]:
     tables = _tables(connection)
+    if "schema_migrations" not in tables and "runtime_schema" in tables:
+        schema = connection.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
+        if not schema or schema[0] != CANONICAL_FORMAT_ID or int(schema[1]) != SCHEMA_VERSION:
+            raise ValidationError("upgrade requires the current canonical schema")
+        if REVISION_TABLES.issubset(tables):
+            raise ValidationError("upgrade source already contains the canonical revision tables; schema_migrations is absent")
+        unknown = tables - set(REQUIRED_SCHEMA_TABLES)
+        if unknown:
+            raise ValidationError("upgrade refuses unknown source tables: " + ", ".join(sorted(unknown)))
+        excluded = {"runtime_schema", *REVISION_TABLES}
+        columns: dict[str, list[str]] = {}
+        for table in sorted(REQUIRED_SCHEMA_TABLES - excluded):
+            actual = _table_columns(connection, table)
+            expected = list(REQUIRED_SCHEMA_COLUMNS[table])
+            if set(actual) != set(expected) or len(actual) != len(expected):
+                raise ValidationError(f"upgrade source shape differs for table {table}")
+            columns[table] = actual
+        return tables, columns, str(schema[1])
     if "schema_migrations" not in tables:
         raise ValidationError("upgrade requires a legacy schema_migrations table")
     version = connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0]
     if int(version) != 23:
         raise ValidationError(f"upgrade requires schema version 23, found {version}")
-    if tables & NEW_TABLES:
+    # A legacy fixture may have been opened once by a newer Runtime before it
+    # was returned to the retired migration shape.  The revision tables are
+    # additive and are intentionally empty in that source; the original v24
+    # marker/output tables remain the repeatability fence.
+    if tables & {"runtime_schema", "managed_output_associations", "managed_output_lifecycle"}:
         raise ValidationError("upgrade source already contains v24 tables")
     unknown = tables - set(REQUIRED_SCHEMA_TABLES) - LEGACY_TABLES
     if unknown:
@@ -440,7 +472,7 @@ def upgrade_realm(root: str | Path, *, archive_root: str | Path | None = None, t
             _fsync_directory(root)
             archive_meta.update({"state": "activated", "activated_at": now()})
             _write_manifest(archive, archive_meta)
-            return {"ok": True, "realm_id": realm_id, "archive": str(archive), "root": str(root), "source_schema_version": 23, "target_schema_version": SCHEMA_VERSION, "shared_tables": fingerprints, "historical_managed_outputs": {"migrated": historical_inserted, "skipped": historical_skipped, "skipped_count": len(historical_skipped)}}
+            return {"ok": True, "realm_id": realm_id, "archive": str(archive), "root": str(root), "source_schema_version": int(source_version), "target_schema_version": SCHEMA_VERSION, "shared_tables": fingerprints, "historical_managed_outputs": {"migrated": historical_inserted, "skipped": historical_skipped, "skipped_count": len(historical_skipped)}}
         except Exception:
             if target is not None:
                 target.close()

@@ -215,6 +215,15 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if not key:
                 raise ProtocolError("Idempotency-Key header is required")
             return self._send(201, self.runtime.create_timeline_document(path[2], self._body(), idempotency_key=key))
+        if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.publish_parent_composition(path[2], path[4], self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+        if len(path) == 7 and path[:2] == ["v1", "projects"] and path[5] == "revisions" and method == "GET":
+            self._identity("projects:read")
+            if path[3] == "shots":
+                return self._send(200, self.runtime.get_project_shot_revision(path[2], path[4], path[6]))
+            if path[3] == "timelines":
+                return self._send(200, self.runtime.get_project_timeline_revision(path[2], path[4], path[6]))
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] in ("shots", "references") and method == "POST":
             self._identity("projects:write")
             body = self._body()

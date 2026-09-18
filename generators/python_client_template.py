@@ -710,6 +710,18 @@ class WorkspaceClient:
         items, next_cursor = self._page(value)
         return list(items), next_cursor
 
+    def publish_parent_composition(self, project_id: str, timeline_id: str, publication: Mapping[str, Any], *, idempotency_key: str) -> MutationResult:
+        payload = dict(publication)
+        payload["project_id"] = project_id
+        payload["timeline_id"] = timeline_id
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/composition-revisions", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def get_project_shot_revision(self, project_id: str, shot_id: str, revision: str) -> Mapping[str, Any]:
+        return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/shots/{_path_part(shot_id)}/revisions/{_path_part(revision)}")[2])
+
+    def get_project_timeline_revision(self, project_id: str, timeline_id: str, revision: str) -> Mapping[str, Any]:
+        return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/revisions/{_path_part(revision)}")[2])
+
     def get_timeline(self, timeline_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/timelines/{_path_part(timeline_id)}")[2])
 
