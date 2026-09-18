@@ -3427,6 +3427,9 @@ class RealmStore:
                 project = self.conn.execute("SELECT id FROM projects WHERE id=?", (row["project_id"],)).fetchone()
                 if project is None or shot is None or shot["project_id"] != row["project_id"] or internal is None or internal["project_id"] != row["project_id"]:
                     revision_issue("shot_revisions", row["id"], "shot_internal_project_closure", project_id=row["project_id"], shot_id=row["shot_id"], internal_timeline_revision_id=row["internal_timeline_revision_id"])
+                payload = shot_payloads.get(row["id"])
+                if isinstance(payload, dict) and payload.get("internal_timeline_revision_id") != row["internal_timeline_revision_id"]:
+                    revision_issue("shot_revisions", row["id"], "declared_internal_timeline_revision_mismatch", declared=payload.get("internal_timeline_revision_id"), row_value=row["internal_timeline_revision_id"])
         if {"parent_composition_revisions", "timelines", "projects"}.issubset(actual_tables):
             for row in self.conn.execute("SELECT * FROM parent_composition_revisions"):
                 parent_payloads[row["id"]] = revision_payload(row, "parent_composition_revisions")
@@ -3436,14 +3439,49 @@ class RealmStore:
                     revision_issue("parent_composition_revisions", row["id"], "project_timeline_identity", project_id=row["project_id"], timeline_id=row["timeline_id"])
 
         if {"composition_revision_occurrences", "parent_composition_revisions", "shot_revisions", "project_shots"}.issubset(actual_tables):
-            for row in self.conn.execute("SELECT * FROM composition_revision_occurrences"):
-                parent = self.conn.execute("SELECT project_id, timeline_id FROM parent_composition_revisions WHERE id=?", (row["parent_revision_id"],)).fetchone()
-                shot = self.conn.execute("SELECT project_id, shot_id, internal_timeline_revision_id FROM shot_revisions WHERE id=?", (row["shot_revision_id"],)).fetchone()
-                project_shot = self.conn.execute("SELECT project_id FROM project_shots WHERE id=?", (row["shot_id"],)).fetchone()
-                if parent is None or shot is None or project_shot is None or row["project_id"] != (parent["project_id"] if parent else None) or shot["project_id"] != row["project_id"] or shot["shot_id"] != row["shot_id"] or project_shot["project_id"] != row["project_id"]:
-                    revision_issue("composition_revision_occurrences", f"{row['parent_revision_id']}:{row['occurrence_id']}", "occurrence_identity_closure")
-                elif not self.conn.execute("SELECT 1 FROM internal_timeline_revisions WHERE id=? AND project_id=?", (shot["internal_timeline_revision_id"], row["project_id"])).fetchone():
-                    revision_issue("composition_revision_occurrences", f"{row['parent_revision_id']}:{row['occurrence_id']}", "occurrence_internal_timeline_missing", internal_timeline_revision_id=shot["internal_timeline_revision_id"])
+            occurrence_fields = {
+                "placement": "placement_json", "source_offset": "source_offset_json",
+                "duration_ms": "duration_ms", "speed": "speed_json", "track": "track",
+                "transform": "transform_json", "gain": "gain", "muted": "muted",
+                "provenance": "provenance_json",
+            }
+            for parent_id, payload in parent_payloads.items():
+                if not isinstance(payload, dict):
+                    continue
+                expected_occurrences = {item.get("occurrence_id"): item for item in payload.get("occurrences", []) if isinstance(item, dict)}
+                stored_rows = self.conn.execute("SELECT * FROM composition_revision_occurrences WHERE parent_revision_id=? ORDER BY occurrence_id", (parent_id,)).fetchall()
+                stored_ids = {row["occurrence_id"] for row in stored_rows}
+                for occurrence_id in sorted(set(expected_occurrences) - stored_ids):
+                    revision_issue("composition_revision_occurrences", f"{parent_id}:{occurrence_id}", "occurrence_missing")
+                for occurrence_id in sorted(stored_ids - set(expected_occurrences)):
+                    revision_issue("composition_revision_occurrences", f"{parent_id}:{occurrence_id}", "occurrence_extra")
+                parent = self.conn.execute("SELECT project_id FROM parent_composition_revisions WHERE id=?", (parent_id,)).fetchone()
+                for row in stored_rows:
+                    identity = f"{parent_id}:{row['occurrence_id']}"
+                    expected = expected_occurrences.get(row["occurrence_id"])
+                    shot = self.conn.execute("SELECT project_id, shot_id, internal_timeline_revision_id FROM shot_revisions WHERE id=?", (row["shot_revision_id"],)).fetchone()
+                    project_shot = self.conn.execute("SELECT project_id FROM project_shots WHERE id=?", (row["shot_id"],)).fetchone()
+                    if parent is None or shot is None or project_shot is None or row["project_id"] != (parent["project_id"] if parent else None) or shot["project_id"] != row["project_id"] or shot["shot_id"] != row["shot_id"] or project_shot["project_id"] != row["project_id"]:
+                        revision_issue("composition_revision_occurrences", identity, "occurrence_identity_closure")
+                    if shot is not None and not self.conn.execute("SELECT 1 FROM internal_timeline_revisions WHERE id=? AND project_id=?", (shot["internal_timeline_revision_id"], row["project_id"])).fetchone():
+                        revision_issue("composition_revision_occurrences", identity, "occurrence_internal_timeline_missing", internal_timeline_revision_id=shot["internal_timeline_revision_id"])
+                    if expected is None:
+                        continue
+                    for field, column in occurrence_fields.items():
+                        try:
+                            actual = json.loads(row[column]) if column.endswith("_json") else row[column]
+                        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                            revision_issue("composition_revision_occurrences", identity, "occurrence_field_malformed", field=field, error=str(exc))
+                            continue
+                        if field == "muted":
+                            expected_value = int(bool(expected.get("muted", expected.get("mute", False))))
+                            actual = int(actual)
+                        elif field == "duration_ms":
+                            expected_value = int(expected.get(field))
+                        else:
+                            expected_value = expected.get(field, {} if field in {"transform", "provenance"} else None)
+                        if actual != expected_value:
+                            revision_issue("composition_revision_occurrences", identity, "occurrence_field_mismatch", field=field, expected=expected_value, actual=actual)
 
         if {"composition_revision_dependencies", "parent_composition_revisions", "shot_revisions", "internal_timeline_revisions", "objects", "project_objects"}.issubset(actual_tables):
             for row in self.conn.execute("SELECT * FROM composition_revision_dependencies"):
@@ -3486,34 +3524,41 @@ class RealmStore:
             for parent_id, parent in parent_payloads.items():
                 if not isinstance(parent, dict):
                     continue
-                stored = {(row["dependency_kind"], row["dependency_id"], row["content_digest"]) for row in self.conn.execute("SELECT dependency_kind, dependency_id, content_digest FROM composition_revision_dependencies WHERE parent_revision_id=?", (parent_id,))}
-                expected = set()
+                shot_expected = []
+                internal_expected = []
                 child_payloads = []
+                child_rows = []
                 for occurrence in parent.get("occurrences", []):
                     if not isinstance(occurrence, dict):
                         continue
-                    shot_id = occurrence.get("shot_revision_id")
-                    shot = self.conn.execute("SELECT content_digest, internal_timeline_revision_id FROM shot_revisions WHERE id=?", (shot_id,)).fetchone()
+                    shot = self.conn.execute("SELECT * FROM shot_revisions WHERE id=? AND shot_id=?", (occurrence.get("shot_revision_id"), occurrence.get("shot_id"))).fetchone()
                     if shot is None:
                         continue
-                    expected.add(("shot_revision", shot_id, shot["content_digest"]))
-                    internal = self.conn.execute("SELECT content_digest, payload_json FROM internal_timeline_revisions WHERE id=?", (shot["internal_timeline_revision_id"],)).fetchone()
+                    child_rows.append(shot)
+                for shot in sorted(child_rows, key=lambda row: (str(row["shot_id"]), str(row["id"]))):
+                    shot_expected.append(("shot_revision", shot["id"], shot["content_digest"]))
+                    if shot["id"] in shot_payloads and isinstance(shot_payloads[shot["id"]], dict):
+                        child_payloads.append(shot_payloads[shot["id"]])
+                    internal = self.conn.execute("SELECT * FROM internal_timeline_revisions WHERE id=?", (shot["internal_timeline_revision_id"],)).fetchone()
                     if internal is not None:
-                        expected.add(("internal_timeline_revision", shot["internal_timeline_revision_id"], internal["content_digest"]))
-                        try:
-                            child_payloads.append(json.loads(internal["payload_json"]))
-                        except (TypeError, ValueError, json.JSONDecodeError):
-                            pass
-                    if shot_id in shot_payloads and isinstance(shot_payloads[shot_id], dict):
-                        child_payloads.append(shot_payloads[shot_id])
-                for media in payload_media(parent):
-                    expected.add(("media", media, media))
+                        internal_expected.append((str(internal["timeline_id"]), "internal_timeline_revision", internal["id"], internal["content_digest"]))
+                        if internal["id"] in internal_payloads and isinstance(internal_payloads[internal["id"]], dict):
+                            child_payloads.append(internal_payloads[internal["id"]])
+                expected = shot_expected + [item[1:] for item in sorted(internal_expected, key=lambda item: (item[0], item[2]))]
+                for media in sorted(payload_media(parent)):
+                    expected.append(("media", media, media))
                 for child in child_payloads:
-                    for media in payload_media(child):
-                        expected.add(("media", media, media))
-                missing_dependencies = sorted(expected - stored)
-                for kind, dependency_id, digest in missing_dependencies:
-                    revision_issue("composition_revision_dependencies", parent_id, "dependency_missing", dependency_kind=kind, dependency_id=dependency_id, content_digest=digest)
+                    for media in sorted(payload_media(child)):
+                        expected.append(("media", media, media))
+                # The publication canonicalizes each dependency family and
+                # stores one exact ordinal sequence.  Compare the sequence,
+                # not only set membership, so extra and reordered rows are
+                # actionable corruption as well.
+                expected = list(dict.fromkeys(expected))
+                actual_rows = self.conn.execute("SELECT dependency_kind, dependency_id, content_digest, ordinal FROM composition_revision_dependencies WHERE parent_revision_id=? ORDER BY ordinal", (parent_id,)).fetchall()
+                actual = [(row["dependency_kind"], row["dependency_id"], row["content_digest"]) for row in actual_rows]
+                if actual != expected or [int(row["ordinal"]) for row in actual_rows] != list(range(len(actual_rows))):
+                    revision_issue("composition_revision_dependencies", parent_id, "dependency_graph_mismatch", expected=expected, actual=actual, actual_ordinals=[int(row["ordinal"]) for row in actual_rows])
         if realm_identity["ok"] and {"realm", "realm_lifecycle"}.issubset(actual_tables):
             lifecycle_rows = self.conn.execute(
                 "SELECT realm_id, state FROM realm_lifecycle"

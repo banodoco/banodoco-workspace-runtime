@@ -166,11 +166,12 @@ def test_failure_injection_rolls_back_every_publication_write(tmp_path, monkeypa
     service, project_id = _service(tmp_path)
     try:
         command_count = service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0]
+        baseline = {table: service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("shot_revisions", "internal_timeline_revisions", "parent_composition_revisions", "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences", "composition_revision_dependencies")}
         monkeypatch.setattr(service.store, "_append_timeline_event", lambda *args: (_ for _ in ()).throw(RuntimeError("injected")))
         with pytest.raises(RuntimeError, match="injected"):
             service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="injected")
         for table in ("shot_revisions", "internal_timeline_revisions", "parent_composition_revisions", "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences", "composition_revision_dependencies"):
-            assert service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+            assert service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == baseline[table]
         assert service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0] == command_count
         assert service.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id='main'").fetchone()[0] == 1
     finally:
