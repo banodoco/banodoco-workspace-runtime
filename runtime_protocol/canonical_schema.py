@@ -279,6 +279,77 @@ CREATE TABLE managed_output_lifecycle (
     expires_at TEXT, pinned_at TEXT, lease_id TEXT, lease_owner TEXT,
     lease_expires_at TEXT, updated_at TEXT NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE internal_timeline_revisions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    timeline_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    content_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, timeline_id, id)
+);
+CREATE TABLE shot_revisions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    shot_id TEXT NOT NULL REFERENCES project_shots(id) ON DELETE CASCADE,
+    internal_timeline_revision_id TEXT NOT NULL REFERENCES internal_timeline_revisions(id),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    content_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, shot_id, id)
+);
+CREATE TABLE parent_composition_revisions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    timeline_id TEXT NOT NULL REFERENCES timelines(id) ON DELETE CASCADE,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    content_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(project_id, timeline_id, id)
+);
+CREATE TABLE shot_revision_heads (
+    shot_id TEXT PRIMARY KEY REFERENCES project_shots(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    revision_id TEXT NOT NULL REFERENCES shot_revisions(id),
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE parent_composition_heads (
+    timeline_id TEXT PRIMARY KEY REFERENCES timelines(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    revision_id TEXT REFERENCES parent_composition_revisions(id),
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE composition_revision_occurrences (
+    parent_revision_id TEXT NOT NULL REFERENCES parent_composition_revisions(id) ON DELETE CASCADE,
+    occurrence_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    shot_id TEXT NOT NULL REFERENCES project_shots(id),
+    shot_revision_id TEXT NOT NULL REFERENCES shot_revisions(id),
+    placement_json TEXT NOT NULL CHECK (json_valid(placement_json)),
+    source_offset_json TEXT NOT NULL CHECK (json_valid(source_offset_json)),
+    duration_ms INTEGER NOT NULL CHECK (duration_ms > 0),
+    speed_json TEXT NOT NULL CHECK (json_valid(speed_json)),
+    track TEXT NOT NULL,
+    transform_json TEXT NOT NULL CHECK (json_valid(transform_json)),
+    gain REAL NOT NULL,
+    muted INTEGER NOT NULL CHECK (muted IN (0,1)),
+    provenance_json TEXT NOT NULL CHECK (json_valid(provenance_json)),
+    PRIMARY KEY(parent_revision_id, occurrence_id)
+);
+CREATE TABLE composition_revision_dependencies (
+    parent_revision_id TEXT NOT NULL REFERENCES parent_composition_revisions(id) ON DELETE CASCADE,
+    dependency_kind TEXT NOT NULL,
+    dependency_id TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    PRIMARY KEY(parent_revision_id, dependency_kind, dependency_id, ordinal)
+);
+CREATE INDEX idx_internal_timeline_revisions_identity ON internal_timeline_revisions(project_id, timeline_id, id);
+CREATE INDEX idx_shot_revisions_identity ON shot_revisions(project_id, shot_id, id);
+CREATE INDEX idx_parent_composition_revisions_identity ON parent_composition_revisions(project_id, timeline_id, id);
+CREATE INDEX idx_composition_occurrences_shot ON composition_revision_occurrences(project_id, shot_id, shot_revision_id);
+CREATE INDEX idx_composition_dependencies_digest ON composition_revision_dependencies(content_digest);
 CREATE UNIQUE INDEX idx_attempts_recovery_nonce ON attempts(recovery_nonce) WHERE recovery_nonce IS NOT NULL;
 CREATE INDEX idx_events_run ON events(run_id, id);
 CREATE INDEX idx_projects_realm ON projects(realm_id);

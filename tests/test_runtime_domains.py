@@ -246,7 +246,7 @@ def test_timeline_document_is_one_atomic_runtime_command(tmp_path, monkeypatch):
         assert result["slug"] == "composition" and result["name"] == "composition"
         assert result["receipt"]["command_kind"] == "timeline_document.create"
         assert len(result["receipt"]["event_ids"]) == 1
-        assert client.get_timeline("composition")["config"] == {"tracks": []}
+        assert client.get_project_timeline(project.project_id, "composition")["config"] == {"tracks": []}
 
         # Replaying is served by the runtime ledger, not a client repair loop.
         replay = client.create_timeline_document(

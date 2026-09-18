@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/shot-composition.json",
+  "title": "Canonical one-level shot composition publication",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["project_id", "timeline_id", "expected_head", "parent_composition"],
+  "properties": {
+    "project_id": { "type": "string", "minLength": 1 },
+    "timeline_id": { "type": "string", "minLength": 1 },
+    "expected_head": { "type": ["string", "null"] },
+    "parent_revision_id": { "type": "string", "minLength": 1 },
+    "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "parent_composition": { "$ref": "#/$defs/ParentComposition" },
+    "shot_revisions": { "type": "array", "items": { "$ref": "#/$defs/ShotRevisionInput" } },
+    "internal_timeline_revisions": { "type": "array", "items": { "$ref": "#/$defs/InternalTimelineRevisionInput" } },
+    "dependency_manifest": { "$ref": "#/$defs/DependencyManifest" }
+  },
+  "$defs": {
+    "ParentComposition": {
+      "type": "object",
+      "required": ["config", "registry", "clips", "occurrences"],
+      "properties": { "config": { "type": "object" }, "registry": { "type": "object" }, "clips": { "type": "array" }, "occurrences": { "type": "array", "items": { "$ref": "#/$defs/Occurrence" } } }
+    },
+    "Occurrence": {
+      "type": "object",
+      "required": ["occurrence_id", "shot_id", "shot_revision_id", "placement", "duration_ms", "track"],
+      "properties": { "occurrence_id": { "type": "string", "minLength": 1 }, "shot_id": { "type": "string", "minLength": 1 }, "shot_revision_id": { "type": "string", "minLength": 1 }, "placement": { "type": "object" }, "source_offset": {}, "duration_ms": { "type": "integer", "exclusiveMinimum": 0 }, "speed": {}, "track": { "type": "string", "minLength": 1 }, "transform": { "type": "object" }, "gain": { "type": "number" }, "mute": { "type": "boolean" }, "provenance": { "type": "object" } }
+    },
+    "ShotRevisionInput": {
+      "type": "object",
+      "required": ["shot_id", "revision_id", "internal_timeline_revision_id", "payload"],
+      "properties": { "shot_id": { "type": "string", "minLength": 1 }, "revision_id": { "type": "string", "minLength": 1 }, "internal_timeline_revision_id": { "type": "string", "minLength": 1 }, "content_digest": { "type": "string" }, "payload": { "type": "object" } }
+    },
+    "InternalTimelineRevisionInput": {
+      "type": "object",
+      "required": ["timeline_id", "revision_id", "payload"],
+      "properties": { "timeline_id": { "type": "string", "minLength": 1 }, "revision_id": { "type": "string", "minLength": 1 }, "content_digest": { "type": "string" }, "payload": { "type": "object" } }
+    },
+    "DependencyManifest": {
+      "type": "object",
+      "properties": { "media": { "type": "array" }, "shots": { "type": "array" }, "internal_timelines": { "type": "array" }, "timelines": { "type": "array" } }
+    }
+  }
+}

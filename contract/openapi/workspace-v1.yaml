@@ -193,17 +193,49 @@ paths:
       operationId: listTimelines
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
       responses: { '200': { description: Timelines, content: { application/json: { schema: { $ref: '#/components/schemas/TimelinePage' } } } } }
+  /v1/projects/{project_id}/timelines/{timeline_id}:
+    get:
+      operationId: getProjectTimeline
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      responses: { '200': { description: Project-scoped timeline with its canonical composition head, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions:
+    post:
+      operationId: publishParentComposition
+      description: Atomically publish one complete one-level parent composition and its immutable child/internal revisions.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ParentCompositionPublication' } } } }
+      responses: { '200': { description: Durable parent publication receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions/{revision}:
+    get:
+      operationId: getProjectParentCompositionRevision
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
+      responses: { '200': { description: Exact immutable parent composition revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
   /v1/projects/{project_id}/timeline-documents:
     post:
       operationId: createTimelineDocument
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateTimelineDocument' } } } }
       responses: { '201': { description: Timeline and composition document committed atomically, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
-  /v1/timelines/{timeline_id}:
+  /v1/projects/{project_id}/shots/{shot_id}/revisions/{revision}:
     get:
-      operationId: getTimeline
-      parameters: [ { $ref: '#/components/parameters/TimelineId' } ]
-      responses: { '200': { description: Timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } } }
+      operationId: getProjectShotRevision
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/ShotId' }
+        - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
+      responses: { '200': { description: Exact immutable shot revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/revisions/{revision}:
+    get:
+      operationId: getProjectTimelineRevision
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
+      responses: { '200': { description: Exact immutable internal timeline revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/timelines/{timeline_id}:
     patch:
       operationId: updateTimeline
       parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
@@ -977,7 +1009,7 @@ components:
       type: object
       additionalProperties: false
       required: [shot_id, project_id, name, metadata, version, items, archived]
-      properties: { shot_id: { type: string }, project_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object }, version: { type: integer, minimum: 1 }, items: { type: array, items: { $ref: '#/components/schemas/ShotItem' } }, archived: { type: boolean }, created_at: { type: string }, updated_at: { type: string } }
+      properties: { shot_id: { type: string }, project_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object }, version: { type: integer, minimum: 1 }, items: { type: array, items: { $ref: '#/components/schemas/ShotItem' } }, archived: { type: boolean }, revision_id: { type: string }, internal_timeline_revision_id: { type: string }, content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, created_at: { type: string }, updated_at: { type: string } }
     CommittedMutation:
       type: object
       additionalProperties: false
@@ -1028,6 +1060,32 @@ components:
       type: object
       required: [items, next_cursor]
       properties: { items: { type: array, items: { $ref: '#/components/schemas/ProjectShot' } }, next_cursor: { type: [string, 'null'] } }
+    ImmutableRevision:
+      type: object
+      required: [revision_id, project_id, content_digest, payload, created_at]
+      properties:
+        revision_id: { type: string, minLength: 1 }
+        project_id: { type: string, minLength: 1 }
+        shot_id: { type: string }
+        timeline_id: { type: string }
+        internal_timeline_revision_id: { type: string }
+        content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        payload: { type: object }
+        created_at: { type: string }
+    ParentCompositionPublication:
+      type: object
+      additionalProperties: false
+      required: [project_id, timeline_id, expected_head, parent_composition]
+      properties:
+        project_id: { type: string, minLength: 1 }
+        timeline_id: { type: string, minLength: 1 }
+        expected_head: { type: [string, 'null'] }
+        parent_revision_id: { type: string, minLength: 1 }
+        content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        parent_composition: { type: object }
+        shot_revisions: { type: array, items: { type: object } }
+        internal_timeline_revisions: { type: array, items: { type: object } }
+        dependency_manifest: { type: object }
     ShotTextBinding:
       type: object
       additionalProperties: false

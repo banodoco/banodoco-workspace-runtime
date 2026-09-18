@@ -65,6 +65,11 @@ def test_product_clients_match_canonical_contract_projection() -> None:
         "update_timeline_document"
     }
     assert typescript_methods - set(operation_ids) == {"updateTimelineDocument"}
+    assert typescript_methods == set(operation_ids) | {"updateTimelineDocument"}
+    assert "getTimeline" not in typescript_methods
+    assert "getProjectTimeline" in typescript_methods
+    assert {"publishParentComposition", "getProjectShotRevision", "getProjectTimelineRevision"}.issubset(typescript_methods)
+    assert {"publish_parent_composition", "get_project_shot_revision", "get_project_timeline_revision"}.issubset(_python_methods())
 
     component_digest = "sha256:" + hashlib.sha256((ROOT / "contract" / "component-manifest.json").read_bytes()).hexdigest()
     from generators.generate import contract_digest

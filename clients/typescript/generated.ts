@@ -5,9 +5,9 @@
 export const PROTOCOL = "workspace.v1" as const;
 export const GENERATOR = "GENERATOR-TYPESCRIPT-CONFORMANCE" as const;
 export const COMPONENT_MANIFEST_SHA256 = "dc91a45390f33582f0299f81285d165128e1885a9fd62b4ccffa7b8e465ed63a" as const;
-export const CONTRACT_SHA256 = "0c29dac93ac59face918c4028dad837088a172ddb4ba26fe66bd0b879614ab63" as const;
-export const SCHEMA_MANIFEST_SHA256 = "de8661038e4f673976e9a848246569ed76fc2016dade6275b58e5f641f948044" as const;
-export const OPERATIONS = ["addShotItem","admitTask","adoptManagedOutput","archiveProjectReference","archiveProjectShot","archiveReference","archiveShot","archiveTimeline","associateReference","cancelRun","cancelTask","checkpointAttempt","claimTask","createBackup","createDocument","createGeneration","createMediaRelation","createProject","createProjectReference","createProjectShot","createReference","createShot","createTimeline","createTimelineDocument","createVariant","currentProject","diffTimeline","doctor","exportManagedOutput","exportRealm","failAttempt","getDocument","getGeneration","getManagedOutput","getObject","getProject","getProjectObjectLocation","getProjectReference","getProjectShot","getProjectShotTextBinding","getRealm","getReference","getRun","getShot","getTask","getTimeline","getVariant","handshake","headObject","health","heartbeatAttempt","ingestObject","ingestProjectObject","linkReferences","listCapabilities","listDocuments","listEvents","listGenerations","listManagedOutputs","listMediaRelations","listProjectObjects","listProjectReferences","listProjectRuns","listProjectShotTextBindings","listProjectShots","listProjectTasks","listProjects","listRunEvents","listTimelineHistory","listTimelines","listVariants","prepareReboot","promoteProjectShotCandidate","publishTimelineRender","purgeRealm","rebindProjectShotTextBinding","recoverProjectReference","recoverProjectShot","recoverRealm","recoverReference","recoverShot","recoverTimeline","registerCapability","registerExecutor","removeShotItem","reorderShotItems","replaceTimelineClip","requestReboot","restoreBackup","resumeAttempt","retryRun","retryTask","selectProject","setPrimaryReference","setProjectShotTextBinding","setProjectShotTextBindingById","settleAttempt","tombstoneRealm","updateDocument","updateManagedOutputLifecycle","updateProject","updateProjectReference","updateProjectShot","updateReference","updateShot","updateTimeline"] as const;
+export const CONTRACT_SHA256 = "a23b9c9025cac1463c0548ae5b3b0e2aeeec5505b5b761defe09f09457e60a4c" as const;
+export const SCHEMA_MANIFEST_SHA256 = "9c8aa1a6a68c346233687ed070bc244737559c04a9f61574c808226f5a9a7d97" as const;
+export const OPERATIONS = ["addShotItem","admitTask","adoptManagedOutput","archiveProjectReference","archiveProjectShot","archiveReference","archiveShot","archiveTimeline","associateReference","cancelRun","cancelTask","checkpointAttempt","claimTask","createBackup","createDocument","createGeneration","createMediaRelation","createProject","createProjectReference","createProjectShot","createReference","createShot","createTimeline","createTimelineDocument","createVariant","currentProject","diffTimeline","doctor","exportManagedOutput","exportRealm","failAttempt","getDocument","getGeneration","getManagedOutput","getObject","getProject","getProjectObjectLocation","getProjectParentCompositionRevision","getProjectReference","getProjectShot","getProjectShotRevision","getProjectShotTextBinding","getProjectTimeline","getProjectTimelineRevision","getRealm","getReference","getRun","getShot","getTask","getVariant","handshake","headObject","health","heartbeatAttempt","ingestObject","ingestProjectObject","linkReferences","listCapabilities","listDocuments","listEvents","listGenerations","listManagedOutputs","listMediaRelations","listProjectObjects","listProjectReferences","listProjectRuns","listProjectShotTextBindings","listProjectShots","listProjectTasks","listProjects","listRunEvents","listTimelineHistory","listTimelines","listVariants","prepareReboot","promoteProjectShotCandidate","publishParentComposition","publishTimelineRender","purgeRealm","rebindProjectShotTextBinding","recoverProjectReference","recoverProjectShot","recoverRealm","recoverReference","recoverShot","recoverTimeline","registerCapability","registerExecutor","removeShotItem","reorderShotItems","replaceTimelineClip","requestReboot","restoreBackup","resumeAttempt","retryRun","retryTask","selectProject","setPrimaryReference","setProjectShotTextBinding","setProjectShotTextBindingById","settleAttempt","tombstoneRealm","updateDocument","updateManagedOutputLifecycle","updateProject","updateProjectReference","updateProjectShot","updateReference","updateShot","updateTimeline"] as const;
 export type HeadersLike = Record<string, string>;
 export type Transport = (method: string, path: string, headers: HeadersLike, body?: Uint8Array) => Promise<{ status: number; headers: HeadersLike; body: Uint8Array }>;
 export interface ObjectLocation { object_id: string; digest: string; size: number; media_type: string; filename?: string | null; local_path: string; storage: "runtime_cas"; verified: true }
@@ -58,7 +58,7 @@ export class WorkspaceClient {
 
   supports(operationId: string): boolean { return (OPERATIONS as readonly string[]).includes(operationId); }
 
-  async call(operationId: string, method: string, path: string, body?: Uint8Array, headers: HeadersLike = {}, expected: number[] = [200]): Promise<{ status: number; headers: HeadersLike; body: Uint8Array }> {
+    async call(operationId: string, method: string, path: string, body?: Uint8Array, headers: HeadersLike = {}, expected: number[] = [200]): Promise<{ status: number; headers: HeadersLike; body: Uint8Array }> {
     if (!this.supports(operationId)) throw new Error("unknown workspace operation: " + operationId);
     const requestHeaders: HeadersLike = { Accept: "application/json", ...headers };
     if (this.token) requestHeaders.Authorization ??= "Bearer " + this.token;
@@ -89,6 +89,13 @@ export class WorkspaceClient {
     if (!value.data || !value.receipt) throw new Error("invalid mutation response: committed receipt is required");
     return Object.assign(value.data, { receipt: value.receipt }) as MutationResult<T>;
   }
+  async handshake(clientName: string, clientVersion: string, requestedScopes: string[]): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("handshake", "POST", "/v1/handshake", new TextEncoder().encode(JSON.stringify({ protocol: PROTOCOL, client_name: clientName, client_version: clientVersion, requested_scopes: requestedScopes })), { "Content-Type": "application/json" })).body);
+  }
+  async createProject(name: string, idempotencyKey: string, slug?: string, metadata?: Record<string, unknown>): Promise<MutationResult<Record<string, unknown>>> {
+    const payload: Record<string, unknown> = { name }; if (slug !== undefined) payload.slug = slug; if (metadata !== undefined) payload.metadata = metadata;
+    return this.mutation<Record<string, unknown>>((await this.call("createProject", "POST", "/v1/projects", new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200, 201])).body);
+  }
   async listManagedOutputs(taskId: string, cursor?: string, limit = 50): Promise<ManagedOutputPage> {
     const query = "?limit=" + limit + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
     return this.page<ManagedOutput>(
@@ -106,5 +113,39 @@ export class WorkspaceClient {
   }
   async updateManagedOutputLifecycle(associationId: string, body: ManagedOutputLifecycle, idempotencyKey: string): Promise<MutationResult<ManagedOutput>> {
     return this.mutation<ManagedOutput>((await this.call("updateManagedOutputLifecycle", "POST", "/v1/managed-outputs/" + encodeURIComponent(associationId) + "/lifecycle", new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
+  }
+  async registerCapability(capability: Record<string, unknown>, idempotencyKey?: string): Promise<Record<string, unknown>> {
+    const headers: HeadersLike = { "Content-Type": "application/json" }; if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+    return this.json<Record<string, unknown>>((await this.call("registerCapability", "POST", "/v1/capabilities", new TextEncoder().encode(JSON.stringify({ status: "ready", required_resource_keys: [], estimated_scratch_bytes: 0, estimated_output_bytes: 0, ...capability })), headers, [200, 201])).body);
+  }
+  async failAttempt(attemptId: string, leaseId: string, fence: number, error: unknown, runtimeEpoch: number | string, idempotencyKey?: string): Promise<MutationResult<Record<string, unknown>>> {
+    const headers: HeadersLike = { "Content-Type": "application/json" }; if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+    return this.mutation<Record<string, unknown>>((await this.call("failAttempt", "POST", "/v1/attempts/" + encodeURIComponent(attemptId) + "/fail", new TextEncoder().encode(JSON.stringify({ lease_id: leaseId, fence, runtime_epoch: runtimeEpoch, error })), headers)).body);
+  }
+  async prepareReboot(attemptId: string, leaseId: string, fence: number, runtimeEpoch: number): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("prepareReboot", "POST", "/v1/attempts/" + encodeURIComponent(attemptId) + "/prepare-reboot", new TextEncoder().encode(JSON.stringify({ lease_id: leaseId, fence, runtime_epoch: runtimeEpoch })), { "Content-Type": "application/json" })).body);
+  }
+  async checkpointAttempt(attemptId: string, leaseId: string, fence: number, nonce: string, authorization: string, state: Record<string, unknown>, runtimeEpoch: number): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("checkpointAttempt", "POST", "/v1/attempts/" + encodeURIComponent(attemptId) + "/checkpoint", new TextEncoder().encode(JSON.stringify({ lease_id: leaseId, fence, nonce, authorization, state, runtime_epoch: runtimeEpoch })), { "Content-Type": "application/json" }, [200, 201])).body);
+  }
+  async publishParentComposition(projectId: string, timelineId: string, publication: Record<string, unknown>, idempotencyKey: string): Promise<MutationResult<Record<string, unknown>>> {
+    const payload = { ...publication, project_id: projectId, timeline_id: timelineId };
+    return this.mutation<Record<string, unknown>>((await this.call("publishParentComposition", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/composition-revisions", new TextEncoder().encode(JSON.stringify(payload)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
+  }
+  async getProjectShotRevision(projectId: string, shotId: string, revision: string): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("getProjectShotRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/shots/" + encodeURIComponent(shotId) + "/revisions/" + encodeURIComponent(revision))).body);
+  }
+  async getProjectTimelineRevision(projectId: string, timelineId: string, revision: string): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("getProjectTimelineRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/revisions/" + encodeURIComponent(revision))).body);
+  }
+  async getProjectTimeline(projectId: string, timelineId: string): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("getProjectTimeline", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId))).body);
+  }
+  async getProjectParentCompositionRevision(projectId: string, timelineId: string, revision: string): Promise<Record<string, unknown>> {
+    return this.json<Record<string, unknown>>((await this.call("getProjectParentCompositionRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/composition-revisions/" + encodeURIComponent(revision))).body);
+  }
+  async updateTimelineDocument(projectId: string, timelineId: string, expectedVersion: number, idempotencyKey: string, config: Record<string, unknown>, registry: Record<string, unknown>): Promise<MutationResult<Record<string, unknown>>> {
+    const body = { expected_version: expectedVersion, content: { config, registry } };
+    return this.mutation<Record<string, unknown>>((await this.call("updateDocument", "PATCH", "/v1/projects/" + encodeURIComponent(projectId) + "/documents/timeline%3A" + encodeURIComponent(timelineId), new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
   }
 }
