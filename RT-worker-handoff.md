@@ -1,23 +1,39 @@
-# RT worker handoff — review round 2 completion
+# RT worker handoff — review round 3 final completion
 
-The Runtime-owned one-level shot-composition foundation was amended again in
-the delivery worktree on branch `otto/shot-composition-unification-20260917`.
+The Runtime foundation final completion pass was applied in the delivery
+worktree on branch `otto/shot-composition-unification-20260917`, starting from
+candidate `9f516f4`. The host should commit these worktree changes after the
+independent final review.
 
-Changes include complete legacy timeline/shot/reference/document mutation
-coverage, project-scoped dependency closure rebuilt after linked-child
-resolution, recursive media checks, project-scoped exact timeline/parent
-reads, deterministic linked-shot head/projection verification, and complete
-revision/occurrence/dependency integrity checks.
+Closed findings:
+
+- Occurrence-only linked reuse now resolves the complete committed shot row,
+  verifies its stored internal timeline revision row and payload, and includes
+  recursive child/internal media in the final closure. Dependency rows and the
+  returned manifest are built from that resolved set. A regression covers a
+  publication omitting both `shot_revisions` and
+  `internal_timeline_revisions`.
+- `composition_revision_occurrences` now persists authored `ordinal` values.
+  Canonical schema shape, required columns, publication inserts, and revision
+  integrity checks are updated. Integrity compares the exact occurrence
+  sequence and all authored fields; order and identity tampering are unhealthy.
+- The product TypeScript client now exposes every declared OpenAPI operation,
+  including `getProjectTimeline`, `replaceTimelineClip`, and
+  `publishTimelineRender`. The timeline document helper uses the project-
+  scoped read.
+- The old unscoped `GET /v1/timelines/{timeline_id}` was removed from
+  OpenAPI, server routing, generated Python/TypeScript clients, operation
+  metadata, and the neutral conformance actor. The project-scoped timeline
+  read is the only public timeline/head read.
 
 Validation run:
 
 - `python3 generators/generate.py --check` — passed.
 - `node tools/generate_typescript_conformance.mjs --check --contract contract/openapi/workspace-v1.yaml --schema-manifest contract/manifest.json --component-manifest contract/component-manifest.json --source-root . --fixture-root conformance/fixtures` — passed.
-- `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. pytest -q tests/test_shot_composition_runtime.py tests/test_runtime_upgrade.py tests/test_t3_foundation_contract.py tests/test_schema_validation.py tests/test_client_parity.py tests/test_typescript_generator.py --disable-warnings --maxfail=1` — 25 passed.
-- `PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import ast; ...'` — syntax parsed for the five Runtime Python modules.
-- `npm test` in `packages/typescript` remains unavailable because `tsc` is not installed in the worktree environment.
-- HTTP daemon tests remain unavailable because the sandbox denies loopback socket bind (`PermissionError: [Errno 1] Operation not permitted`).
+- `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. pytest -q tests/test_shot_composition_runtime.py tests/test_runtime_upgrade.py tests/test_t3_foundation_contract.py tests/test_schema_validation.py tests/test_client_parity.py tests/test_typescript_generator.py --disable-warnings --maxfail=1` — 28 passed.
+- `PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import ast; ...'` — syntax parsed for the five requested Runtime Python modules.
+- `git diff --check` — passed.
 
-The worker was stopped after source changes were applied; the host ran the
-focused checks and will create the commit. This candidate must receive the
-final independent runtime-foundation review before T2 opens.
+The TypeScript package has no installed `node_modules` in this worktree, so its
+`npm test` build was not available; the requested generator/conformance check
+does not require that dependency. No commit was created.

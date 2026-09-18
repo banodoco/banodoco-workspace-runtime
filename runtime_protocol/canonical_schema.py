@@ -322,6 +322,7 @@ CREATE TABLE parent_composition_heads (
 CREATE TABLE composition_revision_occurrences (
     parent_revision_id TEXT NOT NULL REFERENCES parent_composition_revisions(id) ON DELETE CASCADE,
     occurrence_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     shot_id TEXT NOT NULL REFERENCES project_shots(id),
     shot_revision_id TEXT NOT NULL REFERENCES shot_revisions(id),

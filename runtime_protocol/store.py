@@ -65,7 +65,7 @@ REQUIRED_SCHEMA_COLUMNS = {
     "parent_composition_revisions": frozenset("id project_id timeline_id payload_json content_digest created_at".split()),
     "shot_revision_heads": frozenset("shot_id project_id revision_id updated_at".split()),
     "parent_composition_heads": frozenset("timeline_id project_id revision_id updated_at".split()),
-    "composition_revision_occurrences": frozenset("parent_revision_id occurrence_id project_id shot_id shot_revision_id placement_json source_offset_json duration_ms speed_json track transform_json gain muted provenance_json".split()),
+    "composition_revision_occurrences": frozenset("parent_revision_id occurrence_id ordinal project_id shot_id shot_revision_id placement_json source_offset_json duration_ms speed_json track transform_json gain muted provenance_json".split()),
     "composition_revision_dependencies": frozenset("parent_revision_id dependency_kind dependency_id content_digest ordinal".split()),
     "objects": frozenset("digest size media_type original_name created_at".split()),
     "project_documents": frozenset("id project_id kind content_json version created_at updated_at".split()),
@@ -3448,14 +3448,23 @@ class RealmStore:
             for parent_id, payload in parent_payloads.items():
                 if not isinstance(payload, dict):
                     continue
-                expected_occurrences = {item.get("occurrence_id"): item for item in payload.get("occurrences", []) if isinstance(item, dict)}
-                stored_rows = self.conn.execute("SELECT * FROM composition_revision_occurrences WHERE parent_revision_id=? ORDER BY occurrence_id", (parent_id,)).fetchall()
+                expected_sequence = [
+                    (ordinal, item.get("occurrence_id"), item)
+                    for ordinal, item in enumerate(payload.get("occurrences", []))
+                    if isinstance(item, dict)
+                ]
+                expected_occurrences = {occurrence_id: item for _, occurrence_id, item in expected_sequence}
+                stored_rows = self.conn.execute(
+                    "SELECT * FROM composition_revision_occurrences WHERE parent_revision_id=? ORDER BY ordinal, occurrence_id",
+                    (parent_id,),
+                ).fetchall()
                 stored_ids = {row["occurrence_id"] for row in stored_rows}
                 for occurrence_id in sorted(set(expected_occurrences) - stored_ids):
                     revision_issue("composition_revision_occurrences", f"{parent_id}:{occurrence_id}", "occurrence_missing")
                 for occurrence_id in sorted(stored_ids - set(expected_occurrences)):
                     revision_issue("composition_revision_occurrences", f"{parent_id}:{occurrence_id}", "occurrence_extra")
                 parent = self.conn.execute("SELECT project_id FROM parent_composition_revisions WHERE id=?", (parent_id,)).fetchone()
+                actual_sequence = []
                 for row in stored_rows:
                     identity = f"{parent_id}:{row['occurrence_id']}"
                     expected = expected_occurrences.get(row["occurrence_id"])
@@ -3467,6 +3476,7 @@ class RealmStore:
                         revision_issue("composition_revision_occurrences", identity, "occurrence_internal_timeline_missing", internal_timeline_revision_id=shot["internal_timeline_revision_id"])
                     if expected is None:
                         continue
+                    values = {"ordinal": int(row["ordinal"]), "occurrence_id": row["occurrence_id"], "shot_id": row["shot_id"], "shot_revision_id": row["shot_revision_id"]}
                     for field, column in occurrence_fields.items():
                         try:
                             actual = json.loads(row[column]) if column.endswith("_json") else row[column]
@@ -3480,8 +3490,36 @@ class RealmStore:
                             expected_value = int(expected.get(field))
                         else:
                             expected_value = expected.get(field, {} if field in {"transform", "provenance"} else None)
+                        values[field] = actual
                         if actual != expected_value:
                             revision_issue("composition_revision_occurrences", identity, "occurrence_field_mismatch", field=field, expected=expected_value, actual=actual)
+                    actual_sequence.append(values)
+                expected_values = []
+                for ordinal, occurrence_id, expected in expected_sequence:
+                    placement = expected.get("placement")
+                    expected_values.append({
+                        "ordinal": ordinal,
+                        "occurrence_id": occurrence_id,
+                        "shot_id": expected.get("shot_id"),
+                        "shot_revision_id": expected.get("shot_revision_id"),
+                        "placement": placement,
+                        "source_offset": expected.get("source_offset"),
+                        "duration_ms": int(expected.get("duration_ms", expected.get("duration"))),
+                        "speed": expected.get("speed", 1),
+                        "track": expected.get("track", placement.get("track") if isinstance(placement, dict) else None),
+                        "transform": expected.get("transform", {}),
+                        "gain": expected.get("gain", 1),
+                        "muted": bool(expected.get("muted", expected.get("mute", False))),
+                        "provenance": expected.get("provenance", {}),
+                    })
+                if actual_sequence != expected_values:
+                    revision_issue(
+                        "composition_revision_occurrences",
+                        parent_id,
+                        "occurrence_sequence_mismatch",
+                        expected=expected_values,
+                        actual=actual_sequence,
+                    )
 
         if {"composition_revision_dependencies", "parent_composition_revisions", "shot_revisions", "internal_timeline_revisions", "objects", "project_objects"}.issubset(actual_tables):
             for row in self.conn.execute("SELECT * FROM composition_revision_dependencies"):

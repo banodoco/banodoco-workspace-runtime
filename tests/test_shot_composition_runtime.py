@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -84,6 +85,61 @@ def test_parent_revision_and_head_reads_and_linked_reuse_do_not_regress_child_he
         second = service.publish_parent_composition(project_id, "main", reused, idempotency_key="publish-2")
         assert second["data"]["new_head"] == "parent-2"
         assert service.store.conn.execute("SELECT revision_id FROM shot_revision_heads WHERE shot_id='shot-1'").fetchone()[0] == "shot-rev-1"
+    finally:
+        service.close()
+
+
+def test_occurrence_only_linked_reuse_resolves_committed_child_closure(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        first = service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
+        reused = _publication(project_id, expected_head="parent-1", parent_revision_id="parent-2")
+        reused.pop("shot_revisions")
+        reused.pop("internal_timeline_revisions")
+        second = service.publish_parent_composition(project_id, "main", reused, idempotency_key="publish-2")
+
+        assert second["data"]["dependency_manifest"] == first["data"]["dependency_manifest"]
+        rows = service.store.conn.execute(
+            "SELECT dependency_kind, dependency_id FROM composition_revision_dependencies WHERE parent_revision_id=? ORDER BY ordinal",
+            ("parent-2",),
+        ).fetchall()
+        assert [(row["dependency_kind"], row["dependency_id"]) for row in rows] == [
+            ("shot_revision", "shot-rev-1"),
+            ("internal_timeline_revision", "timeline-rev-1"),
+        ]
+    finally:
+        service.close()
+
+
+def test_integrity_report_detects_occurrence_order_tampering(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        body = _publication(project_id)
+        second = copy.deepcopy(body["parent_composition"]["occurrences"][0])
+        second["occurrence_id"] = "occurrence-2"
+        second["placement"] = {"start_ms": 1000}
+        body["parent_composition"]["occurrences"].append(second)
+        service.publish_parent_composition(project_id, "main", body, idempotency_key="publish-1")
+        service.store.conn.execute(
+            "UPDATE composition_revision_occurrences SET ordinal=CASE occurrence_id WHEN 'occurrence-1' THEN 1 ELSE 0 END WHERE parent_revision_id='parent-1'"
+        )
+        report = service.store.integrity_report()
+        assert report["ok"] is False
+        assert any(error["reason"] == "occurrence_sequence_mismatch" for error in report["checks"]["revisions"]["errors"])
+    finally:
+        service.close()
+
+
+def test_integrity_report_detects_occurrence_identity_tampering(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
+        service.store.conn.execute(
+            "UPDATE composition_revision_occurrences SET occurrence_id='tampered' WHERE parent_revision_id='parent-1'"
+        )
+        report = service.store.integrity_report()
+        assert report["ok"] is False
+        assert any(error["reason"] in {"occurrence_missing", "occurrence_extra", "occurrence_sequence_mismatch"} for error in report["checks"]["revisions"]["errors"])
     finally:
         service.close()
 

@@ -699,7 +699,7 @@ class WorkspaceClient:
         if slug is not None: content["slug"] = slug
         if name is not None: content["name"] = name
         document = self.update_document(project_id, f"timeline:{timeline_id}", expected_version=expected_version, idempotency_key=idempotency_key, content=content)
-        timeline = self.get_timeline(timeline_id)
+        timeline = self.get_project_timeline(project_id, timeline_id)
         result = dict(timeline)
         result.update({"slug": content.get("slug", timeline_id), "name": content.get("name", timeline_id), "config_version": document.version, "config": dict(config), "registry": dict(registry)})
         return MutationResult(result, document.receipt)
@@ -724,9 +724,6 @@ class WorkspaceClient:
 
     def get_project_parent_composition_revision(self, project_id: str, timeline_id: str, revision: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/composition-revisions/{_path_part(revision)}")[2])
-
-    def get_timeline(self, timeline_id: str) -> Mapping[str, Any]:
-        return self._json(self._request("GET", f"/v1/timelines/{_path_part(timeline_id)}")[2])
 
     def get_project_timeline(self, project_id: str, timeline_id: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}")[2])

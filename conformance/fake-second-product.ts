@@ -34,7 +34,7 @@ export async function runSecondProduct(control: WorkspaceClient, execution: Work
   const timelineId = "second-product-timeline-1";
   await control.createTimeline(project.project_id, timelineId, "second-product-timeline-1");
   const listedTimelines = await control.listTimelines(project.project_id);
-  const timeline = await control.getTimeline(timelineId);
+  const timeline = await control.getProjectTimeline(project.project_id, timelineId);
   const shot = await control.createShot(timelineId, { shot_id: "second-product-shot-1", start_ms: 0, duration_ms: 1000, reference_ids: [] }, "second-product-shot-1");
   const reference = await control.createReference(timelineId, { reference_id: "second-product-reference-1", object_id: object.object_id, role: "source" }, "second-product-reference-1");
   const updatedTimeline = await control.updateTimeline(timelineId, 1, "second-product-timeline-update-1", [shot], [reference]);

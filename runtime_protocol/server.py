@@ -237,8 +237,6 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if not key:
                 raise ProtocolError("Idempotency-Key header is required")
             return self._send(201, self.runtime.create_shot(path[2], body, idempotency_key=key) if path[3] == "shots" else self.runtime.create_reference(path[2], body, idempotency_key=key))
-        if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "GET":
-            self._identity("projects:read"); return self._send(200, self.runtime._timeline_resource(path[2]))
         if len(path) == 3 and path[:2] == ["v1", "timelines"] and method == "PATCH":
             self._identity("projects:write"); return self._send(200, self.runtime.update_timeline(path[2], self._body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "timelines"] and path[3] == "replace-clip" and method == "POST":

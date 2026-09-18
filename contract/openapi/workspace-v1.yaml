@@ -236,10 +236,6 @@ paths:
         - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
       responses: { '200': { description: Exact immutable internal timeline revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
   /v1/timelines/{timeline_id}:
-    get:
-      operationId: getTimeline
-      parameters: [ { $ref: '#/components/parameters/TimelineId' } ]
-      responses: { '200': { description: Timeline, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } } }
     patch:
       operationId: updateTimeline
       parameters: [ { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]

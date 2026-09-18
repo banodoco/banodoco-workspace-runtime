@@ -1801,7 +1801,41 @@ class RuntimeService:
                 payload = json.loads(existing_child["payload_json"])
                 if self._revision_digest(payload) != existing_child["content_digest"]:
                     raise ConflictError("occurrence shot revision bytes failed immutable verification", details={"revision_id": existing_child["id"]})
+                shot_identity = self.store.conn.execute(
+                    "SELECT project_id FROM project_shots WHERE id=?",
+                    (existing_child["shot_id"],),
+                ).fetchone()
+                if shot_identity is None or shot_identity["project_id"] != project["id"]:
+                    raise ConflictError("occurrence shot revision has the wrong project or shot identity")
+                if payload.get("internal_timeline_revision_id") != existing_child["internal_timeline_revision_id"]:
+                    raise ConflictError(
+                        "occurrence shot revision internal timeline identity is corrupt",
+                        details={"revision_id": existing_child["id"]},
+                    )
                 shots[shot_key] = {"revision_id": occurrence["shot_revision_id"], "shot_id": occurrence["shot_id"], "internal_timeline_revision_id": existing_child["internal_timeline_revision_id"], "payload": payload, "content_digest": existing_child["content_digest"], "existing": True}
+                existing_internal = self.store.conn.execute(
+                    "SELECT * FROM internal_timeline_revisions WHERE id=?",
+                    (existing_child["internal_timeline_revision_id"],),
+                ).fetchone()
+                if existing_internal is None:
+                    raise NotFoundError(
+                        "shot revision internal timeline dependency is missing",
+                        details={"revision_id": existing_child["internal_timeline_revision_id"]},
+                    )
+                if existing_internal["project_id"] != project["id"]:
+                    raise ConflictError("internal timeline revision belongs to a different project")
+                existing_internal_payload = json.loads(existing_internal["payload_json"])
+                if self._revision_digest(existing_internal_payload) != existing_internal["content_digest"]:
+                    raise ConflictError(
+                        "internal timeline revision bytes failed immutable verification",
+                        details={"revision_id": existing_internal["id"]},
+                    )
+                internal[(existing_internal["timeline_id"], existing_internal["id"])] = {
+                    "revision_id": existing_internal["id"],
+                    "timeline_id": existing_internal["timeline_id"],
+                    "payload": existing_internal_payload,
+                    "content_digest": existing_internal["content_digest"],
+                }
         for occurrence in parent_payload["occurrences"]:
             normalized = self._normalize_occurrence(occurrence, shot_lookup=shots)
             if normalized["occurrence_id"] in occurrence_ids:
@@ -1919,7 +1953,7 @@ class RuntimeService:
         if not parent_existing:
             self.store.conn.execute("INSERT INTO parent_composition_revisions(id, project_id, timeline_id, payload_json, content_digest, created_at) VALUES (?, ?, ?, ?, ?, ?)", (parent_revision_id, project["id"], timeline_id, canonical_json(parent_payload), parent_digest, timestamp))
             for ordinal, occurrence in enumerate(occurrences):
-                self.store.conn.execute("INSERT INTO composition_revision_occurrences(parent_revision_id, occurrence_id, project_id, shot_id, shot_revision_id, placement_json, source_offset_json, duration_ms, speed_json, track, transform_json, gain, muted, provenance_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (parent_revision_id, occurrence["occurrence_id"], project["id"], occurrence["shot_id"], occurrence["shot_revision_id"], canonical_json(occurrence["placement"]), canonical_json(occurrence["source_offset"]), occurrence["duration_ms"], canonical_json(occurrence["speed"]), occurrence["track"], canonical_json(occurrence["transform"]), occurrence["gain"], int(occurrence["muted"]), canonical_json(occurrence["provenance"])))
+                self.store.conn.execute("INSERT INTO composition_revision_occurrences(parent_revision_id, occurrence_id, ordinal, project_id, shot_id, shot_revision_id, placement_json, source_offset_json, duration_ms, speed_json, track, transform_json, gain, muted, provenance_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (parent_revision_id, occurrence["occurrence_id"], ordinal, project["id"], occurrence["shot_id"], occurrence["shot_revision_id"], canonical_json(occurrence["placement"]), canonical_json(occurrence["source_offset"]), occurrence["duration_ms"], canonical_json(occurrence["speed"]), occurrence["track"], canonical_json(occurrence["transform"]), occurrence["gain"], int(occurrence["muted"]), canonical_json(occurrence["provenance"])))
             for ordinal, dependency in enumerate(manifest["shots"] + manifest["internal_timelines"] + manifest["media"]):
                 kind = "shot_revision" if "shot_id" in dependency else "internal_timeline_revision" if "timeline_id" in dependency else "media"
                 identity = dependency.get("revision_id", dependency.get("media_id"))

@@ -25,7 +25,7 @@ steps:
     assert: [sha256 digest, strong ETag, Accept-Ranges=bytes, inclusive Content-Range, 206]
   - id: timeline-shot-reference-create-read-update
     request: neutral commands for timeline, shot, and reference
-    then: ["POST /v1/projects/{project_id}/timelines", "GET /v1/timelines/{timeline_id}", "POST /v1/timelines/{timeline_id}/shots", "GET /v1/shots/{shot_id}", "POST /v1/timelines/{timeline_id}/references", "GET /v1/references/{reference_id}", "PATCH /v1/timelines/{timeline_id}"]
+    then: ["POST /v1/projects/{project_id}/timelines", "GET /v1/projects/{project_id}/timelines/{timeline_id}", "POST /v1/timelines/{timeline_id}/shots", "GET /v1/shots/{shot_id}", "POST /v1/timelines/{timeline_id}/references", "GET /v1/references/{reference_id}", "PATCH /v1/timelines/{timeline_id}"]
     assert: [opaque ids, optimistic version 1 to 2, neutral fields only]
   - id: register-capability-executor
     request: POST /v1/capabilities then POST /v1/executors
