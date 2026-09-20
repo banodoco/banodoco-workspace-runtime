@@ -3880,14 +3880,15 @@ class RealmStore:
                 for child in child_payloads:
                     for media in sorted(payload_media(child)):
                         expected.append(("media", media, media))
-                # The publication canonicalizes each dependency family and
-                # stores one exact ordinal sequence.  Compare the sequence,
-                # not only set membership, so extra and reordered rows are
-                # actionable corruption as well.
+                # The publication canonicalizes each dependency family, but
+                # older migrated parents may retain the same valid closure in
+                # a different family order. Compare the complete multiset so
+                # extra, missing, or duplicate rows remain actionable while
+                # preserving compatibility with those durable revisions.
                 expected = list(dict.fromkeys(expected))
                 actual_rows = self.conn.execute("SELECT dependency_kind, dependency_id, content_digest, ordinal FROM composition_revision_dependencies WHERE parent_revision_id=? ORDER BY ordinal", (parent_id,)).fetchall()
                 actual = [(row["dependency_kind"], row["dependency_id"], row["content_digest"]) for row in actual_rows]
-                if actual != expected or [int(row["ordinal"]) for row in actual_rows] != list(range(len(actual_rows))):
+                if sorted(actual) != sorted(expected) or [int(row["ordinal"]) for row in actual_rows] != list(range(len(actual_rows))):
                     revision_issue("composition_revision_dependencies", parent_id, "dependency_graph_mismatch", expected=expected, actual=actual, actual_ordinals=[int(row["ordinal"]) for row in actual_rows])
         if realm_identity["ok"] and {"realm", "realm_lifecycle"}.issubset(actual_tables):
             lifecycle_rows = self.conn.execute(
