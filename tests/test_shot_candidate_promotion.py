@@ -36,7 +36,13 @@ def test_candidate_promotion_is_atomic_fixed_point_and_byte_stable_on_replay(tmp
         assert promoted["promotion"]["superseded_item_id"] == "old"
         assert {entry["item_id"] for entry in promoted["invalidation"]["stale"]} >= {"plate", "proxy"}
         assert "timeline-1" in {entry.get("asset_id") for entry in promoted["invalidation"]["stale"]}
-        assert promoted.receipt["result"] == {"promotion": promoted["promotion"], "invalidation": promoted["invalidation"]}
+        assert promoted.receipt["result"] == {
+            "promotion": promoted["promotion"],
+            "invalidation": promoted["invalidation"],
+            "revision_id": promoted["revision_id"],
+            "internal_timeline_revision_id": promoted["internal_timeline_revision_id"],
+            "content_digest": promoted["content_digest"],
+        }
         replay = client.promote_project_shot_candidate(project.project_id, shot.shot_id, "new", expected_head_seq=expected_head, timeline_assets=timeline, idempotency_key="promotion-command")
         assert replay == promoted
         shown = client.get_project_shot(project.project_id, shot.shot_id)

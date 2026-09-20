@@ -573,7 +573,7 @@ def _provision_connection(connection: Any, actor_id: str, token: str, realm_id: 
         handshake(protocol_version=PROTOCOL_VERSION, schema_version=SCHEMA_VERSION)
 
 
-def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid") -> None:
+def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *, realm_root: Path, new_realm: bool, credential_before: bytes | None, catalog_before: bytes | None = None, source_before: bytes | None = None, source_profile: str = "astrid", candidate_pid: int | None = None) -> None:
     """Return neutral support state to its pre-launch shape after a failed handoff."""
     # Rollback is allowed to remove only metadata emitted by this candidate.
     # A concurrent/previous owner may still be serving even when its support
@@ -582,7 +582,7 @@ def _rollback_failed_bootstrap(paths: RuntimePaths, boundary: RuntimeBoundary, *
     # duplicate candidate.  Capture the candidate PID before ``stop`` clears
     # the boundary handle, then fence each support file by its owner marker.
     candidate = getattr(boundary, "_process", None)
-    candidate_pid = getattr(candidate, "pid", None)
+    candidate_pid = candidate_pid if candidate_pid is not None else getattr(candidate, "pid", None)
     stop = getattr(boundary, "stop", None)
     if callable(stop):
         try:
@@ -834,7 +834,12 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         pid = int(handle["pid"])
         instance_id = str(handle["runtime_instance_id"])
     except (KeyError, TypeError, ValueError) as exc:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        raw_candidate_pid = handle.get("pid") if isinstance(handle, Mapping) else None
+        try:
+            candidate_pid = int(raw_candidate_pid) if raw_candidate_pid is not None else None
+        except (TypeError, ValueError):
+            candidate_pid = None
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=candidate_pid)
         raise BootstrapError("Runtime start returned incomplete owner metadata.") from exc
     process_birth_id = str(handle.get("process_birth_id") or handle.get("birth_id") or "")
     if not process_birth_id:
@@ -849,15 +854,15 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     try:
         endpoint = _validate_loopback_endpoint(endpoint)
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     try:
         healthy = bool(boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id))
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     if not healthy:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise BootstrapError("Runtime started but failed health check; next action: " + RECONFIGURE_NEXT_ACTION)
     worker = _worker_handoff(handle)
     # The marker contains ownership metadata only and never a credential.
@@ -867,7 +872,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         connection = boundary.connect(endpoint=endpoint, credential=token)
         _provision_connection(connection, actor_id, token, realm_id)
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     realm["source_profile"] = source.profile
     catalog["source_profiles"][source.profile] = source.as_dict()
@@ -898,7 +903,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     try:
         _commit_bootstrap_metadata(paths, source, catalog, discovery_value)
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile, candidate_pid=pid)
         raise
     return BootstrapResult(
         "started", realm_id, str(realm["display_name"]), endpoint, actor_id,
