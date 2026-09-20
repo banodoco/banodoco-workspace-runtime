@@ -5,6 +5,7 @@ import hashlib
 import pytest
 
 from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError
+from runtime_protocol.managed_render_snapshot import ShotExpansionError, expand_shot_clips
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 
@@ -365,3 +366,92 @@ def test_direct_managed_render_rejects_nested_shot_before_queueing(tmp_path):
         assert service.list_project_tasks(project["id"])["items"] == []
     finally:
         service.close()
+
+
+def test_shot_expansion_rejects_conflicting_asset_keys():
+    config = {
+        "clips": [{
+            "id": "shot",
+            "clipType": "shot",
+            "at": 0,
+            "hold": 1,
+            "params": {"shot_id": "shot-1", "timeline_document_id": "child"},
+        }],
+    }
+    registry = {"assets": {"shared": {"media_id": "parent-media"}}}
+
+    with pytest.raises(ShotExpansionError, match="asset key collision"):
+        expand_shot_clips(
+            config,
+            registry,
+            load_timeline=lambda _ref: (
+                {"clips": [{"id": "child-clip", "at": 0, "hold": 1, "asset": "shared"}]},
+                {"assets": {"shared": {"media_id": "child-media"}}},
+            ),
+        )
+
+
+def test_shot_expansion_namespaces_repeated_child_clip_ids_and_trims_left_window():
+    config = {
+        "clips": [
+            {
+                "id": "shot-a",
+                "clipType": "shot",
+                "at": 1,
+                "hold": 2,
+                "params": {"shot_id": "shot-1", "timeline_document_id": "child"},
+            },
+            {
+                "id": "shot-b",
+                "clipType": "shot",
+                "at": 4,
+                "hold": 2,
+                "params": {"shot_id": "shot-1", "timeline_document_id": "child"},
+            },
+        ],
+    }
+    child_config = {
+        "clips": [{
+            "id": "shared-child-id",
+            "clipType": "media",
+            "at": -0.5,
+            "hold": 2,
+            "from": 0,
+            "to": 2,
+            "asset": "shared",
+        }],
+    }
+    expanded, _registry = expand_shot_clips(
+        config,
+        {"assets": {}},
+        load_timeline=lambda _ref: (child_config, {"assets": {"shared": {"media_id": "media"}}}),
+    )
+
+    clips = expanded["clips"]
+    assert [clip["id"] for clip in clips] == [
+        "shot-occ-0000-shot-1--shared-child-id",
+        "shot-occ-0001-shot-1--shared-child-id",
+    ]
+    assert [clip["shot_occurrence_id"] for clip in clips] == [
+        "shot-occ-0000-shot-1",
+        "shot-occ-0001-shot-1",
+    ]
+    assert clips[0]["at"] == 1.0
+    assert clips[0]["hold"] == 1.5
+    assert clips[0]["from"] == 0.5
+    assert clips[0]["to"] == 2.0
+
+
+def test_shot_expansion_rejects_non_finite_or_non_positive_timing():
+    with pytest.raises(ShotExpansionError, match="finite"):
+        expand_shot_clips(
+            {"clips": [{"id": "shot", "clipType": "shot", "at": float("nan"), "hold": 1, "params": {"shot_id": "s", "timeline_document_id": "child"}}]},
+            {"assets": {}},
+            load_timeline=lambda _ref: ({"clips": []}, {"assets": {}}),
+        )
+    with pytest.raises(ShotExpansionError, match="positive hold"):
+        expand_shot_clips(
+            {"clips": [{"id": "shot", "clipType": "shot", "at": 0, "hold": 0, "params": {"shot_id": "s", "timeline_document_id": "child"}}]},
+            {"assets": {}},
+            load_timeline=lambda _ref: ({"clips": []}, {"assets": {}}),
+        )

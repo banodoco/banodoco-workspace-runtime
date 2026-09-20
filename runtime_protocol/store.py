@@ -2401,6 +2401,10 @@ class RealmStore:
                     raise ValidationError("generation.publish_v1 variant_key must be a non-empty string")
                 if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
                     raise ValidationError("generation.publish_v1 ordinal must be a non-negative integer")
+                if payload["partial_success_policy"] == "reject" and selector.get("required") is False:
+                    raise ValidationError(
+                        "generation.publish_v1 reject policy cannot declare an optional selector"
+                    )
                 required = selector.get("required", payload["partial_success_policy"] == "reject")
                 if not isinstance(required, bool):
                     raise ValidationError("generation.publish_v1 required must be a boolean")

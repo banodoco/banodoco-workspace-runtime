@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from copy import deepcopy
+import math
 from pathlib import Path
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,9 +32,10 @@ def expand_shot_clips(
     """Flatten authored shot clips into a renderable timeline snapshot.
 
     The input documents are never mutated. Child timelines are loaded by the
-    caller through an already-authorized project-scoped loader. Parent assets
-    win on key collisions, and nested shot clips fail closed rather than being
-    expanded against a changing project during execution.
+    caller through an already-authorized project-scoped loader. Asset-key
+    collisions fail closed when the entries differ, and nested shot clips fail
+    closed rather than being expanded against a changing project during
+    execution.
     """
     raw_clips = config.get("clips", [])
     if not isinstance(raw_clips, list):
@@ -44,6 +46,15 @@ def expand_shot_clips(
         raise ShotExpansionError("timeline registry assets must be an object")
     merged_assets: dict[str, object] = dict(raw_assets)
     expanded_clips: list[dict[str, object]] = []
+
+    def finite_float(value: object, label: str) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ShotExpansionError(f"{label} must be a finite number") from exc
+        if not math.isfinite(result):
+            raise ShotExpansionError(f"{label} must be a finite number")
+        return result
 
     def is_still_asset(asset_id: object) -> bool:
         if not isinstance(asset_id, str):
@@ -108,11 +119,17 @@ def expand_shot_clips(
         if not isinstance(child_assets, Mapping):
             raise ShotExpansionError(f"sub-timeline {child_ref} has an invalid asset registry")
         for asset_id, entry in child_assets.items():
+            if asset_id in merged_assets and merged_assets[asset_id] != entry:
+                raise ShotExpansionError(
+                    f"asset key collision for {asset_id!r} while expanding {child_ref}"
+                )
             merged_assets.setdefault(asset_id, entry)
         reject_unbounded_stills(child_clips)
 
-        parent_at = float(clip.get("at", 0.0))
-        parent_hold = float(clip.get("hold", 0.0))
+        parent_at = finite_float(clip.get("at", 0.0), f"shot clip {clip.get('id', '?')} at")
+        parent_hold = finite_float(clip.get("hold", 0.0), f"shot clip {clip.get('id', '?')} hold")
+        if parent_hold <= 0.0:
+            raise ShotExpansionError(f"shot clip {clip.get('id', '?')} must have a positive hold")
         parent_end = parent_at + parent_hold
         for child_clip in child_clips:
             if not isinstance(child_clip, Mapping):
@@ -128,32 +145,44 @@ def expand_shot_clips(
                     f"Sub-clip {child_id} references missing asset {asset_id!r} inside sub-timeline {child_ref}"
                 )
 
-            child_at = float(child_clip.get("at", 0.0))
-            child_hold = float(child_clip.get("hold", 0.0))
-            speed = float(child_clip.get("speed", 1.0))
+            child_at = finite_float(child_clip.get("at", 0.0), f"Sub-clip {child_id} at")
+            child_hold = finite_float(child_clip.get("hold", 0.0), f"Sub-clip {child_id} hold")
+            speed = finite_float(child_clip.get("speed", 1.0), f"Sub-clip {child_id} speed")
             if speed <= 0.0:
                 raise ShotExpansionError(f"Sub-clip {child_id} inside sub-timeline {child_ref} has invalid speed")
-            source_from = float(child_clip.get("from", 0.0))
-            source_to = float(child_clip.get("to", 0.0))
+            has_source_from = "from" in child_clip
+            has_source_to = "to" in child_clip
+            if has_source_from != has_source_to:
+                raise ShotExpansionError(f"Sub-clip {child_id} must provide both from and to source bounds")
+            source_from = finite_float(child_clip.get("from", 0.0), f"Sub-clip {child_id} from")
+            source_to = finite_float(child_clip.get("to", 0.0), f"Sub-clip {child_id} to")
+            if has_source_from and source_to <= source_from:
+                raise ShotExpansionError(f"Sub-clip {child_id} must have a positive source window")
+            if child_hold < 0.0:
+                raise ShotExpansionError(f"Sub-clip {child_id} must not have a negative hold")
             if child_hold <= 0.0 and source_to > source_from:
                 child_hold = (source_to - source_from) / speed
+            if child_hold <= 0.0:
+                raise ShotExpansionError(f"Sub-clip {child_id} must have a positive duration")
 
-            new_at = parent_at + child_at
-            new_end = new_at + child_hold
-            if new_end <= parent_at:
+            raw_at = parent_at + child_at
+            raw_end = raw_at + child_hold
+            visible_at = max(raw_at, parent_at)
+            visible_end = min(raw_end, parent_end)
+            if visible_end <= visible_at:
                 _LOGGER.debug("Dropping child clip %s outside parent shot window", child_id)
                 continue
-            remaining = parent_end - new_at
-            if new_end > parent_end and new_at >= parent_end:
-                _LOGGER.debug("Dropping child clip %s outside parent shot window", child_id)
-                continue
+            left_trim = visible_at - raw_at
+            visible_duration = visible_end - visible_at
             expanded = dict(child_clip)
-            expanded["at"] = new_at
-            if new_end > parent_end:
-                if "hold" in expanded:
-                    expanded["hold"] = remaining
-                if source_to > source_from:
-                    expanded["to"] = source_from + remaining * speed
+            expanded["id"] = f"{occurrence_id}--{child_id}"
+            expanded["source_clip_id"] = child_id
+            expanded["at"] = visible_at
+            if "hold" in expanded or not has_source_from:
+                expanded["hold"] = visible_duration
+            if has_source_from:
+                expanded["from"] = source_from + left_trim * speed
+                expanded["to"] = expanded["from"] + visible_duration * speed
             if child_clip.get("track") is None:
                 expanded["track"] = clip.get("track")
             expanded["shot_id"] = shot_id

@@ -193,6 +193,27 @@ def test_publish_v1_reject_missing_selector_rolls_back_everything(tmp_path):
         service.close()
 
 
+def test_publish_v1_reject_policy_disallows_explicit_optional_selector(tmp_path):
+    def effect_factory(project_id):
+        return _effect(
+            project_id,
+            policy="reject",
+            groups=[{
+                "group_key": "main",
+                "selectors": [{
+                    "selector": "optional",
+                    "ordinal": 0,
+                    "variant_key": "optional",
+                    "output_port": "video",
+                    "required": False,
+                }],
+            }],
+        )
+
+    with pytest.raises(ValidationError, match="reject policy cannot declare an optional selector"):
+        _fixture(tmp_path, effect_factory=effect_factory, slug="reject-optional")
+
+
 def test_publish_v1_allow_records_missing_members_without_empty_generations(tmp_path):
     def effect_factory(project_id):
         return _effect(
