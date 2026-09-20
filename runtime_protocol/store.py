@@ -11,6 +11,7 @@ import stat
 import tempfile
 import threading
 import time
+import uuid
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from pathlib import Path
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .dirfd import remove_tree_at
+from .managed_render_snapshot import ShotExpansionError, expand_shot_clips
 from .util import canonical_json, new_id, now
 
 try:
@@ -37,6 +39,11 @@ OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 MAX_STORAGE_ESTIMATE_BYTES = (1 << 53) - 1
 GENERATION_INTENT_STORAGE_KEY = "__runtime_generation_intent"
 LEGACY_GENERATION_INTENT_STORAGE_KEY = "generation_intent"
+# Remotion creates a webpack/Chromium workspace in addition to the
+# Runtime-owned materialization and encoded output.  Keep that bounded
+# workspace in the admission envelope so live scratch accounting cannot
+# reject a render that passed admission.
+_REMOTION_RUNTIME_WORKSPACE_BYTES = 128 * 1024 * 1024
 FACT_EXACT_KEYS = frozenset({
     "interpreter", "runtime_lock", "engine_lock", "model_digest",
     "custom_node_digest", "driver", "root", "port",
@@ -1019,9 +1026,197 @@ class RealmStore:
         assets = registry.get("assets", {})
         if not isinstance(assets, dict):
             raise ValidationError("canonical timeline registry assets must be an object")
+
+        # Resolve every child through this same project-scoped Runtime before
+        # expanding. The renderer must receive only the resulting immutable
+        # snapshot; it must never reopen the project to resolve a shot.
+        child_cache = {}
+        child_records = []
+        shot_records = {}
+        shot_occurrences = []
+
+        def load_child(child_ref):
+            cached = child_cache.get(child_ref)
+            if cached is not None:
+                return cached["config"], cached["registry"]
+            child_rows = self.conn.execute(
+                "SELECT t.id, t.archived_at, d.content_json, d.version "
+                "FROM timelines t JOIN project_documents d "
+                "ON d.id=('timeline:' || t.id) AND d.project_id=t.project_id "
+                "WHERE t.project_id=? AND (t.id=? OR json_extract(d.content_json, '$.slug')=?)",
+                (project_id, str(child_ref), str(child_ref)),
+            ).fetchall()
+            if not child_rows:
+                raise NotFoundError(
+                    "shot child timeline is not in the selected project",
+                    details={"project_id": project_id, "timeline_ref": child_ref},
+                )
+            if len(child_rows) != 1:
+                raise ConflictError("shot child timeline reference is ambiguous within the selected project")
+            child_row = child_rows[0]
+            if child_row["archived_at"]:
+                raise ConflictError(
+                    "shot child timeline is archived",
+                    details={"timeline_id": child_row["id"], "timeline_ref": child_ref},
+                )
+            child_content = json.loads(child_row["content_json"])
+            if (
+                not isinstance(child_content, dict)
+                or not isinstance(child_content.get("config"), dict)
+                or not isinstance(child_content.get("registry"), dict)
+            ):
+                raise ValidationError(f"shot child timeline {child_ref!r} has an invalid snapshot")
+            child_config = child_content["config"]
+            child_registry = child_content["registry"]
+            record = {
+                "timeline_id": str(child_row["id"]),
+                "timeline_ulid": str(child_row["id"]),
+                "slug": str(child_content.get("slug") or child_row["id"]),
+                "config_version": int(child_row["version"]),
+                "config_hash": hashlib.sha256(canonical_json(child_config).encode()).hexdigest(),
+                "registry_hash": hashlib.sha256(canonical_json(child_registry).encode()).hexdigest(),
+            }
+            child_cache[child_ref] = {
+                "config": child_config,
+                "registry": child_registry,
+                "record": record,
+            }
+            child_records.append(record)
+            return child_config, child_registry
+
+        raw_clips = config.get("clips", [])
+        if not isinstance(raw_clips, list):
+            raise ValidationError("canonical timeline config clips must be a list")
+        for index, clip in enumerate(raw_clips):
+            if not isinstance(clip, dict) or clip.get("clipType") != "shot":
+                continue
+            if clip.get("shot_occurrence_id"):
+                raise ValidationError(
+                    f"canonical timeline {timeline_ref!r} shot clip at index {index} "
+                    "contains caller-authored shot_occurrence_id"
+                )
+            shot_params = clip.get("params")
+            shot_id = shot_params.get("shot_id") if isinstance(shot_params, dict) else None
+            child_ref = shot_params.get("timeline_document_id") if isinstance(shot_params, dict) else None
+            if not isinstance(shot_id, str) or not shot_id:
+                raise ValidationError(
+                    f"canonical timeline {timeline_ref!r} shot clip at index {index} "
+                    "is missing a registered shot_id"
+                )
+            if not isinstance(child_ref, str) or not child_ref:
+                raise ValidationError(
+                    f"canonical timeline {timeline_ref!r} shot {shot_id!r} "
+                    "is missing timeline_document_id"
+                )
+            shot_row = self.conn.execute(
+                "SELECT id, name, version, archived_at FROM project_shots "
+                "WHERE id=? AND project_id=?",
+                (shot_id, project_id),
+            ).fetchone()
+            if not shot_row:
+                raise ValidationError(
+                    f"canonical timeline {timeline_ref!r} references unregistered shot {shot_id!r}"
+                )
+            if shot_row["archived_at"]:
+                raise ConflictError(
+                    "render shot reference is archived",
+                    details={"shot_id": shot_id, "timeline_ref": timeline_ref},
+                )
+            child_config, child_registry = load_child(child_ref)
+            child_record = child_cache[child_ref]["record"]
+            binding_rows = self.conn.execute(
+                "SELECT id, kind, slot, media_digest, event_stream_id, head_seq "
+                "FROM shot_text_bindings WHERE project_id=? AND shot_id=? ORDER BY id",
+                (project_id, shot_id),
+            ).fetchall()
+            bindings = []
+            for binding in binding_rows:
+                identity = {
+                    "schema": "workspace.shot.text_binding.identity/v1",
+                    "project_id": str(project_id),
+                    "shot_id": shot_id,
+                    "kind": str(binding["kind"]),
+                    "slot": binding["slot"],
+                }
+                expected_binding_id = str(uuid.uuid5(uuid.NAMESPACE_URL, canonical_json(identity)))
+                if str(binding["id"]) != expected_binding_id:
+                    raise ConflictError("text binding identity is corrupt")
+                expected_stream = expected_binding_id + ":shot.text_binding"
+                if str(binding["event_stream_id"]) != expected_stream:
+                    raise ConflictError("text binding stream identity is corrupt")
+                media = self.conn.execute(
+                    "SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest "
+                    "WHERE o.digest=? AND po.project_id=? AND po.relation='managed'",
+                    (binding["media_digest"], project_id),
+                ).fetchone()
+                if media is None:
+                    raise ConflictError("bound text media is missing")
+                bindings.append({
+                    "binding_id": expected_binding_id,
+                    "project_id": str(project_id),
+                    "shot_id": shot_id,
+                    "kind": str(binding["kind"]),
+                    "slot": binding["slot"],
+                    "media_id": "sha256:" + str(media["digest"]),
+                    "event_stream_id": expected_stream,
+                    "head": int(binding["head_seq"]),
+                    "content_hash": "sha256:" + str(media["digest"]),
+                    "mime_type": str(media["media_type"]),
+                    "byte_size": int(media["size"]),
+                })
+            shot_records.setdefault(
+                shot_id,
+                {
+                    "shot_id": shot_id,
+                    "name": str(shot_row["name"] or shot_id),
+                    "version": int(shot_row["version"]),
+                    "text_bindings": bindings,
+                },
+            )
+            shot_occurrences.append(
+                {
+                    "shot_occurrence_id": f"shot-occ-{len(shot_occurrences):04d}-{shot_id}",
+                    "shot_id": shot_id,
+                    "name": str(shot_row["name"] or shot_id),
+                    "at": float(clip.get("at", 0)),
+                    "hold": float(clip.get("hold", 0)),
+                    "source_index": index,
+                    "timeline_document_id": child_ref,
+                    "timeline_id": child_record["timeline_id"],
+                    "timeline_version": child_record["config_version"],
+                }
+            )
+
+        try:
+            expanded_config, expanded_registry = expand_shot_clips(
+                config,
+                registry,
+                load_timeline=load_child,
+            )
+        except (ShotExpansionError, TypeError, ValueError, OverflowError) as exc:
+            raise ValidationError(str(exc)) from exc
+
+        occurrence_names = {
+            item["shot_occurrence_id"]: item["name"] for item in shot_occurrences
+        }
+        for flat_clip in expanded_config.get("clips", []):
+            if not isinstance(flat_clip, dict):
+                continue
+            occurrence_id = flat_clip.get("shot_occurrence_id")
+            if occurrence_id is not None:
+                name = occurrence_names.get(occurrence_id)
+                if name is None:
+                    raise ValidationError(
+                        f"expanded clip {flat_clip.get('id', '?')} has an unknown shot occurrence"
+                    )
+                flat_clip["shot_name"] = name
+
+        expanded_assets = expanded_registry.get("assets", {})
+        if not isinstance(expanded_assets, dict):
+            raise ValidationError("expanded render registry assets must be an object")
         ordered_input_ids = []
         managed_media = {}
-        for asset_name, asset in assets.items():
+        for asset_name, asset in expanded_assets.items():
             if not isinstance(asset, dict):
                 raise ValidationError("canonical timeline registry assets must contain objects")
             media_id = asset.get("media_id") or asset.get("object_id")
@@ -1045,6 +1240,11 @@ class RealmStore:
             normalized = "sha256:" + OBJECT_ID_RE.fullmatch(digest).group(1)
             if normalized not in ordered_input_ids:
                 ordered_input_ids.append(normalized)
+            previous = managed_media.get(media_id)
+            if previous is not None and previous != normalized:
+                raise ConflictError(
+                    f"canonical render registry contains conflicting digests for media_id {media_id!r}"
+                )
             managed_media[media_id] = normalized
         supplied = list(supplied_input_object_ids or [])
         if supplied:
@@ -1068,6 +1268,8 @@ class RealmStore:
             )
         config_hash = hashlib.sha256(canonical_json(config).encode()).hexdigest()
         registry_hash = hashlib.sha256(canonical_json(registry).encode()).hexdigest()
+        expanded_config_hash = hashlib.sha256(canonical_json(expanded_config).encode()).hexdigest()
+        materialized_registry_hash = hashlib.sha256(canonical_json(expanded_registry).encode()).hexdigest()
         event = self.conn.execute(
             "SELECT id, event_hash FROM timeline_events WHERE timeline_id=? ORDER BY id DESC LIMIT 1",
             (row["id"],),
@@ -1084,10 +1286,17 @@ class RealmStore:
             "head_hash": event["event_hash"] if event else config_hash,
             "config_hash": config_hash,
             "registry_hash": registry_hash,
-            "materialized_registry_hash": registry_hash,
+            "materialized_registry_hash": materialized_registry_hash,
             "managed_media_admissions": managed_media,
         }
-        frozen["timeline_snapshot"] = {"config": config, "registry": registry}
+        if shot_occurrences:
+            authority["expansion"] = {
+                "children": child_records,
+                "shots": [shot_records[key] for key in sorted(shot_records)],
+                "occurrences": shot_occurrences,
+                "expanded_config_hash": expanded_config_hash,
+            }
+        frozen["timeline_snapshot"] = {"config": expanded_config, "registry": expanded_registry}
         inputs["timeline_ref"] = timeline_ref
         inputs["timeline_authority"] = authority
         for field in ("selector", "profile", "output_name"):
@@ -1213,7 +1422,10 @@ class RealmStore:
         )
         scratch_bytes = max(
             256 * 1024 * 1024,
-            materialization_bytes + output_bytes + 2 * 1024 * 1024,
+            materialization_bytes
+            + output_bytes
+            + 2 * 1024 * 1024
+            + _REMOTION_RUNTIME_WORKSPACE_BYTES,
         )
         return {"scratch_bytes": int(scratch_bytes), "output_bytes": int(output_bytes)}
 
@@ -1620,10 +1832,10 @@ class RealmStore:
         rows = self.conn.execute("SELECT * FROM events WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
         return [dict(row) | {"payload": json.loads(row["payload_json"])} for row in rows]
 
-    def _append_event(self, run_id, task_id, kind, payload):
+    def _append_event(self, run_id, task_id, kind, payload, *, created_at=None):
         previous = self.conn.execute("SELECT event_hash FROM events WHERE run_id=? ORDER BY id DESC LIMIT 1", (run_id,)).fetchone()
         previous_hash = previous[0] if previous else ""
-        timestamp = now()
+        timestamp = created_at or now()
         event_hash = hashlib.sha256(canonical_json({"run_id":run_id,"task_id":task_id,"kind":kind,"payload":payload,"previous_hash":previous_hash,"created_at":timestamp}).encode()).hexdigest()
         self.conn.execute("INSERT INTO events(run_id, task_id, kind, payload_json, previous_hash, event_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (run_id, task_id, kind, canonical_json(payload), previous_hash, event_hash, timestamp))
         # Event IDs are the committed event-table identities, never a ledger
@@ -1695,8 +1907,8 @@ class RealmStore:
     def _set_waiting_reason(self, task_id, reason):
         self.conn.execute("UPDATE tasks SET waiting_reason=?, updated_at=? WHERE id=? AND status='queued'", (reason, now(), task_id))
 
-    def _release_reservations(self, task_id, lease_token=None):
-        timestamp = now()
+    def _release_reservations(self, task_id, lease_token=None, *, released_at=None):
+        timestamp = released_at or now()
         if lease_token is None:
             self.conn.execute("UPDATE reservations SET released_at=? WHERE task_id=? AND released_at IS NULL", (timestamp, task_id))
         else:
@@ -2173,9 +2385,9 @@ class RealmStore:
             group_declarations = []
             seen_group_variants = set()
             for selector in selectors:
-                if not isinstance(selector, dict) or set(selector) != {"selector", "ordinal", "variant_key", "output_port"}:
+                if not isinstance(selector, dict) or not {"selector", "ordinal", "variant_key", "output_port"}.issubset(selector) or set(selector) - {"selector", "ordinal", "variant_key", "output_port", "required"}:
                     raise ValidationError(
-                        "generation.publish_v1 selector requires exactly selector, ordinal, variant_key, and output_port"
+                        "generation.publish_v1 selector requires selector, ordinal, variant_key, output_port, and optional required"
                     )
                 label = selector["selector"]
                 output_port = selector["output_port"]
@@ -2189,6 +2401,9 @@ class RealmStore:
                     raise ValidationError("generation.publish_v1 variant_key must be a non-empty string")
                 if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
                     raise ValidationError("generation.publish_v1 ordinal must be a non-negative integer")
+                required = selector.get("required", payload["partial_success_policy"] == "reject")
+                if not isinstance(required, bool):
+                    raise ValidationError("generation.publish_v1 required must be a boolean")
                 key = (output_port, group_key, variant_key, ordinal)
                 if key in seen_selectors:
                     raise ValidationError("generation.publish_v1 selectors must not contain duplicates")
@@ -2202,6 +2417,7 @@ class RealmStore:
                     "ordinal": ordinal,
                     "variant_key": variant_key,
                     "output_port": output_port,
+                    "required": required,
                 }
                 group_declarations.append((key, declaration))
             declared.append((group_key, group_declarations))
@@ -2253,13 +2469,36 @@ class RealmStore:
                 if output.get("kind") != "object":
                     raise ValidationError("generation.publish_v1 selectors must resolve verified object outputs")
                 selected.append((key, declaration, output))
-            if payload["partial_success_policy"] == "reject" and missing:
+            required_missing = [declaration for declaration in missing if declaration["required"]]
+            if required_missing:
+                missing_for_error = [
+                    {
+                        key: value for key, value in declaration.items()
+                        if key != "required"
+                    }
+                    for declaration in required_missing
+                ]
+                message = (
+                    "generation.publish_v1 reject policy requires every declared selector"
+                    if payload["partial_success_policy"] == "reject"
+                    else "generation.publish_v1 required selectors are missing"
+                )
                 raise ValidationError(
-                    "generation.publish_v1 reject policy requires every declared selector",
-                    details={"group_key": group_key, "missing": missing},
+                    message,
+                    details={"group_key": group_key, "missing": missing_for_error},
                 )
             selected_count += len(selected)
-            plan.append({"group_key": group_key, "selected": selected, "missing": missing})
+            plan.append({
+                "group_key": group_key,
+                "selected": selected,
+                "missing": [
+                    {
+                        key: value for key, value in declaration.items()
+                        if key != "required"
+                    }
+                    for declaration in missing
+                ],
+            })
         if selected_count == 0:
             raise ValidationError("generation.publish_v1 requires at least one successful declared output")
         return plan
@@ -2481,6 +2720,8 @@ class RealmStore:
         result=None,
         task_id=None,
         input_object_ids=None,
+        settled_at=None,
+        attempt_id=None,
     ):
         kind = effect.get("effect_type")
         if kind == "generation.publish_v1":
@@ -2505,7 +2746,7 @@ class RealmStore:
                 generation_id = "generation-" + hashlib.sha256(
                     canonical_json({"task_id": str(task_id), "group_key": group_key}).encode()
                 ).hexdigest()
-                timestamp = now()
+                timestamp = settled_at or now()
                 self.conn.execute(
                     "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 'completed', ?, 1, ?, ?)",
                     (
@@ -2528,6 +2769,24 @@ class RealmStore:
                         }).encode()
                     ).hexdigest()
                     output_digest = output["digest"].removeprefix("sha256:")
+                    runtime_provenance = dict(output.get("provenance") or {})
+                    runtime_provenance["task_id"] = str(task_id)
+                    if attempt_id is not None:
+                        runtime_provenance["attempt_id"] = str(attempt_id)
+                    task_row = self.conn.execute(
+                        "SELECT capability FROM tasks WHERE id=?", (str(task_id),)
+                    ).fetchone()
+                    if task_row:
+                        runtime_provenance["capability_id"] = task_row["capability"]
+                    if attempt_id is not None:
+                        attempt_row = self.conn.execute(
+                            "SELECT executor_id, fence, runtime_epoch FROM attempts WHERE id=?",
+                            (str(attempt_id),),
+                        ).fetchone()
+                        if attempt_row:
+                            runtime_provenance["executor_id"] = attempt_row["executor_id"]
+                            runtime_provenance["fence"] = int(attempt_row["fence"])
+                            runtime_provenance["runtime_epoch"] = int(attempt_row["runtime_epoch"])
                     variant_metadata = {
                         "selector": declaration["selector"],
                         "output_port": declaration["output_port"],
@@ -2539,7 +2798,7 @@ class RealmStore:
                         "size": int(output["size"]),
                         "role": output.get("role") or "output",
                         "producer": dict(output.get("producer") or {}),
-                        "provenance": dict(output.get("provenance") or {}),
+                        "provenance": runtime_provenance,
                         "durability": output.get("durability", "durable"),
                         "regeneration": output.get("regeneration"),
                         "coverage": output.get("coverage"),
@@ -2599,7 +2858,7 @@ class RealmStore:
                 "task_id": str(task_id),
             }
             variant_id = "initial-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
-            timestamp = now()
+            timestamp = settled_at or now()
             generation_metadata = dict(payload["metadata"])
             params = generation_metadata.get("params", {})
             if not isinstance(params, dict):
@@ -2679,7 +2938,7 @@ class RealmStore:
                 "task_id": str(task_id),
             }
             variant_id = "append-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
-            timestamp = now()
+            timestamp = settled_at or now()
             changed = self.conn.execute(
                 "UPDATE generations SET version=version+1, updated_at=? WHERE id=? AND project_id=? AND version=?",
                 (timestamp, str(effect["target_id"]), str(project_id), int(effect["expected_version"])),
@@ -2793,8 +3052,18 @@ class RealmStore:
             "JOIN tasks t ON t.id=a.task_id "
         )
 
-    def _associate_managed_outputs(self, result, *, task_id, attempt_id, project_id, applied_effect=None):
+    def _associate_managed_outputs(
+        self,
+        result,
+        *,
+        task_id,
+        attempt_id,
+        project_id,
+        applied_effect=None,
+        created_at=None,
+    ):
         """Persist immutable output identity and initial Runtime lifecycle atomically."""
+        timestamp = created_at or now()
         manifest_digest = self._validated_manifest_digest(result, project_id=project_id)
         if manifest_digest is None:
             manifest_output = next(
@@ -2844,16 +3113,19 @@ class RealmStore:
             ).fetchone()
             if task_row:
                 producer.setdefault("capability_id", task_row["capability"])
-            provenance.setdefault("task_id", str(task_id))
-            provenance.setdefault("attempt_id", str(attempt_id))
+            # These fields are Runtime-owned custody facts.  A child may
+            # report observations, but it cannot forge the task/attempt that
+            # owns the committed association.
+            provenance["task_id"] = str(task_id)
+            provenance["attempt_id"] = str(attempt_id)
             if task_row:
-                provenance.setdefault("capability_id", task_row["capability"])
+                provenance["capability_id"] = task_row["capability"]
             if attempt_row:
-                provenance.setdefault("executor_id", attempt_row["executor_id"])
-                provenance.setdefault("fence", int(attempt_row["fence"]))
-                provenance.setdefault("runtime_epoch", int(attempt_row["runtime_epoch"]))
+                provenance["executor_id"] = attempt_row["executor_id"]
+                provenance["fence"] = int(attempt_row["fence"])
+                provenance["runtime_epoch"] = int(attempt_row["runtime_epoch"])
             else:
-                provenance.setdefault("runtime_epoch", self._current_runtime_epoch())
+                provenance["runtime_epoch"] = self._current_runtime_epoch()
             identity = {
                 "task_id": str(task_id), "output_port": output_port,
                 "group_key": group_key, "generation_id": generation_id,
@@ -2876,13 +3148,13 @@ class RealmStore:
                     canonical_json(producer), canonical_json(provenance), durability,
                     canonical_json(output["regeneration"]) if output.get("regeneration") is not None else None,
                     canonical_json(output["coverage"]) if output.get("coverage") is not None else None,
-                    now(),
+                    timestamp,
                 ),
             )
             lifecycle_state = "temporary" if durability == "temporary" else "available"
             self.conn.execute(
                 "INSERT OR IGNORE INTO managed_output_lifecycle(association_id, state, version, expires_at, pinned_at, lease_id, lease_owner, lease_expires_at, updated_at, created_at) VALUES (?, ?, 1, NULL, NULL, NULL, NULL, NULL, ?, ?)",
-                (association_id, lifecycle_state, now(), now()),
+                (association_id, lifecycle_state, timestamp, timestamp),
             )
             row = self.conn.execute(
                 self._managed_output_select() +
@@ -3068,6 +3340,8 @@ class RealmStore:
                         result=result,
                         task_id=task_id,
                         input_object_ids=input_object_ids,
+                        settled_at=timestamp,
+                        attempt_id=attempt_id,
                     )
                 if publish is not None and not append_effect:
                     publish()
@@ -3086,16 +3360,27 @@ class RealmStore:
                     attempt_id=attempt_id,
                     project_id=task_project_id,
                     applied_effect=applied_effect,
+                    created_at=timestamp,
                 )
                 self.conn.execute("UPDATE tasks SET status='completed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
-                self._release_reservations(task_id, lease_token)
-                event_id = self._append_event(task["run_id"], task_id, "task.completed", {"result": result, "effect": effect, "objects": result.get("outputs", [])})
+                self._release_reservations(task_id, lease_token, released_at=timestamp)
+                event_id = self._append_event(
+                    task["run_id"], task_id, "task.completed",
+                    {"result": result, "effect": effect, "objects": result.get("outputs", [])},
+                    created_at=timestamp,
+                )
                 continuation_event_ids = self._refresh_continuations_for_predecessor(task_id)
                 value = self.get_task(task_id)
                 if record is not None:
-                    record(value, event_ids=[event_id, *continuation_event_ids], primary_stream_id=task["run_id"], resulting_stream_seq=None)
+                    record(
+                        value,
+                        event_ids=[event_id, *continuation_event_ids],
+                        primary_stream_id=task["run_id"],
+                        resulting_stream_seq=None,
+                        created_at=timestamp,
+                    )
                 return value
 
     def heartbeat_task(self, task_id, lease_token, *, fence=None, lease_seconds=LEASE_SECONDS, record=None):
@@ -3549,7 +3834,10 @@ class RealmStore:
                 found = set()
                 if isinstance(value, dict):
                     for key, child in value.items():
-                        if key in {"media_id", "object_id", "digest", "content_sha256", "sha256", "hash"} and isinstance(child, str):
+                        # Match Runtime publication's authoritative media
+                        # closure: record/content hashes are not necessarily
+                        # CAS object identities.
+                        if key in {"media_id", "object_id"} and isinstance(child, str):
                             bare = child.removeprefix("sha256:")
                             if re.fullmatch(r"[0-9a-f]{64}", bare):
                                 found.add("sha256:" + bare)

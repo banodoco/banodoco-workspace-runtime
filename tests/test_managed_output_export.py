@@ -177,6 +177,35 @@ def test_existing_legacy_images_association_exports_without_source_rewrite(tmp_p
         second.close()
 
 
+def test_collision_safe_export_reserves_temporary_name_budget_for_long_leaf(tmp_path: Path) -> None:
+    root = tmp_path / "realm"
+    export_root = tmp_path / "exports"
+    export_root.mkdir()
+    long_filename = ("x" * 155) + ".bin"
+    first, association, _task, payload, _epoch = _settled_service(
+        root, export_root, filename=long_filename,
+    )
+    try:
+        first_export = first.export_managed_output(
+            association["association_id"],
+            {"destination_filename": long_filename},
+            idempotency_key="long-first-export",
+        )
+        first_name = first_export["data"]["destination"]["filename"]
+        second_export = first.export_managed_output(
+            association["association_id"],
+            {"destination_filename": long_filename},
+            idempotency_key="long-second-export",
+        )
+        second_name = second_export["data"]["destination"]["filename"]
+        assert len(second_name.encode("utf-8")) <= first._export_leaf_max_bytes()
+        assert second_name != first_name
+        assert second_name.count(association["association_id"]) == 1
+        assert (export_root / second_name).read_bytes() == payload
+    finally:
+        first.close()
+
+
 @pytest.mark.parametrize("filename", ["../output.png", "images/../output.png", "/tmp/output.png", "images/nested/output.png", "images\\output.png"])
 def test_managed_output_filename_rejects_arbitrary_paths(filename: str) -> None:
     with pytest.raises(ValidationError, match="output filename"):
@@ -223,13 +252,13 @@ def test_generated_http_export_replay_conflict_and_durable_event(tmp_path: Path)
             )
         assert changed.value.status == 409
 
-        with pytest.raises(ApiError) as overwrite:
-            client.export_managed_output(
-                output.association_id,
-                destination_filename=output.filename,
-                idempotency_key="http-export-overwrite",
-            )
-        assert overwrite.value.status == 409
+        second_export = client.export_managed_output(
+            output.association_id,
+            destination_filename=output.filename,
+            idempotency_key="http-export-overwrite",
+        )
+        assert second_export["destination"]["filename"].startswith(f"{output.association_id}--")
+        assert (export_root / second_export["destination"]["filename"]).read_bytes() == payload
 
         with pytest.raises(ApiError) as unsafe_name:
             client.export_managed_output(
@@ -241,7 +270,7 @@ def test_generated_http_export_replay_conflict_and_durable_event(tmp_path: Path)
 
         events, _ = client.list_run_events(task["run"]["id"])
         exported_events = [event for event in events if event.event_type == "managed_output.exported"]
-        assert len(exported_events) == 1
+        assert len(exported_events) == 2
         assert exported_events[0].payload["export_id"] == result["export_id"]
     finally:
         daemon.stop()

@@ -1233,7 +1233,7 @@ class RuntimeService:
         )
         return result if found else None
 
-    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, with_receipt=True):
+    def _command_record(self, kind, aggregate_id, idempotency_key, request_hash, result, *, project_id=None, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, with_receipt=True, created_at=None):
         if idempotency_key is not None:
             validate_idempotency_key(idempotency_key)
             if project_id is not None:
@@ -1242,6 +1242,7 @@ class RuntimeService:
                     project_id=project_id, event_ids=event_ids,
                     primary_stream_id=primary_stream_id,
                     resulting_stream_seq=resulting_stream_seq,
+                    created_at=created_at,
                 )
                 row = self.store.conn.execute(
                     "SELECT txn_id, command_kind, idempotency_key, request_hash, result_json, "
@@ -1660,7 +1661,11 @@ class RuntimeService:
         found = set()
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in {"media_id", "object_id", "digest", "content_sha256", "sha256", "hash"} and isinstance(item, str):
+                # Only authoritative object identities participate in the
+                # media closure.  Canonical shot records also carry record
+                # digests and source/content hashes that describe metadata or
+                # lineage, not Runtime-owned CAS objects.
+                if key in {"media_id", "object_id"} and isinstance(item, str):
                     bare = item.removeprefix("sha256:")
                     if re.fullmatch(r"[0-9a-f]{64}", bare):
                         found.add("sha256:" + bare)
@@ -3386,6 +3391,8 @@ class RuntimeService:
     def _materialize_export(self, filename, data):
         if self.export_root is None:
             raise ConflictError("managed-output export root is not configured")
+        if len(str(filename).encode("utf-8")) > self._export_leaf_max_bytes():
+            raise ConflictError("managed-output export destination filename is too long")
         identity, root_fd, _ = _pin_directory(self.export_root)
         temporary = f".{filename}.{os.getpid()}-{uuid.uuid4().hex}.tmp"
         fd = -1
@@ -3413,10 +3420,48 @@ class RuntimeService:
                 pass
             _close_pinned(identity)
 
+    def _export_leaf_max_bytes(self):
+        """Return the safe direct-leaf budget including the temporary file name."""
+        try:
+            name_max = int(os.pathconf(self.export_root, "PC_NAME_MAX"))
+        except (OSError, TypeError, ValueError):
+            name_max = 255
+        # _materialize_export writes .<leaf>.<pid>-<uuid>.tmp before linking
+        # the final leaf. Reserve the complete fixed suffix so a valid final
+        # name cannot fail only because its private staging sibling is longer.
+        temporary_suffix = f"..{os.getpid()}-{'0' * 32}.tmp"
+        return max(1, name_max - len(temporary_suffix.encode("utf-8")))
+
+    @staticmethod
+    def _truncate_utf8(value, limit):
+        raw = str(value).encode("utf-8")
+        if len(raw) <= limit:
+            return str(value)
+        truncated = raw[:limit].decode("utf-8", "ignore")
+        return truncated or "output"
+
+    def _collision_safe_export_filename(self, association_id, filename):
+        """Return a deterministic direct-leaf fallback under the export root."""
+        prefix = f"{association_id}--"
+        filename = str(filename)
+        if filename.startswith(prefix):
+            filename = filename[len(prefix):]
+        counter = 1
+        while True:
+            suffix = "" if counter == 1 else f"--{counter}"
+            available = self._export_leaf_max_bytes() - len((prefix + suffix).encode("utf-8"))
+            base = self._truncate_utf8(filename, max(1, available))
+            candidate = f"{prefix}{base}{suffix}"
+            if not os.path.lexists(self.export_root / candidate):
+                return candidate
+            counter += 1
+
     @_durable_mutation
     def export_managed_output(self, association_id, body, *, idempotency_key=None):
         """Materialize exact CAS bytes for one completed retained output."""
         idempotency_key = require_idempotency_key(idempotency_key)
+        if self.export_root is None:
+            raise ConflictError("managed-output export root is not configured")
         body = _wire_object(body, required=("destination_filename",), allowed=("destination_filename", "expected"))
         destination_filename = _wire_string(body, "destination_filename")
         expected = body.get("expected") or {}
@@ -3454,15 +3499,34 @@ class RuntimeService:
         replay = self._command_replay("managed_output.export", str(association_id), idempotency_key, request_hash, project_id=project_id)
         if replay is not None:
             return replay
+        destination_export_filename = export_filename
+        if (
+            len(destination_export_filename.encode("utf-8")) > self._export_leaf_max_bytes()
+            or os.path.lexists(self.export_root / destination_export_filename)
+        ):
+            destination_export_filename = self._collision_safe_export_filename(
+                association["association_id"], export_filename
+            )
+        for _attempt in range(100):
+            try:
+                self._materialize_export(destination_export_filename, data)
+                break
+            except ConflictError as exc:
+                if "destination already exists" not in str(exc):
+                    raise
+                destination_export_filename = self._collision_safe_export_filename(
+                    association["association_id"], export_filename
+                )
+        else:
+            raise ConflictError("managed-output export could not allocate a collision-safe destination")
         result = {
             "export_id": "export-" + new_id(),
             **source,
             "producer": association.get("producer") or {},
-            "destination": {"root": str(self.export_root), "filename": export_filename},
+            "destination": {"root": str(self.export_root), "filename": destination_export_filename},
             "source_provenance": association.get("provenance") or {},
             "exported_at": now(),
         }
-        self._materialize_export(export_filename, data)
         event_id = self.store._append_event(
             association["run_id"], association["task_id"], "managed_output.exported", result,
         )
@@ -3578,6 +3642,14 @@ class RuntimeService:
             resource["lease_expires_at"] = task["lease_expires_at"]
         if task.get("result") is not None:
             resource["result"] = task["result"]
+        progress = self.store.conn.execute(
+            "SELECT payload_json FROM events WHERE task_id=? AND kind='task.progress' ORDER BY id DESC LIMIT 1",
+            (task["id"],),
+        ).fetchone()
+        if progress:
+            payload = json.loads(progress["payload_json"])
+            if isinstance(payload, dict):
+                resource["progress"] = payload
         return resource
 
     @_verified_mutation
@@ -3899,13 +3971,14 @@ class RuntimeService:
                 result = dict(body.get("result") or {})
                 result["outputs"] = staged["outputs"]
                 recorded = None
-                def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None):
+                def record(value, *, event_ids=(), primary_stream_id=None, resulting_stream_seq=None, created_at=None):
                     nonlocal recorded
                     recorded = self._command_record(
                         "attempt.settle", attempt_id, idempotency_key, request_hash,
                         self._task_resource(value), project_id=project_id or "unscoped",
                         event_ids=event_ids, primary_stream_id=primary_stream_id,
                         resulting_stream_seq=resulting_stream_seq,
+                        created_at=created_at,
                     )
                 self.store._settle_attempt(
                     row["task_id"], row["lease_id"], result,
@@ -5014,7 +5087,7 @@ class RuntimeService:
         body = _wire_object(
             body,
             required=("lease_id", "fence", "runtime_epoch"),
-            allowed=("lease_id", "fence", "runtime_epoch", "lease_seconds"),
+            allowed=("lease_id", "fence", "runtime_epoch", "lease_seconds", "progress"),
         )
         _wire_string(body, "lease_id")
         # Fence zero is deliberately accepted as a typed stale fence. The
@@ -5027,6 +5100,35 @@ class RuntimeService:
             or body["lease_seconds"] <= 0
         ):
             raise ValidationError("lease_seconds must be a positive integer")
+        progress = body.get("progress")
+        if progress is not None:
+            if not isinstance(progress, Mapping):
+                raise ValidationError("progress must be an object")
+            unexpected = set(progress) - {"phase", "percent", "current", "total"}
+            if unexpected:
+                raise ValidationError("progress contains unsupported fields", details={"fields": sorted(unexpected)})
+            normalized_progress = {}
+            if "phase" in progress:
+                phase = progress["phase"]
+                if not isinstance(phase, str) or not phase.strip() or len(phase) > 128:
+                    raise ValidationError("progress.phase must be a non-empty string of at most 128 characters")
+                normalized_progress["phase"] = phase.strip()
+            for key in ("percent", "current", "total"):
+                if key not in progress:
+                    continue
+                value = progress[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                    raise ValidationError(f"progress.{key} must be a finite number")
+                if key == "percent" and not 0 <= float(value) <= 100:
+                    raise ValidationError("progress.percent must be between 0 and 100")
+                if key == "total" and float(value) < 1:
+                    raise ValidationError("progress.total must be at least 1")
+                if key == "current" and float(value) < 0:
+                    raise ValidationError("progress.current must be non-negative")
+                normalized_progress[key] = value
+            if not normalized_progress:
+                raise ValidationError("progress must contain phase, percent, current, or total")
+            body["progress"] = normalized_progress
         with self.store._mutex:
             row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             self._assert_attempt_identity(row, identity)
@@ -5044,6 +5146,8 @@ class RuntimeService:
                 nonlocal recorded
                 expires = value["task"].get("lease_expires_at")
                 self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
+                if progress is not None:
+                    self.store._append_event(task["run_id"], row["task_id"], "task.progress", progress)
                 result = {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires, "runtime_epoch": self.store._current_runtime_epoch()}
                 recorded = self._command_record("attempt.heartbeat", attempt_id, idempotency_key, request_hash, result, project_id=project_id or "unscoped")
             self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30), record=record)

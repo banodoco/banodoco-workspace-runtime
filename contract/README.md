@@ -27,3 +27,15 @@ output provenance, receipts, and event history remain Runtime-owned and are
 the canonical readback surface for Reigh's gallery and timeline consumers.
 Product clients must not bypass this boundary with a direct database client or
 legacy task-table fallback.
+
+## Output locations
+
+Runtime owns durable output bytes in the realm CAS at
+`cas/sha256/<first-two>/<remaining-digest>`. Attempt scratch and settlement
+staging are temporary and are not public result paths. Managed-output rows are
+the portable readback identity. An explicit export materializes bytes under
+the separately configured export root; the returned `destination.filename` is
+the authoritative local filename. If a requested export filename already
+exists or is too long for the host's temporary-name byte budget, Runtime keeps
+the same root and chooses a deterministic association-scoped direct filename
+rather than overwriting it or failing on the private staging sibling.

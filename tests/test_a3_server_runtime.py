@@ -40,6 +40,46 @@ def test_empty_claim_replays_committed_null(service):
     assert json.loads(receipt["result_json"]) is None
 
 
+def test_heartbeat_progress_is_exposed_on_task_resource(service):
+    service.register_executor({"executor_id": "worker", "capabilities": ["render.basic"]})
+    service.create_task(
+        {
+            "capability_id": "render.basic",
+            "spec": {},
+            "idempotency_key": "progress-task",
+        }
+    )
+    epoch = service.health()["runtime_epoch"]
+    attempt = service.claim_next(
+        {
+            "executor_id": "worker",
+            "capability_ids": ["render.basic"],
+            "runtime_epoch": epoch,
+        },
+        idempotency_key="progress-claim",
+    )
+
+    service.heartbeat_attempt(
+        attempt["attempt_id"],
+        {
+            "lease_id": attempt["lease_id"],
+            "fence": attempt["fence"],
+            "runtime_epoch": epoch,
+            "progress": {"phase": "render", "percent": 42},
+        },
+        idempotency_key="progress-heartbeat",
+    )
+
+    resource = service._task_resource(service.store.get_task(attempt["task_id"]))
+    assert resource["progress"] == {"phase": "render", "percent": 42}
+    progress_events = [
+        event
+        for event in service.events_page(attempt["task_id"])["items"]
+        if event["event_type"] == "task.progress"
+    ]
+    assert progress_events[-1]["payload"] == {"phase": "render", "percent": 42}
+
+
 @pytest.mark.parametrize(
     "invoke",
     [

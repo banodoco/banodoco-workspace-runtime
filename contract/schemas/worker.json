@@ -236,9 +236,10 @@
       "required": ["selector", "ordinal", "variant_key", "output_port"],
       "properties": {
         "selector": { "type": "string", "minLength": 1, "maxLength": 255 },
-        "ordinal": { "type": "integer", "minimum": 0 },
-        "variant_key": { "type": "string", "minLength": 1, "maxLength": 255 },
-        "output_port": { "type": "string", "minLength": 1, "maxLength": 255 }
+              "ordinal": { "type": "integer", "minimum": 0 },
+              "variant_key": { "type": "string", "minLength": 1, "maxLength": 255 },
+              "output_port": { "type": "string", "minLength": 1, "maxLength": 255 },
+              "required": { "type": "boolean" }
       }
     }
   }

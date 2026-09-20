@@ -130,7 +130,15 @@ def test_publish_v1_matches_out_of_order_groups_and_derives_domain_identity(tmp_
         outputs = [
             _output(b"audio", output_port="audio", group_key="audio", variant_key="original", ordinal=0),
             _output(b"extra", output_port="thumbnail", group_key="other", variant_key="preview", ordinal=0, generation_id="forged-generation"),
-            _output(b"first", output_port="video", group_key="main", variant_key="first", ordinal=0, filename="first.mp4"),
+            _output(
+                b"first",
+                output_port="video",
+                group_key="main",
+                variant_key="first",
+                ordinal=0,
+                filename="first.mp4",
+                provenance={"task_id": "forged", "attempt_id": "forged", "fence": -1},
+            ),
             _output(b"second", output_port="video", group_key="main", variant_key="second", ordinal=1, filename="second.mp4"),
         ]
         settled = _settle(service, attempt, outputs, effect=effect)
@@ -152,6 +160,10 @@ def test_publish_v1_matches_out_of_order_groups_and_derives_domain_identity(tmp_
             variant = service.get_variant(variant_id)
             assert variant["generation_id"] == generation_id
             assert variant["variant_type"] == variant_key
+            if variant_key == "first":
+                assert variant["metadata"]["provenance"]["task_id"] == task_id
+                assert variant["metadata"]["provenance"]["attempt_id"] == attempt["attempt_id"]
+                assert variant["metadata"]["provenance"]["fence"] == attempt["fence"]
 
         associations = service.managed_outputs(task_id)
         selected = {(item["output_port"], item["group_key"], item["variant_key"], item["ordinal"]): item for item in associations}
@@ -219,6 +231,91 @@ def test_publish_v1_allow_records_missing_members_without_empty_generations(tmp_
         assert publication["publications"][1]["published"] == []
         assert service.store.conn.execute("SELECT COUNT(*) FROM generations").fetchone()[0] == 1
         assert service.store.conn.execute("SELECT COUNT(*) FROM generation_variants").fetchone()[0] == 1
+    finally:
+        service.close()
+
+
+def test_publish_v1_allow_still_rejects_an_explicit_required_member(tmp_path):
+    def effect_factory(project_id):
+        return _effect(
+            project_id,
+            policy="allow",
+            groups=[{
+                "group_key": "main",
+                "selectors": [
+                    {"selector": "required", "ordinal": 0, "variant_key": "required", "output_port": "video", "required": True},
+                    {"selector": "optional", "ordinal": 1, "variant_key": "optional", "output_port": "video", "required": False},
+                ],
+            }],
+        )
+
+    service, _project, _task, attempt, effect = _fixture(
+        tmp_path, effect_factory=effect_factory, slug="allow-required"
+    )
+    try:
+        with pytest.raises(ValidationError, match="required selectors are missing"):
+            _settle(
+                service,
+                attempt,
+                [_output(b"optional", output_port="video", group_key="main", variant_key="optional", ordinal=1)],
+                effect=effect,
+                key="allow-required-settle",
+            )
+    finally:
+        service.close()
+
+
+def test_publish_v1_settlement_uses_one_runtime_timestamp_for_publication_rows(tmp_path):
+    service, _project, task, attempt, effect = _fixture(
+        tmp_path,
+        slug="shared-timestamp",
+        effect_factory=lambda project_id: _effect(
+            project_id,
+            policy="allow",
+            groups=[{
+                "group_key": "main",
+                "selectors": [{
+                    "selector": "first", "ordinal": 0, "variant_key": "first", "output_port": "video",
+                }],
+            }],
+        ),
+    )
+    try:
+        _settle(
+            service,
+            attempt,
+            [_output(b"first", output_port="video", group_key="main", variant_key="first", ordinal=0)],
+            effect=effect,
+            key="shared-timestamp-settle",
+        )
+        task_id = task["task"]["id"]
+        run_id = task["task"]["run_id"]
+        generation_id = _derived_generation(task_id, "main")
+        values = {
+            row[0]
+            for row in service.store.conn.execute(
+                "SELECT created_at FROM generations WHERE id=? UNION ALL "
+                "SELECT updated_at FROM generations WHERE id=? UNION ALL "
+                "SELECT created_at FROM generation_variants WHERE generation_id=? UNION ALL "
+                "SELECT a.created_at FROM managed_output_associations a WHERE a.task_id=? UNION ALL "
+                "SELECT l.created_at FROM managed_output_lifecycle l JOIN managed_output_associations a ON a.association_id=l.association_id WHERE a.task_id=? UNION ALL "
+                "SELECT l.updated_at FROM managed_output_lifecycle l JOIN managed_output_associations a ON a.association_id=l.association_id WHERE a.task_id=? UNION ALL "
+                "SELECT updated_at FROM tasks WHERE id=? UNION ALL "
+                "SELECT updated_at FROM runs WHERE id=? UNION ALL "
+                "SELECT released_at FROM reservations WHERE task_id=? UNION ALL "
+                "SELECT created_at FROM events WHERE task_id=? AND kind='task.completed' UNION ALL "
+                "SELECT created_at FROM command_idempotency WHERE command_kind='attempt.settle' AND aggregate_id=?",
+                (generation_id, generation_id, generation_id, task_id, task_id, task_id, task_id, run_id, task_id, task_id, task_id),
+            )
+        }
+        assert len(values) == 1
+        receipt = service.store.conn.execute(
+            "SELECT created_at FROM command_idempotency "
+            "WHERE command_kind='attempt.settle' AND aggregate_id=?",
+            (attempt["attempt_id"],),
+        ).fetchone()
+        assert receipt is not None
+        assert receipt[0] in values
     finally:
         service.close()
 
