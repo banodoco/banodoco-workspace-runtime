@@ -3,6 +3,17 @@
   "$id": "https://banodoco.dev/workspace/v1/schemas/generation.json",
   "title": "Minimal neutral generation and variant records",
   "type": "object", "additionalProperties": false,
+  "definitions": {
+    "ThumbnailDescriptor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["object_id", "source_object_id", "recipe_version"],
+      "properties": {
+        "object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "source_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "recipe_version": { "type": "integer", "const": 1 }
+      }
+    }
+  },
   "required": ["generation_id", "project_id", "type", "status", "metadata", "version", "created_at", "updated_at"],
   "properties": {
     "generation_id": { "type": "string", "minLength": 1 },
@@ -10,7 +21,12 @@
     "source_task_id": { "type": ["string", "null"] },
     "type": { "type": "string", "minLength": 1 },
     "status": { "type": "string", "minLength": 1 },
-    "metadata": { "type": "object", "additionalProperties": true },
+    "metadata": {
+      "type": "object", "additionalProperties": true,
+      "properties": {
+        "thumbnail": { "$ref": "#/definitions/ThumbnailDescriptor" }
+      }
+    },
     "version": { "type": "integer", "minimum": 1 },
     "created_at": { "type": "string" },
     "updated_at": { "type": "string" }

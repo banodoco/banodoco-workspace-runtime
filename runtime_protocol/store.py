@@ -39,6 +39,7 @@ OBJECT_ID_RE = re.compile(r"^(?:sha256:)?([0-9a-f]{64})$")
 MAX_STORAGE_ESTIMATE_BYTES = (1 << 53) - 1
 GENERATION_INTENT_STORAGE_KEY = "__runtime_generation_intent"
 LEGACY_GENERATION_INTENT_STORAGE_KEY = "generation_intent"
+THUMBNAIL_RECIPE_VERSION = 1
 # Remotion creates a webpack/Chromium workspace in addition to the
 # Runtime-owned materialization and encoded output.  Keep that bounded
 # workspace in the admission envelope so live scratch accounting cannot
@@ -1514,6 +1515,12 @@ class RealmStore:
                 self._validate_settlement_effect(expected_effect, project_id=project_id)
                 if project_id is None:
                     raise ConflictError("generation.publish_v1 requires a project-scoped task")
+            if isinstance(expected_effect, dict) and expected_effect.get("effect_type") == "generation.thumbnail.attach":
+                self._validate_settlement_effect(
+                    expected_effect,
+                    project_id=project_id,
+                    input_object_ids=spec.get("input_object_ids", []) if isinstance(spec, dict) else [],
+                )
             self._validate_task_inputs(project_id, spec)
             with self._transaction():
                 request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
@@ -2281,13 +2288,12 @@ class RealmStore:
                 result=result,
             )
         if kind == "generation.create_with_variant":
-            self._validate_generation_create_with_variant_effect(
+            return self._validate_generation_create_with_variant_effect(
                 effect,
                 project_id=project_id,
                 result=result,
                 input_object_ids=input_object_ids,
             )
-            return
         target = effect.get("target_id")
         expected = effect.get("expected_version")
         try:
@@ -2297,13 +2303,19 @@ class RealmStore:
         if not target or expected is None or expected_version < 1:
             raise ValidationError("settlement effect requires target_id and positive expected_version")
         if kind == "generation.variant.append":
-            self._validate_generation_variant_append_effect(
+            return self._validate_generation_variant_append_effect(
                 effect,
                 project_id=project_id,
                 result=result,
                 input_object_ids=input_object_ids,
             )
-            return
+        if kind == "generation.thumbnail.attach":
+            return self._validate_generation_thumbnail_attach_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
         if kind != "project.update":
             raise ValidationError("unsupported settlement effect_type")
         try:
@@ -2322,6 +2334,146 @@ class RealmStore:
             output.get("variant_key", str(ordinal)),
             int(ordinal),
         )
+
+    @staticmethod
+    def _validate_generation_metadata_input(metadata, *, effect_type):
+        if not isinstance(metadata, dict):
+            raise ValidationError(f"{effect_type} metadata must be an object")
+        if "thumbnail" in metadata:
+            raise ValidationError(
+                f"{effect_type} metadata.thumbnail is Runtime-owned",
+                details={"field": "metadata.thumbnail"},
+            )
+
+    @staticmethod
+    def _thumbnail_output_descriptor(output, *, effect_type):
+        if not isinstance(output, dict) or output.get("role") != "thumbnail":
+            return None
+        if output.get("kind") != "object":
+            raise ValidationError(f"{effect_type} thumbnail output must be an object")
+        if output.get("output_port") != "thumbnail":
+            raise ValidationError(f"{effect_type} thumbnail output_port must be thumbnail")
+        if output.get("media_type") != "image/jpeg":
+            raise ValidationError(f"{effect_type} thumbnail output must use image/jpeg")
+        if output.get("durability", "durable") != "durable":
+            raise ValidationError(f"{effect_type} thumbnail output must be durable")
+        if "is_primary" in output:
+            raise ValidationError(f"{effect_type} thumbnail output must not declare is_primary")
+        provenance = output.get("provenance")
+        if not isinstance(provenance, dict):
+            raise ValidationError(f"{effect_type} thumbnail output provenance must be an object")
+        thumbnail = provenance.get("thumbnail")
+        if not isinstance(thumbnail, dict) or set(thumbnail) != {"source_object_ids", "recipe_version"}:
+            raise ValidationError(
+                f"{effect_type} thumbnail provenance requires source_object_ids and recipe_version"
+            )
+        sources = thumbnail["source_object_ids"]
+        if not isinstance(sources, list) or not sources:
+            raise ValidationError(f"{effect_type} thumbnail source_object_ids must be a non-empty list")
+        if len(set(sources)) != len(sources):
+            raise ValidationError(f"{effect_type} thumbnail source_object_ids must be unique")
+        if any(not isinstance(source, str) or not source.startswith("sha256:") or not OBJECT_ID_RE.fullmatch(source) for source in sources):
+            raise ValidationError(f"{effect_type} thumbnail source_object_ids must be canonical sha256 object ids")
+        recipe_version = thumbnail["recipe_version"]
+        if isinstance(recipe_version, bool) or recipe_version != THUMBNAIL_RECIPE_VERSION:
+            raise ValidationError(
+                f"{effect_type} thumbnail recipe_version is unsupported",
+                details={"supported": [THUMBNAIL_RECIPE_VERSION]},
+            )
+        return {
+            "output": output,
+            "source_object_ids": list(sources),
+            "recipe_version": recipe_version,
+        }
+
+    def _validate_thumbnail_outputs(self, outputs, *, allowed_source_object_ids, effect_type):
+        allowed = set(allowed_source_object_ids)
+        by_source = {}
+        for output in outputs:
+            descriptor = self._thumbnail_output_descriptor(output, effect_type=effect_type)
+            if descriptor is None:
+                continue
+            unknown = sorted(set(descriptor["source_object_ids"]) - allowed)
+            if unknown:
+                raise ConflictError(
+                    f"{effect_type} thumbnail source is not an admitted creative object",
+                    details={"source_object_ids": unknown},
+                )
+            for source_object_id in descriptor["source_object_ids"]:
+                if source_object_id in by_source:
+                    raise ValidationError(
+                        f"{effect_type} has ambiguous thumbnail outputs for one source",
+                        details={"source_object_id": source_object_id},
+                    )
+                by_source[source_object_id] = descriptor
+        return by_source
+
+    @staticmethod
+    def _thumbnail_metadata_descriptor(descriptor, source_object_id):
+        return {
+            "object_id": descriptor["output"]["digest"],
+            "source_object_id": source_object_id,
+            "recipe_version": descriptor["recipe_version"],
+        }
+
+    @staticmethod
+    def _validate_existing_generation_thumbnail(value, *, generation_id):
+        if value is None:
+            return
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"object_id", "source_object_id", "recipe_version"}
+            or not isinstance(value.get("object_id"), str)
+            or not value["object_id"].startswith("sha256:")
+            or not OBJECT_ID_RE.fullmatch(value["object_id"])
+            or not isinstance(value.get("source_object_id"), str)
+            or not value["source_object_id"].startswith("sha256:")
+            or not OBJECT_ID_RE.fullmatch(value["source_object_id"])
+            or value.get("recipe_version") != THUMBNAIL_RECIPE_VERSION
+        ):
+            raise ConflictError(
+                "generation metadata.thumbnail conflicts with the reserved Runtime descriptor",
+                details={"generation_id": generation_id},
+            )
+
+    @staticmethod
+    def _selected_primary_publish_output(selected, *, effect_type):
+        explicit = [entry for entry in selected if entry[2].get("is_primary") is True]
+        if len(explicit) > 1:
+            raise ValidationError(f"{effect_type} group has multiple primary outputs")
+        if explicit:
+            return explicit[0][2]
+        originals = [entry for entry in selected if entry[1]["variant_key"] == "original"]
+        if originals:
+            return originals[0][2]
+        return selected[0][2]
+
+    def _generation_primary_variant(self, generation_id):
+        rows = self.conn.execute(
+            "SELECT * FROM generation_variants WHERE generation_id=? ORDER BY created_at, id",
+            (str(generation_id),),
+        ).fetchall()
+        if not rows:
+            raise ConflictError(
+                "generation has no primary media variant",
+                details={"generation_id": generation_id},
+            )
+        explicit = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            if metadata.get("is_primary") is True:
+                explicit.append(row)
+        if len(explicit) > 1:
+            raise ConflictError(
+                "generation has multiple explicit primary variants",
+                details={"generation_id": generation_id},
+            )
+        if explicit:
+            return explicit[0]
+        for row in rows:
+            if row["variant_type"] == "original":
+                return row
+        return rows[0]
 
     def _validate_generation_publish_v1_effect(self, effect, *, project_id=None, result=None):
         """Validate the exact GEN D1 multi-output publication effect."""
@@ -2359,8 +2511,9 @@ class RealmStore:
             raise ValidationError("generation.publish_v1 payload.modality is invalid")
         if not isinstance(payload["generation_type"], str) or not payload["generation_type"] or len(payload["generation_type"]) > 128:
             raise ValidationError("generation.publish_v1 generation_type must be a non-empty string of at most 128 characters")
-        if not isinstance(payload["metadata"], dict):
-            raise ValidationError("generation.publish_v1 metadata must be an object")
+        self._validate_generation_metadata_input(
+            payload["metadata"], effect_type="generation.publish_v1"
+        )
         if not isinstance(payload["partial_success_policy"], str) or payload["partial_success_policy"] not in {"reject", "allow"}:
             raise ValidationError("generation.publish_v1 partial_success_policy is invalid")
         groups = payload["groups"]
@@ -2450,6 +2603,8 @@ class RealmStore:
         for output in outputs:
             if not isinstance(output, dict):
                 continue
+            if output.get("role") == "thumbnail":
+                continue
             key = self._generation_publish_output_key(output)
             if any(key == declared_key for _group_key, selectors in declared for declared_key, _selector in selectors):
                 output_matches[key].append(output)
@@ -2505,6 +2660,26 @@ class RealmStore:
             })
         if selected_count == 0:
             raise ValidationError("generation.publish_v1 requires at least one successful declared output")
+        selected_source_object_ids = {
+            output["digest"]
+            for group in plan
+            for _key, _declaration, output in group["selected"]
+        }
+        thumbnails_by_source = self._validate_thumbnail_outputs(
+            outputs,
+            allowed_source_object_ids=selected_source_object_ids,
+            effect_type="generation.publish_v1",
+        )
+        for group in plan:
+            if not group["selected"]:
+                group["primary_output"] = None
+                group["thumbnail"] = None
+                continue
+            primary_output = self._selected_primary_publish_output(
+                group["selected"], effect_type="generation.publish_v1"
+            )
+            group["primary_output"] = primary_output
+            group["thumbnail"] = thumbnails_by_source.get(primary_output["digest"])
         return plan
 
     def _validate_generation_create_with_variant_effect(
@@ -2543,8 +2718,9 @@ class RealmStore:
         if not isinstance(generation_type, str) or not generation_type or len(generation_type) > 128:
             raise ValidationError("generation_type must be a non-empty string of at most 128 characters")
         metadata = payload["metadata"]
-        if not isinstance(metadata, dict):
-            raise ValidationError("generation metadata must be an object")
+        self._validate_generation_metadata_input(
+            metadata, effect_type="generation.create_with_variant"
+        )
         if "params" in metadata and not isinstance(metadata["params"], dict):
             raise ValidationError("generation.create_with_variant metadata.params must be an object")
         variant_type = payload["variant_type"]
@@ -2578,12 +2754,16 @@ class RealmStore:
         if result is None:
             return
         outputs = result.get("outputs") if isinstance(result, dict) else None
-        if not isinstance(outputs, list) or len(outputs) != 1:
-            raise ValidationError("generation.create_with_variant requires exactly one settlement output")
-        selected = outputs[0]
+        if not isinstance(outputs, list):
+            raise ValidationError("generation.create_with_variant settlement requires an outputs list")
+        creative_outputs = [output for output in outputs if isinstance(output, dict) and output.get("role") != "thumbnail"]
+        if len(creative_outputs) != 1:
+            raise ValidationError("generation.create_with_variant requires exactly one settlement output plus optional thumbnail outputs")
+        selected = creative_outputs[0]
         if (
             not isinstance(selected, dict)
             or selected.get("name") != output_name
+            or selected.get("ordinal", 0) != 0
             or selected.get("kind") != "object"
             or not isinstance(selected.get("digest"), str)
             or not OBJECT_ID_RE.fullmatch(selected["digest"])
@@ -2592,6 +2772,15 @@ class RealmStore:
                 "generation.create_with_variant output selector did not resolve exactly one object",
                 details={"output_name": output_name, "output_ordinal": 0},
             )
+        thumbnails = self._validate_thumbnail_outputs(
+            outputs,
+            allowed_source_object_ids={selected["digest"]},
+            effect_type="generation.create_with_variant",
+        )
+        return {
+            "creative_output": selected,
+            "thumbnail": thumbnails.get(selected["digest"]),
+        }
 
     def _validate_generation_variant_append_effect(
         self,
@@ -2700,13 +2889,16 @@ class RealmStore:
         if result is None:
             return
         outputs = result.get("outputs") if isinstance(result, dict) else None
-        if not isinstance(outputs, list) or len(outputs) != 1:
-            raise ValidationError("generation.variant.append requires exactly one settlement output")
-        selected = outputs[0]
+        if not isinstance(outputs, list):
+            raise ValidationError("generation.variant.append settlement requires an outputs list")
+        creative_outputs = [output for output in outputs if isinstance(output, dict) and output.get("role") != "thumbnail"]
+        if len(creative_outputs) != 1:
+            raise ValidationError("generation.variant.append requires exactly one settlement output plus optional thumbnail outputs")
+        selected = creative_outputs[0]
         if (
             not isinstance(selected, dict)
             or selected.get("name") != output_name
-            or output_ordinal != 0
+            or selected.get("ordinal", 0) != output_ordinal
             or selected.get("kind") != "object"
             or not isinstance(selected.get("digest"), str)
             or not OBJECT_ID_RE.fullmatch(selected["digest"])
@@ -2715,6 +2907,134 @@ class RealmStore:
                 "generation.variant.append output selector did not resolve exactly one object",
                 details={"output_name": output_name, "output_ordinal": output_ordinal},
             )
+        primary_variant = self._generation_primary_variant(generation["id"])
+        primary_source_object_id = "sha256:" + primary_variant["object_id"]
+        thumbnails = self._validate_thumbnail_outputs(
+            outputs,
+            allowed_source_object_ids={selected["digest"], primary_source_object_id},
+            effect_type="generation.variant.append",
+        )
+        return {
+            "creative_output": selected,
+            "primary_source_object_id": primary_source_object_id,
+            "thumbnail": thumbnails.get(primary_source_object_id),
+        }
+
+    def _validate_generation_thumbnail_attach_effect(
+        self,
+        effect,
+        *,
+        project_id=None,
+        result=None,
+        input_object_ids=None,
+    ):
+        effect_type = "generation.thumbnail.attach"
+        required_effect = {"effect_type", "target_id", "expected_version", "payload"}
+        if not isinstance(effect, dict) or set(effect) != required_effect:
+            raise ValidationError(
+                f"{effect_type} effect has the wrong fields",
+                details={
+                    "missing": sorted(required_effect - set(effect or {})),
+                    "unexpected": sorted(set(effect or {}) - required_effect),
+                },
+            )
+        if effect["effect_type"] != effect_type:
+            raise ValidationError(f"{effect_type} effect_type is invalid")
+        target_id = effect["target_id"]
+        if not isinstance(target_id, str) or not target_id:
+            raise ValidationError(f"{effect_type} target_id must be a non-empty string")
+        expected_version = effect["expected_version"]
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 1:
+            raise ValidationError(f"{effect_type} expected_version must be a positive integer")
+        payload = effect["payload"]
+        required_payload = {"source_object_id", "output_name", "output_ordinal", "recipe_version"}
+        if not isinstance(payload, dict) or set(payload) != required_payload:
+            raise ValidationError(
+                f"{effect_type} payload has the wrong fields",
+                details={
+                    "missing": sorted(required_payload - set(payload or {})),
+                    "unexpected": sorted(set(payload or {}) - required_payload),
+                },
+            )
+        source_object_id = payload["source_object_id"]
+        if not isinstance(source_object_id, str) or not source_object_id.startswith("sha256:") or not OBJECT_ID_RE.fullmatch(source_object_id):
+            raise ValidationError(f"{effect_type} source_object_id must be a canonical sha256 object id")
+        output_name = payload["output_name"]
+        if not isinstance(output_name, str) or not output_name or len(output_name) > 512:
+            raise ValidationError(f"{effect_type} output_name must be a non-empty string of at most 512 characters")
+        if isinstance(payload["output_ordinal"], bool) or payload["output_ordinal"] != 0:
+            raise ValidationError(f"{effect_type} output_ordinal must be zero")
+        if isinstance(payload["recipe_version"], bool) or payload["recipe_version"] != THUMBNAIL_RECIPE_VERSION:
+            raise ValidationError(
+                f"{effect_type} recipe_version is unsupported",
+                details={"supported": [THUMBNAIL_RECIPE_VERSION]},
+            )
+
+        if project_id is None and result is None:
+            return None
+        if not project_id:
+            raise ConflictError(f"{effect_type} requires a project-scoped task")
+        generation = self.conn.execute(
+            "SELECT * FROM generations WHERE id=?", (target_id,)
+        ).fetchone()
+        if not generation:
+            raise NotFoundError(
+                "thumbnail attachment target generation not found",
+                details={"target_id": target_id},
+            )
+        if generation["project_id"] != str(project_id):
+            raise ConflictError(
+                "thumbnail attachment generation is outside the task project",
+                details={"target_id": target_id, "project_id": project_id},
+            )
+        if int(generation["version"]) != expected_version:
+            raise ConflictError(
+                "stale thumbnail attachment target generation version",
+                details={"target": target_id, "expected": expected_version, "actual": int(generation["version"])},
+            )
+        primary_variant = self._generation_primary_variant(target_id)
+        primary_source_object_id = "sha256:" + primary_variant["object_id"]
+        if primary_source_object_id != source_object_id:
+            raise ConflictError(
+                "thumbnail source is not the generation primary object",
+                details={"expected": primary_source_object_id, "actual": source_object_id},
+            )
+        source_digest = source_object_id.removeprefix("sha256:")
+        if not self.conn.execute("SELECT 1 FROM objects WHERE digest=?", (source_digest,)).fetchone():
+            raise ConflictError("thumbnail source object is not present in Runtime CAS")
+        if not self.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+            (str(project_id), source_digest),
+        ).fetchone():
+            raise ConflictError("thumbnail source object is outside the task project")
+        if not isinstance(input_object_ids, list) or source_object_id not in input_object_ids:
+            raise ConflictError("thumbnail source object is not an admitted task input")
+        if result is None:
+            return None
+        outputs = result.get("outputs") if isinstance(result, dict) else None
+        if not isinstance(outputs, list) or len(outputs) != 1:
+            raise ValidationError(f"{effect_type} requires exactly one thumbnail settlement output")
+        selected = outputs[0]
+        if selected.get("name") != output_name or selected.get("ordinal", 0) != 0:
+            raise ValidationError(
+                f"{effect_type} output selector did not resolve exactly one thumbnail",
+                details={"output_name": output_name, "output_ordinal": 0},
+            )
+        thumbnails = self._validate_thumbnail_outputs(
+            outputs,
+            allowed_source_object_ids={source_object_id},
+            effect_type=effect_type,
+        )
+        descriptor = thumbnails.get(source_object_id)
+        if descriptor is None or descriptor["output"] is not selected:
+            raise ValidationError(f"{effect_type} selected output must be a thumbnail")
+        if descriptor["recipe_version"] != payload["recipe_version"]:
+            raise ConflictError(f"{effect_type} payload and output recipe_version differ")
+        return {
+            "generation": generation,
+            "primary_source_object_id": primary_source_object_id,
+            "thumbnail": descriptor,
+        }
 
     def _apply_settlement_effect(
         self,
@@ -2751,6 +3071,11 @@ class RealmStore:
                     canonical_json({"task_id": str(task_id), "group_key": group_key}).encode()
                 ).hexdigest()
                 timestamp = settled_at or now()
+                generation_metadata = dict(payload["metadata"])
+                if group["thumbnail"] is not None:
+                    generation_metadata["thumbnail"] = self._thumbnail_metadata_descriptor(
+                        group["thumbnail"], group["primary_output"]["digest"]
+                    )
                 self.conn.execute(
                     "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 'completed', ?, 1, ?, ?)",
                     (
@@ -2758,7 +3083,7 @@ class RealmStore:
                         str(project_id),
                         str(task_id),
                         payload["generation_type"],
-                        canonical_json(payload["metadata"]),
+                        canonical_json(generation_metadata),
                         timestamp,
                         timestamp,
                     ),
@@ -2792,6 +3117,7 @@ class RealmStore:
                             runtime_provenance["fence"] = int(attempt_row["fence"])
                             runtime_provenance["runtime_epoch"] = int(attempt_row["runtime_epoch"])
                     variant_metadata = {
+                        "is_primary": output is group["primary_output"],
                         "selector": declaration["selector"],
                         "output_port": declaration["output_port"],
                         "group_key": group_key,
@@ -2831,6 +3157,26 @@ class RealmStore:
                         "ordinal": declaration["ordinal"],
                         "output_port": declaration["output_port"],
                     })
+                if group["thumbnail"] is not None:
+                    thumbnail_output = group["thumbnail"]["output"]
+                    thumbnail_key = self._generation_publish_output_key(thumbnail_output)
+                    prior_override = association_overrides.get(thumbnail_key)
+                    if prior_override is None:
+                        association_overrides[thumbnail_key] = {
+                            "generation_id": generation_id,
+                            "variant_id": None,
+                            "selector": "thumbnail",
+                        }
+                    elif prior_override.get("generation_id") != generation_id:
+                        # One content-addressed thumbnail may intentionally
+                        # describe multiple primary sources. Its task/project
+                        # custody remains authoritative, but the single
+                        # association row cannot claim one Generation owner.
+                        association_overrides[thumbnail_key] = {
+                            "generation_id": None,
+                            "variant_id": None,
+                            "selector": "thumbnail",
+                        }
                 publications.append({
                     "group_key": group_key,
                     "generation_id": generation_id,
@@ -2843,14 +3189,14 @@ class RealmStore:
                 "_association_overrides": association_overrides,
             }
         if kind == "generation.create_with_variant":
-            self._validate_settlement_effect(
+            plan = self._validate_settlement_effect(
                 effect,
                 project_id=project_id,
                 result=result,
                 input_object_ids=input_object_ids,
             )
             payload = effect["payload"]
-            output = result["outputs"][payload["output_ordinal"]]
+            output = plan["creative_output"]
             output_digest = output["digest"].removeprefix("sha256:")
             generation_id = "generation-task-" + str(task_id)
             identity = {
@@ -2878,6 +3224,10 @@ class RealmStore:
             generation_metadata["output_name"] = payload["output_name"]
             generation_metadata["output_ordinal"] = payload["output_ordinal"]
             generation_metadata["primary_policy"] = payload["primary_policy"]
+            if plan["thumbnail"] is not None:
+                generation_metadata["thumbnail"] = self._thumbnail_metadata_descriptor(
+                    plan["thumbnail"], output["digest"]
+                )
             self.conn.execute(
                 "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, 'completed', ?, 1, ?, ?)",
                 (
@@ -2919,17 +3269,54 @@ class RealmStore:
                 "metadata": variant_metadata,
                 "created_at": timestamp,
             }
+        if kind == "generation.thumbnail.attach":
+            plan = self._validate_settlement_effect(
+                effect,
+                project_id=project_id,
+                result=result,
+                input_object_ids=input_object_ids,
+            )
+            generation = plan["generation"]
+            descriptor = self._thumbnail_metadata_descriptor(
+                plan["thumbnail"], plan["primary_source_object_id"]
+            )
+            metadata = json.loads(generation["metadata_json"])
+            existing = metadata.get("thumbnail")
+            self._validate_existing_generation_thumbnail(
+                existing, generation_id=generation["id"]
+            )
+            changed = existing != descriptor
+            timestamp = settled_at or now()
+            if changed:
+                metadata["thumbnail"] = descriptor
+                updated = self.conn.execute(
+                    "UPDATE generations SET metadata_json=?, version=version+1, updated_at=? "
+                    "WHERE id=? AND project_id=? AND version=?",
+                    (
+                        canonical_json(metadata), timestamp, generation["id"],
+                        str(project_id), int(effect["expected_version"]),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ConflictError("stale thumbnail attachment target generation version")
+            return {
+                "effect_type": "generation.thumbnail.attach",
+                "generation_id": generation["id"],
+                "thumbnail": descriptor,
+                "changed": changed,
+                "version": int(generation["version"]) + (1 if changed else 0),
+            }
         if kind != "project.update":
             if kind != "generation.variant.append":
                 raise ValidationError("unsupported settlement effect_type")
-            self._validate_settlement_effect(
+            plan = self._validate_settlement_effect(
                 effect,
                 project_id=project_id,
                 result=result,
                 input_object_ids=input_object_ids,
             )
             payload = effect["payload"]
-            output = result["outputs"][payload["output_ordinal"]]
+            output = plan["creative_output"]
             output_digest = output["digest"].removeprefix("sha256:")
             identity = {
                 "generation_id": str(effect["target_id"]),
@@ -2943,9 +3330,21 @@ class RealmStore:
             }
             variant_id = "append-" + hashlib.sha256(canonical_json(identity).encode()).hexdigest()
             timestamp = settled_at or now()
+            generation = self.conn.execute(
+                "SELECT metadata_json FROM generations WHERE id=?", (str(effect["target_id"]),)
+            ).fetchone()
+            generation_metadata = json.loads(generation["metadata_json"])
+            if plan["thumbnail"] is not None:
+                self._validate_existing_generation_thumbnail(
+                    generation_metadata.get("thumbnail"),
+                    generation_id=str(effect["target_id"]),
+                )
+                generation_metadata["thumbnail"] = self._thumbnail_metadata_descriptor(
+                    plan["thumbnail"], plan["primary_source_object_id"]
+                )
             changed = self.conn.execute(
-                "UPDATE generations SET version=version+1, updated_at=? WHERE id=? AND project_id=? AND version=?",
-                (timestamp, str(effect["target_id"]), str(project_id), int(effect["expected_version"])),
+                "UPDATE generations SET metadata_json=?, version=version+1, updated_at=? WHERE id=? AND project_id=? AND version=?",
+                (canonical_json(generation_metadata), timestamp, str(effect["target_id"]), str(project_id), int(effect["expected_version"])),
             )
             if changed.rowcount != 1:
                 raise ConflictError("stale settlement effect target generation version")
@@ -3328,6 +3727,7 @@ class RealmStore:
                     "generation.variant.append",
                     "generation.create_with_variant",
                     "generation.publish_v1",
+                    "generation.thumbnail.attach",
                 }
                 if publish is not None:
                     if append_effect:
@@ -3356,6 +3756,8 @@ class RealmStore:
                             for key, value in applied_effect.items()
                             if not key.startswith("_")
                         }
+                    elif effect.get("effect_type") == "generation.thumbnail.attach":
+                        result["generation_thumbnail"] = applied_effect
                     else:
                         result["generation_variant"] = applied_effect
                 managed_outputs = self._associate_managed_outputs(

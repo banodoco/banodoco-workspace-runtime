@@ -58,3 +58,74 @@ def test_worker_schema_declares_continuation_waits_and_output_primary_contract()
     output = schema["definitions"]["Output"]["properties"]
     assert output["is_primary"] == {"type": "boolean"}
     assert output["role"]["maxLength"] == 255
+
+
+def test_worker_schema_declares_thumbnail_auxiliary_and_attach_effect() -> None:
+    schema = json.loads((ROOT / "contract/schemas/worker.json").read_text())
+    output_schema = {
+        "$schema": schema["$schema"],
+        "definitions": schema["definitions"],
+        **schema["definitions"]["Output"],
+    }
+    source = "sha256:" + "a" * 64
+    thumbnail = {
+        "name": "thumbnail.jpg",
+        "kind": "object",
+        "digest": "sha256:" + "b" * 64,
+        "media_type": "image/jpeg",
+        "size": 4,
+        "output_port": "thumbnail",
+        "role": "thumbnail",
+        "durability": "durable",
+        "provenance": {
+            "thumbnail": {"source_object_ids": [source], "recipe_version": 1}
+        },
+    }
+    assert not list(Draft202012Validator(output_schema).iter_errors(thumbnail))
+    wrong_mime = {**thumbnail, "media_type": "image/png"}
+    assert list(Draft202012Validator(output_schema).iter_errors(wrong_mime))
+    forged_primary = {**thumbnail, "is_primary": False}
+    assert list(Draft202012Validator(output_schema).iter_errors(forged_primary))
+
+    effect_schema = {
+        "$schema": schema["$schema"],
+        "definitions": schema["definitions"],
+        **schema["definitions"]["Effect"],
+    }
+    effect = {
+        "effect_type": "generation.thumbnail.attach",
+        "target_id": "generation-1",
+        "expected_version": 1,
+        "payload": {
+            "source_object_id": source,
+            "output_name": "thumbnail.jpg",
+            "output_ordinal": 0,
+            "recipe_version": 1,
+        },
+    }
+    assert not list(Draft202012Validator(effect_schema).iter_errors(effect))
+
+
+def test_generation_schema_reserves_direct_thumbnail_descriptor() -> None:
+    schema = json.loads((ROOT / "contract/schemas/generation.json").read_text())
+    generation = {
+        "generation_id": "generation-1",
+        "project_id": "project-1",
+        "source_task_id": "task-1",
+        "type": "video",
+        "status": "completed",
+        "metadata": {
+            "shot_id": "shot-1",
+            "thumbnail": {
+                "object_id": "sha256:" + "b" * 64,
+                "source_object_id": "sha256:" + "a" * 64,
+                "recipe_version": 1,
+            },
+        },
+        "version": 1,
+        "created_at": "2026-09-22T00:00:00Z",
+        "updated_at": "2026-09-22T00:00:00Z",
+    }
+    assert not list(Draft202012Validator(schema).iter_errors(generation))
+    generation["metadata"]["thumbnail"]["recipe_version"] = 2
+    assert list(Draft202012Validator(schema).iter_errors(generation))

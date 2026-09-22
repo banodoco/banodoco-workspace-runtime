@@ -139,6 +139,41 @@
         "regeneration": { "$ref": "./managed-output.json#/properties/regeneration" },
         "coverage": { "$ref": "./managed-output.json#/properties/coverage" },
          "duration_seconds": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["role"],
+            "properties": { "role": { "const": "thumbnail" } }
+          },
+          "then": {
+            "required": ["output_port", "durability", "provenance"],
+            "not": { "required": ["is_primary"] },
+            "properties": {
+              "output_port": { "const": "thumbnail" },
+              "media_type": { "const": "image/jpeg" },
+              "durability": { "const": "durable" },
+              "provenance": { "$ref": "#/definitions/ThumbnailOutputProvenance" }
+            }
+          }
+        }
+      ]
+    },
+    "ThumbnailOutputProvenance": {
+      "type": "object", "additionalProperties": true,
+      "required": ["thumbnail"],
+      "properties": {
+        "thumbnail": {
+          "type": "object", "additionalProperties": false,
+          "required": ["source_object_ids", "recipe_version"],
+          "properties": {
+            "source_object_ids": {
+              "type": "array", "minItems": 1, "uniqueItems": true,
+              "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+            },
+            "recipe_version": { "type": "integer", "const": 1 }
+          }
+        }
       }
     },
     "Effect": {
@@ -146,7 +181,8 @@
         { "$ref": "#/definitions/ProjectUpdateEffect" },
         { "$ref": "#/definitions/GenerationVariantAppendEffect" },
         { "$ref": "#/definitions/GenerationCreateWithVariantEffect" },
-        { "$ref": "#/definitions/GenerationPublishV1Effect" }
+        { "$ref": "#/definitions/GenerationPublishV1Effect" },
+        { "$ref": "#/definitions/GenerationThumbnailAttachEffect" }
       ]
     },
     "ProjectUpdateEffect": {
@@ -240,6 +276,26 @@
               "variant_key": { "type": "string", "minLength": 1, "maxLength": 255 },
               "output_port": { "type": "string", "minLength": 1, "maxLength": 255 },
               "required": { "type": "boolean" }
+      }
+    },
+    "GenerationThumbnailAttachEffect": {
+      "type": "object", "additionalProperties": false,
+      "required": ["effect_type", "target_id", "expected_version", "payload"],
+      "properties": {
+        "effect_type": { "type": "string", "const": "generation.thumbnail.attach" },
+        "target_id": { "type": "string", "minLength": 1 },
+        "expected_version": { "type": "integer", "minimum": 1 },
+        "payload": { "$ref": "#/definitions/GenerationThumbnailAttachPayload" }
+      }
+    },
+    "GenerationThumbnailAttachPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_object_id", "output_name", "output_ordinal", "recipe_version"],
+      "properties": {
+        "source_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "output_name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "output_ordinal": { "type": "integer", "const": 0 },
+        "recipe_version": { "type": "integer", "const": 1 }
       }
     }
   }
