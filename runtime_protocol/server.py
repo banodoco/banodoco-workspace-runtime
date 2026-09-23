@@ -24,6 +24,8 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
 
 class RuntimeHandler(BaseHTTPRequestHandler):
     server_version = "BanodocoRuntime/0.1"
+    # Bound abandoned request bodies and clients that stop consuming responses.
+    timeout = 30
     MAX_BODY_BYTES = 64 * 1024 * 1024
     REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 
@@ -92,6 +94,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             raise ProtocolError(str(exc)) from exc
 
     def _send(self, status, payload=None, *, headers=None, body=None, error=None, receipt=None, idempotency_key=None):
+        if getattr(self, "_defer_response", False):
+            self._pending_response = (status, payload, {
+                "headers": headers, "body": body, "error": error,
+                "receipt": receipt, "idempotency_key": idempotency_key,
+            })
+            return
         self.send_response(status)
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-ID", self._request_id())
@@ -311,6 +319,25 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET": return self._send(200, self.runtime.get_document(selector, path[4]))
                 return self._send(200, self.runtime.update_document(selector, path[4], self._body(), idempotency_key=self._idempotency_key()))
+            if len(path) == 4 and path[3] == "media-imports" and method == "POST":
+                identity = self._identity("projects:write")
+                key = self._idempotency_key()
+                result = self.runtime.import_media(
+                    selector,
+                    self._raw_body(),
+                    media_type=self.headers.get("Content-Type", "application/octet-stream"),
+                    original_name=self.headers.get("X-Original-Name"),
+                    expected_digest=self.headers.get("X-Expected-Digest"),
+                    actor_id=identity["actor"],
+                    width=self.headers.get("X-Media-Width"),
+                    height=self.headers.get("X-Media-Height"),
+                    duration_seconds=self.headers.get("X-Media-Duration-Seconds"),
+                    idempotency_key=key,
+                )
+                return self._send(201, result)
+            if len(path) == 5 and path[3] == "media-imports" and method == "GET":
+                self._identity("projects:read")
+                return self._send(200, self.runtime.get_media_import(selector, path[4]))
             if len(path) == 4 and path[3] == "generations":
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET":
@@ -567,6 +594,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.resume_attempt(self._body(), identity=identity))
         if len(path) == 3 and path[:2] == ["v1", "generations"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_generation(path[2]))
+        if len(path) == 5 and path[:2] == ["v1", "generations"] and path[3] == "variants" and path[4] == "viewed" and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.mark_generation_variants_viewed(path[2], idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "generations"] and path[3] == "variants":
             self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
@@ -575,6 +605,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if method == "POST": return self._send(201, self.runtime.create_variant(path[2], self._body(), idempotency_key=self._idempotency_key()))
         if len(path) == 3 and path[:2] == ["v1", "variants"] and method == "GET":
             self._identity("projects:read"); return self._send(200, self.runtime.get_variant(path[2]))
+        if len(path) == 4 and path[:2] == ["v1", "variants"] and path[3] == "thumbnail" and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.attach_variant_thumbnail(path[2], self._body(), idempotency_key=self._idempotency_key()))
+        if len(path) == 4 and path[:2] == ["v1", "variants"] and path[3] == "viewed" and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.mark_variant_viewed(path[2], idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "runs"] and path[3] == "events" and method == "GET":
             self._identity("tasks:read")
             query = parse_qs(urlsplit(self.path).query)
@@ -621,11 +657,24 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         this runtime intentionally owns one SQLite connection.  The service
         has finer-grained locks around many mutations, but read paths and
         multi-step handlers also touch the connection; the HTTP boundary must
-        therefore serialize the complete route.
+        therefore serialize the service portion of the route. Response socket
+        writes happen afterwards: an unread client must not hold the database
+        lock and stall every other request, including health checks.
         """
         try:
-            with self.runtime.store._mutex:
-                self._route()
+            self._pending_response = None
+            self._defer_response = True
+            try:
+                with self.runtime.store._mutex:
+                    self._route()
+            finally:
+                self._defer_response = False
+            if self._pending_response is not None:
+                status, payload, kwargs = self._pending_response
+                self._pending_response = None
+                self._send(status, payload, **kwargs)
+        except (ConnectionError, TimeoutError):
+            self.close_connection = True
         except Exception as exc:
             self._error(exc)
 

@@ -174,6 +174,36 @@ def test_stale_publication_rolls_back_and_retry_conflicts(tmp_path):
         service.close()
 
 
+def test_lost_response_replay_returns_original_head_after_a_newer_publish(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        first_body = _publication(project_id)
+        first = service.publish_parent_composition(
+            project_id, "main", first_body, idempotency_key="publish-lost-response"
+        )
+        second_body = _publication(
+            project_id,
+            expected_head="parent-1",
+            parent_revision_id="parent-2",
+            shot_revision_id="shot-rev-2",
+            config={"writer": 2},
+        )
+        service.publish_parent_composition(
+            project_id, "main", second_body, idempotency_key="publish-second-writer"
+        )
+
+        replay = service.publish_parent_composition(
+            project_id, "main", copy.deepcopy(first_body), idempotency_key="publish-lost-response"
+        )
+
+        assert replay == first
+        assert replay["data"]["new_head"] == "parent-1"
+        assert replay["receipt"]["result"]["new_head"] == "parent-1"
+        assert service._timeline_resource("main")["head_revision_id"] == "parent-2"
+    finally:
+        service.close()
+
+
 def test_same_head_concurrent_publishers_have_one_winner(tmp_path):
     service, project_id = _service(tmp_path)
     try:
@@ -222,13 +252,64 @@ def test_failure_injection_rolls_back_every_publication_write(tmp_path, monkeypa
     service, project_id = _service(tmp_path)
     try:
         command_count = service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0]
-        baseline = {table: service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("shot_revisions", "internal_timeline_revisions", "parent_composition_revisions", "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences", "composition_revision_dependencies")}
+        baseline = {table: service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("project_shots", "shot_items", "shot_revisions", "internal_timeline_revisions", "parent_composition_revisions", "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences", "composition_revision_dependencies")}
         monkeypatch.setattr(service.store, "_append_timeline_event", lambda *args: (_ for _ in ()).throw(RuntimeError("injected")))
         with pytest.raises(RuntimeError, match="injected"):
             service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="injected")
-        for table in ("shot_revisions", "internal_timeline_revisions", "parent_composition_revisions", "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences", "composition_revision_dependencies"):
+        for table in ("project_shots", "shot_items", "shot_revisions", "internal_timeline_revisions", "parent_composition_revisions", "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences", "composition_revision_dependencies"):
             assert service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == baseline[table]
         assert service.store.conn.execute("SELECT COUNT(*) FROM command_idempotency").fetchone()[0] == command_count
         assert service.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id='main'").fetchone()[0] == 1
+    finally:
+        service.close()
+
+
+def test_publication_preserves_opaque_parent_and_occurrence_fields(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        body = _publication(project_id)
+        body["parent_composition"]["opaque_parent"] = {"future": [1, 2, 3]}
+        occurrence = body["parent_composition"]["occurrences"][0]
+        occurrence["placement"]["opaque_geometry"] = {"anchor": "center"}
+        occurrence["opaque_occurrence"] = {"future_schema": True}
+
+        published = service.publish_parent_composition(
+            project_id, "main", body, idempotency_key="opaque-publication"
+        )
+        reread = service.get_project_parent_composition_revision(
+            project_id, "main", published["data"]["new_head"]
+        )
+
+        assert reread["payload"]["opaque_parent"] == {"future": [1, 2, 3]}
+        stored = reread["payload"]["occurrences"][0]
+        assert stored["opaque_occurrence"] == {"future_schema": True}
+        assert stored["placement"]["opaque_geometry"] == {"anchor": "center"}
+    finally:
+        service.close()
+
+
+def test_missing_selected_media_rejects_publication_without_identity_leak(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        body = _publication(project_id)
+        missing = "sha256:" + "f" * 64
+        body["shot_revisions"][0]["payload"]["items"] = [
+            {"item_id": "missing-item", "media_id": missing, "metadata": {}}
+        ]
+        before = {
+            table: service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("project_shots", "shot_items", "shot_revisions", "internal_timeline_revisions")
+        }
+
+        with pytest.raises(NotFoundError, match="media dependency"):
+            service.publish_parent_composition(
+                project_id, "main", body, idempotency_key="missing-selected-media"
+            )
+
+        after = {
+            table: service.store.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in before
+        }
+        assert after == before
     finally:
         service.close()

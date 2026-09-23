@@ -27,6 +27,7 @@ from runtime_protocol.upgrade import (
     DEFAULT_UPGRADE_TIMEOUT_SECONDS,
     HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION,
     _open_readonly,
+    migrate_canonical_v24_to_v25,
     migrate_historical_managed_outputs,
     upgrade_realm,
 )
@@ -62,15 +63,15 @@ def _schema_kind(root: Path) -> str:
         }
         if "runtime_schema" in tables:
             row = connection.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
-            if row and str(row[0]) == "astrid-runtime-sqlite-v1" and int(row[1]) == 24:
-                return "v24"
+            if row and str(row[0]) == "astrid-runtime-sqlite-v1" and int(row[1]) in {24, 25}:
+                return f"v{int(row[1])}"
             raise OperatorUpgradeError("realm has an unsupported canonical runtime schema")
         if "schema_migrations" in tables:
             version = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if version == 23:
                 return "v23"
             raise OperatorUpgradeError(f"realm has unsupported legacy schema version {version}")
-        raise OperatorUpgradeError("realm is neither canonical v24 nor the supported v23 format")
+        raise OperatorUpgradeError("realm is neither canonical v25, v24, nor the supported v23 format")
     finally:
         connection.close()
 
@@ -240,6 +241,11 @@ def upgrade_workspace(
             _journal(paths, operation_id=operation_id, state="stopped", realm_id=realm_id, schema_before=kind, idle=idle)
             if kind == "v23":
                 migration = upgrade_realm(realm_root, timeout_seconds=timeout_seconds, confirmation=f"UPGRADE {realm_id}")
+            elif kind == "v24":
+                migration = migrate_canonical_v24_to_v25(
+                    realm_root, timeout_seconds=timeout_seconds,
+                    confirmation=f"MIGRATE VARIANT STATE {realm_id}",
+                )
             else:
                 migration = migrate_historical_managed_outputs(
                     realm_root, timeout_seconds=timeout_seconds,

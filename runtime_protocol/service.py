@@ -34,6 +34,9 @@ from .shot_dependencies import analyze_invalidation
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
 OBJECT_MAX_BYTES = 64 * 1024 * 1024
+MEDIA_IMPORT_CAPABILITY = "runtime.media.import.v1"
+MEDIA_IMPORT_EXECUTOR = "runtime-host-media-import"
+MEDIA_IMPORT_CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(MEDIA_IMPORT_CAPABILITY.encode()).hexdigest()
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
@@ -1576,6 +1579,11 @@ class RuntimeService:
     def _normalize_occurrence(self, occurrence, *, shot_lookup):
         if not isinstance(occurrence, dict):
             raise ValidationError("occurrences must be objects")
+        # Occurrences are authored records, not a transport DTO.  Start from
+        # the submitted object so forward-compatible/opaque placement fields
+        # survive immutable publication.  The known fields below are then
+        # validated and written back in their canonical spellings.
+        result = copy.deepcopy(occurrence)
         occurrence_id = occurrence.get("occurrence_id")
         if not isinstance(occurrence_id, str) or not occurrence_id:
             raise ValidationError("occurrence_id is required")
@@ -1620,7 +1628,25 @@ class RuntimeService:
         provenance = occurrence.get("provenance", {})
         if not isinstance(provenance, dict):
             raise ValidationError("occurrence provenance must be an object")
-        return {"occurrence_id": occurrence_id, "shot_id": shot_id, "shot_revision_id": shot_revision_id, "placement": placement, "source_offset": source_offset, "duration_ms": int(duration), "speed": speed, "track": track, "transform": transform, "gain": gain, "muted": muted, "provenance": provenance}
+        result.update({
+            "occurrence_id": occurrence_id,
+            "shot_id": shot_id,
+            "shot_revision_id": shot_revision_id,
+            "placement": copy.deepcopy(placement),
+            "source_offset": copy.deepcopy(source_offset),
+            "duration_ms": int(duration),
+            "speed": copy.deepcopy(speed),
+            "track": track,
+            "transform": copy.deepcopy(transform),
+            "gain": gain,
+            "muted": muted,
+            "provenance": copy.deepcopy(provenance),
+        })
+        # These accepted aliases are known/derived rather than opaque fields.
+        result.pop("duration", None)
+        result.pop("source_offset_ms", None)
+        result.pop("mute", None)
+        return result
 
     def _validate_media_dependencies(self, project_id, manifest):
         media = manifest.get("media", []) if isinstance(manifest, dict) else []
@@ -2922,7 +2948,10 @@ class RuntimeService:
         if replay is not None:
             return replay
         try:
-            self.store.conn.execute("INSERT INTO generation_variants VALUES (?, ?, ?, ?, ?, ?)", (variant_id, generation_id, object_id, variant_type, canonical_json(metadata), now()))
+            self.store.conn.execute(
+                "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version, viewed_at, created_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)",
+                (variant_id, generation_id, object_id, variant_type, canonical_json(metadata), now()),
+            )
         except sqlite3.IntegrityError as exc:
             raise ConflictError("generation variant already exists", details={"variant_id": variant_id}) from exc
         result = self._variant_resource(self.store.conn.execute("SELECT * FROM generation_variants WHERE id=?", (variant_id,)).fetchone())
@@ -2935,6 +2964,17 @@ class RuntimeService:
         value["metadata"] = json.loads(value.pop("metadata_json"))
         if value.get("object_id"):
             value["object_id"] = "sha256:" + value["object_id"]
+        thumbnail_object_id = value.pop("thumbnail_object_id", None)
+        thumbnail_source_object_id = value.pop("thumbnail_source_object_id", None)
+        thumbnail_recipe_version = value.pop("thumbnail_recipe_version", None)
+        if thumbnail_object_id and thumbnail_source_object_id and thumbnail_recipe_version is not None:
+            value["thumbnail"] = {
+                "object_id": "sha256:" + str(thumbnail_object_id),
+                "source_object_id": "sha256:" + str(thumbnail_source_object_id),
+                "recipe_version": int(thumbnail_recipe_version),
+            }
+        else:
+            value["thumbnail"] = None
         return value
 
     def list_variants(self, generation_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
@@ -2949,6 +2989,138 @@ class RuntimeService:
         if not row:
             raise NotFoundError("generation variant not found")
         return self._variant_resource(row)
+
+    @_durable_mutation
+    def attach_variant_thumbnail(self, variant_id, body, *, idempotency_key=None):
+        """Attach a source-verified managed JPEG poster to one variant."""
+        if not idempotency_key:
+            raise InvalidRequestError("Idempotency-Key is required for state mutations")
+        self._require_object_body(body)
+        if set(body) != {"thumbnail_object_id", "source_object_id", "recipe_version"}:
+            raise ValidationError(
+                "variant thumbnail requires thumbnail_object_id, source_object_id, and recipe_version"
+            )
+        thumbnail_object_id = body["thumbnail_object_id"]
+        source_object_id = body["source_object_id"]
+        recipe_version = body["recipe_version"]
+        for field, value in (("thumbnail_object_id", thumbnail_object_id), ("source_object_id", source_object_id)):
+            if not isinstance(value, str) or not OBJECT_ID_RE.fullmatch(value) or not value.startswith("sha256:"):
+                raise ValidationError(f"{field} must be a canonical sha256 object id")
+        if isinstance(recipe_version, bool) or recipe_version != 1:
+            raise ValidationError("recipe_version must be 1")
+        row = self.store.conn.execute(
+            "SELECT gv.*, g.project_id FROM generation_variants gv JOIN generations g ON g.id=gv.generation_id WHERE gv.id=?",
+            (variant_id,),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("generation variant not found")
+        source_digest = source_object_id.removeprefix("sha256:")
+        thumbnail_digest = thumbnail_object_id.removeprefix("sha256:")
+        if row["object_id"] != source_digest:
+            raise ConflictError(
+                "variant source changed before thumbnail attachment",
+                details={"variant_id": str(variant_id), "expected_source_object_id": "sha256:" + str(row["object_id"]), "actual_source_object_id": source_object_id},
+            )
+        project_id = str(row["project_id"])
+        thumbnail_row = self.store.conn.execute(
+            "SELECT media_type FROM objects WHERE digest=?", (thumbnail_digest,)
+        ).fetchone()
+        if not thumbnail_row:
+            raise NotFoundError("thumbnail object not found")
+        if str(thumbnail_row["media_type"]).lower() != "image/jpeg":
+            raise ConflictError("variant thumbnail object must be image/jpeg")
+        if not self.store.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+            (project_id, thumbnail_digest),
+        ).fetchone():
+            raise ConflictError("thumbnail object is outside the variant project")
+        request_hash = hashlib.sha256(canonical_json({"variant_id": str(variant_id), **body}).encode()).hexdigest()
+        replay = self._command_replay(
+            "variant.thumbnail.attach", str(variant_id), idempotency_key, request_hash,
+            project_id=project_id,
+        )
+        if replay is not None:
+            return replay
+        self.store.conn.execute(
+            "UPDATE generation_variants SET thumbnail_object_id=?, thumbnail_source_object_id=?, thumbnail_recipe_version=? WHERE id=? AND object_id=?",
+            (thumbnail_digest, source_digest, recipe_version, variant_id, source_digest),
+        )
+        updated = self.store.conn.execute(
+            "SELECT * FROM generation_variants WHERE id=?", (variant_id,)
+        ).fetchone()
+        return self._command_record(
+            "variant.thumbnail.attach", str(variant_id), idempotency_key,
+            request_hash, self._variant_resource(updated), project_id=project_id,
+        )
+
+    @_durable_mutation
+    def mark_variant_viewed(self, variant_id, *, idempotency_key=None):
+        """Persist the first lightbox view for one Runtime-owned variant."""
+        if not idempotency_key:
+            raise InvalidRequestError("Idempotency-Key is required for state mutations")
+        row = self.store.conn.execute(
+            "SELECT gv.*, g.project_id FROM generation_variants gv JOIN generations g ON g.id=gv.generation_id WHERE gv.id=?",
+            (variant_id,),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("generation variant not found")
+        project_id = str(row["project_id"])
+        request_hash = hashlib.sha256(canonical_json({"variant_id": str(variant_id)}).encode()).hexdigest()
+        replay = self._command_replay(
+            "variant.view", str(variant_id), idempotency_key, request_hash,
+            project_id=project_id,
+        )
+        if replay is not None:
+            return replay
+        timestamp = now()
+        self.store.conn.execute(
+            "UPDATE generation_variants SET viewed_at=COALESCE(viewed_at, ?) WHERE id=?",
+            (timestamp, variant_id),
+        )
+        updated = self.store.conn.execute(
+            "SELECT gv.* FROM generation_variants gv WHERE gv.id=?", (variant_id,)
+        ).fetchone()
+        return self._command_record(
+            "variant.view", str(variant_id), idempotency_key,
+            request_hash, self._variant_resource(updated), project_id=project_id,
+        )
+
+    @_durable_mutation
+    def mark_generation_variants_viewed(self, generation_id, *, idempotency_key=None):
+        """Persist first-view timestamps for every variant in a generation."""
+        if not idempotency_key:
+            raise InvalidRequestError("Idempotency-Key is required for state mutations")
+        generation = self.store.conn.execute(
+            "SELECT id, project_id FROM generations WHERE id=?", (generation_id,)
+        ).fetchone()
+        if not generation:
+            raise NotFoundError("generation not found")
+        project_id = str(generation["project_id"])
+        request_hash = hashlib.sha256(canonical_json({"generation_id": str(generation_id)}).encode()).hexdigest()
+        replay = self._command_replay(
+            "generation.variants.view", str(generation_id), idempotency_key,
+            request_hash, project_id=project_id,
+        )
+        if replay is not None:
+            return replay
+        timestamp = now()
+        self.store.conn.execute(
+            "UPDATE generation_variants SET viewed_at=COALESCE(viewed_at, ?) WHERE generation_id=?",
+            (timestamp, generation_id),
+        )
+        rows = self.store.conn.execute(
+            "SELECT * FROM generation_variants WHERE generation_id=? ORDER BY created_at, id",
+            (generation_id,),
+        ).fetchall()
+        result = {
+            "generation_id": str(generation_id),
+            "viewed_at": timestamp,
+            "variants": [self._variant_resource(row) for row in rows],
+        }
+        return self._command_record(
+            "generation.variants.view", str(generation_id), idempotency_key,
+            request_hash, result, project_id=project_id,
+        )
 
     def get_reference(self, reference_id):
         row = self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (reference_id,)).fetchone()
@@ -3072,6 +3244,313 @@ class RuntimeService:
             if not obj["deduplicated"]:
                 self._discard_published_digest(obj["digest"])
             raise
+
+    @staticmethod
+    def _media_import_operation_id(project_id, idempotency_key):
+        # The caller persists this key before sending bytes, so it remains a
+        # usable recovery identity even when the first acknowledgement is
+        # lost. Project scoping is carried by every ledger lookup below.
+        _ = project_id
+        return str(idempotency_key)
+
+    @staticmethod
+    def _media_import_aggregate_id(project_id, operation_id):
+        return f"{project_id}:{operation_id}"
+
+    @staticmethod
+    def _media_import_subkey(operation_id, purpose):
+        return "media-import-" + purpose + "-" + hashlib.sha256(
+            str(operation_id).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _media_import_optional_integer(value, field):
+        if value is None:
+            return None
+        if isinstance(value, str) and value.isdecimal():
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValidationError(f"{field} must be a positive integer")
+        return value
+
+    @staticmethod
+    def _media_import_optional_duration(value):
+        if value is None:
+            return None
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("duration_seconds must be a positive finite number") from exc
+        if not math.isfinite(normalized) or normalized <= 0:
+            raise ValidationError("duration_seconds must be a positive finite number")
+        return normalized
+
+    def _media_import_request(self, project, data, *, media_type, original_name,
+                              expected_digest, actor_id, width, height,
+                              duration_seconds, idempotency_key):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise InvalidRequestError("media import body must be bytes")
+        if len(data) > OBJECT_MAX_BYTES:
+            raise ValidationError("object exceeds 64 MiB limit")
+        data = bytes(data)
+        project_row = self.store.get_project(project)
+        if not isinstance(media_type, str) or not media_type or len(media_type) > 255:
+            raise ValidationError("media import Content-Type is invalid")
+        content_type = "image" if media_type.lower().startswith("image/") else (
+            "video" if media_type.lower().startswith("video/") else None
+        )
+        if content_type is None:
+            raise ValidationError("media import Content-Type must be image/* or video/*")
+        if original_name is not None:
+            original_name = _canonical_managed_output_filename(original_name)
+        if not isinstance(actor_id, str) or not actor_id:
+            raise ValidationError("media import actor is required")
+        width = self._media_import_optional_integer(width, "width")
+        height = self._media_import_optional_integer(height, "height")
+        duration_seconds = self._media_import_optional_duration(duration_seconds)
+        if content_type == "image" and duration_seconds is not None:
+            raise ValidationError("image imports must not declare duration_seconds")
+        expected = (expected_digest or "").removeprefix("sha256:") or None
+        digest = sha256_bytes(data)
+        operation_id = self._media_import_operation_id(project_row["id"], idempotency_key)
+        request = {
+            "project_id": project_row["id"],
+            "content_digest": digest,
+            "media_type": media_type,
+            "original_name": original_name,
+            "expected_digest": expected,
+            "actor_id": actor_id,
+            "width": width,
+            "height": height,
+            "duration_seconds": duration_seconds,
+        }
+        return {
+            "data": data,
+            "project": project_row,
+            "content_type": content_type,
+            "digest": digest,
+            "operation_id": operation_id,
+            "idempotency_key": idempotency_key,
+            "request": request,
+            "request_hash": hashlib.sha256(canonical_json(request).encode()).hexdigest(),
+        }
+
+    def _claim_media_import_task(self, task_id):
+        """Claim one exact private import task through the normal lease fence."""
+        epoch = self.store._current_runtime_epoch()
+        self.store.upsert_executor(
+            MEDIA_IMPORT_EXECUTOR,
+            [{
+                "capability_id": MEDIA_IMPORT_CAPABILITY,
+                "definition_digest": MEDIA_IMPORT_CAPABILITY_DIGEST,
+                "status": "ready",
+                "required_resource_keys": [],
+                "estimated_scratch_bytes": 0,
+                "estimated_output_bytes": 0,
+            }],
+            max_concurrency=1,
+            runtime_epoch=epoch,
+        )
+        lease_id = new_id()
+        claimed = self.store._claim_task(
+            task_id, MEDIA_IMPORT_EXECUTOR, lease_id,
+            runtime_epoch=epoch, _transactional=False,
+        )
+        task = claimed["task"]
+        if task.get("status") != "running" or task.get("lease_token") != lease_id:
+            raise ConflictError(
+                "runtime host could not claim media import task",
+                details={"task_id": task_id, "status": task.get("status")},
+            )
+        attempt_id = new_id()
+        fence = int(task["lease_fence"])
+        expires = task["lease_expires_at"]
+        self.store.conn.execute(
+            "INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            (attempt_id, task_id, lease_id, fence, MEDIA_IMPORT_EXECUTOR, expires, epoch),
+        )
+        self.store.conn.execute(
+            "UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, task_id)
+        )
+        return {
+            "attempt_id": attempt_id,
+            "lease_id": lease_id,
+            "fence": fence,
+            "runtime_epoch": epoch,
+        }
+
+    @_durable_mutation
+    def _settle_media_import_catalog(self, prepared, object_resource):
+        """Atomically settle the host-owned task and publish one catalog pair."""
+        project = prepared["project"]
+        operation_id = prepared["operation_id"]
+        idempotency_key = prepared["idempotency_key"]
+        replay = self._command_replay(
+            "media.import",
+            self._media_import_aggregate_id(project["id"], operation_id),
+            idempotency_key,
+            prepared["request_hash"], project_id=project["id"],
+        )
+        if replay is not None:
+            return replay
+
+        object_id = object_resource["digest"]
+        details = {
+            "filename": prepared["request"]["original_name"],
+            "mime_type": prepared["request"]["media_type"],
+            "size": int(object_resource["size"]),
+            "width": prepared["request"]["width"],
+            "height": prepared["request"]["height"],
+            "duration_seconds": prepared["request"]["duration_seconds"],
+        }
+        provenance = {
+            "source": "external_upload",
+            "origin": "imported",
+            "actor_id": prepared["request"]["actor_id"],
+            "import_operation_id": operation_id,
+        }
+        effect = {
+            "effect_type": "generation.create_with_variant",
+            "target_id": project["id"],
+            "payload": {
+                "generation_type": prepared["content_type"],
+                "metadata": {
+                    "provenance": provenance,
+                    "params": {"content_type": prepared["content_type"], **details},
+                },
+                "variant_type": "original",
+                "output_name": "original",
+                "output_ordinal": 0,
+                "primary_policy": "preserve",
+            },
+        }
+        task = self.create_task({
+            "capability_id": MEDIA_IMPORT_CAPABILITY,
+            "capability_digest": MEDIA_IMPORT_CAPABILITY_DIGEST,
+            "project": project["id"],
+            "input_object_ids": [object_id],
+            "settlement_effect": effect,
+            "spec": {
+                "operation": "media_import",
+                "import_operation_id": operation_id,
+            },
+            "idempotency_key": self._media_import_subkey(operation_id, "task"),
+        }, _host_owned=True)
+        task_id = task["task"]["id"]
+        attempt = self._claim_media_import_task(task_id)
+        output = {
+            "name": "original",
+            "filename": prepared["request"]["original_name"] or "original",
+            "kind": "object",
+            "digest": object_id,
+            "media_type": prepared["request"]["media_type"],
+            "size": int(object_resource["size"]),
+            "ordinal": 0,
+            "role": "primary",
+            "is_primary": True,
+            "producer": {"kind": "runtime_host_import"},
+            "provenance": provenance,
+        }
+        if prepared["request"]["duration_seconds"] is not None:
+            output["duration_seconds"] = prepared["request"]["duration_seconds"]
+        settled = self.settle_attempt(
+            attempt["attempt_id"],
+            {
+                "lease_id": attempt["lease_id"],
+                "fence": attempt["fence"],
+                "runtime_epoch": attempt["runtime_epoch"],
+                "outputs": [output],
+                "effect": effect,
+            },
+            idempotency_key=self._media_import_subkey(operation_id, "settle"),
+        )
+        generation_variant = settled["data"]["result"]["generation_variant"]
+        result = {
+            "provider": "runtime",
+            "project": project["id"],
+            "import_operation_id": operation_id,
+            "status": "completed",
+            "task_id": task_id,
+            "generation_id": generation_variant["generation_id"],
+            "variant_id": generation_variant["variant_id"],
+            "asset_id": object_id,
+            "entry": {
+                "object_id": object_id,
+                "media_type": prepared["request"]["media_type"],
+                "size": int(object_resource["size"]),
+                "filename": prepared["request"]["original_name"],
+            },
+            "provenance": provenance,
+            "actor_id": prepared["request"]["actor_id"],
+            **details,
+        }
+        return self._command_record(
+            "media.import",
+            self._media_import_aggregate_id(project["id"], operation_id),
+            idempotency_key,
+            prepared["request_hash"], result, project_id=project["id"],
+        )
+
+    def import_media(self, project, data: bytes, *, media_type, original_name=None,
+                     expected_digest=None, actor_id, width=None, height=None,
+                     duration_seconds=None, idempotency_key=None):
+        """Ingest and settle one authenticated image/video import operation."""
+        prepared = self._media_import_request(
+            project, data, media_type=media_type, original_name=original_name,
+            expected_digest=expected_digest, actor_id=actor_id, width=width,
+            height=height, duration_seconds=duration_seconds,
+            idempotency_key=idempotency_key,
+        )
+        ingested = self.ingest(
+            prepared["project"]["id"], prepared["data"],
+            media_type=prepared["request"]["media_type"],
+            original_name=prepared["request"]["original_name"],
+            expected_digest=prepared["request"]["expected_digest"],
+            idempotency_key=self._media_import_subkey(prepared["operation_id"], "object"),
+        )
+        return self._settle_media_import_catalog(prepared, ingested["data"])
+
+    def get_media_import(self, project, operation_id):
+        """Recover a completed import or its durable pre-settlement ingest."""
+        if not isinstance(operation_id, str) or not IDEMPOTENCY_KEY_RE.fullmatch(operation_id):
+            raise NotFoundError("media import operation not found")
+        project_row = self.store.get_project(project)
+        completed = self.store.conn.execute(
+            "SELECT result_json FROM command_idempotency WHERE command_kind='media.import' AND aggregate_id=?",
+            (self._media_import_aggregate_id(project_row["id"], operation_id),),
+        ).fetchone()
+        if completed:
+            result = json.loads(completed["result_json"])
+            if result.get("project") != project_row["id"]:
+                raise NotFoundError("media import operation not found")
+            return result
+        pending = self.store.conn.execute(
+            "SELECT result_json FROM command_idempotency WHERE command_kind='object.ingest' AND aggregate_id=? AND idempotency_key=?",
+            (
+                project_row["id"],
+                self._media_import_subkey(operation_id, "object"),
+            ),
+        ).fetchone()
+        if not pending:
+            raise NotFoundError("media import operation not found")
+        object_resource = json.loads(pending["result_json"])
+        return {
+            "provider": "runtime",
+            "project": project_row["id"],
+            "import_operation_id": operation_id,
+            "status": "pending",
+            "task_id": None,
+            "generation_id": None,
+            "variant_id": None,
+            "asset_id": object_resource["digest"],
+            "entry": {
+                "object_id": object_resource["digest"],
+                "media_type": object_resource["media_type"],
+                "size": int(object_resource["size"]),
+                "filename": object_resource.get("filename"),
+            },
+        }
 
     @staticmethod
     def _generic_output_idempotency_key(binding):
@@ -3299,10 +3778,12 @@ class RuntimeService:
                           resource_fn=lambda row: {"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]})
 
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False):
+    def create_task(self, body, *, enforce_readiness=False, _host_owned=False):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
         capability = body.get("capability_id")
+        if capability == MEDIA_IMPORT_CAPABILITY and not _host_owned:
+            raise AuthorizationError("runtime media import capability is host-owned")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
         if "generation_intent" in body:

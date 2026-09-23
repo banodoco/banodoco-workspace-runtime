@@ -440,6 +440,8 @@ def test_shot_expansion_namespaces_repeated_child_clip_ids_and_trims_left_window
     assert clips[0]["hold"] == 1.5
     assert clips[0]["from"] == 0.5
     assert clips[0]["to"] == 2.0
+    assert "source_clip_id" not in clips[0]
+    assert clips[0]["app"]["astrid_shot_composition"]["source_clip_id"] == "shared-child-id"
 
 
 def test_shot_expansion_rejects_non_finite_or_non_positive_timing():

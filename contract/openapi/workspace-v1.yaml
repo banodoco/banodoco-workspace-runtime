@@ -138,6 +138,37 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
       responses: { '201': { description: Managed object with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectObjectMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/media-imports:
+    post:
+      operationId: importProjectMedia
+      description: Authenticated Runtime-host image/video ingest and atomic Generation plus original primary Variant settlement. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - { name: X-Original-Name, in: header, required: false, schema: { type: string, minLength: 1, maxLength: 512 } }
+        - { name: X-Expected-Digest, in: header, required: false, schema: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+        - { name: X-Media-Width, in: header, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: X-Media-Height, in: header, required: false, schema: { type: integer, minimum: 1 } }
+        - { name: X-Media-Duration-Seconds, in: header, required: false, schema: { type: number, exclusiveMinimum: 0 } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream: { schema: { type: string, format: binary, maxLength: 67108864 } }
+          image/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
+          video/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
+      responses:
+        '201': { description: Completed Runtime media import with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/projects/{project_id}/media-imports/{import_operation_id}:
+    get:
+      operationId: getProjectMediaImport
+      description: Recover the durable completed or pending state of one Runtime media import after refresh, timeout, or lost acknowledgement.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { name: import_operation_id, in: path, required: true, description: The caller-persisted project-scoped Idempotency-Key used for the import., schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' } }
+      responses:
+        '200': { description: Durable media import state, content: { application/json: { schema: { $ref: '#/components/schemas/MediaImportOperation' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/projects/{project_id}/tasks:
     get:
       operationId: listProjectTasks
@@ -592,11 +623,27 @@ paths:
       parameters: [ { $ref: '#/components/parameters/GenerationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateVariant' } } } }
       responses: { '201': { description: Generation variant with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/generations/{generation_id}/variants/viewed:
+    post:
+      operationId: markGenerationVariantsViewed
+      parameters: [ { $ref: '#/components/parameters/GenerationId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses: { '200': { description: Generation variants with persisted view state, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/variants/{variant_id}:
     get:
       operationId: getVariant
       parameters: [ { name: variant_id, in: path, required: true, schema: { type: string } } ]
       responses: { '200': { description: Generation variant, content: { application/json: { schema: { $ref: '#/components/schemas/Variant' } } } } }
+  /v1/variants/{variant_id}/thumbnail:
+    post:
+      operationId: attachVariantThumbnail
+      parameters: [ { name: variant_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [thumbnail_object_id, source_object_id, recipe_version], properties: { thumbnail_object_id: { type: string }, source_object_id: { type: string }, recipe_version: { type: integer, const: 1 } } } } } }
+      responses: { '200': { description: Generation variant with attached poster, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/variants/{variant_id}/viewed:
+    post:
+      operationId: markVariantViewed
+      parameters: [ { name: variant_id, in: path, required: true, schema: { type: string } }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      responses: { '200': { description: Generation variant with persisted view state, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/settle:
     post:
       operationId: settleAttempt
@@ -710,6 +757,36 @@ components:
         scope: { type: string, enum: [workspace, user] }
         project: { $ref: './schemas/project.json' }
         updated_at: { type: string }
+    MediaImportOperation:
+      type: object
+      additionalProperties: false
+      required: [provider, project, import_operation_id, status, task_id, generation_id, variant_id, asset_id, entry]
+      properties:
+        provider: { type: string, const: runtime }
+        project: { type: string }
+        import_operation_id: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' }
+        status: { type: string, enum: [pending, completed] }
+        task_id: { type: [string, 'null'] }
+        generation_id: { type: [string, 'null'] }
+        variant_id: { type: [string, 'null'] }
+        asset_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        entry:
+          type: object
+          additionalProperties: false
+          required: [object_id, media_type, size, filename]
+          properties:
+            object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            media_type: { type: string }
+            size: { type: integer, minimum: 0, maximum: 67108864 }
+            filename: { type: [string, 'null'] }
+        provenance: { type: object, additionalProperties: true }
+        actor_id: { type: string }
+        filename: { type: [string, 'null'] }
+        mime_type: { type: string }
+        size: { type: integer, minimum: 0, maximum: 67108864 }
+        width: { type: [integer, 'null'], minimum: 1 }
+        height: { type: [integer, 'null'], minimum: 1 }
+        duration_seconds: { type: [number, 'null'], exclusiveMinimum: 0 }
     RunAction:
       type: object
       additionalProperties: false
@@ -869,7 +946,20 @@ components:
     Variant:
       type: object
       required: [variant_id, generation_id, variant_type, metadata, created_at]
-      properties: { variant_id: { type: string }, generation_id: { type: string }, object_id: { type: [string, 'null'] }, variant_type: { type: string }, metadata: { type: object }, created_at: { type: string } }
+      properties:
+        variant_id: { type: string }
+        generation_id: { type: string }
+        object_id: { type: [string, 'null'] }
+        variant_type: { type: string }
+        metadata: { type: object }
+        thumbnail:
+          type: [object, 'null']
+          properties:
+            object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            source_object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            recipe_version: { type: integer, const: 1 }
+        viewed_at: { type: [string, 'null'] }
+        created_at: { type: string }
     VariantPage:
       type: object
       required: [items, next_cursor]

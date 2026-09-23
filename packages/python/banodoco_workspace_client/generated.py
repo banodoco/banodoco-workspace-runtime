@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 PROTOCOL = "workspace.v1"
-SCHEMA_DIGEST = "sha256:e83404829332ef5b7aa2fbee0c33ff7a305503e38425b58e1bb6b6dc85cd293e"
-OPERATIONS = ('health', 'handshake', 'getRealm', 'doctor', 'createBackup', 'restoreBackup', 'exportRealm', 'tombstoneRealm', 'recoverRealm', 'purgeRealm', 'listProjects', 'createProject', 'getProject', 'updateProject', 'currentProject', 'selectProject', 'listDocuments', 'createDocument', 'getDocument', 'updateDocument', 'listProjectObjects', 'ingestProjectObject', 'listProjectTasks', 'listManagedOutputs', 'getManagedOutput', 'adoptManagedOutput', 'getProjectObjectLocation', 'exportManagedOutput', 'updateManagedOutputLifecycle', 'listProjectRuns', 'createTimeline', 'listTimelines', 'getProjectTimeline', 'publishParentComposition', 'getProjectParentCompositionRevision', 'createTimelineDocument', 'getProjectShotRevision', 'getProjectTimelineRevision', 'updateTimeline', 'listTimelineHistory', 'replaceTimelineClip', 'diffTimeline', 'archiveTimeline', 'recoverTimeline', 'createShot', 'getShot', 'updateShot', 'archiveShot', 'recoverShot', 'createReference', 'createProjectShot', 'listProjectShots', 'getProjectShot', 'updateProjectShot', 'archiveProjectShot', 'recoverProjectShot', 'addShotItem', 'removeShotItem', 'promoteProjectShotCandidate', 'reorderShotItems', 'listProjectShotTextBindings', 'setProjectShotTextBinding', 'getProjectShotTextBinding', 'setProjectShotTextBindingById', 'rebindProjectShotTextBinding', 'createProjectReference', 'listProjectReferences', 'getProjectReference', 'updateProjectReference', 'archiveProjectReference', 'recoverProjectReference', 'associateReference', 'setPrimaryReference', 'linkReferences', 'getReference', 'updateReference', 'archiveReference', 'recoverReference', 'listMediaRelations', 'createMediaRelation', 'ingestObject', 'getObject', 'headObject', 'admitTask', 'claimTask', 'getTask', 'cancelTask', 'retryTask', 'getRun', 'cancelRun', 'retryRun', 'listRunEvents', 'listEvents', 'registerExecutor', 'listCapabilities', 'registerCapability', 'listGenerations', 'createGeneration', 'getGeneration', 'listVariants', 'createVariant', 'getVariant', 'settleAttempt', 'prepareReboot', 'checkpointAttempt', 'publishTimelineRender', 'failAttempt', 'heartbeatAttempt', 'requestReboot', 'resumeAttempt')
+SCHEMA_DIGEST = "sha256:01d16edabbf734ee66c611d6c07b308332a13e78e5030e527c8c8332609a2c7e"
+OPERATIONS = ('health', 'handshake', 'getRealm', 'doctor', 'createBackup', 'restoreBackup', 'exportRealm', 'tombstoneRealm', 'recoverRealm', 'purgeRealm', 'listProjects', 'createProject', 'getProject', 'updateProject', 'currentProject', 'selectProject', 'listDocuments', 'createDocument', 'getDocument', 'updateDocument', 'listProjectObjects', 'ingestProjectObject', 'importProjectMedia', 'getProjectMediaImport', 'listProjectTasks', 'listManagedOutputs', 'getManagedOutput', 'adoptManagedOutput', 'getProjectObjectLocation', 'exportManagedOutput', 'updateManagedOutputLifecycle', 'listProjectRuns', 'createTimeline', 'listTimelines', 'getProjectTimeline', 'publishParentComposition', 'getProjectParentCompositionRevision', 'createTimelineDocument', 'getProjectShotRevision', 'getProjectTimelineRevision', 'updateTimeline', 'listTimelineHistory', 'replaceTimelineClip', 'diffTimeline', 'archiveTimeline', 'recoverTimeline', 'createShot', 'getShot', 'updateShot', 'archiveShot', 'recoverShot', 'createReference', 'createProjectShot', 'listProjectShots', 'getProjectShot', 'updateProjectShot', 'archiveProjectShot', 'recoverProjectShot', 'addShotItem', 'removeShotItem', 'promoteProjectShotCandidate', 'reorderShotItems', 'listProjectShotTextBindings', 'setProjectShotTextBinding', 'getProjectShotTextBinding', 'setProjectShotTextBindingById', 'rebindProjectShotTextBinding', 'createProjectReference', 'listProjectReferences', 'getProjectReference', 'updateProjectReference', 'archiveProjectReference', 'recoverProjectReference', 'associateReference', 'setPrimaryReference', 'linkReferences', 'getReference', 'updateReference', 'archiveReference', 'recoverReference', 'listMediaRelations', 'createMediaRelation', 'ingestObject', 'getObject', 'headObject', 'admitTask', 'claimTask', 'getTask', 'cancelTask', 'retryTask', 'getRun', 'cancelRun', 'retryRun', 'listRunEvents', 'listEvents', 'registerExecutor', 'listCapabilities', 'registerCapability', 'listGenerations', 'createGeneration', 'getGeneration', 'listVariants', 'createVariant', 'markGenerationVariantsViewed', 'getVariant', 'attachVariantThumbnail', 'markVariantViewed', 'settleAttempt', 'prepareReboot', 'checkpointAttempt', 'publishTimelineRender', 'failAttempt', 'heartbeatAttempt', 'requestReboot', 'resumeAttempt')
 
 
 @dataclass(frozen=True)
@@ -160,10 +160,12 @@ class GenerationVariant:
     metadata: Mapping[str, Any]
     created_at: str
     object_id: str | None = None
+    thumbnail: Mapping[str, Any] | None = None
+    viewed_at: str | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "GenerationVariant":
-        return cls(variant_id=value["variant_id"], generation_id=value["generation_id"], variant_type=value["variant_type"], metadata=value.get("metadata", {}), created_at=value["created_at"], object_id=value.get("object_id"))
+        return cls(variant_id=value["variant_id"], generation_id=value["generation_id"], variant_type=value["variant_type"], metadata=value.get("metadata", {}), created_at=value["created_at"], object_id=value.get("object_id"), thumbnail=value.get("thumbnail"), viewed_at=value.get("viewed_at"))
 
 
 @dataclass(frozen=True)
@@ -944,6 +946,19 @@ class WorkspaceClient:
         _, _, body = self._request("POST", f"/v1/projects/{_path_part(project_id)}/objects", body=bytes(data), headers=headers, expected=(200, 201))
         return self._mutation_json(body)
 
+    def import_project_media(self, project_id: str, data: bytes, *, media_type: str, idempotency_key: str, filename: str | None = None, expected_digest: str | None = None, width: int | None = None, height: int | None = None, duration_seconds: float | None = None) -> MutationResult:
+        headers = {"Content-Type": media_type, "Idempotency-Key": idempotency_key}
+        if filename is not None: headers["X-Original-Name"] = filename
+        if expected_digest is not None: headers["X-Expected-Digest"] = expected_digest
+        if width is not None: headers["X-Media-Width"] = str(width)
+        if height is not None: headers["X-Media-Height"] = str(height)
+        if duration_seconds is not None: headers["X-Media-Duration-Seconds"] = str(duration_seconds)
+        _, _, body = self._request("POST", f"/v1/projects/{_path_part(project_id)}/media-imports", body=bytes(data), headers=headers, expected=(200, 201))
+        return self._mutation_json(body)
+
+    def get_project_media_import(self, project_id: str, import_operation_id: str) -> Mapping[str, Any]:
+        return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/media-imports/{_path_part(import_operation_id)}")[2])
+
     def list_project_objects(self, project_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[ManagedObject], str | None]:
         query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/objects" + query)[2])
@@ -1143,6 +1158,16 @@ class WorkspaceClient:
 
     def get_variant(self, variant_id: str) -> GenerationVariant:
         return GenerationVariant.from_json(self._json(self._request("GET", f"/v1/variants/{_path_part(variant_id)}")[2]))
+
+    def mark_variant_viewed(self, variant_id: str, *, idempotency_key: str) -> MutationResult:
+        return self._mutation_json(self._request("POST", f"/v1/variants/{_path_part(variant_id)}/viewed", body=b"{}", headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def attach_variant_thumbnail(self, variant_id: str, *, thumbnail_object_id: str, source_object_id: str, recipe_version: int = 1, idempotency_key: str) -> MutationResult:
+        body = json.dumps({"thumbnail_object_id": thumbnail_object_id, "source_object_id": source_object_id, "recipe_version": recipe_version}, separators=(",", ":")).encode()
+        return self._mutation_json(self._request("POST", f"/v1/variants/{_path_part(variant_id)}/thumbnail", body=body, headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
+    def mark_generation_variants_viewed(self, generation_id: str, *, idempotency_key: str) -> MutationResult:
+        return self._mutation_json(self._request("POST", f"/v1/generations/{_path_part(generation_id)}/variants/viewed", body=b"{}", headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
 
     def create_variant(self, generation_id: str, variant_id: str, *, idempotency_key: str, object_id: str | None = None, variant_type: str = "original", metadata: Mapping[str, Any] | None = None) -> MutationResult:
         payload: dict[str, Any] = {"variant_id": variant_id, "variant_type": variant_type, "metadata": metadata or {}}
