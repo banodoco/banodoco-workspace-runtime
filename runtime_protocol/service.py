@@ -1570,6 +1570,219 @@ class RuntimeService:
             raise NotFoundError("parent composition revision not found", details={"timeline_id": timeline_id, "revision": revision})
         return {"revision_id": row["id"], "project_id": row["project_id"], "timeline_id": row["timeline_id"], "content_digest": row["content_digest"], "payload": json.loads(row["payload_json"]), "created_at": row["created_at"]}
 
+    @_durable_mutation
+    def replace_parent_composition_media(self, project_id, timeline_id, body, *, idempotency_key=None):
+        """Replace one selected clip in an exact parent-composition closure.
+
+        This is the project-scoped public operation for canonical timelines.
+        It materializes only the selected shot/internal revisions and then
+        delegates the immutable child + parent-head CAS to the existing
+        ``publish_parent_composition`` boundary.  It deliberately does not
+        touch the legacy timeline-document store.
+        """
+        idempotency_key = require_idempotency_key(idempotency_key)
+        self._require_object_body(body)
+        allowed = {"occurrence_id", "clip_id", "source_object_id", "expected_head", "timing"}
+        unexpected = set(body) - allowed
+        if unexpected:
+            raise ValidationError("parent-composition replacement contains unsupported fields", details={"fields": sorted(unexpected)})
+        occurrence_id = body.get("occurrence_id")
+        clip_id = body.get("clip_id")
+        source_object_id = body.get("source_object_id")
+        expected_head = body.get("expected_head")
+        timing = body.get("timing", "preserve-duration")
+        if not all(isinstance(value, str) and value for value in (occurrence_id, clip_id, source_object_id, expected_head)):
+            raise ValidationError("occurrence_id, clip_id, source_object_id, and expected_head are required")
+        if timing != "preserve-duration":
+            raise ValidationError("timing must be preserve-duration")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_object_id):
+            raise ValidationError("source_object_id must be a canonical SHA-256 object id")
+
+        project = self.store.get_project(project_id)
+        timeline = self.store.conn.execute(
+            "SELECT * FROM timelines WHERE id=? AND project_id=?", (timeline_id, project["id"])
+        ).fetchone()
+        if timeline is None:
+            raise NotFoundError("timeline not found", details={"timeline_id": timeline_id, "project_id": project["id"]})
+        request = {
+            "project_id": project["id"],
+            "timeline_id": timeline_id,
+            "occurrence_id": occurrence_id,
+            "clip_id": clip_id,
+            "source_object_id": source_object_id,
+            "expected_head": expected_head,
+            "timing": timing,
+        }
+        request_hash = hashlib.sha256(canonical_json(request).encode()).hexdigest()
+        replay = self._command_replay("parent_composition.media.replace", timeline_id, idempotency_key, request_hash, project_id=project["id"])
+        if replay is not None:
+            return replay
+
+        source_digest = source_object_id.removeprefix("sha256:")
+        source = self.store.conn.execute(
+            "SELECT objects.* FROM objects JOIN project_objects ON project_objects.digest=objects.digest "
+            "WHERE objects.digest=? AND project_objects.project_id=? AND project_objects.relation='managed'",
+            (source_digest, project["id"]),
+        ).fetchone()
+        if source is None:
+            raise NotFoundError("managed source object not found in timeline project", details={"source_object_id": source_object_id, "project_id": project["id"]})
+
+        parent_row = self.store.conn.execute(
+            "SELECT * FROM parent_composition_revisions WHERE id=? AND project_id=? AND timeline_id=?",
+            (expected_head, project["id"], timeline_id),
+        ).fetchone()
+        if parent_row is None:
+            raise NotFoundError("parent composition revision not found", details={"timeline_id": timeline_id, "revision": expected_head})
+        parent_payload = json.loads(parent_row["payload_json"])
+        occurrences = parent_payload.get("occurrences") if isinstance(parent_payload, dict) else None
+        if not isinstance(occurrences, list):
+            raise ValidationError("parent composition occurrences must be a list")
+        matches = [row for row in occurrences if isinstance(row, dict) and row.get("occurrence_id") == occurrence_id]
+        if len(matches) != 1:
+            raise ValidationError("occurrence_id must identify exactly one parent occurrence", details={"occurrence_id": occurrence_id, "match_count": len(matches)})
+        target_occurrence = matches[0]
+        target_shot_id = target_occurrence.get("shot_id")
+        target_shot_revision_id = target_occurrence.get("shot_revision_id")
+        if not isinstance(target_shot_id, str) or not isinstance(target_shot_revision_id, str):
+            raise ValidationError("target occurrence is missing its pinned shot identity")
+        if sum(1 for row in occurrences if isinstance(row, dict) and row.get("shot_revision_id") == target_shot_revision_id) != 1:
+            raise ValidationError("selected occurrence shares its shot revision; use an occurrence-specific authoring candidate")
+
+        shot_row = self.store.conn.execute(
+            "SELECT * FROM shot_revisions WHERE id=? AND project_id=? AND shot_id=?",
+            (target_shot_revision_id, project["id"], target_shot_id),
+        ).fetchone()
+        if shot_row is None:
+            raise NotFoundError("target shot revision not found", details={"shot_revision_id": target_shot_revision_id})
+        shot_payload = json.loads(shot_row["payload_json"])
+        internal_revision_id = shot_row["internal_timeline_revision_id"]
+        internal_row = self.store.conn.execute(
+            "SELECT * FROM internal_timeline_revisions WHERE id=? AND project_id=?",
+            (internal_revision_id, project["id"]),
+        ).fetchone()
+        if internal_row is None:
+            raise NotFoundError("target internal timeline revision not found", details={"revision_id": internal_revision_id})
+        internal_payload = json.loads(internal_row["payload_json"])
+        clips = internal_payload.get("clips") if isinstance(internal_payload, dict) else None
+        if not isinstance(clips, list):
+            raise ValidationError("target internal timeline clips must be a list")
+        clip_matches = [row for row in clips if isinstance(row, dict) and row.get("id") == clip_id]
+        if len(clip_matches) != 1:
+            raise ValidationError("clip_id must identify exactly one internal clip", details={"clip_id": clip_id, "match_count": len(clip_matches)})
+
+        # Require the source before changing the detached payload.  The source
+        # bytes are already project-owned; publish_parent_composition performs
+        # the same digest/ownership closure check for every referenced media.
+        changed_internal = copy.deepcopy(internal_payload)
+        changed_clips = changed_internal["clips"]
+        changed_clip = next(row for row in changed_clips if isinstance(row, dict) and row.get("id") == clip_id)
+        registry = changed_internal.get("registry")
+        assets = registry.get("assets") if isinstance(registry, dict) else None
+        if not isinstance(registry, dict):
+            registry = {"assets": {}}
+            changed_internal["registry"] = registry
+        if not isinstance(assets, dict):
+            assets = {}
+            registry["assets"] = assets
+        asset_key = None
+        for candidate_key, metadata in assets.items():
+            if not isinstance(candidate_key, str) or not isinstance(metadata, dict):
+                continue
+            values = {metadata.get(field) for field in ("media_id", "object_id", "digest", "content_sha256")}
+            if source_object_id in values or source_digest in values:
+                asset_key = candidate_key
+                break
+        if asset_key is None:
+            asset_key = "media_" + source_digest[:24]
+            assets[asset_key] = {
+                "media_id": source_object_id,
+                "content_sha256": source_digest,
+                "type": "image",
+                "origin": "runtime-parent-media-replacement",
+            }
+        for field in ("asset", "asset_id", "media_id", "object_id"):
+            changed_clip.pop(field, None)
+        changed_clip["asset"] = asset_key
+
+        def stable_id(prefix, payload):
+            return prefix + "-" + hashlib.sha256(canonical_json(payload).encode()).hexdigest()[:48]
+
+        changed_internal_revision_id = stable_id(
+            "parent-media-internal",
+            {"project_id": project["id"], "timeline_id": internal_row["timeline_id"], "base_revision": internal_revision_id, "clip_id": clip_id, "source_object_id": source_object_id, "payload": changed_internal},
+        )
+        changed_internal_digest = self._revision_digest(changed_internal)
+        changed_shot = copy.deepcopy(shot_payload)
+        changed_shot["internal_timeline_revision_id"] = changed_internal_revision_id
+        changed_shot_revision_id = stable_id(
+            "parent-media-shot",
+            {"project_id": project["id"], "shot_id": target_shot_id, "base_revision": target_shot_revision_id, "internal_revision": changed_internal_revision_id, "payload": changed_shot},
+        )
+        changed_shot_digest = self._revision_digest(changed_shot)
+        changed_parent = copy.deepcopy(parent_payload)
+        changed_occurrences = changed_parent["occurrences"]
+        next_occurrence = next(row for row in changed_occurrences if isinstance(row, dict) and row.get("occurrence_id") == occurrence_id)
+        next_occurrence["shot_revision_id"] = changed_shot_revision_id
+        changed_parent_digest = self._revision_digest(changed_parent)
+        changed_parent_revision_id = stable_id(
+            "parent-media-parent",
+            {"project_id": project["id"], "timeline_id": timeline_id, "expected_head": expected_head, "occurrence_id": occurrence_id, "clip_id": clip_id, "source_object_id": source_object_id, "payload": changed_parent},
+        )
+
+        # The publication manifest is the complete current closure, with only
+        # the selected shot/internal rows replaced by their new identities.
+        shot_manifest = []
+        internal_manifest = []
+        media = set(self._collect_digest_media(changed_parent))
+        media.update(self._collect_digest_media(changed_shot))
+        media.update(self._collect_digest_media(changed_internal))
+        internal_by_id = {}
+        shot_by_id = {}
+        for occurrence in occurrences:
+            if not isinstance(occurrence, dict):
+                continue
+            shot_id = occurrence.get("shot_id")
+            revision_id = occurrence.get("shot_revision_id")
+            if not isinstance(shot_id, str) or not isinstance(revision_id, str):
+                continue
+            if revision_id == target_shot_revision_id:
+                shot_by_id[(shot_id, revision_id)] = {"shot_id": shot_id, "revision_id": changed_shot_revision_id, "internal_timeline_revision_id": changed_internal_revision_id, "content_digest": changed_shot_digest}
+                internal_by_id[(internal_row["timeline_id"], internal_revision_id)] = {"timeline_id": internal_row["timeline_id"], "revision_id": changed_internal_revision_id, "content_digest": changed_internal_digest}
+                continue
+            row = self.store.conn.execute("SELECT * FROM shot_revisions WHERE id=? AND project_id=? AND shot_id=?", (revision_id, project["id"], shot_id)).fetchone()
+            if row is None:
+                raise NotFoundError("parent composition shot dependency is missing", details={"revision_id": revision_id})
+            row_payload = json.loads(row["payload_json"])
+            media.update(self._collect_digest_media(row_payload))
+            internal_id = row["internal_timeline_revision_id"]
+            internal_dep = self.store.conn.execute("SELECT * FROM internal_timeline_revisions WHERE id=? AND project_id=?", (internal_id, project["id"])).fetchone()
+            if internal_dep is None:
+                raise NotFoundError("parent composition internal dependency is missing", details={"revision_id": internal_id})
+            media.update(self._collect_digest_media(json.loads(internal_dep["payload_json"])))
+            internal_by_id[(internal_dep["timeline_id"], internal_id)] = {"timeline_id": internal_dep["timeline_id"], "revision_id": internal_id, "content_digest": internal_dep["content_digest"]}
+            shot_by_id[(shot_id, revision_id)] = {"shot_id": shot_id, "revision_id": revision_id, "internal_timeline_revision_id": internal_id, "content_digest": row["content_digest"]}
+        for row in sorted(shot_by_id.values(), key=lambda item: (item["shot_id"], item["revision_id"])):
+            shot_manifest.append(row)
+        for row in sorted(internal_by_id.values(), key=lambda item: (item["timeline_id"], item["revision_id"])):
+            internal_manifest.append(row)
+        media = sorted(media)
+        publication = {
+            "project_id": project["id"],
+            "timeline_id": timeline_id,
+            "expected_head": expected_head,
+            "parent_revision_id": changed_parent_revision_id,
+            "content_digest": changed_parent_digest,
+            "parent_composition": changed_parent,
+            "internal_timeline_revisions": [{"timeline_id": internal_row["timeline_id"], "revision_id": changed_internal_revision_id, "payload": changed_internal, "content_digest": changed_internal_digest}],
+            "shot_revisions": [{"shot_id": target_shot_id, "revision_id": changed_shot_revision_id, "internal_timeline_revision_id": changed_internal_revision_id, "payload": changed_shot, "content_digest": changed_shot_digest}],
+            "dependency_manifest": {
+                "shots": shot_manifest,
+                "internal_timelines": internal_manifest,
+                "media": [{"media_id": item, "content_digest": item} for item in media],
+            },
+        }
+        return self.publish_parent_composition(project["id"], timeline_id, publication, idempotency_key=idempotency_key)
+
     @staticmethod
     def _finite_number(value, field, *, positive=False):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or (positive and value <= 0):
