@@ -426,6 +426,17 @@ class RuntimeDaemon:
             close_pinned(active_identity)
 
     def stop(self):
+        # The installed local Worker is a child of this Runtime instance.  A
+        # normal shutdown must close that private control channel before the
+        # Runtime disappears; otherwise the next startup can inherit a live
+        # executor with no owner-side handle.
+        if self.local_worker_preparer is not None:
+            active = getattr(self.local_worker_preparer, "_active", None)
+            if active is not None:
+                try:
+                    self.local_worker_preparer.abort(active)
+                except Exception:
+                    pass
         if self.service is not None:
             try:
                 self.catalog.revoke_readiness(self.service.realm["id"], instance_id=self.instance_id, reason="runtime_stopped")
