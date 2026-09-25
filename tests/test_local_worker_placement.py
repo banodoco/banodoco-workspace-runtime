@@ -611,6 +611,26 @@ def test_old_liveness_watcher_cannot_fence_replacement_generation(tmp_path):
     assert launcher._active_handle is new_handle
 
 
+def test_installing_replacement_retires_old_watcher_generation(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher = _launcher(store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77)
+    old_handle = object()
+    new_handle = object()
+    old_stop = threading.Event()
+    with launcher._state_lock:
+        launcher._active_handle = old_handle
+        launcher._active_profile = profile
+        launcher._active_identity = {"generation": "old"}
+        launcher._watch_stop = old_stop
+
+    launcher._install_active(new_handle, profile, {"generation": "new"}, {})
+
+    assert old_stop.is_set()
+    assert launcher._active_handle is new_handle
+
+
 def test_shutdown_fences_auth_before_hung_abort_and_is_bounded(tmp_path, monkeypatch):
     profile = _profile(tmp_path, str(uuid.uuid4()))
     store = CredentialStore(tmp_path / "credentials")

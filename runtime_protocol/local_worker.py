@@ -478,6 +478,11 @@ class LocalWorkerLauncher:
         with self._state_lock:
             if self._shutdown.is_set():
                 raise ConflictError("Runtime owner is shutting down")
+            if self._active_handle is not None and self._active_handle is not handle:
+                # A reconnect failure can fall through to a fresh launch while
+                # the previous generation's watcher is still healthy. Retire
+                # its event before _start_watcher evaluates the old thread.
+                self._watch_stop.set()
             self._active_handle = handle
             self._active_profile = profile
             self._active_identity = dict(identity)
