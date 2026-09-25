@@ -595,6 +595,22 @@ def test_liveness_loss_revokes_bearer_before_cleanup(tmp_path, lost):
     assert preparer.aborted is True
 
 
+def test_old_liveness_watcher_cannot_fence_replacement_generation(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher = _launcher(store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77)
+    old_handle = object()
+    new_handle = object()
+    with launcher._state_lock:
+        launcher._active_handle = new_handle
+        launcher._active_profile = profile
+        launcher._active_identity = {"generation": "new"}
+
+    assert launcher.check_liveness(old_handle) is True
+    assert launcher._active_handle is new_handle
+
+
 def test_shutdown_fences_auth_before_hung_abort_and_is_bounded(tmp_path, monkeypatch):
     profile = _profile(tmp_path, str(uuid.uuid4()))
     store = CredentialStore(tmp_path / "credentials")

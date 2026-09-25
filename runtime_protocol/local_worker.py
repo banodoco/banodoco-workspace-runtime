@@ -488,31 +488,48 @@ class LocalWorkerLauncher:
         with self._state_lock:
             if self._shutdown.is_set() or self._active_handle is None:
                 return
-            if self._watch_thread is not None and self._watch_thread.is_alive():
+            if (
+                self._watch_thread is not None
+                and self._watch_thread.is_alive()
+                and not self._watch_stop.is_set()
+            ):
                 return
-            self._watch_stop.clear()
+            # A failed generation may still be unwinding its final check. Use
+            # a fresh stop event and capture the handle so that old watcher
+            # work cannot fence a replacement generation.
+            stop = threading.Event()
+            handle = self._active_handle
+            self._watch_stop = stop
             self._watch_thread = threading.Thread(
                 target=self._watch_liveness,
-                args=(weakref.ref(self), self._watch_stop),
+                args=(weakref.ref(self), stop, handle),
                 name="local-worker-liveness",
                 daemon=True,
             )
             self._watch_thread.start()
 
     @staticmethod
-    def _watch_liveness(owner_ref: "weakref.ReferenceType[LocalWorkerLauncher]", stop: threading.Event) -> None:
+    def _watch_liveness(
+        owner_ref: "weakref.ReferenceType[LocalWorkerLauncher]",
+        stop: threading.Event,
+        handle: object,
+    ) -> None:
         while not stop.wait(1.0):
             owner = owner_ref()
-            if owner is None or not owner.check_liveness():
+            if owner is None or not owner.check_liveness(handle):
                 return
             del owner
 
-    def check_liveness(self) -> bool:
+    def check_liveness(self, expected_handle: object | None = None) -> bool:
         """Run one deterministic owner-side liveness check and fence on loss."""
         with self._state_lock:
             handle = self._active_handle
             profile = self._active_profile
             expected = self._active_identity
+        if expected_handle is not None and handle is not expected_handle:
+            # This watcher belongs to an older generation. It must not fence
+            # a replacement that was activated before the old thread exited.
+            return True
         if handle is None or profile is None or expected is None:
             return False
         try:

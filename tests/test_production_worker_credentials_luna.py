@@ -71,6 +71,23 @@ def test_receiptless_worker_bearer_is_rotated_before_http_start(tmp_path):
         second.credentials.load(stale)
 
 
+def test_pre_marker_worker_bearer_is_rotated_before_http_start(tmp_path):
+    root = tmp_path / "realm"
+    support = tmp_path / "support"
+    RealmStore.initialize(root).close()
+    legacy_store = CredentialStore(support / "credentials")
+    stale, path = legacy_store.provision(WORKER_ACTOR, list(WORKER_SCOPES))
+    path.with_suffix(".commit").unlink()
+
+    daemon = RuntimeDaemon(root, support_root=support, production_worker_credentials=True)
+    daemon._provision_credentials()
+
+    assert daemon.worker_token != stale
+    with pytest.raises(AuthorizationError):
+        daemon.credentials.load(stale)
+    assert path.with_suffix(".commit").exists()
+
+
 def test_pack_host_cannot_mutate_control_plane_or_forge_settlement_effects(tmp_path):
     RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(

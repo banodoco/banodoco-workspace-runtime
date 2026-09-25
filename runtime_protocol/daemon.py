@@ -121,7 +121,11 @@ class RuntimeDaemon:
             # before HTTP starts; fixture-mode credentials retain their
             # historical behavior for in-process tests.
             existing_worker = self.credentials.actor_metadata(WORKER_ACTOR)
-            rotate_worker = rotate or bool(self.production_worker_credentials and existing_worker)
+            rotate_worker = (
+                rotate
+                or bool(self.production_worker_credentials and existing_worker)
+                or self.credentials.has_legacy_generation(WORKER_ACTOR)
+            )
             self.worker_token, self.worker_credential_path = self.credentials.provision(
                 WORKER_ACTOR, list(WORKER_SCOPES), rotate=rotate_worker
             )

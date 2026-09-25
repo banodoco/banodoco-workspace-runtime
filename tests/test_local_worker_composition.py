@@ -342,6 +342,23 @@ def test_cross_process_abort_is_bounded_and_reaps_after_kill(tmp_path, monkeypat
     assert preparer._active is None
 
 
+def test_cancel_current_does_not_wait_unbounded_for_spawn_handoff(tmp_path):
+    profile, _handle = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(
+        profile=profile,
+        config={},
+        environment={},
+        cleanup_timeout_seconds=0.05,
+    )
+    preparer._handoff_lock.acquire()
+    started = __import__("time").monotonic()
+    try:
+        preparer.cancel_current()
+    finally:
+        preparer._handoff_lock.release()
+    assert __import__("time").monotonic() - started < 0.5
+
+
 def test_control_probe_rejects_buffered_data_from_closed_peer(tmp_path, monkeypatch):
     profile, _unused = _inspector_fixture(tmp_path)
 

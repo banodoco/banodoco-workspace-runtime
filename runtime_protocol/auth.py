@@ -126,6 +126,12 @@ class CredentialStore:
             return None
         return (token, metadata) if token and isinstance(metadata, dict) else None
 
+    def has_legacy_generation(self, actor: str) -> bool:
+        """Return whether actor storage is the pre-commit credential format."""
+        actor = self._actor(actor)
+        with self._lock:
+            return self._legacy_pair(actor) is not None
+
     def provision(self, actor: str, scopes: list[str], *, metadata: dict | None = None, rotate: bool = False, enabled: bool = True) -> tuple[str, Path]:
         actor = self._actor(actor)
         if metadata is not None and not isinstance(metadata, dict):
