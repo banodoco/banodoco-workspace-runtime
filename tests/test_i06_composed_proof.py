@@ -226,6 +226,7 @@ def _profile(root: Path, support: Path, realm_id: str) -> LocalWorkerProfile:
         host_executable=Path("/fake/astrid-python"),
         engine_executable=Path("/fake/vibecomfy-daemon"),
         engine_listener_executable=Path("/fake/comfy-listener"),
+        engine_endpoint="http://127.0.0.1:8188",
         worker_artifact_digest=WORKER_ARTIFACT,
         host_artifact_digest=HOST_ARTIFACT,
         engine_artifact_digest=ENGINE_ARTIFACT,
@@ -250,6 +251,7 @@ def _observation(root: Path, support: Path, realm_id: str) -> LocalWorkerObserva
         engine=ProcessIdentity(ENGINE_PID, ENGINE_BIRTH, uid, WORKER_PID, ENGINE_PID, ENGINE_PID, Path("/fake/vibecomfy-daemon"), ENGINE_ARTIFACT),
         engine_listener=ProcessIdentity(LISTENER_PID, LISTENER_BIRTH, uid, ENGINE_PID, ENGINE_PID, ENGINE_PID, Path("/fake/comfy-listener"), LISTENER_ARTIFACT),
         engine_listener_socket_owner_pid=LISTENER_PID,
+        engine_endpoint="http://127.0.0.1:8188",
         session_config_digest=SESSION_DIGEST,
     )
 
@@ -326,6 +328,8 @@ def test_i06_composed_runtime_worker_astrid_proof(monkeypatch, tmp_path: Path) -
         boot_manifest_hash="sha256:" + "a" * 64,
     )
     preparer = supervisor.LocalWorkerProcessPreparer(config, environ={}, timeout_seconds=2)
+    preparer.control_alive = lambda handle: getattr(preparer, "_active", None) is handle
+    preparer.current_handle = lambda: getattr(preparer, "_active", None)
     inspector = _FakeInspector(_observation(root, support, realm_id), events)
     daemon = RuntimeDaemon(
         root,
@@ -490,8 +494,9 @@ def test_i06_composed_identity_mutations_fail_before_issue(tmp_path: Path, field
         observation = replace(base_observation, host=replace(base_observation.host, artifact_digest=value))
 
     credentials = CredentialStore(support / "credentials")
+    handle = object()
     preparer = SimpleNamespace(
-        prepare=lambda profile, operation_id, channel_id: object(),
+        prepare=lambda profile, operation_id, channel_id: handle,
         report=lambda handle: {
             "version": "runtime.local-worker-preparation/v2",
             "operation_id": "op",
@@ -503,6 +508,8 @@ def test_i06_composed_identity_mutations_fail_before_issue(tmp_path: Path, field
         activate=lambda handle, grant: pytest.fail("invalid identity was issued a grant"),
         abort=lambda handle: None,
         reconnect=lambda receipt: None,
+        control_alive=lambda candidate: candidate is handle,
+        current_handle=lambda: handle,
     )
     launcher = LocalWorkerLauncher(
         credentials=credentials,

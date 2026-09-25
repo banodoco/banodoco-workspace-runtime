@@ -8,14 +8,17 @@ checks the process facts supplied by an OS inspector before issuing anything.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import threading
 import uuid
+import weakref
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
+from urllib.parse import urlsplit
 
 from .auth import CredentialStore
 from .errors import ConflictError, ValidationError
@@ -24,7 +27,7 @@ from .errors import ConflictError, ValidationError
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 PREPARATION_VERSION = "runtime.local-worker-preparation/v2"
 ACTIVATION_VERSION = "runtime.local-worker-activation/v1"
-RECEIPT_VERSION = "runtime.local-worker-receipt/v2"
+RECEIPT_VERSION = "runtime.local-worker-receipt/v3"
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class LocalWorkerProfile:
     host_executable: Path
     engine_executable: Path
     engine_listener_executable: Path
+    engine_endpoint: str
     worker_artifact_digest: str
     host_artifact_digest: str
     engine_artifact_digest: str
@@ -72,6 +76,7 @@ class LocalWorkerObservation:
     engine: ProcessIdentity
     engine_listener: ProcessIdentity
     engine_listener_socket_owner_pid: int
+    engine_endpoint: str
     session_config_digest: str
 
 
@@ -84,6 +89,8 @@ class LocalWorkerPreparer(Protocol):
     def activate(self, handle: object, grant: Mapping[str, Any]) -> None: ...
     def abort(self, handle: object) -> None: ...
     def reconnect(self, receipt: Mapping[str, Any]) -> object | None: ...
+    def control_alive(self, handle: object) -> bool: ...
+    def current_handle(self) -> object | None: ...
 
 
 class LocalWorkerInspector(Protocol):
@@ -118,6 +125,30 @@ def _require_digest(value: str, label: str) -> str:
     return value
 
 
+def _engine_endpoint(value: str) -> str:
+    """Return one unambiguous local HTTP endpoint suitable for socket proof."""
+    try:
+        parsed = urlsplit(str(value))
+        address = ipaddress.ip_address(parsed.hostname or "")
+        port = parsed.port
+    except (ValueError, TypeError) as exc:
+        raise ValidationError("engine_endpoint must be an HTTP loopback IP endpoint") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or not address.is_loopback
+        or port is None
+        or not 1 <= port <= 65535
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError("engine_endpoint must be an HTTP loopback IP endpoint")
+    host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+    return f"http://{host}:{port}"
+
+
 class LocalWorkerLauncher:
     """Serialize prepare/verify/issue/activate for the reserved Worker actor."""
 
@@ -146,12 +177,76 @@ class LocalWorkerLauncher:
         self.actor = actor
         self.scopes = tuple(scopes)
         self._operation_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._shutdown = threading.Event()
+        self._watch_stop = threading.Event()
+        self._watch_thread: threading.Thread | None = None
+        self._active_handle: object | None = None
+        self._active_profile: LocalWorkerProfile | None = None
+        self._active_identity: dict[str, Any] | None = None
+        self._preparing_handle: object | None = None
         self._active_receipt: dict[str, Any] | None = None
+        self._cleanup_handles: list[object] = []
+        for method in ("control_alive", "current_handle"):
+            if not callable(getattr(preparer, method, None)):
+                raise ValueError(f"local worker preparer must implement {method}")
         existing = credentials.actor_metadata(actor)
-        if existing and existing.get("local_launch_receipt"):
-            # A durable bearer is not usable after owner restart until the
-            # surviving process identity is independently revalidated.
+        if existing:
+            # Every durable bearer is unusable after owner restart until the
+            # surviving process identity is independently revalidated. A
+            # pre-I-06 generation has no receipt and can never be revalidated.
             credentials.disable_actor(actor)
+            if not self._receipt_shape_valid(existing):
+                self._revoke_actor()
+
+    def _revoke_actor(self) -> None:
+        """Synchronously fence authentication even if durable cleanup fails."""
+        self.credentials.disable_actor(self.actor)
+        try:
+            self.credentials.revoke(self.actor)
+        except OSError:
+            pass
+
+    def _receipt_shape_valid(self, metadata: Mapping[str, Any]) -> bool:
+        receipt = metadata.get("local_launch_receipt")
+        binding = metadata.get("execution_binding")
+        if not isinstance(receipt, Mapping) or receipt.get("version") != RECEIPT_VERSION:
+            return False
+        profile_id = receipt.get("profile_id")
+        if not isinstance(profile_id, str):
+            return False
+        profile = self.profiles.get(profile_id)
+        engine_binding = receipt.get("engine_binding")
+        verification = binding.get("verification") if isinstance(binding, Mapping) else None
+        actual = binding.get("actual") if isinstance(binding, Mapping) else None
+        incarnation = receipt.get("executor_incarnation")
+        evidence = receipt.get("evidence_digest")
+        try:
+            endpoint = _engine_endpoint(engine_binding.get("endpoint")) if isinstance(engine_binding, Mapping) else None
+        except ValidationError:
+            return False
+        return bool(
+            profile is not None
+            and receipt.get("workspace_uuid") == self.workspace_uuid
+            and isinstance(receipt.get("machine_id"), str) and bool(receipt.get("machine_id"))
+            and isinstance(receipt.get("session_config_digest"), str)
+            and bool(_DIGEST.fullmatch(receipt.get("session_config_digest")))
+            and all(isinstance(receipt.get(name), Mapping) for name in ("worker", "host", "engine", "engine_listener"))
+            and endpoint == profile.engine_endpoint
+            and isinstance(incarnation, str) and incarnation
+            and isinstance(evidence, str) and _DIGEST.fullmatch(evidence)
+            and isinstance(binding, Mapping)
+            and binding.get("executor_incarnation") == incarnation
+            and isinstance(verification, Mapping)
+            and verification.get("verified") is True
+            and verification.get("evidence_digest") == evidence
+            and isinstance(actual, Mapping)
+            and actual.get("kind") == "machine"
+            and actual.get("id") == receipt.get("machine_id")
+            and actual.get("profile_revision") == profile.profile_revision
+            and actual.get("profile_digest") == profile.profile_digest
+            and actual.get("release_digest") == profile.release_digest
+        )
 
     def _profile(self, profile_id: str, expected_workspace_uuid: str) -> LocalWorkerProfile:
         if not isinstance(profile_id, str) or not profile_id:
@@ -172,6 +267,8 @@ class LocalWorkerLauncher:
             "engine_listener_executable",
         ):
             _absolute_pin(Path(getattr(profile, field)), field)
+        if _engine_endpoint(profile.engine_endpoint) != profile.engine_endpoint:
+            raise ValidationError("engine_endpoint must be canonical")
         for field in (
             "worker_artifact_digest", "host_artifact_digest", "engine_artifact_digest",
             "engine_listener_artifact_digest", "session_config_digest", "profile_digest",
@@ -205,6 +302,7 @@ class LocalWorkerLauncher:
                 "listener_pid": observed.engine_listener.pid,
                 "listener_parent_pid": observed.engine_listener.parent_pid,
                 "socket_owner_pid": observed.engine_listener_socket_owner_pid,
+                "endpoint": observed.engine_endpoint,
             },
             "session_config_digest": observed.session_config_digest,
             "profile_revision": profile.profile_revision,
@@ -289,6 +387,8 @@ class LocalWorkerLauncher:
             raise ConflictError("local worker process identities must be distinct")
         if observed.engine_listener_socket_owner_pid != observed.engine_listener.pid:
             raise ConflictError("engine listener socket is not owned by the verified listener process")
+        if observed.engine_endpoint != profile.engine_endpoint:
+            raise ConflictError("observed engine endpoint does not match the installed profile")
         if observed.session_config_digest != profile.session_config_digest:
             raise ConflictError("engine session configuration does not match the installed profile")
         if report is not None:
@@ -340,15 +440,136 @@ class LocalWorkerLauncher:
         payload["evidence_digest"] = _digest(stable_identity)
         return payload
 
-    def _abort(self, handle: object | None) -> None:
+    def _abort(self, handle: object | None, *, timeout: float = 1.0) -> None:
         if handle is None:
             return
+        with self._state_lock:
+            if any(handle is current for current in self._cleanup_handles):
+                return
+            self._cleanup_handles.append(handle)
+        def cleanup() -> None:
+            try:
+                self.preparer.abort(handle)
+            except BaseException:
+                # The adapter must itself signal only positively identified
+                # owned children. Cleanup failure cannot restore authority.
+                pass
+
+        thread = threading.Thread(target=cleanup, name="local-worker-abort", daemon=True)
+        thread.start()
+        thread.join(max(0.0, float(timeout)))
+
+    def _control_alive(self, handle: object) -> bool:
+        return bool(self.preparer.control_alive(handle))
+
+    def _install_active(
+        self,
+        handle: object,
+        profile: LocalWorkerProfile,
+        identity: Mapping[str, Any],
+        receipt: Mapping[str, Any],
+    ) -> None:
+        with self._state_lock:
+            if self._shutdown.is_set():
+                raise ConflictError("Runtime owner is shutting down")
+            self._active_handle = handle
+            self._active_profile = profile
+            self._active_identity = dict(identity)
+            self._active_receipt = dict(receipt)
+            self._preparing_handle = None
+
+    def _start_watcher(self) -> None:
+        with self._state_lock:
+            if self._shutdown.is_set() or self._active_handle is None:
+                return
+            if self._watch_thread is not None and self._watch_thread.is_alive():
+                return
+            self._watch_stop.clear()
+            self._watch_thread = threading.Thread(
+                target=self._watch_liveness,
+                args=(weakref.ref(self), self._watch_stop),
+                name="local-worker-liveness",
+                daemon=True,
+            )
+            self._watch_thread.start()
+
+    @staticmethod
+    def _watch_liveness(owner_ref: "weakref.ReferenceType[LocalWorkerLauncher]", stop: threading.Event) -> None:
+        while not stop.wait(1.0):
+            owner = owner_ref()
+            if owner is None or not owner.check_liveness():
+                return
+            del owner
+
+    def check_liveness(self) -> bool:
+        """Run one deterministic owner-side liveness check and fence on loss."""
+        with self._state_lock:
+            handle = self._active_handle
+            profile = self._active_profile
+            expected = self._active_identity
+        if handle is None or profile is None or expected is None:
+            return False
         try:
-            self.preparer.abort(handle)
-        except Exception:
-            # The adapter must itself signal only positively identified owned
-            # children.  Cleanup failure cannot restore credential authority.
-            pass
+            if not self._control_alive(handle):
+                raise ConflictError("local Worker control channel is not alive")
+            current = self._validate_observation(
+                profile, self.inspector.observe(handle), report=None, reconnect=True
+            )
+            if current != expected:
+                raise ConflictError("active local Worker identity changed")
+            return True
+        except BaseException:
+            self._fence_generation(handle, abort=True)
+            return False
+
+    def _fence_generation(self, handle: object, *, abort: bool) -> bool:
+        with self._state_lock:
+            if self._active_handle is not handle and self._preparing_handle is not handle:
+                return False
+            self._revoke_actor()
+            if self._active_handle is handle:
+                self._active_handle = None
+                self._active_profile = None
+                self._active_identity = None
+                self._active_receipt = None
+            if self._preparing_handle is handle:
+                self._preparing_handle = None
+            self._watch_stop.set()
+        if abort:
+            self._abort(handle)
+        return True
+
+    def begin_shutdown(self) -> list[object]:
+        """Fence authority synchronously; return owned handles for later cleanup."""
+        self._shutdown.set()
+        self._watch_stop.set()
+        with self._state_lock:
+            handles = [
+                value for value in (
+                    self._active_handle,
+                    self._preparing_handle,
+                    self.preparer.current_handle(),
+                )
+                if value is not None
+            ]
+            self._revoke_actor()
+            self._active_handle = None
+            self._active_profile = None
+            self._active_identity = None
+            self._active_receipt = None
+            self._preparing_handle = None
+        unique = []
+        for handle in handles:
+            if not any(handle is current for current in unique):
+                unique.append(handle)
+        return unique
+
+    def finish_shutdown(self, handles: list[object]) -> None:
+        watcher = self._watch_thread
+        if watcher is not None and watcher is not threading.current_thread():
+            watcher.join(0.5)
+        for handle in handles:
+            self._abort(handle)
 
     def _try_reconnect(self, profile: LocalWorkerProfile, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         receipt = metadata.get("local_launch_receipt")
@@ -381,13 +602,15 @@ class LocalWorkerLauncher:
                 or actual.get("release_digest") != profile.release_digest
             ):
                 raise ConflictError("surviving local worker incarnation is inconsistent")
-            self.credentials.enable_actor(self.actor)
             result = dict(receipt)
             result["state"] = "reconnected"
-            self._active_receipt = dict(receipt)
+            self._install_active(handle, profile, identity, receipt)
+            self.credentials.enable_actor(self.actor)
+            self._start_watcher()
             return result
         except Exception:
-            self._abort(handle)
+            if not self._fence_generation(handle, abort=True):
+                self._abort(handle)
             raise
 
     def start(self, profile_id: str, expected_workspace_uuid: str) -> dict[str, Any]:
@@ -396,6 +619,8 @@ class LocalWorkerLauncher:
         handle: object | None = None
         credential_issued = False
         try:
+            if self._shutdown.is_set():
+                raise ConflictError("Runtime owner is shutting down")
             profile = self._profile(profile_id, expected_workspace_uuid)
             existing = self.credentials.actor_metadata(self.actor)
             if existing:
@@ -403,15 +628,19 @@ class LocalWorkerLauncher:
                 try:
                     reconnected = self._try_reconnect(profile, existing)
                 except Exception:
-                    self.credentials.revoke(self.actor)
+                    self._revoke_actor()
                     raise
                 if reconnected is not None:
                     return reconnected
-                self.credentials.revoke(self.actor)
+                self._revoke_actor()
 
             operation_id = uuid.uuid4().hex
             channel_id = uuid.uuid4().hex
             handle = self.preparer.prepare(profile, operation_id=operation_id, channel_id=channel_id)
+            with self._state_lock:
+                if self._shutdown.is_set():
+                    raise ConflictError("Runtime owner is shutting down")
+                self._preparing_handle = handle
             report = self.preparer.report(handle)
             first = self._validate_observation(
                 profile, self.inspector.observe(handle), report=report,
@@ -475,8 +704,9 @@ class LocalWorkerLauncher:
             # Publication is last: neither the parked process nor another
             # holder of the file can authenticate before the private grant is
             # accepted and the same process identity is observed once more.
+            self._install_active(handle, profile, activated, receipt)
             self.credentials.enable_actor(self.actor)
-            self._active_receipt = dict(receipt)
+            self._start_watcher()
             return {
                 "state": "active",
                 "operation_id": operation_id,
@@ -488,7 +718,16 @@ class LocalWorkerLauncher:
             }
         except Exception:
             if credential_issued:
-                self.credentials.revoke(self.actor)
+                self._revoke_actor()
+            with self._state_lock:
+                if self._preparing_handle is handle:
+                    self._preparing_handle = None
+                if self._active_handle is handle:
+                    self._active_handle = None
+                    self._active_profile = None
+                    self._active_identity = None
+                    self._active_receipt = None
+                    self._watch_stop.set()
             self._abort(handle)
             raise
         finally:

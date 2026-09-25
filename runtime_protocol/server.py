@@ -20,6 +20,7 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
     # durable idempotent replay. Keep a bounded backlog sized for the local
     # control-plane fan-in.
     request_queue_size = 64
+    accepting_authenticated_requests = True
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):
@@ -48,6 +49,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def _identity(self, scope):
         if self.path.split("?", 1)[0] == "/v1/health":
             return {"actor": "health", "scopes": ["health"]}
+        if not getattr(self.server, "accepting_authenticated_requests", True):
+            raise AuthorizationError("runtime is not accepting authenticated requests")
         value = self.headers.get("Authorization", "")
         if not value.startswith("Bearer "):
             raise AuthorizationError("bearer credential required")

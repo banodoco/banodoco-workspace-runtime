@@ -12,7 +12,7 @@ from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR, WORKER_SCOPES
 from runtime_protocol.store import RealmStore
 
 
-def test_pack_host_credential_is_scoped_distinct_and_persistent(tmp_path):
+def test_pack_host_credential_is_scoped_distinct_and_rotated_for_new_owner(tmp_path):
     root = tmp_path / "realm"
     support = tmp_path / "support"
     RealmStore.initialize(root).close()
@@ -47,10 +47,28 @@ def test_pack_host_credential_is_scoped_distinct_and_persistent(tmp_path):
     ).start()
     try:
         assert second.worker_credential_path == worker_path
-        assert second.worker_token == worker_token
+        assert second.worker_token != worker_token
+        with pytest.raises(AuthorizationError):
+            second.credentials.load(worker_token)
         assert json.loads(second.worker_credential_path.with_suffix(".json").read_text(encoding="utf-8")) == metadata
     finally:
         second.stop()
+
+
+def test_receiptless_worker_bearer_is_rotated_before_http_start(tmp_path):
+    root = tmp_path / "realm"
+    support = tmp_path / "support"
+    RealmStore.initialize(root).close()
+    first = RuntimeDaemon(root, support_root=support, production_worker_credentials=True)
+    first._provision_credentials()
+    stale = first.worker_token
+
+    second = RuntimeDaemon(root, support_root=support, production_worker_credentials=True)
+    second._provision_credentials()
+
+    assert second.worker_token != stale
+    with pytest.raises(AuthorizationError):
+        second.credentials.load(stale)
 
 
 def test_pack_host_cannot_mutate_control_plane_or_forge_settlement_effects(tmp_path):

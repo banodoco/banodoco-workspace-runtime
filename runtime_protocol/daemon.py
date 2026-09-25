@@ -116,7 +116,15 @@ class RuntimeDaemon:
             self.worker_token = None
             self.worker_credential_path = self.credentials.path_for(WORKER_ACTOR)
         else:
-            self.worker_token, self.worker_credential_path = self.credentials.provision(WORKER_ACTOR, list(WORKER_SCOPES), rotate=rotate)
+            # A new production owner must never inherit a receipt-less legacy
+            # Worker bearer. Rotate the single CredentialStore generation
+            # before HTTP starts; fixture-mode credentials retain their
+            # historical behavior for in-process tests.
+            existing_worker = self.credentials.actor_metadata(WORKER_ACTOR)
+            rotate_worker = rotate or bool(self.production_worker_credentials and existing_worker)
+            self.worker_token, self.worker_credential_path = self.credentials.provision(
+                WORKER_ACTOR, list(WORKER_SCOPES), rotate=rotate_worker
+            )
         if not self.production_worker_credentials and not self.local_worker_profiles:
             # Test-only in-process convenience.  The production CLI never
             # selects this branch; its pack host receives WORKER_ACTOR's
@@ -426,17 +434,14 @@ class RuntimeDaemon:
             close_pinned(active_identity)
 
     def stop(self):
-        # The installed local Worker is a child of this Runtime instance.  A
-        # normal shutdown must close that private control channel before the
-        # Runtime disappears; otherwise the next startup can inherit a live
-        # executor with no owner-side handle.
-        if self.local_worker_preparer is not None:
-            active = getattr(self.local_worker_preparer, "_active", None)
-            if active is not None:
-                try:
-                    self.local_worker_preparer.abort(active)
-                except Exception:
-                    pass
+        # Fence bearer authority and authenticated acceptance before any
+        # potentially blocking child cleanup. The launcher's abort wrapper is
+        # bounded independently of the Worker's configured RPC timeout.
+        worker_handles = []
+        if self.httpd is not None:
+            self.httpd.accepting_authenticated_requests = False
+        if self.local_worker_launcher is not None:
+            worker_handles = self.local_worker_launcher.begin_shutdown()
         if self.service is not None:
             try:
                 self.catalog.revoke_readiness(self.service.realm["id"], instance_id=self.instance_id, reason="runtime_stopped")
@@ -444,6 +449,9 @@ class RuntimeDaemon:
                 pass
         self.discovery.clear(self.instance_id)
         self._shutdown_http()
+        if self.local_worker_launcher is not None:
+            self.local_worker_launcher.finish_shutdown(worker_handles)
+            self.local_worker_launcher = None
         if self.service:
             self.service.close()
             self.service = None

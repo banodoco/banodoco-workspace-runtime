@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,6 +39,7 @@ def _profile(tmp_path, workspace_uuid: str) -> LocalWorkerProfile:
         host_executable=tmp_path / "host-python",
         engine_executable=tmp_path / "vibecomfy-daemon-python",
         engine_listener_executable=tmp_path / "comfy-listener-python",
+        engine_endpoint="http://127.0.0.1:8188",
         worker_artifact_digest=_digest("a"),
         host_artifact_digest=_digest("b"),
         engine_artifact_digest=_digest("c"),
@@ -84,6 +87,7 @@ def _observation(profile: LocalWorkerProfile, runtime_pid: int, *, base=1000) ->
         engine=engine,
         engine_listener=engine_listener,
         engine_listener_socket_owner_pid=engine_listener.pid,
+        engine_endpoint=profile.engine_endpoint,
         session_config_digest=profile.session_config_digest,
     )
 
@@ -98,12 +102,14 @@ class FakePreparer:
         self.events = []
         self.operation_id = self.channel_id = None
         self.aborted = False
+        self.handle = None
 
     def prepare(self, _profile, *, operation_id, channel_id):
         assert self.store.actor_metadata(WORKER_ACTOR) is None
         self.operation_id, self.channel_id = operation_id, channel_id
         self.events.append("prepare")
-        return object()
+        self.handle = object()
+        return self.handle
 
     def report(self, _handle):
         self.events.append("report")
@@ -140,10 +146,21 @@ class FakePreparer:
     def abort(self, _handle):
         self.aborted = True
         self.events.append("abort")
+        if self.handle is _handle:
+            self.handle = None
 
     def reconnect(self, _receipt):
         self.events.append("reconnect")
-        return object() if self.reconnect_enabled else None
+        if not self.reconnect_enabled:
+            return None
+        self.handle = object()
+        return self.handle
+
+    def control_alive(self, handle):
+        return self.handle is handle and not self.aborted
+
+    def current_handle(self):
+        return self.handle
 
 
 class FakeInspector:
@@ -206,6 +223,7 @@ def test_owner_transaction_issues_only_after_two_observations_then_activates(tmp
         "listener_pid": observed.engine_listener.pid,
         "listener_parent_pid": observed.engine.pid,
         "socket_owner_pid": observed.engine_listener.pid,
+        "endpoint": profile.engine_endpoint,
     }
     assert observed.engine_listener.process_group == observed.engine.pid
     assert observed.engine_listener.session_id == observed.engine.pid
@@ -508,6 +526,212 @@ def test_interrupted_credential_generation_fails_closed(tmp_path, monkeypatch):
         store.provision("worker", ["worker:execute"], metadata={"generation": "new"})
     with pytest.raises(AuthorizationError):
         store.load(old_token)
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        None,
+        {},
+        {"version": "runtime.local-worker-receipt/v2"},
+        {"version": "runtime.local-worker-receipt/v3"},
+    ],
+)
+def test_new_owner_revokes_legacy_or_malformed_worker_bearer(tmp_path, receipt):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    metadata = {} if receipt is None else {"local_launch_receipt": receipt}
+    old_token, _ = store.provision(WORKER_ACTOR, list(WORKER_SCOPES), metadata=metadata)
+    assert store.load(old_token)["actor"] == WORKER_ACTOR
+    observed = _observation(profile, 77)
+
+    _launcher(
+        store,
+        profile,
+        FakePreparer(store, observed),
+        FakeInspector(store, observed),
+        77,
+    )
+
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    with pytest.raises(AuthorizationError):
+        store.load(old_token)
+
+
+@pytest.mark.parametrize("lost", ["worker", "host", "engine", "listener", "endpoint", "control"])
+def test_liveness_loss_revokes_bearer_before_cleanup(tmp_path, lost):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class WatchPreparer(FakePreparer):
+        control_ok = True
+
+        def control_alive(self, _handle):
+            return self.control_ok
+
+    preparer = WatchPreparer(store, observed)
+    inspector = FakeInspector(store, observed)
+    launcher = _launcher(store, profile, preparer, inspector, 77)
+    launcher.start("astrid", profile.workspace_uuid)
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+
+    if lost == "control":
+        preparer.control_ok = False
+    elif lost == "endpoint":
+        inspector.observation = replace(observed, engine_endpoint="http://127.0.0.1:8189")
+    else:
+        name = "engine_listener" if lost == "listener" else lost
+        process = getattr(observed, name)
+        inspector.observation = replace(
+            observed,
+            **{name: replace(process, birth_id=f"dead-{name}")},
+        )
+
+    assert launcher.check_liveness() is False
+    with pytest.raises(AuthorizationError):
+        store.load(token)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    assert preparer.aborted is True
+
+
+def test_shutdown_fences_auth_before_hung_abort_and_is_bounded(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    entered_abort = threading.Event()
+    release_abort = threading.Event()
+    shutdown_http = threading.Event()
+
+    class HungAbort(FakePreparer):
+        def abort(self, _handle):
+            assert store.actor_metadata(WORKER_ACTOR) is None
+            assert daemon.httpd.accepting_authenticated_requests is False
+            assert shutdown_http.is_set()
+            entered_abort.set()
+            release_abort.wait(timeout=10)
+
+    preparer = HungAbort(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    launcher.start("astrid", profile.workspace_uuid)
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+
+    daemon = RuntimeDaemon(tmp_path / "daemon-realm", support_root=tmp_path / "daemon-support")
+    daemon.local_worker_launcher = launcher
+    daemon.httpd = SimpleNamespace(accepting_authenticated_requests=True)
+    daemon.service = None
+    monkeypatch.setattr(daemon.discovery, "clear", lambda _instance: None)
+    monkeypatch.setattr(daemon, "_shutdown_http", shutdown_http.set)
+
+    started = time.monotonic()
+    daemon.stop()
+    elapsed = time.monotonic() - started
+    try:
+        assert elapsed < 1.5
+        assert entered_abort.wait(timeout=1)
+        with pytest.raises(AuthorizationError):
+            store.load(token)
+    finally:
+        release_abort.set()
+
+
+def test_shutdown_race_cannot_reenable_revoked_bearer(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class BlockingActivation(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def activate(self, _handle, _grant):
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+
+    preparer = BlockingActivation(store, observed)
+    launcher = _launcher(
+        store,
+        profile,
+        preparer,
+        SimpleNamespace(observe=lambda _handle: observed),
+        77,
+    )
+    failures = []
+    thread = threading.Thread(
+        target=lambda: _capture_failure(
+            failures, launcher.start, "astrid", profile.workspace_uuid
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert preparer.entered.wait(timeout=5)
+    handles = launcher.begin_shutdown()
+    preparer.release.set()
+    thread.join(timeout=5)
+    launcher.finish_shutdown(handles)
+
+    assert not thread.is_alive()
+    assert failures and isinstance(failures[0], ConflictError)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+
+
+def test_shutdown_captures_worker_blocked_inside_prepare(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class HungPrepare(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.abort_calls = 0
+
+        def prepare(self, profile, *, operation_id, channel_id):
+            self.handle = object()
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            raise ConflictError("prepare interrupted")
+
+        def abort(self, handle):
+            self.abort_calls += 1
+            self.aborted = True
+            self.release.set()
+            if self.handle is handle:
+                self.handle = None
+
+    preparer = HungPrepare(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    failures = []
+    thread = threading.Thread(
+        target=lambda: _capture_failure(
+            failures, launcher.start, "astrid", profile.workspace_uuid
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert preparer.entered.wait(timeout=5)
+
+    started = time.monotonic()
+    handles = launcher.begin_shutdown()
+    launcher.finish_shutdown(handles)
+    elapsed = time.monotonic() - started
+    thread.join(timeout=5)
+
+    assert elapsed < 1.5
+    assert not thread.is_alive()
+    assert failures and isinstance(failures[0], ConflictError)
+    assert preparer.aborted is True
+    assert preparer.abort_calls == 1
+
+
+def _capture_failure(target, function, *args):
+    try:
+        function(*args)
+    except BaseException as exc:
+        target.append(exc)
 
 
 def test_private_owner_route_does_not_take_sqlite_mutex(tmp_path):
