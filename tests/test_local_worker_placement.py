@@ -727,6 +727,52 @@ def test_shutdown_captures_worker_blocked_inside_prepare(tmp_path):
     assert preparer.abort_calls == 1
 
 
+def test_shutdown_cancels_prepare_before_handle_publication(tmp_path):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class PrePublishHung(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.cancelled = False
+
+        def prepare(self, profile, *, operation_id, channel_id):
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            raise ConflictError("prepare interrupted before handle publication")
+
+        def cancel_current(self):
+            self.cancelled = True
+            self.release.set()
+
+    preparer = PrePublishHung(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    failures = []
+    thread = threading.Thread(
+        target=lambda: _capture_failure(
+            failures, launcher.start, "astrid", profile.workspace_uuid
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert preparer.entered.wait(timeout=5)
+
+    started = time.monotonic()
+    handles = launcher.begin_shutdown()
+    launcher.finish_shutdown(handles)
+    elapsed = time.monotonic() - started
+    thread.join(timeout=5)
+
+    assert elapsed < 1.5
+    assert not thread.is_alive()
+    assert preparer.cancelled is True
+    assert failures and isinstance(failures[0], ConflictError)
+    assert store.actor_metadata(WORKER_ACTOR) is None
+
+
 def _capture_failure(target, function, *args):
     try:
         function(*args)

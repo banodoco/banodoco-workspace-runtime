@@ -91,6 +91,8 @@ class LocalWorkerPreparer(Protocol):
     def reconnect(self, receipt: Mapping[str, Any]) -> object | None: ...
     def control_alive(self, handle: object) -> bool: ...
     def current_handle(self) -> object | None: ...
+    def set_prepare_cancel_event(self, event: threading.Event) -> None: ...
+    def cancel_current(self) -> None: ...
 
 
 class LocalWorkerInspector(Protocol):
@@ -187,9 +189,13 @@ class LocalWorkerLauncher:
         self._preparing_handle: object | None = None
         self._active_receipt: dict[str, Any] | None = None
         self._cleanup_handles: list[object] = []
+        self._prepare_cancel = threading.Event()
         for method in ("control_alive", "current_handle"):
             if not callable(getattr(preparer, method, None)):
                 raise ValueError(f"local worker preparer must implement {method}")
+        set_cancel = getattr(preparer, "set_prepare_cancel_event", None)
+        if callable(set_cancel):
+            set_cancel(self._prepare_cancel)
         existing = credentials.actor_metadata(actor)
         if existing:
             # Every durable bearer is unusable after owner restart until the
@@ -543,6 +549,30 @@ class LocalWorkerLauncher:
         """Fence authority synchronously; return owned handles for later cleanup."""
         self._shutdown.set()
         self._watch_stop.set()
+        self._prepare_cancel.set()
+        with self._state_lock:
+            self._revoke_actor()
+            self._active_handle = None
+            self._active_profile = None
+            self._active_identity = None
+            self._active_receipt = None
+            self._preparing_handle = None
+        cancel_current = getattr(self.preparer, "cancel_current", None)
+        if callable(cancel_current):
+            try:
+                cancel_current()
+            except BaseException:
+                # Authority is already fenced. Cleanup is retried through the
+                # bounded handle path below and must not make stop unbounded.
+                pass
+        # A request thread may already be inside prepare(). Let the bounded
+        # cancellation above unwind that operation before Runtime closes its
+        # HTTP/server state. Adapters without cancellation still get a hard
+        # upper bound; their late result is rejected by _shutdown and aborted
+        # by start()'s exception path.
+        acquired = self._operation_lock.acquire(timeout=1.0)
+        if acquired:
+            self._operation_lock.release()
         with self._state_lock:
             handles = [
                 value for value in (
@@ -552,12 +582,6 @@ class LocalWorkerLauncher:
                 )
                 if value is not None
             ]
-            self._revoke_actor()
-            self._active_handle = None
-            self._active_profile = None
-            self._active_identity = None
-            self._active_receipt = None
-            self._preparing_handle = None
         unique = []
         for handle in handles:
             if not any(handle is current for current in unique):
@@ -622,6 +646,10 @@ class LocalWorkerLauncher:
             if self._shutdown.is_set():
                 raise ConflictError("Runtime owner is shutting down")
             profile = self._profile(profile_id, expected_workspace_uuid)
+            with self._state_lock:
+                if self._shutdown.is_set():
+                    raise ConflictError("Runtime owner is shutting down")
+                self._prepare_cancel.clear()
             existing = self.credentials.actor_metadata(self.actor)
             if existing:
                 self.credentials.disable_actor(self.actor)

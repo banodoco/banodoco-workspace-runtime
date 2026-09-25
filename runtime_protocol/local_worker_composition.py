@@ -101,6 +101,22 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         self.timeout_seconds = float(timeout_seconds)
         self.cleanup_timeout_seconds = max(0.05, float(cleanup_timeout_seconds))
         self._active: _PreparedWorker | None = None
+        self._prepare_cancel = threading.Event()
+
+    def set_prepare_cancel_event(self, event: threading.Event) -> None:
+        self._prepare_cancel = event
+
+    def cancel_current(self) -> None:
+        """Interrupt a prepare RPC without waiting for its normal timeout."""
+        handle = self._active
+        if handle is None or handle.closed:
+            return
+        try:
+            self.abort(handle)
+        except BaseException:
+            # The owner has already fenced authority. The prepare caller will
+            # observe the closed channel and run its own bounded abort path.
+            pass
 
     def bind_runtime(self, *, endpoint: str, runtime_instance_id: str, credential_file: Path) -> None:
         self.config.update({
@@ -143,6 +159,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
     def prepare(self, profile: LocalWorkerProfile, *, operation_id: str, channel_id: str) -> _PreparedWorker:
         if self._active is not None:
             self.abort(self._active)
+        if self._prepare_cancel.is_set():
+            raise ConflictError("local Worker preparation cancelled")
         parent, child = socket.socketpair()
         worker: subprocess.Popen[bytes] | None = None
         handle: _PreparedWorker | None = None
@@ -172,6 +190,16 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 pass_fds=(child.fileno(),),
             )
             child.close()
+            if self._prepare_cancel.is_set():
+                try:
+                    os.killpg(worker.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    worker.wait(timeout=self.cleanup_timeout_seconds)
+                except (subprocess.TimeoutExpired, TimeoutError):
+                    pass
+                raise ConflictError("local Worker preparation cancelled")
             parent.settimeout(self.timeout_seconds)
             handle = _PreparedWorker(
                 worker,
