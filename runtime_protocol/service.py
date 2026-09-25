@@ -33,6 +33,8 @@ from .errors import AuthorizationError, ConflictError, NotFoundError, Validation
 from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
+from .timeline_inspection import inspect as inspect_timeline_closure
+from .timeline_view import markdown as render_timeline_markdown, png as render_timeline_png
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
@@ -1597,6 +1599,49 @@ class RuntimeService:
         if not row:
             raise NotFoundError("parent composition revision not found", details={"timeline_id": timeline_id, "revision": revision})
         return {"revision_id": row["id"], "project_id": row["project_id"], "timeline_id": row["timeline_id"], "content_digest": row["content_digest"], "payload": json.loads(row["payload_json"]), "created_at": row["created_at"]}
+
+    def inspect_timeline(self, project, timeline_id, options=None):
+        """Inspect one immutable timeline closure without reading source media."""
+        project_row = self.store.get_project(project)
+        with self.store._mutex:
+            return inspect_timeline_closure(self.store.conn, project_row["id"], timeline_id, options)
+
+    def create_timeline_view(self, project, timeline_id, options=None):
+        """Persist deterministic declared-input views as project-owned objects."""
+        project_row = self.store.get_project(project)
+        inspection = self.inspect_timeline(project_row["id"], timeline_id, options)
+        formats = inspection["selectors"].get("formats") or ["md"]
+        artifacts = {}
+        for kind in formats:
+            if kind == "md":
+                data, media_type, suffix = render_timeline_markdown(inspection), "text/markdown", "md"
+            elif kind == "png":
+                data, media_type, suffix = render_timeline_png(inspection), "image/png", "png"
+            else:
+                raise ValidationError("unsupported timeline view format")
+            artifact_key = "timeline-view-" + hashlib.sha256(canonical_json({
+                "project_id": project_row["id"], "timeline_id": timeline_id,
+                "snapshot_digest": inspection["snapshot_digest"],
+                "selectors": inspection["selectors"], "format": kind,
+            }).encode()).hexdigest()
+            stored = self.ingest(
+                project_row["id"], data, media_type=media_type,
+                original_name=f"timeline-{timeline_id}-{suffix}.{suffix}",
+                idempotency_key=artifact_key,
+            )
+            resource = stored["data"]
+            artifacts[kind] = {
+                "status": "available", "object_id": resource["object_id"],
+                "digest": resource["digest"], "size": resource["size"],
+                "media_type": resource["media_type"], "filename": resource.get("filename"),
+            }
+        return {
+            "inspection": inspection,
+            "evidence_kind": "declared_inputs",
+            "render_requested": False,
+            "formats": {kind: {"status": value["status"], "object_id": value["object_id"]} for kind, value in artifacts.items()},
+            "artifacts": artifacts,
+        }
 
     @_durable_mutation
     def replace_parent_composition_media(self, project_id, timeline_id, body, *, idempotency_key=None):

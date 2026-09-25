@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/timeline-view.json",
+  "title": "Declared timeline view result",
+  "type": "object",
+  "required": ["inspection", "evidence_kind", "render_requested", "formats", "artifacts"],
+  "properties": {
+    "inspection": { "type": "object" },
+    "evidence_kind": { "const": "declared_inputs" },
+    "render_requested": { "const": false },
+    "formats": { "type": "object" },
+    "artifacts": { "type": "object" }
+  }
+}

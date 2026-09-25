@@ -1,0 +1,1 @@
+{"aggregate_id":"task-neutral-1","aggregate_type":"task","cursor":"cursor-1","event_id":"event-neutral-1","event_type":"task.admitted","occurred_at":"2026-08-30T00:00:00Z","payload":{"state":"queued"},"sequence":1}

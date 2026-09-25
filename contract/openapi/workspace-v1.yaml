@@ -229,6 +229,18 @@ paths:
       operationId: getProjectTimeline
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
       responses: { '200': { description: Project-scoped timeline with its canonical composition head, content: { application/json: { schema: { $ref: './schemas/timeline.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/inspect:
+    post:
+      operationId: inspectTimeline
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/timeline-inspection.json' } } } }
+      responses: { '200': { description: Metadata-only inspection of the pinned timeline closure, content: { application/json: { schema: { type: object } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/views:
+    post:
+      operationId: createTimelineView
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
+      requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/timeline-inspection.json' } } } }
+      responses: { '200': { description: Deterministic metadata-only Markdown/PNG view, content: { application/json: { schema: { $ref: './schemas/timeline-view.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
   /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions:
     post:
       operationId: publishParentComposition
