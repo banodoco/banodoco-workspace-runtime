@@ -163,6 +163,11 @@ class LocalRuntimeBoundary:
         source_checkout = source_checkout.resolve()
         if not source_checkout.exists():
             raise BootstrapError(f"Source checkout from the editable profile does not exist: {source_checkout}")
+        if source.worker_profile:
+            worker_profile = Path(source.worker_profile).expanduser()
+            self._validate_path(worker_profile, "worker profile")
+            if worker_profile.is_symlink() or not worker_profile.is_file():
+                raise BootstrapError(f"Configured worker profile is unavailable: {worker_profile}")
         if source.runtime_environment:
             environment = Path(source.runtime_environment).expanduser()
             LocalRuntimeBoundary._validate_path(environment, "runtime environment")
@@ -239,6 +244,8 @@ class LocalRuntimeBoundary:
             argv += ["--bootstrap-token-file", str(token_file)]
         if not any("--admission-timeout" == part for part in argv):
             argv += ["--admission-timeout", str(self.admission_timeout_seconds)]
+        if source.worker_profile and "--worker-profile" not in argv:
+            argv += ["--worker-profile", str(Path(source.worker_profile).expanduser().resolve())]
         return argv
 
     def create(self, *, realm_id: str, realm_root: Path, display_name: str, source_profile: SourceProfile) -> Mapping[str, Any]:

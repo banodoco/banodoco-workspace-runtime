@@ -111,6 +111,7 @@ class SourceProfile:
     runtime_checkout: str
     source_checkout: str
     runtime_environment: str | None = None
+    worker_profile: str | None = None
     runtime_command: tuple[str, ...] = ()
     protocol_version: str = PROTOCOL_VERSION
     schema_version: str = SCHEMA_VERSION
@@ -124,6 +125,7 @@ class SourceProfile:
             raise BootstrapError("Source profile manifest must contain an object.")
         allowed = {
             "profile", "runtime_checkout", "source_checkout", "runtime_environment",
+            "worker_profile",
             "runtime_command", "protocol_version", "schema_version", "capability_digest",
             "source_digest", "lock_digest",
         }
@@ -164,6 +166,7 @@ class SourceProfile:
             runtime_checkout=runtime_checkout,
             source_checkout=source_checkout,
             runtime_environment=(str(value["runtime_environment"]) if value.get("runtime_environment") else None),
+            worker_profile=(str(value["worker_profile"]) if value.get("worker_profile") else None),
             runtime_command=tuple(str(part) for part in command),
             protocol_version=str(value.get("protocol_version", PROTOCOL_VERSION)),
             schema_version=str(value.get("schema_version", SCHEMA_VERSION)),
@@ -191,6 +194,7 @@ class SourceProfile:
             "runtime_checkout": self.runtime_checkout,
             "source_checkout": self.source_checkout,
             "runtime_environment": self.runtime_environment,
+            "worker_profile": self.worker_profile,
             "runtime_command": list(self.runtime_command),
             "protocol_version": self.protocol_version,
             "schema_version": self.schema_version,
@@ -309,6 +313,12 @@ def _validate_source_profile(source: SourceProfile, *, expected_profile: str = "
         raise BootstrapError("Source profile runtime_checkout must be an explicit absolute pinned checkout path.")
     if not source_path.is_absolute() or _has_symlink_component(source_path):
         raise BootstrapError("Source profile source_checkout must be an absolute symlink-free provenance path.")
+    if source.worker_profile:
+        worker_profile = Path(source.worker_profile).expanduser()
+        if not worker_profile.is_absolute() or _has_symlink_component(worker_profile) or worker_profile.is_symlink():
+            raise BootstrapError("Source profile worker_profile must be an absolute symlink-free path.")
+        if not worker_profile.is_file():
+            raise BootstrapError(f"Source profile worker_profile does not exist: {worker_profile}")
     if source.runtime_command:
         raise BootstrapError("Source profile runtime_command is not permitted; runtime launch is fixed by the installed runtime.")
     if source.protocol_version != PROTOCOL_VERSION or source.schema_version != SCHEMA_VERSION:

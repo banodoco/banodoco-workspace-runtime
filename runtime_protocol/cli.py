@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .daemon import RuntimeDaemon, WORKER_SCOPES
+from .local_worker_composition import load_local_worker_composition
 from .backup import create_backup, restore_backup, structured_export
 from .errors import RuntimeErrorBase
 from .store import RealmStore
@@ -36,6 +37,7 @@ def _parser():
     start.add_argument("--owner-lock")
     start.add_argument("--bootstrap-token-file")
     start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
+    start.add_argument("--worker-profile", help="absolute installed local Worker composition profile")
     create = sub.add_parser("create", help="explicitly create one fresh canonical realm")
     create.add_argument("--root", required=True)
     create.add_argument("--display-name", default="Workspace")
@@ -250,7 +252,33 @@ def main(argv=None):
         print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
         return 0
     try:
-        daemon = RuntimeDaemon(args.root, support_root=args.support_root, export_root=args.export_root, display_name=args.display_name, host=args.host, port=args.port, realm_id=args.realm_id, owner_lock=args.owner_lock, bootstrap_token_file=args.bootstrap_token_file, production_worker_credentials=True, admission_timeout=args.admission_timeout).start()
+        composition = None
+        if getattr(args, "worker_profile", None):
+            if not args.realm_id:
+                raise RuntimeErrorBase("--worker-profile requires --realm-id")
+            composition = load_local_worker_composition(
+                args.worker_profile,
+                workspace_uuid=args.realm_id,
+                realm_root=Path(args.root).expanduser().resolve(),
+                support_root=Path(args.support_root).expanduser().resolve() if args.support_root else Path(args.root).expanduser().resolve() / "support",
+                runtime_instance_id="pending-startup",
+            )
+        daemon = RuntimeDaemon(
+            args.root,
+            support_root=args.support_root,
+            export_root=args.export_root,
+            display_name=args.display_name,
+            host=args.host,
+            port=args.port,
+            realm_id=args.realm_id,
+            owner_lock=args.owner_lock,
+            bootstrap_token_file=args.bootstrap_token_file,
+            production_worker_credentials=True,
+            admission_timeout=args.admission_timeout,
+            local_worker_profiles=composition.profiles if composition else None,
+            local_worker_preparer=composition.preparer if composition else None,
+            local_worker_inspector=composition.inspector if composition else None,
+        ).start()
     except KeyboardInterrupt:
         raise
     except Exception as exc:
@@ -259,7 +287,7 @@ def main(argv=None):
         error = exc.as_dict() if isinstance(exc, RuntimeErrorBase) else {"code": "startup_error", "message": str(exc)}
         print(json.dumps({"ok": False, "error": error}, sort_keys=True))
         return 1
-    print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path), "worker_credential_file": str(daemon.worker_credential_path), "worker_actor": "astrid-pack-host", "worker_scopes": list(WORKER_SCOPES)}, sort_keys=True), flush=True)
+    print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path), "worker_credential_file": str(daemon.worker_credential_path), "worker_actor": "astrid-pack-host", "worker_scopes": list(WORKER_SCOPES), "worker_profile_configured": bool(daemon.local_worker_profiles)}, sort_keys=True), flush=True)
     stop = False
     def handle(*_):
         nonlocal stop

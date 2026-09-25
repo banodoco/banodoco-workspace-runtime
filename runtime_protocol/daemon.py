@@ -212,7 +212,14 @@ class RuntimeDaemon:
     def start_local_worker(self, profile_id, expected_workspace_uuid):
         if self.local_worker_launcher is None:
             raise ConflictError(
-                "local Worker preparation is not installed; install the I-06b parked-host adapter"
+                "No local Worker profile is configured; set worker_profile in the Astrid source profile and restart the Runtime"
+            )
+        bind_runtime = getattr(self.local_worker_preparer, "bind_runtime", None)
+        if bind_runtime is not None:
+            bind_runtime(
+                endpoint=self.endpoint,
+                runtime_instance_id=self.instance_id,
+                credential_file=self.worker_credential_path,
             )
         return self.local_worker_launcher.start(profile_id, expected_workspace_uuid)
 

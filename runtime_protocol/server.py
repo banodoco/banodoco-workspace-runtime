@@ -654,7 +654,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         raise NotFoundError("route not found")
 
     def _is_local_worker_control(self):
-        return self.command == "POST" and urlsplit(self.path).path == "/v1/control/local-worker/start"
+        return getattr(self, "command", None) == "POST" and urlsplit(getattr(self, "path", "")).path == "/v1/control/local-worker/start"
 
     def _local_worker_control(self):
         identity = self._identity("admin")
