@@ -102,13 +102,18 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         self.cleanup_timeout_seconds = max(0.05, float(cleanup_timeout_seconds))
         self._active: _PreparedWorker | None = None
         self._prepare_cancel = threading.Event()
+        # The only uninterruptible handoff is spawn -> handle construction ->
+        # publication. Cancellation waits for this tiny critical section so a
+        # just-spawned child can never exist without an owner-visible handle.
+        self._handoff_lock = threading.Lock()
 
     def set_prepare_cancel_event(self, event: threading.Event) -> None:
         self._prepare_cancel = event
 
     def cancel_current(self) -> None:
         """Interrupt a prepare RPC without waiting for its normal timeout."""
-        handle = self._active
+        with self._handoff_lock:
+            handle = self._active
         if handle is None or handle.closed:
             return
         try:
@@ -165,52 +170,50 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         worker: subprocess.Popen[bytes] | None = None
         handle: _PreparedWorker | None = None
         try:
-            executable = Path(profile.worker_executable)
-            environment = dict(self.environment)
-            environment.pop("PYTHONPATH", None)
-            worker_environment = environment.pop("ASTRID_WORKER_ENVIRONMENT", "")
-            if worker_environment:
-                env_root = Path(worker_environment).expanduser().resolve()
-                # A venv's ``bin/python`` carries the environment's package
-                # boundary through its adjacent pyvenv.cfg.  Its kernel
-                # executable may resolve to the base interpreter, which is
-                # checked independently by OSProcessInspector below.
-                candidate = env_root / "bin" / "python"
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    executable = candidate
-                environment["VIRTUAL_ENV"] = str(env_root)
-                environment["PATH"] = str(env_root / "bin") + os.pathsep + environment.get("PATH", "")
-            worker = subprocess.Popen(
-                [str(executable), "-m", "source.runtime.supervisor", "--prepared-control-fd", str(child.fileno())],
-                cwd=str(Path(self.config["support_root"])),
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                close_fds=True,
-                pass_fds=(child.fileno(),),
-            )
-            child.close()
+            with self._handoff_lock:
+                if self._prepare_cancel.is_set():
+                    raise ConflictError("local Worker preparation cancelled")
+                executable = Path(profile.worker_executable)
+                environment = dict(self.environment)
+                environment.pop("PYTHONPATH", None)
+                worker_environment = environment.pop("ASTRID_WORKER_ENVIRONMENT", "")
+                if worker_environment:
+                    env_root = Path(worker_environment).expanduser().resolve()
+                    # A venv's ``bin/python`` carries the environment's package
+                    # boundary through its adjacent pyvenv.cfg.  Its kernel
+                    # executable may resolve to the base interpreter, which is
+                    # checked independently by OSProcessInspector below.
+                    candidate = env_root / "bin" / "python"
+                    if candidate.is_file() and os.access(candidate, os.X_OK):
+                        executable = candidate
+                    environment["VIRTUAL_ENV"] = str(env_root)
+                    environment["PATH"] = str(env_root / "bin") + os.pathsep + environment.get("PATH", "")
+                worker = subprocess.Popen(
+                    [str(executable), "-m", "source.runtime.supervisor", "--prepared-control-fd", str(child.fileno())],
+                    cwd=str(Path(self.config["support_root"])),
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                    pass_fds=(child.fileno(),),
+                )
+                child.close()
+                parent.settimeout(self.timeout_seconds)
+                handle = _PreparedWorker(
+                    worker,
+                    self._birth(worker.pid),
+                    parent,
+                    {},
+                    _session_config_path(environment),
+                )
+                # Publish Runtime custody before the first potentially blocking
+                # control RPC. cancel_current() cannot pass the handoff lock
+                # until this handle is visible, so no spawned child can be
+                # missed by owner shutdown.
+                self._active = handle
             if self._prepare_cancel.is_set():
-                try:
-                    os.killpg(worker.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    worker.wait(timeout=self.cleanup_timeout_seconds)
-                except (subprocess.TimeoutExpired, TimeoutError):
-                    pass
+                self.abort(handle)
                 raise ConflictError("local Worker preparation cancelled")
-            parent.settimeout(self.timeout_seconds)
-            handle = _PreparedWorker(
-                worker,
-                self._birth(worker.pid),
-                parent,
-                {},
-                _session_config_path(environment),
-            )
-            # Publish Runtime custody before the first potentially blocking
-            # control RPC so owner shutdown can always fence and abort it.
-            self._active = handle
             response = self._rpc(handle, {
                 "version": CONTROL_VERSION,
                 "command": "prepare",
