@@ -631,6 +631,27 @@ def test_installing_replacement_retires_old_watcher_generation(tmp_path):
     assert launcher._active_handle is new_handle
 
 
+def test_fenced_generation_cannot_reenable_after_durable_revoke_failure(tmp_path, monkeypatch):
+    profile = _profile(tmp_path, str(uuid.uuid4()))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher = _launcher(store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77)
+    stale, _ = store.provision(WORKER_ACTOR, list(WORKER_SCOPES))
+    handle = object()
+    launcher._install_active(handle, profile, {"generation": "active"}, {})
+
+    def fail_revoke(_actor):
+        raise OSError("simulated durable revoke failure")
+
+    monkeypatch.setattr(store, "revoke", fail_revoke)
+    launcher.begin_shutdown()
+
+    with pytest.raises(ConflictError, match="no longer active"):
+        launcher._enable_active_generation(handle)
+    with pytest.raises(AuthorizationError):
+        store.load(stale)
+
+
 def test_shutdown_fences_auth_before_hung_abort_and_is_bounded(tmp_path, monkeypatch):
     profile = _profile(tmp_path, str(uuid.uuid4()))
     store = CredentialStore(tmp_path / "credentials")

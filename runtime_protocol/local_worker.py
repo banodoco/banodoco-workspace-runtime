@@ -489,6 +489,15 @@ class LocalWorkerLauncher:
             self._active_receipt = dict(receipt)
             self._preparing_handle = None
 
+    def _enable_active_generation(self, handle: object) -> None:
+        """Enable a bearer only while this exact generation still owns it."""
+        with self._state_lock:
+            if self._shutdown.is_set() or self._active_handle is not handle:
+                raise ConflictError("local Worker generation is no longer active")
+            # Fencing and enablement share the lifecycle lock. A failed durable
+            # revoke therefore cannot be followed by a stale enable operation.
+            self.credentials.enable_actor(self.actor)
+
     def _start_watcher(self) -> None:
         with self._state_lock:
             if self._shutdown.is_set() or self._active_handle is None:
@@ -651,7 +660,7 @@ class LocalWorkerLauncher:
             result = dict(receipt)
             result["state"] = "reconnected"
             self._install_active(handle, profile, identity, receipt)
-            self.credentials.enable_actor(self.actor)
+            self._enable_active_generation(handle)
             self._start_watcher()
             return result
         except Exception:
@@ -755,7 +764,7 @@ class LocalWorkerLauncher:
             # holder of the file can authenticate before the private grant is
             # accepted and the same process identity is observed once more.
             self._install_active(handle, profile, activated, receipt)
-            self.credentials.enable_actor(self.actor)
+            self._enable_active_generation(handle)
             self._start_watcher()
             return {
                 "state": "active",
