@@ -225,6 +225,36 @@ def _ps(pid: int, field: str) -> str:
     return result.stdout.strip().splitlines()[0].strip()
 
 
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ConflictError(f"cannot independently read executable artifact {path}") from exc
+    return "sha256:" + digest.hexdigest()
+
+
+def _listening_socket_owner(pid: int) -> int:
+    result = subprocess.run(
+        ["lsof", "-a", "-p", str(int(pid)), "-n", "-P", "-iTCP", "-sTCP:LISTEN"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ConflictError(f"cannot independently observe listening sockets for process {pid}")
+    rows = result.stdout.splitlines()
+    if len(rows) < 2:
+        raise ConflictError(f"process {pid} does not independently own a listening socket")
+    for row in rows[1:]:
+        fields = row.split()
+        if len(fields) > 1 and fields[1].isdigit() and int(fields[1]) == int(pid):
+            return int(pid)
+    raise ConflictError(f"process {pid} does not independently own a listening socket")
+
+
 class OSProcessInspector:
     """Independent owner-side observation; Worker reports are only selectors."""
 
@@ -240,7 +270,10 @@ class OSProcessInspector:
         observed_parent = int(_ps(pid, "ppid"))
         if parent_pid is not None and observed_parent != parent_pid:
             raise ConflictError("independent process parent identity disagrees with Worker report")
-        uid = os.getuid()
+        try:
+            uid = int(_ps(pid, "uid"))
+        except ValueError as exc:
+            raise ConflictError("independent process UID observation is invalid") from exc
         try:
             group = os.getpgid(pid)
             session = os.getsid(pid)
@@ -251,7 +284,10 @@ class OSProcessInspector:
         command = _ps(pid, "command")
         if str(executable) not in command and executable.name not in command:
             raise ConflictError("independent executable observation disagrees with profile")
-        return ProcessIdentity(pid, observed_birth, uid, observed_parent, group, session, executable, digest)
+        observed_digest = _file_digest(executable)
+        if observed_digest != digest:
+            raise ConflictError("independent executable artifact digest disagrees with profile")
+        return ProcessIdentity(pid, observed_birth, uid, observed_parent, group, session, executable, observed_digest)
 
     def observe(self, handle: _PreparedWorker) -> LocalWorkerObservation:
         report = getattr(handle, "report_value", None)
@@ -271,8 +307,11 @@ class OSProcessInspector:
         host = self._identity(int(host_data["pid"]), str(host_data["birth_id"]), self.profile.host_executable, self.profile.host_artifact_digest, parent_pid=worker.pid, session_owner=True)
         engine = self._identity(int(engine_data["pid"]), str(engine_data["birth_id"]), self.profile.engine_executable, self.profile.engine_artifact_digest, parent_pid=worker.pid, session_owner=True)
         listener = self._identity(int(listener_data["pid"]), str(listener_data["birth_id"]), self.profile.engine_listener_executable, self.profile.engine_listener_artifact_digest, parent_pid=engine.pid, session_owner=False)
-        socket_owner = int(binding.get("socket_owner_pid", -1))
-        if socket_owner != listener.pid or not process_birth_identity(socket_owner):
+        reported_socket_owner = int(binding.get("socket_owner_pid", -1))
+        observed_socket_owner = _listening_socket_owner(listener.pid)
+        if reported_socket_owner != observed_socket_owner:
+            raise ConflictError("independent listener socket-owner observation disagrees with Worker report")
+        if observed_socket_owner != listener.pid:
             raise ConflictError("independent listener socket-owner observation failed")
         if str(report.get("session_config_digest")) != self.profile.session_config_digest:
             raise ConflictError("engine session configuration does not match profile")
@@ -286,7 +325,7 @@ class OSProcessInspector:
             host=host,
             engine=engine,
             engine_listener=listener,
-            engine_listener_socket_owner_pid=socket_owner,
+            engine_listener_socket_owner_pid=observed_socket_owner,
             session_config_digest=self.profile.session_config_digest,
         )
 
