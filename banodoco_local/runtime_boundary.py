@@ -165,7 +165,7 @@ class LocalRuntimeBoundary:
             raise BootstrapError(f"Source checkout from the editable profile does not exist: {source_checkout}")
         if source.worker_profile:
             worker_profile = Path(source.worker_profile).expanduser()
-            self._validate_path(worker_profile, "worker profile")
+            LocalRuntimeBoundary._validate_path(worker_profile, "worker profile")
             if worker_profile.is_symlink() or not worker_profile.is_file():
                 raise BootstrapError(f"Configured worker profile is unavailable: {worker_profile}")
         if source.runtime_environment:
@@ -374,6 +374,7 @@ class LocalRuntimeBoundary:
             # These are paths and public metadata only; the scoped worker
             # secret remains in the runtime-owned 0600 file.
             "worker_credential_file": discovery.get("worker_credential_file"),
+            "worker_credential_pending": bool(discovery.get("worker_credential_pending")),
             "worker_actor": discovery.get("worker_actor"),
             "worker_scopes": discovery.get("worker_scopes", ()),
         }

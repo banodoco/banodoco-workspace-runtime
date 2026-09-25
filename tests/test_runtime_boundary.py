@@ -56,6 +56,19 @@ def test_startup_admission_budget_is_validated_and_forwarded(tmp_path, monkeypat
     assert argv[flag + 1] == "120.0"
 
 
+def test_worker_profile_is_validated_through_installed_source_boundary(tmp_path):
+    worker_profile = tmp_path / "worker-profile.json"
+    worker_profile.write_text("{}")
+    profile = SourceProfile(
+        profile="astrid",
+        runtime_checkout=str(tmp_path),
+        source_checkout=str(tmp_path),
+        worker_profile=str(worker_profile),
+    )
+
+    LocalRuntimeBoundary._validate_source(profile)
+
+
 def test_invalid_startup_admission_budget_fails_closed(monkeypatch):
     monkeypatch.setenv(ADMISSION_TIMEOUT_ENV, "not-a-duration")
     with pytest.raises(BootstrapError, match="ADMISSION_TIMEOUT"):

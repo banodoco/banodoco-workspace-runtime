@@ -204,7 +204,7 @@ class RuntimeDaemon:
         birth_id = process_birth_identity()
         if self.owner_lock:
             atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"], "realm_root": str(self.root)})
-        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES))
+        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_credential_pending=bool(self.local_worker_profiles), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES))
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="banodoco-runtime", daemon=True)
         self.thread.start()
         return self

@@ -357,20 +357,23 @@ def _worker_handoff(value: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(raw_path, str) or not raw_path:
         raise BootstrapError("Runtime worker credential handoff is invalid; " + RECONFIGURE_NEXT_ACTION)
     path = Path(raw_path).expanduser()
+    pending = bool(value.get("worker_credential_pending"))
     if (not path.is_absolute() or _has_symlink_component(path)
-            or path.is_symlink() or not path.is_file()):
+            or path.is_symlink() or (not pending and not path.is_file())):
         raise BootstrapError("Runtime worker credential handoff is unsafe; " + RECONFIGURE_NEXT_ACTION)
-    try:
-        if stat.S_IMODE(path.stat().st_mode) != 0o600:
-            raise BootstrapError("Runtime worker credential file must be owner-only; " + RECONFIGURE_NEXT_ACTION)
-    except OSError as exc:
-        raise BootstrapError("Runtime worker credential handoff is unavailable; " + RECONFIGURE_NEXT_ACTION) from exc
+    if not pending:
+        try:
+            if stat.S_IMODE(path.stat().st_mode) != 0o600:
+                raise BootstrapError("Runtime worker credential file must be owner-only; " + RECONFIGURE_NEXT_ACTION)
+        except OSError as exc:
+            raise BootstrapError("Runtime worker credential handoff is unavailable; " + RECONFIGURE_NEXT_ACTION) from exc
     actor = str(value.get("worker_actor") or "")
     scopes = tuple(str(scope) for scope in (value.get("worker_scopes") or ()))
     if actor != WORKER_ACTOR or scopes != WORKER_SCOPES:
         raise CompatibilityError("Runtime worker credential scopes are incompatible. " + RECONFIGURE_NEXT_ACTION)
     return {
         "worker_credential_file": path,
+        "worker_credential_pending": pending,
         "worker_actor": actor,
         "worker_scopes": scopes,
     }
@@ -922,6 +925,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         "capability_digest": handle.get("capability_digest", source.capability_digest),
         "credential_file": str(paths.credentials_dir / "astrid.json"),
         "worker_credential_file": str(handle.get("worker_credential_file") or ""),
+        "worker_credential_pending": bool(handle.get("worker_credential_pending")),
         "worker_actor": str(handle.get("worker_actor") or ""),
         "worker_scopes": list(handle.get("worker_scopes") or ()),
         "advertised_at": time.time(),

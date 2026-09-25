@@ -219,7 +219,7 @@ class LiveDiscovery:
         self.path = _safe_path(path, "discovery path")
 
     def publish(self, **fields):
-        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "realm_root", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "worker_credential_file", "worker_actor", "worker_scopes"}
+        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "realm_root", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "worker_credential_file", "worker_credential_pending", "worker_actor", "worker_scopes"}
         atomic_json_write(self.path, {k: fields[k] for k in allowed if k in fields})
 
     def clear(self, instance_id: str | None = None):
