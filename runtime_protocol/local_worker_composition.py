@@ -8,6 +8,7 @@ installed process.  No Worker implementation is imported into Runtime.
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import json
 import os
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import platform
 import signal
 import socket
 import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -136,6 +138,13 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             worker_environment = environment.pop("ASTRID_WORKER_ENVIRONMENT", "")
             if worker_environment:
                 env_root = Path(worker_environment).expanduser().resolve()
+                # A venv's ``bin/python`` carries the environment's package
+                # boundary through its adjacent pyvenv.cfg.  Its kernel
+                # executable may resolve to the base interpreter, which is
+                # checked independently by OSProcessInspector below.
+                candidate = env_root / "bin" / "python"
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    executable = candidate
                 environment["VIRTUAL_ENV"] = str(env_root)
                 environment["PATH"] = str(env_root / "bin") + os.pathsep + environment.get("PATH", "")
             worker = subprocess.Popen(
@@ -236,6 +245,21 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _actual_executable(pid: int) -> Path:
+    """Resolve the kernel-reported executable for one live process."""
+    try:
+        if sys.platform == "darwin":
+            library = ctypes.CDLL("/usr/lib/libproc.dylib")
+            buffer = ctypes.create_string_buffer(4096)
+            result = library.proc_pidpath(int(pid), buffer, len(buffer))
+            if result <= 0:
+                raise OSError("proc_pidpath returned no path")
+            return Path(buffer.value.decode()).resolve()
+        return Path(os.readlink(f"/proc/{int(pid)}/exe")).resolve()
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ConflictError(f"cannot independently resolve executable identity for process {pid}") from exc
+
+
 def _listening_socket_owner(pid: int) -> int:
     result = subprocess.run(
         ["lsof", "-a", "-p", str(int(pid)), "-n", "-P", "-iTCP", "-sTCP:LISTEN"],
@@ -281,9 +305,8 @@ class OSProcessInspector:
             raise ConflictError("independent process group/session observation failed") from exc
         if session_owner and (group != pid or session != pid):
             raise ConflictError("observed process does not own its process group/session")
-        command = _ps(pid, "command")
-        if str(executable) not in command and executable.name not in command:
-            raise ConflictError("independent executable observation disagrees with profile")
+        if _actual_executable(pid) != executable:
+            raise ConflictError("independent executable identity disagrees with profile")
         observed_digest = _file_digest(executable)
         if observed_digest != digest:
             raise ConflictError("independent executable artifact digest disagrees with profile")
