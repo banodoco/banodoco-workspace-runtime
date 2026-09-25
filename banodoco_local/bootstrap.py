@@ -23,6 +23,7 @@ import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
 from .paths import RuntimePaths
+from runtime_protocol.lifecycle import interruption_fence
 
 
 PROTOCOL_VERSION = "workspace.v1"
@@ -83,6 +84,8 @@ class RuntimeBoundary(Protocol):
     def create(self, *, realm_id: str, realm_root: Path, display_name: str,
                source_profile: "SourceProfile") -> Mapping[str, Any]: ...
 
+    def inspect(self, *, realm_root: Path) -> Mapping[str, Any]: ...
+
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path,
               source_profile: "SourceProfile") -> Mapping[str, Any]: ...
 
@@ -90,8 +93,14 @@ class RuntimeBoundary(Protocol):
 
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool: ...
 
+    def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]: ...
+
     def validate_owner(self, *, endpoint: str, pid: int, instance_id: str,
-                       owner_lock: Path, process_birth_id: str | None = None) -> bool: ...
+                       owner_lock: Path, process_birth_id: str | None = None,
+                       expected_realm_id: str | None = None,
+                       expected_realm_root: Path | None = None) -> bool: ...
+
+    def stop_owner(self, **kwargs: Any) -> Mapping[str, Any]: ...
 
     def is_pid_alive(self, pid: int) -> bool: ...
 
@@ -464,6 +473,8 @@ def _selected_realm(catalog: dict[str, Any]) -> dict[str, Any] | None:
     if not realms:
         return None
     selected = catalog.get("selected_realm_id")
+    if selected is None:
+        return None
     realm = realms[0]
     if selected and str(selected) != str(realm.get("realm_id")):
         raise BootstrapError("Catalog selected realm is inconsistent; run banodoco-local doctor.")
@@ -522,14 +533,37 @@ def _pid_alive(boundary: RuntimeBoundary | None, pid: Any) -> bool:
         return False
 
 
-def _lock_matches(paths: RuntimePaths, pid: int, instance_id: str, realm_id: str, process_birth_id: str | None = None) -> bool:
+def _canonical_realm_root(value: str | Path) -> Path:
+    raw = Path(value).expanduser()
+    if not raw.is_absolute() or _has_symlink_component(raw) or raw.is_symlink():
+        raise BootstrapError("Realm-root identity must be absolute and symlink-free.")
+    normalized = Path(os.path.abspath(raw))
+    if normalized != raw:
+        raise BootstrapError("Realm-root identity must be canonical.")
+    resolved = raw.resolve()
+    if not resolved.is_dir():
+        raise BootstrapError("Realm-root identity is unavailable.")
+    return resolved
+
+
+def _lock_matches(
+    paths: RuntimePaths, pid: int, instance_id: str, realm_id: str,
+    process_birth_id: str | None = None, realm_root: Path | None = None,
+) -> bool:
     marker = _read_support_json(paths.instance_lock_path)
+    root_matches = True
+    if realm_root is not None:
+        try:
+            root_matches = _canonical_realm_root(str(marker.get("realm_root") or "")) == realm_root if marker else False
+        except BootstrapError:
+            root_matches = False
     return bool(
         marker
         and str(marker.get("pid")) == str(pid)
         and str(marker.get("runtime_instance_id")) == instance_id
         and str(marker.get("realm_id")) == realm_id
         and (process_birth_id is None or str(marker.get("process_birth_id")) == process_birth_id)
+        and root_matches
     )
 
 
@@ -658,6 +692,10 @@ def bootstrap(
     collision = _legacy_collision(paths, config.legacy_roots)
     if collision is not None:
         raise LegacyRootCollisionError(LEGACY_NEXT_ACTION.format(legacy_root=collision))
+    if _selected_realm(_read_catalog(paths)) is None:
+        raise BootstrapError(
+            "No workspace is configured; run banodoco-local workspace create or workspace attach."
+        )
     config.resolve_source_profile(paths)
     with _bootstrap_mutex(paths):
         return _bootstrap_locked(paths, boundary, config)
@@ -717,7 +755,9 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     catalog = _read_catalog(paths)
     catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     realm = _selected_realm(catalog)
-    new_realm = realm is None
+    if realm is None:
+        raise BootstrapError("No workspace is configured; explicit create or attach is required before up.")
+    new_realm = False
     diagnostics: list[str] = []
 
     discovery = _read_support_json(paths.discovery_path)
@@ -733,11 +773,19 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                     "stop that owner, then run banodoco-local restart --profile astrid."
                 )
             endpoint = _validate_loopback_endpoint(endpoint)
+            try:
+                selected_root = _canonical_realm_root(str(realm.get("data_root") or "")) if realm else None
+                discovered_root = _canonical_realm_root(str(discovery.get("realm_root") or ""))
+            except BootstrapError:
+                selected_root = discovered_root = None
             valid_owner = boundary.validate_owner(
-                endpoint=endpoint, pid=int(pid), instance_id=instance_id, owner_lock=paths.instance_lock_path,
-                process_birth_id=str(discovery.get("process_birth_id") or "")
+                endpoint=endpoint, pid=int(pid), instance_id=instance_id,
+                owner_lock=paths.instance_lock_path,
+                process_birth_id=str(discovery.get("process_birth_id") or ""),
+                expected_realm_id=str(discovery["active_realm"]),
+                expected_realm_root=selected_root,
             )
-            if not valid_owner or not discovery.get("process_birth_id") or not _lock_matches(paths, int(pid), instance_id, str(discovery["active_realm"]), str(discovery.get("process_birth_id"))):
+            if not valid_owner or selected_root is None or discovered_root != selected_root or not discovery.get("process_birth_id") or not _lock_matches(paths, int(pid), instance_id, str(discovery["active_realm"]), str(discovery.get("process_birth_id")), selected_root):
                 raise DuplicateOwnerError(
                     "A different runtime owner is active for the selected realm; "
                     "stop it before retrying banodoco-local up --profile astrid."
@@ -778,21 +826,8 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             "stop it before retrying banodoco-local up --profile astrid."
         )
 
-    if realm is None:
-        realm = {
-            "realm_id": _new_realm_id(),
-            "display_name": config.display_name,
-            "data_root": str(paths.realms_dir / _new_realm_id()),
-        }
-        # Use one opaque id for both catalog identity and root name.
-        realm["data_root"] = str(paths.realms_dir / realm["realm_id"])
-        catalog["realms"] = [realm]
-        catalog["selected_realm_id"] = realm["realm_id"]
-    elif catalog.get("selected_realm_id") is None:
-        catalog["selected_realm_id"] = realm["realm_id"]
-
     realm_id = str(realm["realm_id"])
-    realm_root = Path(str(realm["data_root"])).expanduser()
+    realm_root = _canonical_realm_root(str(realm["data_root"]))
     # ``realm`` was synthesized above only when the catalog was empty. Keep
     # this explicit ownership bit so rollback can remove only a fresh root.
     credential_path = paths.credentials_dir / "astrid.json"
@@ -800,26 +835,6 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     source_manifest_path = paths.source_profiles_dir / f"{source.profile}.json"
     source_before = source_manifest_path.read_bytes() if source_manifest_path.is_file() and not source_manifest_path.is_symlink() else None
     try:
-        if new_realm:
-            create = getattr(boundary, "create", None)
-            if not callable(create):
-                raise BootstrapError(
-                    "The runtime boundary cannot explicitly provision a fresh realm."
-                )
-            created = create(
-                realm_id=realm_id,
-                realm_root=realm_root,
-                display_name=str(realm["display_name"]),
-                source_profile=source,
-            )
-            if (
-                not isinstance(created, Mapping)
-                or created.get("state") != "created"
-                or str(created.get("realm_id")) != realm_id
-            ):
-                raise BootstrapError(
-                    "Runtime realm creation returned incomplete or mismatched identity."
-                )
         handle = boundary.start(
             realm_id=realm_id,
             realm_root=realm_root,
@@ -867,7 +882,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     worker = _worker_handoff(handle)
     # The marker contains ownership metadata only and never a credential.
     try:
-        atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id})
+        atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id, "realm_root": str(realm_root)})
         actor_id, token = _credential(paths)
         connection = boundary.connect(endpoint=endpoint, credential=token)
         _provision_connection(connection, actor_id, token, realm_id)
@@ -890,6 +905,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         "process_birth_id": process_birth_id,
         "runtime_instance_id": instance_id,
         "active_realm": realm_id,
+        "realm_root": str(realm_root),
         "coordinator_epoch": handle.get("coordinator_epoch"),
         "protocol_version": handle.get("protocol_version", source.protocol_version),
         "schema_version": handle.get("schema_version", source.schema_version),
@@ -951,13 +967,31 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     )
 
 
-def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
-    """Restart the selected owner through the client/boundary seam."""
-    config = config or BootstrapConfig()
+def _owner_record_matches(
+    value: Mapping[str, Any] | None, *, pid: int, instance_id: str,
+    process_birth_id: str, realm_id: str, realm_root: Path,
+) -> bool:
+    if not value:
+        return False
+    try:
+        recorded_root = _canonical_realm_root(str(value.get("realm_root") or ""))
+    except BootstrapError:
+        return False
+    return bool(
+        str(value.get("pid")) == str(pid)
+        and str(value.get("runtime_instance_id")) == instance_id
+        and str(value.get("process_birth_id")) == process_birth_id
+        and str(value.get("active_realm") or value.get("realm_id")) == realm_id
+        and recorded_root == realm_root
+    )
+
+
+def _interrupt_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
+    """Identity-stop the owner while the caller holds the launcher mutex."""
     _validate_support_paths(paths)
     discovery = _read_support_json(paths.discovery_path)
     if not discovery:
-        raise BootstrapError("No runtime to restart. Next action: banodoco-local up --profile astrid")
+        raise BootstrapError("No runtime owner is available to interrupt.")
     try:
         pid = int(discovery["pid"])
         endpoint = _validate_loopback_endpoint(str(discovery["endpoint"]))
@@ -965,53 +999,97 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         realm_id = str(discovery["active_realm"])
         process_birth_id = str(discovery["process_birth_id"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise BootstrapError("Runtime restart refused: discovery identity is incomplete; run banodoco-local up.") from exc
+        raise BootstrapError("Runtime interruption refused: discovery identity is incomplete.") from exc
     # Real boundaries must prove liveness.  Tiny in-memory test boundaries do
     # not have an OS identity provider and are allowed to model the hand-off
     # without a kernel PID.
     modeled_boundary = getattr(boundary, "process_birth_identity", None) is None
     if not endpoint or not instance_id or not realm_id or not process_birth_id or (not _pid_alive(boundary, pid) and not modeled_boundary):
-        raise BootstrapError("Runtime restart refused: owner is stale or discovery identity is incomplete.")
-    if not _lock_matches(paths, pid, instance_id, realm_id, process_birth_id):
-        raise BootstrapError("Runtime restart refused: owner lock does not match discovery.")
+        raise BootstrapError("Runtime interruption refused: owner is stale or discovery identity is incomplete.")
+    selected = _selected_realm(_read_catalog(paths))
+    if selected is None or str(selected.get("realm_id")) != realm_id:
+        raise BootstrapError("Runtime interruption refused: discovery does not match the selected workspace.")
+    realm_root = _canonical_realm_root(str(selected["data_root"]))
+    discovery_root = _canonical_realm_root(str(discovery.get("realm_root") or ""))
+    if discovery_root != realm_root:
+        raise BootstrapError("Runtime interruption refused: discovery realm root does not match the selected workspace.")
+    if not _lock_matches(paths, pid, instance_id, realm_id, process_birth_id, realm_root):
+        raise BootstrapError("Runtime interruption refused: owner lock does not match discovery.")
     validate = getattr(boundary, "validate_owner", None)
-    if validate is None or not validate(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path, process_birth_id=process_birth_id):
-        raise BootstrapError("Runtime restart refused: owner endpoint or process identity failed validation.")
-    restart_fn = getattr(boundary, "restart", None)
-    if restart_fn is None:
-        remove_file(paths.discovery_path)
-        result = bootstrap(paths, boundary, config)
-        return BootstrapResult(
-            "restarted", result.realm_id, result.display_name, result.endpoint,
-            result.actor_id, result.source_profile, result.diagnostics,
-            result.discovery_path, result.credential_file,
-            result.worker_credential_file, result.worker_actor,
-            result.worker_scopes, result.source_checkout,
+    if validate is None or not validate(
+        endpoint=endpoint, pid=pid, instance_id=instance_id,
+        owner_lock=paths.instance_lock_path, process_birth_id=process_birth_id,
+        expected_realm_id=realm_id, expected_realm_root=realm_root,
+    ):
+        raise BootstrapError("Runtime interruption refused: owner endpoint or process identity failed validation.")
+    endpoint_metadata = getattr(boundary, "endpoint_metadata", None)
+    endpoint_identity = (
+        endpoint_metadata(
+            endpoint=endpoint,
+            credential_file=paths.runtime_support / "credentials" / "owner.token",
         )
-    handle = restart_fn(endpoint=endpoint, pid=pid, instance_id=instance_id, process_birth_id=process_birth_id, realm_id=realm_id, owner_lock=paths.instance_lock_path, discovery_path=paths.discovery_path)
-    # The boundary restart returns the same metadata shape as start.  Publish
-    # its fresh advertisement, then let normal bootstrap validation reconnect;
-    # this avoids a second start and keeps all credential/client calls unified.
-    refreshed = dict(discovery)
-    refreshed.update({
-        "endpoint": str(handle["endpoint"]),
-        "pid": int(handle["pid"]),
-        "process_birth_id": str(handle.get("process_birth_id") or handle.get("birth_id") or f"synthetic:{handle.get('runtime_instance_id')}:{handle.get('pid')}"),
-        "runtime_instance_id": str(handle["runtime_instance_id"]),
-        "coordinator_epoch": handle.get("coordinator_epoch", discovery.get("coordinator_epoch")),
-        "protocol_version": handle.get("protocol_version", discovery.get("protocol_version")),
-        "schema_version": handle.get("schema_version", discovery.get("schema_version")),
-        "capability_digest": handle.get("capability_digest", discovery.get("capability_digest")),
-        "advertised_at": time.time(),
-    })
-    atomic_write_json(paths.instance_lock_path, {
-        "pid": int(handle["pid"]),
-        "process_birth_id": refreshed["process_birth_id"],
-        "runtime_instance_id": str(handle["runtime_instance_id"]),
-        "realm_id": str(discovery["active_realm"]),
-    })
-    atomic_write_json(paths.discovery_path, refreshed)
-    result = bootstrap(paths, boundary, config)
+        if callable(endpoint_metadata)
+        else {}
+    )
+    if (
+        not endpoint_identity
+        or str(endpoint_identity.get("runtime_instance_id") or "") != instance_id
+        or str(endpoint_identity.get("realm_id") or "") != realm_id
+    ):
+        raise BootstrapError("Runtime interruption refused: endpoint identity does not match the selected owner.")
+    stop_owner = getattr(boundary, "stop_owner", None)
+    if not callable(stop_owner):
+        raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
+    try:
+        with interruption_fence(realm_root) as idle:
+            stop_owner(
+                endpoint=endpoint, pid=pid, instance_id=instance_id,
+                process_birth_id=process_birth_id, realm_id=realm_id,
+                owner_lock=paths.instance_lock_path,
+                discovery_path=paths.discovery_path, require_health=False,
+            )
+    except Exception as exc:
+        raise BootstrapError(str(exc)) from exc
+    # A stop callback must not be able to publish a replacement owner and have
+    # this invocation unlink it. Missing records are fine; differing records
+    # are preserved and turn cleanup into a safe refusal.
+    current_discovery = _read_support_json(paths.discovery_path)
+    current_marker = _read_support_json(paths.instance_lock_path)
+    if current_discovery is not None and not _owner_record_matches(
+        current_discovery, pid=pid, instance_id=instance_id,
+        process_birth_id=process_birth_id, realm_id=realm_id, realm_root=realm_root,
+    ):
+        raise BootstrapError("Runtime owner changed during stop; refusing discovery cleanup.")
+    if current_marker is not None and not _owner_record_matches(
+        current_marker, pid=pid, instance_id=instance_id,
+        process_birth_id=process_birth_id, realm_id=realm_id, realm_root=realm_root,
+    ):
+        raise BootstrapError("Runtime owner changed during stop; refusing owner-lock cleanup.")
+    if current_discovery is not None:
+        remove_file(paths.discovery_path)
+    if current_marker is not None:
+        remove_file(paths.instance_lock_path)
+    return {"status": "stopped", "realm_id": realm_id, "idle": idle}
+
+
+def _interrupt_owner(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
+    """Serialize owner validation, fencing, signal, and cleanup."""
+    with _bootstrap_mutex(paths):
+        return _interrupt_owner_locked(paths, boundary)
+
+
+def down(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
+    """Stop the selected owner only when all durable work is reconciled."""
+    return _interrupt_owner(paths, boundary)
+
+
+def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
+    """Stop under the shared lifecycle fence, then explicitly start again."""
+    config = config or BootstrapConfig()
+    _validate_support_paths(paths)
+    with _bootstrap_mutex(paths):
+        _interrupt_owner_locked(paths, boundary)
+        result = _bootstrap_locked(paths, boundary, config)
     return BootstrapResult(
         "restarted", result.realm_id, result.display_name, result.endpoint,
         result.actor_id, result.source_profile, result.diagnostics,

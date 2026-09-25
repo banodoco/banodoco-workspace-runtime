@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Mapping
+import urllib.error
+import urllib.request
 
 from . import __version__
 from .bootstrap import (
@@ -20,12 +22,14 @@ from .bootstrap import (
     _validate_support_paths,
     bootstrap,
     connect,
+    down,
     doctor,
     restart,
 )
 from .io import read_json
 from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
+from .workspace import configure_workspace, inspect_workspace
 from runtime_protocol.upgrade import DEFAULT_UPGRADE_TIMEOUT_SECONDS
 
 
@@ -60,8 +64,29 @@ def parser() -> argparse.ArgumentParser:
     _read_args(status)
     restart_cmd = sub.add_parser("restart", help="restart the selected runtime owner")
     _profile_args(restart_cmd)
+    down_cmd = sub.add_parser("down", help="stop the selected runtime owner after lifecycle reconciliation")
+    _profile_args(down_cmd)
     doc = sub.add_parser("doctor", help="read-only support-state diagnostics")
     _read_args(doc)
+    start_worker = sub.add_parser("start-worker", help="owner-only verified local Worker launch")
+    _read_args(start_worker)
+    start_worker.add_argument("--profile", default="astrid", choices=["astrid"])
+    start_worker.add_argument("--expected-workspace-uuid", required=True)
+
+    workspace = sub.add_parser("workspace", help="explicitly inspect, create, or attach the sole workspace")
+    workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
+    workspace_inspect = workspace_sub.add_parser("inspect", help="read-only canonical workspace inspection")
+    _read_args(workspace_inspect)
+    workspace_inspect.add_argument("--realm-root", type=Path)
+    workspace_inspect.add_argument("--expected-realm-id")
+    workspace_create = workspace_sub.add_parser("create", help="create and select a fresh canonical workspace")
+    _profile_args(workspace_create)
+    workspace_create.add_argument("--realm-root", required=True, type=Path)
+    workspace_create.add_argument("--realm-id")
+    workspace_attach = workspace_sub.add_parser("attach", help="validate and select an existing canonical workspace")
+    _profile_args(workspace_attach)
+    workspace_attach.add_argument("--realm-root", required=True, type=Path)
+    workspace_attach.add_argument("--realm-id", required=True)
 
     backup = sub.add_parser("backup", help="create a verified backup through the runtime")
     _read_args(backup)
@@ -208,6 +233,39 @@ def _typed_health(paths: RuntimePaths) -> Mapping[str, Any]:
     return _json_value(value)
 
 
+def _start_local_worker(paths: RuntimePaths, *, profile_id: str, expected_workspace_uuid: str) -> Mapping[str, Any]:
+    _validate_support_paths(paths)
+    discovery = _read_support_json(paths.discovery_path)
+    if not discovery or not discovery.get("endpoint"):
+        raise BootstrapError("No runtime discovery is available; run banodoco-local up --profile astrid.")
+    endpoint = _validate_loopback_endpoint(str(discovery["endpoint"])).rstrip("/")
+    payload = json.dumps({
+        "profile_id": profile_id,
+        "expected_workspace_uuid": expected_workspace_uuid,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint + "/v1/control/local-worker/start",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {_credential(paths)}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            detail = {"message": str(exc)}
+        raise BootstrapError(str(detail.get("message") or detail)) from exc
+    if not isinstance(value, Mapping):
+        raise BootstrapError("Runtime returned invalid local Worker launch metadata.")
+    return value
+
+
 def _load_state(raw: str) -> Mapping[str, Any]:
     if raw.startswith("@"):
         raw = Path(raw[1:]).read_text(encoding="utf-8")
@@ -220,6 +278,30 @@ def _load_state(raw: str) -> Mapping[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     paths = _paths(args)
+    if args.command == "workspace":
+        try:
+            boundary = LocalRuntimeBoundary()
+            if args.workspace_command == "inspect":
+                result = inspect_workspace(
+                    paths,
+                    boundary,
+                    realm_root=args.realm_root,
+                    expected_realm_id=args.expected_realm_id,
+                )
+            else:
+                result = configure_workspace(
+                    paths,
+                    boundary,
+                    _config(args, paths),
+                    mode=args.workspace_command,
+                    realm_root=args.realm_root,
+                    realm_id=args.realm_id,
+                )
+            _emit(result, json_mode=args.json)
+            return 0 if result.get("ok") else 1
+        except (BootstrapError, OSError, ValueError) as exc:
+            _emit({"ok": False, "error": str(exc)}, json_mode=True)
+            return 1
     if args.command == "doctor":
         # Doctor is read-only but must still use the concrete process boundary
         # to distinguish a live, matching owner from a stale/reused PID.
@@ -247,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             result = connect(paths, boundary, config)
             _emit(result, json_mode=args.json)
             return 0
-        if args.command == "restart":
+        if args.command in {"restart", "down"}:
             config = _config(args, paths)
             boundary = LocalRuntimeBoundary()
             source = config.resolve_source_profile(paths)
@@ -258,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
             if not realm or not discovery.get("pid"):
                 raise BootstrapError("No selected runtime owner to restart; run banodoco-local up --profile astrid.")
             boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=Path(str(realm["data_root"])), support_root=paths.runtime_support, pid=int(discovery["pid"]))
-            result = restart(paths, boundary, config)
+            result = restart(paths, boundary, config) if args.command == "restart" else down(paths, boundary)
             _emit(result, json_mode=args.json)
             return 0
         if args.command == "status":
@@ -274,6 +356,14 @@ def main(argv: list[str] | None = None) -> int:
                     result["health_error"] = str(exc)
             _emit(result, json_mode=args.json)
             return 0 if result["support"].get("healthy") and not result.get("stale_discovery") else 1
+        if args.command == "start-worker":
+            result = _start_local_worker(
+                paths,
+                profile_id=args.profile,
+                expected_workspace_uuid=args.expected_workspace_uuid,
+            )
+            _emit(result, json_mode=args.json)
+            return 0
         if args.command == "backup":
             _emit(_client(paths).create_backup(str(args.destination.expanduser().resolve())), json_mode=args.json)
             return 0

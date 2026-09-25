@@ -115,7 +115,11 @@ def test_slow_healthy_runtime_and_degraded_owner(tmp_path):
             time.sleep(0.6)
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(json.dumps({"status": self.status, "protocol": "workspace.v1"}).encode())
+            self.wfile.write(json.dumps({
+                "status": self.status,
+                "protocol": "workspace.v1",
+                "runtime_instance_id": "test",
+            }).encode())
 
         def log_message(self, *_args):
             pass

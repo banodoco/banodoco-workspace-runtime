@@ -294,6 +294,26 @@ class LocalRuntimeBoundary:
             raise BootstrapError("Runtime realm creation returned invalid metadata.")
         return created
 
+    def inspect(self, *, realm_root: Path) -> Mapping[str, Any]:
+        """Run Runtime's bounded doctor without opening or starting authority."""
+        root = self._validate_path(Path(realm_root), "realm root")
+        if root.is_symlink() or not root.is_dir():
+            raise BootstrapError(f"realm root is unavailable: {root}")
+        result = subprocess.run(
+            [sys.executable, "-m", "runtime_protocol", "doctor", "--root", str(root), "--json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        try:
+            report = json.loads(result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise BootstrapError("Runtime realm inspection returned invalid metadata.") from exc
+        if not isinstance(report, Mapping):
+            raise BootstrapError("Runtime realm inspection returned invalid metadata.")
+        return report
+
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
         if self._process and self._process.poll() is None:
             raise BootstrapError("runtime boundary already owns a live daemon")
@@ -472,9 +492,53 @@ class LocalRuntimeBoundary:
         return connection
 
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool:
-        return self.is_pid_alive(pid) and self._http_health(endpoint)
+        health = self._http_health_payload(endpoint)
+        return bool(
+            self.is_pid_alive(pid)
+            and health
+            and health.get("status") == "ok"
+            and health.get("runtime_instance_id") == instance_id
+        )
 
-    def validate_owner(self, *, endpoint: str, pid: int, instance_id: str, owner_lock: Path, process_birth_id: str | None = None) -> bool:
+    def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]:
+        """Read endpoint instance and authenticated realm identity without mutation."""
+        health = self._http_health_payload(endpoint)
+        if not health:
+            return {}
+        try:
+            credential_path = self._validate_path(Path(credential_file), "runtime credential")
+            fd = os.open(credential_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return {}
+                raw = bytearray()
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+            finally:
+                os.close(fd)
+            token = bytes(raw).decode("utf-8").strip()
+            if not token:
+                return {}
+            request = urllib.request.Request(
+                str(endpoint).rstrip("/") + "/v1/realm",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(request, timeout=self.HEALTH_TIMEOUT_SECONDS) as response:
+                realm = json.loads(response.read().decode("utf-8"))
+            if not isinstance(realm, Mapping) or not realm.get("realm_id"):
+                return {}
+            return {**health, "realm_id": str(realm["realm_id"])}
+        except (BootstrapError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    def validate_owner(
+        self, *, endpoint: str, pid: int, instance_id: str, owner_lock: Path,
+        process_birth_id: str | None = None, expected_realm_id: str | None = None,
+        expected_realm_root: Path | None = None,
+    ) -> bool:
         if not self.is_pid_alive(pid):
             return False
         try:
@@ -498,23 +562,34 @@ class LocalRuntimeBoundary:
             return False
         if str(marker.get("pid")) != str(pid) or str(marker.get("runtime_instance_id")) != instance_id:
             return False
+        if expected_realm_id is not None and str(marker.get("realm_id")) != str(expected_realm_id):
+            return False
+        if expected_realm_root is not None:
+            try:
+                expected_root = self._validate_path(Path(expected_realm_root), "expected realm root").resolve()
+                marker_root = self._validate_path(Path(str(marker.get("realm_root") or "")), "owner realm root").resolve()
+            except (BootstrapError, OSError):
+                return False
+            if marker_root != expected_root:
+                return False
         expected_birth = process_birth_id or marker.get("process_birth_id")
         if not expected_birth:
             return False
         actual_birth = self.process_birth_identity(pid)
+        health = self._http_health_payload(endpoint)
+        if not health or health.get("runtime_instance_id") != instance_id:
+            return False
         if actual_birth is None:
             # Restricted clients may be able to prove that a PID exists but
             # not inspect its birth marker. Require the daemon itself to
             # attest the durable runtime instance over its loopback health
             # endpoint; health alone is never an identity proof.
-            health = self._http_health_payload(endpoint)
-            if not health or health.get("runtime_instance_id") != instance_id:
-                return False
+            pass
         elif expected_birth != actual_birth:
             return False
         # A degraded runtime can still be the correct owner. Keep health
         # admission separate so database failures are not called PID conflicts.
-        return self._http_status(endpoint) is not None
+        return True
 
     @staticmethod
     def is_pid_alive(pid: int) -> bool:
@@ -605,19 +680,39 @@ class LocalRuntimeBoundary:
                     os.close(fd)
             except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 raise BootstrapError("Runtime restart refused: owner discovery or lock is unavailable.") from exc
+            try:
+                expected_root = self._validate_path(root, "expected realm root").resolve()
+                discovery_root = self._validate_path(
+                    Path(str(discovery.get("realm_root") or "")), "discovery realm root"
+                ).resolve()
+                marker_root = self._validate_path(
+                    Path(str(marker.get("realm_root") or "")), "owner realm root"
+                ).resolve()
+            except (BootstrapError, OSError) as exc:
+                raise BootstrapError("Runtime restart refused: realm-root identity is invalid.") from exc
+            health = self._http_health_payload(endpoint)
+            endpoint_identity = self.endpoint_metadata(
+                endpoint=endpoint,
+                credential_file=support / "credentials" / "owner.token",
+            )
             checks = (
                 str(discovery.get("pid")) == str(expected_pid),
                 str(discovery.get("endpoint")) == endpoint,
                 str(discovery.get("runtime_instance_id")) == expected_instance,
                 str(discovery.get("process_birth_id")) == expected_birth,
                 str(discovery.get("active_realm")) == expected_realm,
+                discovery_root == expected_root,
                 str(marker.get("pid")) == str(expected_pid),
                 str(marker.get("runtime_instance_id")) == expected_instance,
                 str(marker.get("process_birth_id")) == expected_birth,
                 str(marker.get("realm_id")) == expected_realm,
+                marker_root == expected_root,
                 self.is_pid_alive(expected_pid),
                 self.process_birth_identity(expected_pid) == expected_birth,
-                (self._http_health(endpoint) if require_health else True),
+                bool(health and health.get("runtime_instance_id") == expected_instance),
+                bool(endpoint_identity and endpoint_identity.get("runtime_instance_id") == expected_instance),
+                bool(endpoint_identity and endpoint_identity.get("realm_id") == expected_realm),
+                (bool(health and health.get("status") == "ok") if require_health else True),
             )
             if not all(checks):
                 raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")

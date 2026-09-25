@@ -108,6 +108,9 @@ def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) ->
             assert (kwargs["realm_root"] / "realm.sqlite3").is_file()
             return {"endpoint": "http://127.0.0.1:43100", "pid": 101, "runtime_instance_id": "instance", "protocol_version": "workspace.v1", "schema_version": "workspace-schema-v1"}
 
+        def inspect(self, **kwargs):
+            return RealmStore.inspect_realm(kwargs["realm_root"])
+
         def health(self, **kwargs):
             return True
 
@@ -118,11 +121,17 @@ def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) ->
             self.stopped = True
 
     boundary = FailingBoundary()
+    from banodoco_local.workspace import configure_workspace
+    root = paths.realms_dir / "explicit-realm"
+    configure_workspace(
+        paths, boundary, BootstrapConfig(source_profile=profile), mode="create",
+        realm_root=root, realm_id="explicit-realm",
+    )
     with pytest.raises(RuntimeError, match="handoff failed"):
         bootstrap(paths, boundary, BootstrapConfig(source_profile=profile))
     assert boundary.stopped
-    assert not list(paths.realms_dir.iterdir()) if paths.realms_dir.exists() else True
-    assert not paths.catalog_path.exists()
+    assert root.is_dir()
+    assert paths.catalog_path.exists()
     assert not paths.discovery_path.exists()
     assert not paths.instance_lock_path.exists()
 

@@ -21,7 +21,7 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
     def transport(method, path, headers, body):
         calls.append((method, path, headers, body))
         if path == "/v1/health":
-            return 200, {}, json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1}).encode()
+            return 200, {}, json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1, "runtime_session_id": "runtime-session-1", "runtime_instance_id": "runtime-instance-1"}).encode()
         if path == "/v1/handshake":
             return 200, {}, json.dumps({"protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "session_id": "session-1", "actor_id": "actor-1", "realm_id": "realm-1", "scopes": ["realm:read", "project:write"]}).encode()
         if path == "/v1/projects" and method == "POST":
@@ -29,7 +29,10 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
         raise AssertionError((method, path))
 
     client = WorkspaceClient("http://runtime", "token", transport=transport)
-    assert client.health()["protocol"] == "workspace.v1"
+    health = client.health()
+    assert health["protocol"] == "workspace.v1"
+    assert health.runtime_session_id == "runtime-session-1"
+    assert health.runtime_instance_id == "runtime-instance-1"
     session = client.handshake("second-product", "0.1.0", ["realm:read", "project:write"])
     assert session.realm_id == "realm-1"
     project = client.create_project("Neutral", idempotency_key="create-1")
@@ -264,7 +267,7 @@ def test_client_applies_bounded_timeout_to_stdlib_transport(monkeypatch) -> None
             return False
 
         def read(self):
-            return json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1}).encode()
+            return json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1, "runtime_session_id": "runtime-session-1", "runtime_instance_id": "runtime-instance-1"}).encode()
 
     def urlopen(request, *, timeout):
         observed["timeout"] = timeout
@@ -274,6 +277,7 @@ def test_client_applies_bounded_timeout_to_stdlib_transport(monkeypatch) -> None
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     client = WorkspaceClient("http://runtime", timeout=1.5)
     assert client.health().status == "ok"
+    assert client.health().runtime_instance_id == "runtime-instance-1"
     assert observed["timeout"] == 1.5
     assert observed["request_id"].startswith("request-")
     with pytest.raises(ValueError, match="finite and positive"):

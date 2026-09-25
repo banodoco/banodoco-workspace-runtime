@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -61,6 +61,7 @@ REQUIRED_SCHEMA_COLUMNS = {
     "command_idempotency": frozenset("command_kind aggregate_id idempotency_key request_hash result_json created_at txn_id primary_stream_id resulting_stream_seq first_project_seq last_project_seq event_ids_json".split()),
     "continuation_admissions": frozenset("continuation_task_id dependency_snapshot_json admitted_at".split()),
     "events": frozenset("id run_id task_id kind payload_json previous_hash event_hash created_at".split()),
+    "execution_bindings": frozenset("binding_id task_id run_id attempt_id lease_id fence executor_id session_id runtime_epoch capability_id profile_revision profile_digest release_digest target_kind target_id provider_account_ref pod_id storage_json mounts_json resolved_target_json status created_at updated_at".split()),
     "executors": frozenset("id max_concurrency resource_keys_json capabilities_json protocol created_at runtime_epoch readiness readiness_reason last_seen_at source_digest dependency_digest source_epoch".split()),
     "generation_variants": frozenset("id generation_id object_id variant_type metadata_json thumbnail_object_id thumbnail_source_object_id thumbnail_recipe_version viewed_at created_at".split()),
     "generations": frozenset("id project_id source_task_id type status metadata_json version created_at updated_at".split()),
@@ -94,7 +95,7 @@ REQUIRED_SCHEMA_COLUMNS = {
     "shot_text_binding_events": frozenset("event_id binding_id project_id seq kind payload_json previous_hash event_hash created_at".split()),
     "shot_text_bindings": frozenset("id project_id shot_id kind slot media_digest event_stream_id head_seq created_at updated_at".split()),
     "task_dependencies": frozenset("continuation_task_id predecessor_task_id ordinal".split()),
-    "tasks": frozenset("id run_id capability spec_json status lease_token executor_id attempt expected_effect_json result_json created_at updated_at capability_digest waiting_reason lease_expires_at lease_fence attempt_id runtime_epoch".split()),
+    "tasks": frozenset("id run_id capability spec_json status lease_token executor_id attempt expected_effect_json result_json created_at updated_at capability_digest waiting_reason lease_expires_at lease_fence attempt_id runtime_epoch execution_request_json".split()),
     "timeline_events": frozenset("id timeline_id kind payload_json previous_hash event_hash created_at".split()),
     "timeline_reference_state": frozenset("id version archived_at".split()),
     "timeline_references": frozenset("id timeline_id object_id role".split()),
@@ -149,6 +150,11 @@ def normalize_execution_facts(value, *, field="execution facts"):
 def public_task_spec(spec):
     """Split internal generation intent from the public task spec."""
     public = dict(spec or {})
+    # v26 is the first-class execution-request authority.  Rows written by
+    # the short-lived pre-correction shape may still carry the request in the
+    # outer runtime spec; it is a bounded read-compatibility key and never a
+    # public spec field.
+    public.pop("execution_request", None)
     intent = public.pop(GENERATION_INTENT_STORAGE_KEY, None)
     if intent is None and LEGACY_GENERATION_INTENT_STORAGE_KEY in public:
         intent = public.pop(LEGACY_GENERATION_INTENT_STORAGE_KEY)
@@ -163,6 +169,176 @@ def canonical_task_spec_for_compare(spec):
     if intent is not None:
         public[GENERATION_INTENT_STORAGE_KEY] = intent
     return public
+
+
+def legacy_execution_request_from_spec(spec):
+    """Read only the inventoried pre-correction outer-spec request shape."""
+    if not isinstance(spec, dict) or "execution_request" not in spec:
+        return None
+    value = spec.get("execution_request")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValidationError("legacy execution_request row is malformed")
+    return value
+
+
+def _normalize_execution_target(value):
+    if not isinstance(value, dict):
+        raise ValidationError("execution_request.target must be an object")
+    target = json.loads(canonical_json(value))
+    kind = target.get("kind")
+    if kind not in {"default", "profile", "machine", "runpod"}:
+        raise ValidationError("execution_request.target.kind is unsupported")
+    common = {"kind", "profile_revision", "profile_digest", "release_digest", "storage", "mounts"}
+    if kind == "runpod":
+        if set(target) - common - {"pod_id", "provider_account_ref"}:
+            raise ValidationError("runpod execution target contains unsupported identity fields")
+        if not isinstance(target.get("pod_id"), str) or not target["pod_id"]:
+            raise ValidationError("execution_request.target.pod_id is required")
+        if not isinstance(target.get("provider_account_ref"), str) or not target["provider_account_ref"]:
+            raise ValidationError("execution_request.target.provider_account_ref is required")
+    elif kind == "profile":
+        if set(target) - common - {"id", "profile_alias"}:
+            raise ValidationError("profile execution target contains unsupported identity fields")
+        if "id" in target and "profile_alias" in target and target["id"] != target["profile_alias"]:
+            raise ValidationError("profile execution target id and profile_alias conflict")
+        identifier = target.get("id", target.get("profile_alias"))
+        if not isinstance(identifier, str) or not identifier:
+            raise ValidationError("execution_request.target profile id is required")
+        target["id"] = identifier
+        target.pop("profile_alias", None)
+    elif kind == "machine":
+        if set(target) - common - {"id", "machine_id"}:
+            raise ValidationError("machine execution target contains unsupported identity fields")
+        if "id" in target and "machine_id" in target and target["id"] != target["machine_id"]:
+            raise ValidationError("machine execution target id and machine_id conflict")
+        identifier = target.get("id", target.get("machine_id"))
+        if not isinstance(identifier, str) or not identifier:
+            raise ValidationError("execution_request.target machine id is required")
+        target["id"] = identifier
+        target.pop("machine_id", None)
+    elif set(target) != {"kind"}:
+        raise ValidationError("default execution target cannot carry placement identity")
+    return target
+
+
+def normalize_verified_execution_placement(value):
+    """Validate actual placement supplied by authenticated worker identity.
+
+    The request/claim target is only a selector.  Actual placement is trusted
+    only when the HTTP credential metadata attests it, including a stable
+    executor incarnation so a restarted worker cannot inherit an old lease.
+    """
+    if not isinstance(value, dict) or set(value) != {
+        "actual", "verification", "executor_incarnation",
+    }:
+        raise ValidationError(
+            "trusted execution_binding must contain actual, verification, and executor_incarnation"
+        )
+    actual = _normalize_execution_target(value.get("actual"))
+    if actual["kind"] == "default":
+        raise ValidationError("execution_binding.actual.kind cannot be default")
+    verification = value.get("verification")
+    if not isinstance(verification, dict) or set(verification) != {
+        "method", "evidence_digest", "verified",
+    }:
+        raise ValidationError("execution_binding.verification has an invalid shape")
+    if verification.get("method") != "credential_claim" or verification.get("verified") is not True:
+        raise ValidationError("execution binding placement is not verified by a credential claim")
+    digest = verification.get("evidence_digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValidationError("execution_binding.verification.evidence_digest is invalid")
+    incarnation = value.get("executor_incarnation")
+    if not isinstance(incarnation, str) or not incarnation.strip() or len(incarnation) > 256:
+        raise ValidationError("execution_binding.executor_incarnation must be a non-empty string")
+    return {
+        "actual": actual,
+        "verification": {
+            "method": "credential_claim",
+            "evidence_digest": digest,
+            "verified": True,
+        },
+        "executor_incarnation": incarnation.strip(),
+    }
+
+
+def execution_placement_matches(selected, placement):
+    """Return whether verified actual placement satisfies a target selector."""
+    if not isinstance(selected, dict) or not isinstance(placement, dict):
+        return False
+    verification = placement.get("verification")
+    if not isinstance(verification, dict) or verification.get("verified") is not True:
+        return False
+    actual = placement.get("actual")
+    if not isinstance(actual, dict):
+        return False
+    if selected.get("kind") != "default" and selected.get("kind") != actual.get("kind"):
+        return False
+    identity_fields = {
+        "default": (),
+        "profile": ("id",),
+        "machine": ("id",),
+        "runpod": ("pod_id", "provider_account_ref"),
+    }.get(selected.get("kind"), ())
+    for field in identity_fields:
+        if selected.get(field) != actual.get(field):
+            return False
+    for field in (
+        "profile_revision", "profile_digest", "release_digest", "storage", "mounts",
+    ):
+        if field in selected and selected[field] != actual.get(field):
+            return False
+    return True
+
+
+def _normalize_execution_request(value, input_object_ids):
+    """Validate the Runtime-owned targeted admission envelope.
+
+    This intentionally validates only the scheduler-facing portion of the
+    product stencil. Creative fields remain opaque to Runtime, but target
+    identity, caller binding material, and the ordered CAS mirror are not.
+    """
+    if not isinstance(value, dict):
+        raise ValidationError("execution_request must be an object")
+    if "execution_binding" in value:
+        raise ValidationError("caller-supplied execution_binding is not accepted")
+    request = json.loads(canonical_json(value))
+    request["target"] = _normalize_execution_target(request.get("target"))
+    if "inputs" in request:
+        inputs = request["inputs"]
+        if not isinstance(inputs, list):
+            raise ValidationError("execution_request.inputs must be a list")
+        declared = []
+        names = set()
+        for index, item in enumerate(inputs):
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"]:
+                raise ValidationError("execution_request.inputs entries must contain a name", details={"index": index})
+            if item["name"] in names:
+                raise ValidationError("execution_request.inputs contains duplicate names", details={"name": item["name"]})
+            names.add(item["name"])
+            object_id = item.get("object_id")
+            match = OBJECT_ID_RE.fullmatch(object_id) if isinstance(object_id, str) else None
+            if not match:
+                raise ValidationError("execution_request.inputs.object_id must be a sha256 object ID", details={"index": index})
+            declared.append("sha256:" + match.group(1))
+        supplied = list(input_object_ids or [])
+        supplied_normalized = []
+        for index, object_id in enumerate(supplied):
+            match = OBJECT_ID_RE.fullmatch(object_id) if isinstance(object_id, str) else None
+            if not match:
+                raise ValidationError("input_object_ids must contain sha256 object IDs", details={"index": index})
+            supplied_normalized.append("sha256:" + match.group(1))
+        if len(set(declared)) != len(declared):
+            raise ValidationError("execution_request.inputs contains duplicate object IDs")
+        if len(set(supplied_normalized)) != len(supplied_normalized):
+            raise ValidationError("input_object_ids contains duplicate object IDs")
+        if supplied_normalized != declared:
+            raise ValidationError(
+                "input_object_ids must exactly mirror execution_request.inputs in order",
+                details={"expected": declared, "actual": supplied_normalized},
+            )
+    return request
 
 
 def task_spec_for_request_hash(spec):
@@ -232,6 +408,7 @@ class RealmStore:
         store._admission_lock_file = None
         store._mutex = threading.RLock()
         store.conn = None
+        store.admission_timeout = REALM_ADMISSION_TIMEOUT_SECONDS
         parent_fd = -1
         published = False
         root_was_present = root.exists()
@@ -305,6 +482,7 @@ class RealmStore:
 
     def __init__(self, root: str | Path, *, create: bool = False, acquire_owner: bool = True, admission_timeout: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         self.root = Path(root).expanduser().resolve()
+        self.admission_timeout = admission_timeout
         if create:
             raise ValidationError("implicit realm creation is disabled; use RealmStore.initialize")
         if self.root.is_symlink() or not self.root.exists() or not self.root.is_dir():
@@ -621,10 +799,65 @@ class RealmStore:
                     "INSERT INTO runtime_lifecycle(id, runtime_epoch, boot_id, previous_boot_id, started_at, recovered_task_count) VALUES (1, ?, ?, ?, ?, 0) ON CONFLICT(id) DO UPDATE SET runtime_epoch=excluded.runtime_epoch, boot_id=excluded.boot_id, previous_boot_id=excluded.previous_boot_id, started_at=excluded.started_at, recovered_task_count=0",
                     (epoch, boot_id, previous_boot, started_at),
                 )
+                # Prepared bindings belong to the current Runtime boot even
+                # when their task has never been claimed.  Refreshing their
+                # session/epoch here prevents a queued task admitted by a
+                # previous boot from failing the final worker fence merely
+                # because it waited in the durable queue.
+                self.conn.execute(
+                    "UPDATE execution_bindings SET session_id=?, runtime_epoch=?, updated_at=? WHERE status='prepared'",
+                    (boot_id, epoch, started_at),
+                )
                 interrupted = self.conn.execute(
-                    "SELECT id, run_id, lease_token, lease_fence, attempt FROM tasks WHERE status='running' ORDER BY created_at, id"
+                    "SELECT id, run_id, status, lease_token, lease_fence, attempt, attempt_id "
+                    "FROM tasks WHERE status IN ('running', 'cancel_requested') ORDER BY rowid"
                 ).fetchall()
                 for task in interrupted:
+                    binding = self.execution_binding(task["id"])
+                    unresolved_external = bool(
+                        binding
+                        and binding.get("status") in {"claimed", "stale"}
+                        and binding.get("actual_target")
+                        and (binding.get("verification") or {}).get("verified") is True
+                    )
+                    if unresolved_external:
+                        # Restart fences the old Runtime lease but cannot prove
+                        # that an external executor/provider stopped. Preserve
+                        # the attempt, placement, fence, and reservation and
+                        # require checkpoint-authorized reconciliation.
+                        next_status = (
+                            "cancel_requested"
+                            if task["status"] == "cancel_requested"
+                            else "queued"
+                        )
+                        self.conn.execute(
+                            "UPDATE tasks SET status=?, lease_expires_at=NULL, "
+                            "waiting_reason='provider_state_unknown', updated_at=? WHERE id=?",
+                            (next_status, started_at, task["id"]),
+                        )
+                        self.conn.execute(
+                            "UPDATE runs SET status='queued', updated_at=? WHERE id=? AND status='running'",
+                            (started_at, task["run_id"]),
+                        )
+                        self.release_execution_attempt(task["id"], status="stale")
+                        self._append_event(
+                            task["run_id"], task["id"], "task.runtime_recovered",
+                            {
+                                "previous_runtime_epoch": previous_epoch or None,
+                                "runtime_epoch": epoch,
+                                "previous_boot_id": previous_boot,
+                                "boot_id": boot_id,
+                                "stale_fence": int(task["lease_fence"] or 0),
+                                "attempt": int(task["attempt"] or 0),
+                                "attempt_id": task["attempt_id"],
+                                "execution_binding": binding,
+                                "recovery": "provider_state_unknown",
+                            },
+                        )
+                        continue
+                    reconciled_attempt_id = self._reconcile_runtime_attempt(
+                        task["id"], task["attempt_id"]
+                    )
                     self.conn.execute(
                         "UPDATE tasks SET status='queued', executor_id=NULL, lease_token=NULL, lease_expires_at=NULL, attempt_id=NULL, waiting_reason='runtime_recovery', updated_at=? WHERE id=? AND status='running'",
                         (started_at, task["id"]),
@@ -634,9 +867,20 @@ class RealmStore:
                         (started_at, task["run_id"]),
                     )
                     self._release_reservations(task["id"], task["lease_token"])
+                    self.reset_execution_attempt(task["id"], runtime_epoch=epoch)
                     self._append_event(
                         task["run_id"], task["id"], "task.runtime_recovered",
-                        {"previous_runtime_epoch": previous_epoch or None, "runtime_epoch": epoch, "previous_boot_id": previous_boot, "boot_id": boot_id, "stale_fence": int(task["lease_fence"] or 0), "attempt": int(task["attempt"] or 0), "recovery": "requeued"},
+                        {
+                            "previous_runtime_epoch": previous_epoch or None,
+                            "runtime_epoch": epoch,
+                            "previous_boot_id": previous_boot,
+                            "boot_id": boot_id,
+                            "stale_fence": int(task["lease_fence"] or 0),
+                            "attempt": int(task["attempt"] or 0),
+                            "attempt_id": reconciled_attempt_id,
+                            "recovery": "requeued",
+                            "recovery_disposition": "runtime_owned_attempt_reconciled",
+                        },
                     )
                 # A checkpoint from an interrupted boot is now eligible for
                 # the explicit resume command, but its old attempt identity
@@ -1469,9 +1713,32 @@ class RealmStore:
             )
         return normalized
 
-    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False):
+    def create_task(self, capability, spec, project=None, idempotency_key=None, expected_effect=None, capability_digest=None, *, enforce_readiness=False, execution_request=None):
         if not capability:
             raise ValidationError("capability is required")
+        if not isinstance(spec, dict):
+            raise ValidationError("task spec must be an object")
+        if "execution_binding" in spec or (
+            isinstance(spec.get("spec"), dict)
+            and "execution_binding" in spec["spec"]
+        ):
+            raise ValidationError("caller-supplied execution_binding is not accepted")
+        nested_execution_request = "execution_request" in spec or (
+            isinstance(spec.get("spec"), dict)
+            and "execution_request" in spec["spec"]
+        )
+        if execution_request is not None:
+            execution_request = _normalize_execution_request(
+                execution_request, spec.get("input_object_ids", [])
+            )
+            if nested_execution_request:
+                raise ValidationError(
+                    "execution_request must be supplied through the first-class admission field"
+                )
+        elif nested_execution_request:
+            raise ValidationError(
+                "execution_request must be supplied through the first-class admission field"
+            )
         if isinstance(spec, dict) and "required_facts" in spec:
             spec = dict(spec)
             spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
@@ -1523,30 +1790,55 @@ class RealmStore:
                 )
             self._validate_task_inputs(project_id, spec)
             with self._transaction():
-                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
+                request_hash = hashlib.sha256(canonical_json({"capability": capability, "spec": task_spec_for_request_hash(spec), "execution_request": execution_request, "project_id": project_id, "expected_effect": expected_effect, "capability_digest": capability_digest}).encode()).hexdigest()
                 aggregate_id = project_id or "unscoped"
+                old = None
+                old_task = None
+                if idempotency_key:
+                    old = self.conn.execute(
+                        "SELECT * FROM runs WHERE project_id IS ? AND idempotency_key=?",
+                        (project_id, idempotency_key),
+                    ).fetchone()
+                    if old:
+                        old_task = self.conn.execute(
+                            "SELECT * FROM tasks WHERE run_id=?", (old["id"],)
+                        ).fetchone()
+                        old_spec = json.loads(old["spec_json"])
+                        old_request = self._execution_request_from_row(old_task)
+                        if (
+                            canonical_task_spec_for_compare(old_spec)
+                            != canonical_task_spec_for_compare(spec)
+                            or old["capability"] != capability
+                            or old_request != execution_request
+                        ):
+                            raise ConflictError("idempotency key was already used with different input")
                 if idempotency_key:
                     receipt = self.conn.execute(
                         "SELECT result_json, request_hash FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
                         (aggregate_id, idempotency_key),
                     ).fetchone()
                     if receipt:
-                        if receipt["request_hash"] != request_hash:
+                        if receipt["request_hash"] == request_hash:
+                            return json.loads(receipt["result_json"])
+                        if old is None:
                             raise ConflictError("idempotency key was already used with different input")
-                        return json.loads(receipt["result_json"])
-                if idempotency_key:
-                    old = self.conn.execute("SELECT * FROM runs WHERE project_id IS ? AND idempotency_key=?", (project_id, idempotency_key)).fetchone()
-                    if old:
-                        old_spec = json.loads(old["spec_json"])
-                        if canonical_task_spec_for_compare(old_spec) != canonical_task_spec_for_compare(spec) or old["capability"] != capability:
-                            raise ConflictError("idempotency key was already used with different input")
-                        task = self.conn.execute("SELECT * FROM tasks WHERE run_id=?", (old["id"],)).fetchone()
-                        result = self._task_result(old, task)
+                        # A pre-correction receipt hashed the nested legacy
+                        # request as part of spec.  Once the inventoried row
+                        # matches the normalized first-class request, refresh
+                        # only that receipt's canonical hash/result.
+                        result = self._task_result(old, old_task)
                         self.conn.execute(
-                            "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                            ("task.create", aggregate_id, idempotency_key, request_hash, canonical_json(result), old["created_at"]),
+                            "UPDATE command_idempotency SET request_hash=?, result_json=? WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+                            (request_hash, canonical_json(result), aggregate_id, idempotency_key),
                         )
                         return result
+                if old:
+                    result = self._task_result(old, old_task)
+                    self.conn.execute(
+                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        ("task.create", aggregate_id, idempotency_key, request_hash, canonical_json(result), old["created_at"]),
+                    )
+                    return result
                 registered = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (capability,)).fetchone()
                 if registered:
                     registered_digest = registered["definition_digest"]
@@ -1590,7 +1882,24 @@ class RealmStore:
                     waiting_reason = "waiting_for_dependencies"
                 timestamp, run_id, task_id = now(), new_id(), new_id()
                 self.conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)", (run_id, project_id, capability, canonical_json(spec), idempotency_key, timestamp, timestamp))
-                self.conn.execute("INSERT INTO tasks(id, run_id, capability, spec_json, status, capability_digest, waiting_reason, expected_effect_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)", (task_id, run_id, capability, canonical_json(spec), capability_digest, waiting_reason, canonical_json(expected_effect) if expected_effect else None, timestamp, timestamp))
+                self.conn.execute("INSERT INTO tasks(id, run_id, capability, spec_json, status, capability_digest, waiting_reason, expected_effect_json, created_at, updated_at, execution_request_json) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)", (task_id, run_id, capability, canonical_json(spec), capability_digest, waiting_reason, canonical_json(expected_effect) if expected_effect else None, timestamp, timestamp, canonical_json(execution_request) if execution_request is not None else None))
+                if execution_request is not None:
+                    target = execution_request["target"]
+                    target_id = target.get("id") or target.get("profile_alias") or target.get("machine_id") or target.get("pod_id")
+                    session_id = str(self.conn.execute("SELECT boot_id FROM runtime_lifecycle WHERE id=1").fetchone()[0])
+                    self.conn.execute(
+                        "INSERT INTO execution_bindings(binding_id, task_id, run_id, attempt_id, lease_id, fence, executor_id, session_id, runtime_epoch, capability_id, profile_revision, profile_digest, release_digest, target_kind, target_id, provider_account_ref, pod_id, storage_json, mounts_json, resolved_target_json, status, created_at, updated_at) VALUES (?, ?, ?, NULL, NULL, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)",
+                        (
+                            new_id(), task_id, run_id, session_id,
+                            self._current_runtime_epoch(), capability,
+                            target.get("profile_revision"), target.get("profile_digest"),
+                            target.get("release_digest"), target["kind"], target_id,
+                            target.get("provider_account_ref"), target.get("pod_id"),
+                            canonical_json(target["storage"]) if target.get("storage") is not None else None,
+                            canonical_json(target["mounts"]) if target.get("mounts") is not None else None,
+                            canonical_json({"selected": target}), timestamp, timestamp,
+                        ),
+                    )
                 admitted_event_id = self._append_event(run_id, task_id, "task.admitted", {"capability": capability})
                 event_ids = [admitted_event_id]
                 if predecessors:
@@ -1793,9 +2102,137 @@ class RealmStore:
             raise ConflictError("timeline render publication checkpoint is no longer prepared")
         return self.timeline_render_publication(authoring_task_id)
 
+    def execution_binding(self, task_id):
+        row = self.conn.execute(
+            "SELECT * FROM execution_bindings WHERE task_id=?", (str(task_id),)
+        ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        for field in ("storage_json", "mounts_json"):
+            encoded = value.pop(field, None)
+            if encoded is not None:
+                value[field.removesuffix("_json")] = json.loads(encoded)
+        resolved = json.loads(value.pop("resolved_target_json"))
+        # v26 stores the one authoritative binding projection in this row.
+        # Prepared rows carry only the immutable selector; claimed/released/
+        # stale rows additionally carry credential-verified actual placement.
+        if isinstance(resolved, dict) and "selected" in resolved:
+            value["resolved_target"] = resolved["selected"]
+            if isinstance(resolved.get("actual"), dict):
+                value["actual_target"] = resolved["actual"]
+            if isinstance(resolved.get("verification"), dict):
+                value["verification"] = resolved["verification"]
+            if resolved.get("executor_incarnation") is not None:
+                value["executor_incarnation"] = resolved["executor_incarnation"]
+        else:
+            # Read compatibility for bindings admitted before I-05.
+            value["resolved_target"] = resolved
+        return value
+
+    def bind_execution_attempt(
+        self, task_id, *, attempt_id, lease_id, fence, executor_id,
+        runtime_epoch, placement,
+    ):
+        binding = self.conn.execute(
+            "SELECT * FROM execution_bindings WHERE task_id=?", (str(task_id),)
+        ).fetchone()
+        if not binding:
+            return None
+        current = self.execution_binding(task_id)
+        selected = current["resolved_target"]
+        if not execution_placement_matches(selected, placement):
+            raise ConflictError("verified actual placement does not match execution selector")
+        envelope = {
+            "selected": selected,
+            "actual": placement["actual"],
+            "verification": placement["verification"],
+            "executor_incarnation": placement["executor_incarnation"],
+        }
+        updated = self.conn.execute(
+            "UPDATE execution_bindings SET attempt_id=?, lease_id=?, fence=?, executor_id=?, runtime_epoch=?, resolved_target_json=?, status='claimed', updated_at=? WHERE task_id=? AND status='prepared'",
+            (
+                str(attempt_id), str(lease_id), int(fence), str(executor_id),
+                int(runtime_epoch), canonical_json(envelope), now(), str(task_id),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ConflictError("execution binding is no longer claimable")
+        return self.execution_binding(task_id)
+
+    def reset_execution_attempt(self, task_id, *, runtime_epoch=None, status="prepared"):
+        if runtime_epoch is None:
+            runtime_epoch = self._current_runtime_epoch()
+        task = self.conn.execute(
+            "SELECT execution_request_json, spec_json FROM tasks WHERE id=?", (str(task_id),)
+        ).fetchone()
+        selected = None
+        request = self._execution_request_from_row(task) if task else None
+        if request is not None:
+            selected = request["target"]
+        self.conn.execute(
+            "UPDATE execution_bindings SET attempt_id=NULL, lease_id=NULL, fence=0, executor_id=NULL, session_id=(SELECT boot_id FROM runtime_lifecycle WHERE id=1), runtime_epoch=?, resolved_target_json=COALESCE(?, resolved_target_json), status=?, updated_at=? WHERE task_id=? AND status IN ('claimed', 'released', 'stale')",
+            (
+                int(runtime_epoch),
+                canonical_json({"selected": selected}) if selected is not None else None,
+                status, now(), str(task_id),
+            ),
+        )
+
+    def release_execution_attempt(self, task_id, *, status="released"):
+        """Close the current projection without deleting its placement facts."""
+        if status not in {"released", "stale"}:
+            raise ValidationError("execution binding terminal status is invalid")
+        self.conn.execute(
+            "UPDATE execution_bindings SET status=?, updated_at=? WHERE task_id=? AND status='claimed'",
+            (status, now(), str(task_id)),
+        )
+
+    def _reconcile_runtime_attempt(self, task_id, attempt_id):
+        """Terminally reconcile a Runtime-owned attempt being superseded.
+
+        The attempt row and its original lease/fence identity are retained so
+        late settlement remains fenced.  The caller owns the surrounding
+        recovery/terminal transaction and records the durable disposition
+        event after this update.
+        """
+        if not attempt_id:
+            return None
+        updated = self.conn.execute(
+            "UPDATE attempts SET settled=1 WHERE id=? AND task_id=? AND settled=0",
+            (str(attempt_id), str(task_id)),
+        )
+        if updated.rowcount == 1:
+            return str(attempt_id)
+        row = self.conn.execute(
+            "SELECT id FROM attempts WHERE id=? AND task_id=?", (str(attempt_id), str(task_id))
+        ).fetchone()
+        return str(row["id"]) if row else None
+
+    def _execution_request_from_row(self, row):
+        """Return the canonical request, with one bounded legacy read path."""
+        if row is None:
+            return None
+        encoded = row["execution_request_json"] if "execution_request_json" in row.keys() else None
+        if encoded:
+            request = json.loads(encoded)
+            return _normalize_execution_request(
+                request, json.loads(row["spec_json"] or "{}").get("input_object_ids", [])
+            )
+        spec = json.loads(row["spec_json"] or "{}")
+        legacy = legacy_execution_request_from_spec(spec)
+        if legacy is None:
+            return None
+        return _normalize_execution_request(legacy, spec.get("input_object_ids", []))
+
     def _task_result(self, run, task):
         result = dict(task)
-        result["spec"], generation_intent = public_task_spec(json.loads(result.pop("spec_json")))
+        stored_spec = json.loads(result.pop("spec_json"))
+        result.pop("execution_request_json", None)
+        execution_request = self._execution_request_from_row(task)
+        if execution_request is not None:
+            result["execution_request"] = execution_request
+        result["spec"], generation_intent = public_task_spec(stored_spec)
         if generation_intent is not None:
             # The producer intent is part of the immutable admission payload;
             # expose the same opaque value on canonical task readback.
@@ -1810,7 +2247,11 @@ class RealmStore:
             result["result"] = json.loads(result["result_json"])
         if result.get("waiting_reason"):
             result["blocked_reason"] = result["waiting_reason"]
-        return self._public_task_result({"run": dict(run), "task": result})
+        value = {"run": dict(run), "task": result}
+        binding = self.execution_binding(result["id"])
+        if binding is not None:
+            value["execution_binding"] = binding
+        return self._public_task_result(value)
 
     def _public_task_result(self, value):
         """Remove internal/legacy intent keys from a stored task result."""
@@ -1928,7 +2369,10 @@ class RealmStore:
         that carry the v2 lease deadline.
         """
         current = datetime.now(timezone.utc)
-        rows = self.conn.execute("SELECT id, run_id, lease_token, lease_expires_at FROM tasks WHERE status='running' AND lease_expires_at IS NOT NULL").fetchall()
+        rows = self.conn.execute(
+            "SELECT id, run_id, attempt_id, lease_token, lease_expires_at FROM tasks "
+            "WHERE status IN ('running', 'cancel_requested') AND lease_expires_at IS NOT NULL"
+        ).fetchall()
         for row in rows:
             try:
                 expired = datetime.fromisoformat(row["lease_expires_at"]) <= current
@@ -1937,10 +2381,42 @@ class RealmStore:
             if not expired:
                 continue
             timestamp = now()
+            binding = self.execution_binding(row["id"])
+            unresolved_external = bool(
+                binding
+                and binding.get("status") == "claimed"
+                and binding.get("actual_target")
+                and (binding.get("verification") or {}).get("verified") is True
+            )
+            if unresolved_external:
+                self.conn.execute(
+                    "UPDATE tasks SET waiting_reason='provider_state_unknown', updated_at=? WHERE id=?",
+                    (timestamp, row["id"]),
+                )
+                self._append_event(
+                    row["run_id"], row["id"], "task.provider_state_unknown",
+                    {
+                        "reason": "attempt_lease_expired",
+                        "attempt_id": row["attempt_id"],
+                        "execution_binding": binding,
+                    },
+                )
+                continue
             self.conn.execute("UPDATE tasks SET status='queued', executor_id=NULL, lease_token=NULL, lease_expires_at=NULL, waiting_reason='waiting_for_worker', updated_at=? WHERE id=?", (timestamp, row["id"]))
+            reconciled_attempt_id = self._reconcile_runtime_attempt(
+                row["id"], row["attempt_id"]
+            )
             self.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=? AND status='running'", (timestamp, row["run_id"]))
             self._release_reservations(row["id"], row["lease_token"])
-            self._append_event(row["run_id"], row["id"], "task.lease_expired", {"waiting_reason": "waiting_for_worker"})
+            self.reset_execution_attempt(row["id"])
+            self._append_event(
+                row["run_id"], row["id"], "task.lease_expired",
+                {
+                    "waiting_reason": "waiting_for_worker",
+                    "attempt_id": reconciled_attempt_id,
+                    "recovery_disposition": "runtime_owned_attempt_reconciled",
+                },
+            )
 
     def register_capability(self, capability_id, definition_digest, *, required_resource_keys=None, status="ready", unavailable_reason=None, estimated_scratch_bytes=0, estimated_output_bytes=0):
         if not capability_id or not definition_digest:
@@ -2130,7 +2606,10 @@ class RealmStore:
         available = int(shutil.disk_usage(self.root).free)
         return {"ok": available >= required, "required_bytes": required, "available_bytes": available, "scratch_bytes": scratch_bytes, "output_bytes": output_bytes, "estimate_source": source, "reason": None if available >= required else "insufficient_storage"}
 
-    def _claim_task(self, task_id, executor_id, lease_token, *, runtime_epoch=None, _transactional=True):
+    def _claim_task(
+        self, task_id, executor_id, lease_token, *, runtime_epoch=None,
+        _transactional=True, allow_provider_recovery=False,
+    ):
         """Claim one exact task, optionally as part of a larger mutation.
 
         ``claim_next`` must persist task claim, attempt fence, and its
@@ -2148,8 +2627,15 @@ class RealmStore:
                 task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
                 if not task:
                     raise NotFoundError("task not found")
-                if task["status"] != "queued":
+                provider_recovery_claim = (
+                    allow_provider_recovery
+                    and task["waiting_reason"] == "provider_state_unknown"
+                    and task["status"] in {"queued", "cancel_requested"}
+                )
+                if task["status"] != "queued" and not provider_recovery_claim:
                     raise ConflictError("task is not claimable", details={"status": task["status"]})
+                if task["waiting_reason"] == "provider_state_unknown" and not allow_provider_recovery:
+                    return self.get_task(task_id)
                 dependency_rows = self._continuation_rows(task_id)
                 if dependency_rows and not self.conn.execute(
                     "SELECT 1 FROM continuation_admissions WHERE continuation_task_id=?", (task_id,)
@@ -2212,7 +2698,16 @@ class RealmStore:
                 timestamp = now()
                 fence = int(task["lease_fence"] or 0) + 1
                 deadline = (datetime.now(timezone.utc) + timedelta(seconds=LEASE_SECONDS)).isoformat(timespec="milliseconds")
-                self.conn.execute("UPDATE tasks SET status='running', executor_id=?, lease_token=?, lease_fence=?, lease_expires_at=?, waiting_reason=NULL, attempt=attempt+1, runtime_epoch=?, updated_at=? WHERE id=? AND status='queued'", (executor_id, lease_token, fence, deadline, epoch, timestamp, task_id))
+                claimable_status = task["status"] if provider_recovery_claim else "queued"
+                updated = self.conn.execute(
+                    "UPDATE tasks SET status='running', executor_id=?, lease_token=?, lease_fence=?, lease_expires_at=?, waiting_reason=NULL, attempt=attempt+1, runtime_epoch=?, updated_at=? WHERE id=? AND status=?",
+                    (
+                        executor_id, lease_token, fence, deadline, epoch,
+                        timestamp, task_id, claimable_status,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ConflictError("task is no longer claimable")
                 self.conn.execute("UPDATE runs SET status='running', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE executors SET runtime_epoch=?, last_seen_at=? WHERE id=?", (epoch, timestamp, executor_id))
                 for key in self._required_resource_keys(task["capability"]):
@@ -3816,6 +4311,7 @@ class RealmStore:
                 self.conn.execute("UPDATE runs SET status='completed', updated_at=? WHERE id=?", (timestamp, task["run_id"]))
                 self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token, released_at=timestamp)
+                self.release_execution_attempt(task_id)
                 event_id = self._append_event(
                     task["run_id"], task_id, "task.completed",
                     {"result": result, "effect": effect, "objects": result.get("outputs", [])},
@@ -3864,15 +4360,52 @@ class RealmStore:
             task = self.conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not task:
                 raise NotFoundError("task not found")
-            if task["status"] in ("completed", "cancelled"):
+            if task["status"] in ("completed", "cancel_requested", "cancelled"):
                 value = self.get_task(task_id)
                 if record is not None:
                     record(value)
                 return value
             with self._transaction():
+                binding = self.execution_binding(task_id)
+                unresolved_external = bool(
+                    binding
+                    and binding.get("status") in {"claimed", "stale"}
+                    and binding.get("actual_target")
+                    and (binding.get("verification") or {}).get("verified") is True
+                )
+                if unresolved_external:
+                    timestamp = now()
+                    self.conn.execute(
+                        "UPDATE tasks SET status='cancel_requested', waiting_reason='provider_state_unknown', updated_at=? WHERE id=?",
+                        (timestamp, task_id),
+                    )
+                    self.release_execution_attempt(task_id, status="stale")
+                    event_id = self._append_event(
+                        task["run_id"], task_id, "task.cancel_requested",
+                        {
+                            "cancellation_acknowledged": True,
+                            "waiting_reason": "provider_state_unknown",
+                            "remote_stop_confirmed": False,
+                            "billing_stop_confirmed": False,
+                            "attempt_id": task["attempt_id"],
+                            "execution_binding": binding,
+                        },
+                        created_at=timestamp,
+                    )
+                    value = self.get_task(task_id)
+                    if record is not None:
+                        record(
+                            value, event_ids=[event_id],
+                            primary_stream_id=task["run_id"],
+                            resulting_stream_seq=None,
+                        )
+                    return value
+                self._reconcile_runtime_attempt(task_id, task["attempt_id"])
                 self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (now(), task_id))
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (now(), task["run_id"]))
                 self._release_reservations(task_id, task["lease_token"])
+                if binding is not None:
+                    self.release_execution_attempt(task_id)
                 event_id = self._append_event(task["run_id"], task_id, "task.cancelled", {})
                 self._refresh_continuations_for_predecessor(task_id)
                 value = self.get_task(task_id)
@@ -3899,16 +4432,50 @@ class RealmStore:
                 timestamp = now()
                 children = self.conn.execute("SELECT * FROM tasks WHERE run_id=? ORDER BY created_at, id", (run_id,)).fetchall()
                 cancelled = []
+                cancel_requested = []
                 for task in children:
                     if task["status"] in {"completed", "failed", "cancelled"}:
                         continue
+                    binding = self.execution_binding(task["id"])
+                    unresolved_external = bool(
+                        binding
+                        and binding.get("status") in {"claimed", "stale"}
+                        and binding.get("actual_target")
+                        and (binding.get("verification") or {}).get("verified") is True
+                    )
+                    if unresolved_external:
+                        self.conn.execute(
+                            "UPDATE tasks SET status='cancel_requested', waiting_reason='provider_state_unknown', updated_at=? WHERE id=?",
+                            (timestamp, task["id"]),
+                        )
+                        self.release_execution_attempt(task["id"], status="stale")
+                        self._append_event(
+                            run_id, task["id"], "task.cancel_requested",
+                            {
+                                "reason": "run.cancelled",
+                                "cancellation_acknowledged": True,
+                                "waiting_reason": "provider_state_unknown",
+                                "remote_stop_confirmed": False,
+                                "billing_stop_confirmed": False,
+                                "attempt_id": task["attempt_id"],
+                                "execution_binding": binding,
+                            },
+                        )
+                        cancel_requested.append(task["id"])
+                        continue
+                    self._reconcile_runtime_attempt(task["id"], task["attempt_id"])
                     self.conn.execute("UPDATE tasks SET status='cancelled', lease_token=NULL, executor_id=NULL, attempt_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
                     self._release_reservations(task["id"], task["lease_token"])
+                    if binding is not None:
+                        self.release_execution_attempt(task["id"])
                     self._append_event(run_id, task["id"], "task.cancelled", {"reason": "run.cancelled"})
                     self._refresh_continuations_for_predecessor(task["id"])
                     cancelled.append(task["id"])
                 self.conn.execute("UPDATE runs SET status='cancelled', updated_at=? WHERE id=?", (timestamp, run_id))
-                self._append_event(run_id, None, "run.cancelled", {"task_ids": cancelled})
+                self._append_event(
+                    run_id, None, "run.cancelled",
+                    {"task_ids": cancelled, "cancel_requested_task_ids": cancel_requested},
+                )
                 result = dict(self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone())
                 if idempotency_key:
                     self.conn.execute("INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", ("run.cancel", run_id, idempotency_key, request_hash, canonical_json(result), now()))
@@ -3951,6 +4518,7 @@ class RealmStore:
                 retried = []
                 for task in eligible:
                     self._release_reservations(task["id"], task["lease_token"])
+                    self.reset_execution_attempt(task["id"])
                     self.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
                     self._append_event(run_id, task["id"], "task.retried", {"from_status": "failed", "attempt": int(task["attempt"] or 0) + 1, "reason": "run.retry"})
                     self._refresh_continuations_for_predecessor(task["id"])
@@ -3985,6 +4553,7 @@ class RealmStore:
                 if attempt_id is not None:
                     self.conn.execute("UPDATE attempts SET settled=1 WHERE id=? AND settled=0", (attempt_id,))
                 self._release_reservations(task_id, lease_token)
+                self.release_execution_attempt(task_id)
                 event_id = self._append_event(task["run_id"], task_id, "task.failed", {"error": failure})
                 self._refresh_continuations_for_predecessor(task_id)
                 value = self.get_task(task_id)
@@ -4000,7 +4569,7 @@ class RealmStore:
         supplied, support-state checks are included alongside the authoritative
         SQLite/CAS checks.
         """
-        return self.integrity_report(catalog_path=catalog_path)
+        return self.integrity_report(catalog_path=catalog_path, timeout_seconds=self.admission_timeout)
 
     def integrity_report(self, *, catalog_path=None, timeout_seconds: float = REALM_ADMISSION_TIMEOUT_SECONDS):
         """Return a bounded report even when SQLite metadata is malformed."""

@@ -7,6 +7,7 @@ import stat
 import pytest
 
 from http_helpers import Api
+from runtime_protocol.auth import AuthorizationError, CredentialStore
 from runtime_protocol.daemon import RuntimeDaemon, WORKER_ACTOR, WORKER_SCOPES
 from runtime_protocol.store import RealmStore
 
@@ -148,3 +149,52 @@ def test_pack_host_cannot_mutate_control_plane_or_forge_settlement_effects(tmp_p
         assert object_forbidden.value.status == 401
     finally:
         daemon.stop()
+
+
+def test_credential_reuse_compares_placement_and_replaces_without_touching_attempt_state(tmp_path):
+    store = CredentialStore(tmp_path / "credentials")
+    scopes = ["handshake", "worker:execute"]
+    placement_a = {
+        "execution_binding": {
+            "actual": {
+                "kind": "runpod",
+                "pod_id": "pod-a",
+                "provider_account_ref": "account-a",
+                "profile_revision": "profile-a",
+            },
+            "verification": {
+                "method": "credential_claim",
+                "evidence_digest": "sha256:" + "a" * 64,
+                "verified": True,
+            },
+            "executor_incarnation": "incarnation-a",
+        }
+    }
+    token_a, path_a = store.provision(WORKER_ACTOR, scopes, metadata=placement_a)
+
+    # Canonical metadata comparison preserves the same executor incarnation on
+    # reconnects even when a producer serializes object keys in another order.
+    token_reconnect, path_reconnect = store.provision(
+        WORKER_ACTOR,
+        list(reversed(scopes)),
+        metadata={"execution_binding": dict(placement_a["execution_binding"])},
+    )
+    assert (token_reconnect, path_reconnect) == (token_a, path_a)
+
+    placement_b = {
+        "execution_binding": {
+            **placement_a["execution_binding"],
+            "actual": {**placement_a["execution_binding"]["actual"], "pod_id": "pod-b"},
+            "executor_incarnation": "incarnation-b",
+        }
+    }
+    token_b, path_b = store.provision(WORKER_ACTOR, scopes, metadata=placement_b)
+    assert path_b == path_a
+    assert token_b != token_a
+    with pytest.raises(AuthorizationError, match="invalid bearer credential"):
+        store.load(token_a)
+    assert store.load(token_b)["execution_binding"] == placement_b["execution_binding"]
+
+    # No Runtime attempt/binding rows are opened, settled, or reset by
+    # credential replacement; the existing Runtime recovery path owns them.
+    assert sorted(path_a.parent.glob("*.token")) == [path_a]

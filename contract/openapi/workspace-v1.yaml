@@ -236,6 +236,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ParentCompositionPublication' } } } }
       responses: { '200': { description: Durable parent publication receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/replace-parent-media:
+    post:
+      operationId: replaceParentCompositionMedia
+      description: Replace one clip in an exact immutable parent-composition closure and atomically publish its successor.
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ParentCompositionMediaReplacement' } } } }
+      responses: { '200': { description: Durable parent replacement receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions/{revision}:
     get:
       operationId: getProjectParentCompositionRevision
@@ -1187,6 +1194,16 @@ components:
         shot_revisions: { type: array, items: { type: object } }
         internal_timeline_revisions: { type: array, items: { type: object } }
         dependency_manifest: { type: object }
+    ParentCompositionMediaReplacement:
+      type: object
+      additionalProperties: false
+      required: [occurrence_id, clip_id, source_object_id, expected_head]
+      properties:
+        occurrence_id: { type: string, minLength: 1 }
+        clip_id: { type: string, minLength: 1 }
+        source_object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        expected_head: { type: string, minLength: 1 }
+        timing: { type: string, const: preserve-duration, default: preserve-duration }
     ShotTextBinding:
       type: object
       additionalProperties: false

@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
+from .catalog import _safe_path
 from .errors import ConflictError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .store import REQUIRED_SCHEMA_COLUMNS, REQUIRED_SCHEMA_TABLES, SCHEMA_VERSION, RealmStore
 from .util import canonical_json, now
@@ -52,6 +53,9 @@ REVISION_TABLES = frozenset({
 })
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 120.0
 CANONICAL_PREVIOUS_SCHEMA_VERSION = 24
+VARIANT_STATE_TARGET_SCHEMA_VERSION = 25
+EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION = 25
+EXECUTION_BINDING_TARGET_SCHEMA_VERSION = 26
 HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION = "MIGRATE MANAGED OUTPUTS"
 GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION = "REPAIR GENERIC MEDIA TYPES"
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv"})
@@ -80,6 +84,13 @@ def _regular(path: Path, label: str) -> None:
         raise RealmAdmissionError(f"{label} is missing") from exc
     if not stat.S_ISREG(mode) or path.is_symlink():
         raise RealmAdmissionError(f"{label} must be an ordinary file")
+
+
+def _safe_realm_root(root: str | Path) -> Path:
+    try:
+        return _safe_path(root, "realm root").resolve()
+    except ValueError as exc:
+        raise RealmAdmissionError(str(exc)) from exc
 
 
 def _quote(identifier: str) -> str:
@@ -153,6 +164,110 @@ def _tables(connection: sqlite3.Connection) -> set[str]:
     }
 
 
+def _canonical_shape_for(version: int) -> tuple[set[str], dict[str, set[str]]]:
+    """Return the exact supported canonical layout for one historical version.
+
+    Historical targets are deliberately pinned.  A future current schema must
+    not silently change what v24 or v25 means, and a database carrying a known
+    version number with an alternate (for example distributed-binding) layout
+    is not accepted as that version.
+    """
+    if version not in {
+        CANONICAL_PREVIOUS_SCHEMA_VERSION,
+        VARIANT_STATE_TARGET_SCHEMA_VERSION,
+        EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
+    }:
+        raise ValidationError(f"canonical schema version {version} is not supported")
+    tables = set(REQUIRED_SCHEMA_TABLES)
+    columns = {table: set(values) for table, values in REQUIRED_SCHEMA_COLUMNS.items()}
+    if version < EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+        tables.remove("execution_bindings")
+        columns.pop("execution_bindings")
+        columns["tasks"].remove("execution_request_json")
+    if version < VARIANT_STATE_TARGET_SCHEMA_VERSION:
+        columns["generation_variants"] -= {
+            "thumbnail_object_id",
+            "thumbnail_source_object_id",
+            "thumbnail_recipe_version",
+            "viewed_at",
+        }
+    return tables, columns
+
+
+def _canonical_schema_identity(
+    connection: sqlite3.Connection,
+    *,
+    expected_realm_id: str | None = None,
+) -> dict[str, object]:
+    """Classify a supported v24/v25/current database by version *and* shape."""
+    tables = _tables(connection)
+    if "runtime_schema" not in tables:
+        raise ValidationError("canonical runtime_schema table is missing")
+    rows = connection.execute(
+        "SELECT id, format_id, version FROM runtime_schema ORDER BY id"
+    ).fetchall()
+    if len(rows) != 1 or int(rows[0][0]) != 1:
+        raise ValidationError("canonical runtime schema identity is ambiguous")
+    format_id, version = str(rows[0][1]), int(rows[0][2])
+    if format_id != CANONICAL_FORMAT_ID:
+        raise ValidationError(f"unsupported canonical format {format_id!r}")
+    if version > EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+        raise ValidationError(
+            f"canonical schema v{version} is newer than supported v{EXECUTION_BINDING_TARGET_SCHEMA_VERSION}"
+        )
+    if version < CANONICAL_PREVIOUS_SCHEMA_VERSION:
+        raise ValidationError(f"canonical schema v{version} is not a supported migration source")
+    expected_tables, expected_columns = _canonical_shape_for(version)
+    unknown = tables - expected_tables
+    missing = expected_tables - tables
+    if unknown or missing:
+        details = []
+        if unknown:
+            details.append("unexpected tables: " + ", ".join(sorted(unknown)))
+        if missing:
+            details.append("missing tables: " + ", ".join(sorted(missing)))
+        raise ValidationError(
+            f"canonical schema v{version} layout is not the supported layout ({'; '.join(details)})"
+        )
+    for table in sorted(expected_tables):
+        actual = set(_table_columns(connection, table))
+        expected = expected_columns[table]
+        if actual != expected:
+            raise ValidationError(
+                f"canonical schema v{version} layout differs for table {table}"
+            )
+    realm_rows = connection.execute("SELECT id FROM realm ORDER BY id").fetchall()
+    if len(realm_rows) != 1 or not str(realm_rows[0][0]):
+        raise ValidationError("canonical realm identity is missing or ambiguous")
+    realm_id = str(realm_rows[0][0])
+    if expected_realm_id is not None and realm_id != str(expected_realm_id):
+        raise ValidationError(
+            f"canonical realm identity mismatch: expected {expected_realm_id}, found {realm_id}"
+        )
+    return {
+        "format_id": format_id,
+        "version": version,
+        "kind": f"v{version}",
+        "realm_id": realm_id,
+    }
+
+
+def inspect_canonical_schema(
+    root: str | Path,
+    *,
+    expected_realm_id: str | None = None,
+) -> dict[str, object]:
+    """Read-only exact schema/realm classification used before lifecycle effects."""
+    root = _safe_realm_root(root)
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        raise RealmAdmissionError("realm root is missing or invalid")
+    connection = _open_readonly(root / "realm.sqlite3")
+    try:
+        return _canonical_schema_identity(connection, expected_realm_id=expected_realm_id)
+    finally:
+        connection.close()
+
+
 @contextmanager
 def _sqlite_deadline(connection: sqlite3.Connection, deadline: float | None):
     if deadline is None:
@@ -223,6 +338,84 @@ def _open_readonly(db: Path) -> sqlite3.Connection:
     return connection
 
 
+def _apply_v24_to_v25(connection: sqlite3.Connection) -> dict[str, object]:
+    columns = set(_table_columns(connection, "generation_variants"))
+    _, expected_columns = _canonical_shape_for(CANONICAL_PREVIOUS_SCHEMA_VERSION)
+    if columns != expected_columns["generation_variants"]:
+        raise ValidationError("v24 generation_variants shape is not recognized")
+    connection.execute(
+        "ALTER TABLE generation_variants ADD COLUMN thumbnail_object_id TEXT REFERENCES objects(digest)"
+    )
+    connection.execute(
+        "ALTER TABLE generation_variants ADD COLUMN thumbnail_source_object_id TEXT REFERENCES objects(digest)"
+    )
+    connection.execute("ALTER TABLE generation_variants ADD COLUMN thumbnail_recipe_version INTEGER")
+    connection.execute("ALTER TABLE generation_variants ADD COLUMN viewed_at TEXT")
+    connection.execute(
+        "UPDATE runtime_schema SET version=? WHERE id=1",
+        (VARIANT_STATE_TARGET_SCHEMA_VERSION,),
+    )
+    return {
+        "source_schema_version": CANONICAL_PREVIOUS_SCHEMA_VERSION,
+        "target_schema_version": VARIANT_STATE_TARGET_SCHEMA_VERSION,
+        "added_columns": [
+            "generation_variants.thumbnail_object_id",
+            "generation_variants.thumbnail_source_object_id",
+            "generation_variants.thumbnail_recipe_version",
+            "generation_variants.viewed_at",
+        ],
+    }
+
+
+def _apply_v25_to_v26(connection: sqlite3.Connection) -> dict[str, object]:
+    task_columns = set(_table_columns(connection, "tasks"))
+    _, expected_columns = _canonical_shape_for(EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION)
+    if task_columns != expected_columns["tasks"]:
+        raise ValidationError("v25 tasks shape is not recognized")
+    if "execution_bindings" in _tables(connection):
+        raise ValidationError("v25 execution binding table is already present")
+    connection.execute("ALTER TABLE tasks ADD COLUMN execution_request_json TEXT")
+    connection.execute(
+        """
+        CREATE TABLE execution_bindings (
+            binding_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+            run_id TEXT NOT NULL REFERENCES runs(id),
+            attempt_id TEXT REFERENCES attempts(id),
+            lease_id TEXT,
+            fence INTEGER NOT NULL DEFAULT 0,
+            executor_id TEXT,
+            session_id TEXT NOT NULL,
+            runtime_epoch INTEGER NOT NULL,
+            capability_id TEXT NOT NULL,
+            profile_revision TEXT,
+            profile_digest TEXT,
+            release_digest TEXT,
+            target_kind TEXT NOT NULL,
+            target_id TEXT,
+            provider_account_ref TEXT,
+            pod_id TEXT,
+            storage_json TEXT,
+            mounts_json TEXT,
+            resolved_target_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('prepared', 'claimed', 'released', 'stale')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "UPDATE runtime_schema SET version=? WHERE id=1",
+        (EXECUTION_BINDING_TARGET_SCHEMA_VERSION,),
+    )
+    return {
+        "source_schema_version": EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION,
+        "target_schema_version": EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
+        "added_columns": ["tasks.execution_request_json"],
+        "added_tables": ["execution_bindings"],
+    }
+
+
 def migrate_canonical_v24_to_v25(
     root: str | Path,
     *,
@@ -230,11 +423,20 @@ def migrate_canonical_v24_to_v25(
     confirmation: str | None = None,
 ) -> dict:
     """Add variant poster/read-state columns to a stopped canonical v24 realm."""
-    root = Path(root).expanduser().resolve()
+    root = _safe_realm_root(root)
     if not root.exists() or not root.is_dir() or root.is_symlink():
         raise RealmAdmissionError("realm root is missing or invalid")
     if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
         raise ValidationError("timeout_seconds must be positive")
+    identity = inspect_canonical_schema(root)
+    if identity["version"] != CANONICAL_PREVIOUS_SCHEMA_VERSION:
+        raise ValidationError(
+            f"variant state migration requires canonical schema v{CANONICAL_PREVIOUS_SCHEMA_VERSION}"
+        )
+    realm_id = str(identity["realm_id"])
+    expected_confirmation = f"MIGRATE VARIANT STATE {realm_id}"
+    if confirmation != expected_confirmation:
+        raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
     with _owner_fence(root):
         db = root / "realm.sqlite3"
         _regular(db, "realm database")
@@ -242,50 +444,141 @@ def migrate_canonical_v24_to_v25(
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         try:
-            schema = connection.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
-            if not schema or schema[0] != CANONICAL_FORMAT_ID or int(schema[1]) != CANONICAL_PREVIOUS_SCHEMA_VERSION:
-                raise ValidationError(
-                    f"variant state migration requires canonical schema v{CANONICAL_PREVIOUS_SCHEMA_VERSION}"
-                )
-            realm_id = str(connection.execute("SELECT id FROM realm LIMIT 1").fetchone()[0])
-            expected_confirmation = f"MIGRATE VARIANT STATE {realm_id}"
-            if confirmation != expected_confirmation:
-                raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
-            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(generation_variants)")}
-            required = {"id", "generation_id", "object_id", "variant_type", "metadata_json", "created_at"}
-            if not required.issubset(columns):
-                raise ValidationError("v24 generation_variants shape is not recognized")
-            unexpected = columns - required
-            if unexpected:
-                raise ValidationError("v24 generation_variants already has unsupported state columns")
             started = time.monotonic()
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "ALTER TABLE generation_variants ADD COLUMN thumbnail_object_id TEXT REFERENCES objects(digest)"
-            )
-            connection.execute(
-                "ALTER TABLE generation_variants ADD COLUMN thumbnail_source_object_id TEXT REFERENCES objects(digest)"
-            )
-            connection.execute("ALTER TABLE generation_variants ADD COLUMN thumbnail_recipe_version INTEGER")
-            connection.execute("ALTER TABLE generation_variants ADD COLUMN viewed_at TEXT")
-            connection.execute(
-                "UPDATE runtime_schema SET version=? WHERE id=1",
-                (SCHEMA_VERSION,),
-            )
+            current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+            if current["version"] != CANONICAL_PREVIOUS_SCHEMA_VERSION:
+                raise ConflictError("realm schema changed before v24 migration")
+            step = _apply_v24_to_v25(connection)
             connection.commit()
             elapsed = time.monotonic() - started
             return {
                 "ok": True,
                 "realm_id": realm_id,
-                "source_schema_version": CANONICAL_PREVIOUS_SCHEMA_VERSION,
-                "target_schema_version": SCHEMA_VERSION,
-                "added_columns": [
-                    "thumbnail_object_id",
-                    "thumbnail_source_object_id",
-                    "thumbnail_recipe_version",
-                    "viewed_at",
-                ],
+                **step,
                 "elapsed_seconds": elapsed,
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+def migrate_canonical_v25_to_v26(
+    root: str | Path,
+    *,
+    timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    confirmation: str | None = None,
+) -> dict:
+    """Add the durable targeted-execution binding contract to a stopped realm."""
+    root = _safe_realm_root(root)
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        raise RealmAdmissionError("realm root is missing or invalid")
+    if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+        raise ValidationError("timeout_seconds must be positive")
+    identity = inspect_canonical_schema(root)
+    if identity["version"] != EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION:
+        raise ValidationError(
+            f"execution binding migration requires canonical schema v{EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION}"
+        )
+    realm_id = str(identity["realm_id"])
+    expected_confirmation = f"MIGRATE EXECUTION BINDING {realm_id}"
+    if confirmation != expected_confirmation:
+        raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
+    with _owner_fence(root):
+        db = root / "realm.sqlite3"
+        _regular(db, "realm database")
+        connection = sqlite3.connect(db)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            started = time.monotonic()
+            connection.execute("BEGIN IMMEDIATE")
+            current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+            if current["version"] != EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION:
+                raise ConflictError("realm schema changed before v25 migration")
+            step = _apply_v25_to_v26(connection)
+            connection.commit()
+            return {
+                "ok": True,
+                "realm_id": realm_id,
+                **step,
+                "elapsed_seconds": time.monotonic() - started,
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+def migrate_canonical_to_current(
+    root: str | Path,
+    *,
+    timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    confirmation: str | None = None,
+    expected_realm_id: str | None = None,
+) -> dict:
+    """Atomically run every supported canonical step through pinned v26.
+
+    Current v26 is a read-only idempotent result.  Unknown, alternate, and
+    newer layouts are rejected by the read-only preflight before an owner-lock
+    marker, SQLite sidecar, journal, process signal, or schema mutation occurs.
+    """
+    root = _safe_realm_root(root)
+    if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+        raise ValidationError("timeout_seconds must be positive")
+    identity = inspect_canonical_schema(root, expected_realm_id=expected_realm_id)
+    realm_id = str(identity["realm_id"])
+    expected_confirmation = f"MIGRATE CANONICAL {realm_id}"
+    if confirmation != expected_confirmation:
+        raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
+    source_version = int(identity["version"])
+    if source_version == EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+        return {
+            "ok": True,
+            "realm_id": realm_id,
+            "source_schema_version": source_version,
+            "target_schema_version": EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
+            "steps": [],
+            "changed": False,
+        }
+    started = time.monotonic()
+    with _owner_fence(root):
+        connection = sqlite3.connect(root / "realm.sqlite3", timeout=float(timeout_seconds))
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+            if int(current["version"]) != source_version:
+                raise ConflictError("realm schema changed before canonical migration")
+            steps: list[dict[str, object]] = []
+            if source_version == CANONICAL_PREVIOUS_SCHEMA_VERSION:
+                steps.append(_apply_v24_to_v25(connection))
+                current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+                if int(current["version"]) != VARIANT_STATE_TARGET_SCHEMA_VERSION:
+                    raise ValidationError("v24 to v25 migration did not produce the pinned v25 layout")
+            if int(current["version"]) == EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION:
+                steps.append(_apply_v25_to_v26(connection))
+            final = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+            if int(final["version"]) != EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+                raise ValidationError("canonical migration did not produce the pinned v26 layout")
+            if _quick_check(connection, float(timeout_seconds)) != "ok":
+                raise ValidationError("migrated database failed SQLite integrity check")
+            foreign_keys = _foreign_key_errors(connection, float(timeout_seconds))
+            if foreign_keys:
+                raise ValidationError("migrated database failed foreign-key validation")
+            connection.commit()
+            return {
+                "ok": True,
+                "realm_id": realm_id,
+                "source_schema_version": source_version,
+                "target_schema_version": EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
+                "steps": steps,
+                "changed": True,
+                "elapsed_seconds": time.monotonic() - started,
             }
         except Exception:
             connection.rollback()
@@ -464,7 +757,7 @@ def _write_manifest(archive: Path, metadata: dict) -> None:
 
 def upgrade_realm(root: str | Path, *, archive_root: str | Path | None = None, timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS, confirmation: str | None = None) -> dict:
     """Upgrade one stopped v23 realm without discarding legacy evidence."""
-    root = Path(root).expanduser().resolve()
+    root = _safe_realm_root(root)
     if not root.exists() or not root.is_dir() or root.is_symlink():
         raise RealmAdmissionError("realm root is missing or invalid")
     if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
@@ -661,7 +954,7 @@ def repair_generic_media_types(
     every reference to an object agrees with the filename-derived type and the
     CAS bytes still verify against the stored digest and size.
     """
-    root = Path(root).expanduser().resolve()
+    root = _safe_realm_root(root)
     if not root.exists() or not root.is_dir() or root.is_symlink():
         raise RealmAdmissionError("realm root is missing or invalid")
     if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
@@ -1077,7 +1370,7 @@ def migrate_historical_managed_outputs(
     JSON, the task's own output name, project ownership, and the Runtime CAS;
     it never guesses from filesystem names or creates a reader fallback.
     """
-    root = Path(root).expanduser().resolve()
+    root = _safe_realm_root(root)
     if not root.exists() or not root.is_dir() or root.is_symlink():
         raise RealmAdmissionError("realm root is missing or invalid")
     if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:

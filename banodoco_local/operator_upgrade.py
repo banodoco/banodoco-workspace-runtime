@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 import time
 import uuid
@@ -16,6 +15,8 @@ from .bootstrap import (
     RuntimeBoundary,
     _bootstrap_locked,
     _bootstrap_mutex,
+    _canonical_realm_root,
+    _lock_matches,
     _read_catalog,
     _read_support_json,
     _selected_realm,
@@ -25,19 +26,18 @@ from .paths import RuntimePaths
 from .relocation import _reject_live_pack_host, relocate
 from runtime_protocol.upgrade import (
     DEFAULT_UPGRADE_TIMEOUT_SECONDS,
-    HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION,
     _open_readonly,
-    migrate_canonical_v24_to_v25,
-    migrate_historical_managed_outputs,
+    inspect_canonical_schema,
+    migrate_canonical_to_current,
     upgrade_realm,
 )
+from runtime_protocol.lifecycle import inspect_interruption_state, interruption_fence
 
 
 class OperatorUpgradeError(BootstrapError):
     """A guarded upgrade workflow could not safely advance."""
 
 
-_ACTIVE_TASK_STATES = frozenset({"running"})
 _JOURNAL_VERSION = 1
 
 
@@ -48,12 +48,16 @@ def _realm_from_catalog(paths: RuntimePaths) -> tuple[str, Path]:
         raise OperatorUpgradeError("upgrade requires one selected Astrid realm")
     realm_id = str(realm.get("realm_id") or "")
     root = Path(str(realm.get("data_root") or "")).expanduser()
-    if not realm_id or not root.is_absolute() or root.is_symlink() or not root.is_dir():
+    if not realm_id:
         raise OperatorUpgradeError("selected Astrid realm root is missing or unsafe")
-    return realm_id, root.resolve()
+    try:
+        root = _canonical_realm_root(root)
+    except BootstrapError as exc:
+        raise OperatorUpgradeError("selected Astrid realm root is missing or unsafe") from exc
+    return realm_id, root
 
 
-def _schema_kind(root: Path) -> str:
+def _schema_kind(root: Path, *, expected_realm_id: str) -> str:
     connection = _open_readonly(root / "realm.sqlite3")
     try:
         tables = {
@@ -62,52 +66,40 @@ def _schema_kind(root: Path) -> str:
             )
         }
         if "runtime_schema" in tables:
-            row = connection.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
-            if row and str(row[0]) == "astrid-runtime-sqlite-v1" and int(row[1]) in {24, 25}:
-                return f"v{int(row[1])}"
-            raise OperatorUpgradeError("realm has an unsupported canonical runtime schema")
+            try:
+                return str(
+                    inspect_canonical_schema(
+                        root, expected_realm_id=expected_realm_id
+                    )["kind"]
+                )
+            except Exception as exc:
+                raise OperatorUpgradeError(str(exc)) from exc
         if "schema_migrations" in tables:
             version = int(connection.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
             if version == 23:
+                realm_rows = connection.execute("SELECT id FROM realm ORDER BY id").fetchall()
+                if len(realm_rows) != 1 or str(realm_rows[0][0]) != expected_realm_id:
+                    raise OperatorUpgradeError("legacy realm identity does not match the selected workspace")
                 return "v23"
             raise OperatorUpgradeError(f"realm has unsupported legacy schema version {version}")
-        raise OperatorUpgradeError("realm is neither canonical v25, v24, nor the supported v23 format")
+        raise OperatorUpgradeError("realm is neither canonical v24/v25/v26 nor the supported v23 format")
     finally:
         connection.close()
 
 
 def _assert_idle(root: Path) -> dict[str, Any]:
-    """Refuse a cutover while a task is executing or an attempt lease is live."""
-    connection = _open_readonly(root / "realm.sqlite3")
     try:
-        tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        if "tasks" not in tables or "attempts" not in tables:
-            raise OperatorUpgradeError("cannot establish runtime idleness: task/attempt tables are missing")
-        active_tasks = [
-            {"task_id": str(row[0]), "status": str(row[1])}
-            for row in connection.execute("SELECT id, status FROM tasks ORDER BY id")
-            if str(row[1]).lower() in _ACTIVE_TASK_STATES
-        ]
-        unsettled = []
-        for row in connection.execute(
-            "SELECT a.id, a.lease_expires_at, t.status FROM attempts a JOIN tasks t ON t.id=a.task_id WHERE a.settled=0 ORDER BY a.id"
-        ):
-            live_lease = True
-            if row[1]:
-                try:
-                    live_lease = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00")) > datetime.now(timezone.utc)
-                except ValueError:
-                    live_lease = True
-            if str(row[2]).lower() in _ACTIVE_TASK_STATES or live_lease:
-                unsettled.append(str(row[0]))
-        if active_tasks or unsettled:
+        report = inspect_interruption_state(root)
+        if not report["safe"]:
             raise OperatorUpgradeError(
-                "upgrade refused while runtime work is active; stop or settle tasks first: "
-                + json.dumps({"tasks": active_tasks[:10], "unsettled_attempts": unsettled[:10]}, sort_keys=True)
+                "upgrade refused while runtime work is active or unreconciled; reconcile attempts first: "
+                + json.dumps(report, sort_keys=True)
             )
-        return {"active_tasks": 0, "unsettled_attempts": 0}
-    finally:
-        connection.close()
+        return report
+    except OperatorUpgradeError:
+        raise
+    except Exception as exc:
+        raise OperatorUpgradeError(str(exc)) from exc
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -138,7 +130,7 @@ def _journal(paths: RuntimePaths, *, operation_id: str, state: str, journal_root
     return path
 
 
-def _owner_record(paths: RuntimePaths, realm_id: str, boundary: RuntimeBoundary) -> dict[str, Any] | None:
+def _owner_record(paths: RuntimePaths, realm_id: str, realm_root: Path, boundary: RuntimeBoundary) -> dict[str, Any] | None:
     discovery = _read_support_json(paths.discovery_path)
     if not discovery or not discovery.get("pid"):
         marker = _read_support_json(paths.instance_lock_path)
@@ -148,9 +140,29 @@ def _owner_record(paths: RuntimePaths, realm_id: str, boundary: RuntimeBoundary)
         return None
     if str(discovery.get("active_realm")) != realm_id:
         raise OperatorUpgradeError("runtime discovery does not match the selected realm")
-    required = ("endpoint", "pid", "runtime_instance_id", "process_birth_id")
+    required = ("endpoint", "pid", "runtime_instance_id", "process_birth_id", "realm_root")
     if any(not discovery.get(key) for key in required):
         raise OperatorUpgradeError("runtime owner identity is incomplete; refusing to signal it")
+    canonical_root = _canonical_realm_root(realm_root)
+    if _canonical_realm_root(str(discovery["realm_root"])) != canonical_root:
+        raise OperatorUpgradeError("runtime discovery root does not match the selected realm")
+    pid = int(discovery["pid"])
+    instance_id = str(discovery["runtime_instance_id"])
+    birth_id = str(discovery["process_birth_id"])
+    if not _lock_matches(paths, pid, instance_id, realm_id, birth_id, canonical_root):
+        raise OperatorUpgradeError("runtime owner lock does not match discovery")
+    if not boundary.validate_owner(
+        endpoint=str(discovery["endpoint"]), pid=pid, instance_id=instance_id,
+        owner_lock=paths.instance_lock_path, process_birth_id=birth_id,
+        expected_realm_id=realm_id, expected_realm_root=canonical_root,
+    ):
+        raise OperatorUpgradeError("runtime endpoint or process identity does not match discovery")
+    metadata = boundary.endpoint_metadata(
+        endpoint=str(discovery["endpoint"]),
+        credential_file=paths.runtime_support / "credentials" / "owner.token",
+    )
+    if str(metadata.get("runtime_instance_id") or "") != instance_id or str(metadata.get("realm_id") or "") != realm_id:
+        raise OperatorUpgradeError("runtime authenticated endpoint identity does not match discovery")
     return discovery
 
 
@@ -199,8 +211,11 @@ def upgrade_workspace(
     realm_id, realm_root = _realm_from_catalog(paths)
     config.resolve_source_profile(paths)
     _reject_live_pack_host(paths)
+    # Classify exact schema and realm identity before journaling or signaling.
+    # Unknown/newer/alternate layouts therefore retain byte-identical source
+    # and support state on refusal.
+    kind = _schema_kind(realm_root, expected_realm_id=realm_id)
     idle = _assert_idle(realm_root)
-    kind = _schema_kind(realm_root)
     operation_id = uuid.uuid4().hex
     source_support = paths.app_support
     _journal(
@@ -213,7 +228,7 @@ def upgrade_workspace(
     restarted = False
     try:
         with _bootstrap_mutex(paths):
-            owner = _owner_record(paths, realm_id, boundary)
+            owner = _owner_record(paths, realm_id, realm_root, boundary)
             if owner:
                 source = config.resolve_source_profile(paths)
                 prepare = getattr(boundary, "prepare_restart", None)
@@ -225,31 +240,31 @@ def upgrade_workspace(
                     support_root=paths.runtime_support, pid=int(owner["pid"]),
                 )
                 _journal(paths, operation_id=operation_id, state="stopping", realm_id=realm_id, schema_before=kind, idle=idle)
-                stop_owner(
-                    endpoint=str(owner["endpoint"]), pid=int(owner["pid"]),
-                    instance_id=str(owner["runtime_instance_id"]), process_birth_id=str(owner["process_birth_id"]),
-                    realm_id=realm_id, owner_lock=paths.instance_lock_path,
-                    discovery_path=paths.discovery_path, require_health=False,
-                )
-                stopped = True
+                # BEGIN IMMEDIATE serializes with admission/claim/settlement.
+                # Hold it across the final identity-checked signal so a claim
+                # cannot land between the idle decision and owner shutdown.
+                try:
+                    with interruption_fence(realm_root, timeout_seconds=timeout_seconds) as fenced_idle:
+                        stop_owner(
+                            endpoint=str(owner["endpoint"]), pid=int(owner["pid"]),
+                            instance_id=str(owner["runtime_instance_id"]), process_birth_id=str(owner["process_birth_id"]),
+                            realm_id=realm_id, owner_lock=paths.instance_lock_path,
+                            discovery_path=paths.discovery_path, require_health=False,
+                        )
+                        stopped = True
+                        idle = fenced_idle
+                except Exception as exc:
+                    raise OperatorUpgradeError(str(exc)) from exc
                 remove_file(paths.discovery_path)
                 remove_file(paths.instance_lock_path)
-                # The owner can only have changed durable state before its
-                # birth-checked stop. Re-read after the stop so a race with a
-                # remote executor is a safe failure before activation.
-                idle = _assert_idle(realm_root)
             _journal(paths, operation_id=operation_id, state="stopped", realm_id=realm_id, schema_before=kind, idle=idle)
             if kind == "v23":
                 migration = upgrade_realm(realm_root, timeout_seconds=timeout_seconds, confirmation=f"UPGRADE {realm_id}")
-            elif kind == "v24":
-                migration = migrate_canonical_v24_to_v25(
-                    realm_root, timeout_seconds=timeout_seconds,
-                    confirmation=f"MIGRATE VARIANT STATE {realm_id}",
-                )
             else:
-                migration = migrate_historical_managed_outputs(
+                migration = migrate_canonical_to_current(
                     realm_root, timeout_seconds=timeout_seconds,
-                    confirmation=f"{HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION} {realm_id}",
+                    confirmation=f"MIGRATE CANONICAL {realm_id}",
+                    expected_realm_id=realm_id,
                 )
             activated = True
             _journal(paths, operation_id=operation_id, state="activated", realm_id=realm_id, schema_before=kind, migration=migration)

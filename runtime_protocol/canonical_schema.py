@@ -44,7 +44,8 @@ CREATE TABLE tasks (
     executor_id TEXT, attempt INTEGER NOT NULL DEFAULT 0, expected_effect_json TEXT,
     result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     capability_digest TEXT, waiting_reason TEXT, lease_expires_at TEXT,
-    lease_fence INTEGER NOT NULL DEFAULT 0, attempt_id TEXT, runtime_epoch INTEGER
+    lease_fence INTEGER NOT NULL DEFAULT 0, attempt_id TEXT, runtime_epoch INTEGER,
+    execution_request_json TEXT
 );
 CREATE TABLE events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id),
@@ -78,6 +79,31 @@ CREATE TABLE attempts (
     lease_expires_at TEXT NOT NULL, settled INTEGER NOT NULL DEFAULT 0,
     runtime_epoch INTEGER NOT NULL DEFAULT 1, recovery_nonce TEXT,
     recovery_nonce_expires_at TEXT, recovery_nonce_used INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE execution_bindings (
+    binding_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    attempt_id TEXT REFERENCES attempts(id),
+    lease_id TEXT,
+    fence INTEGER NOT NULL DEFAULT 0,
+    executor_id TEXT,
+    session_id TEXT NOT NULL,
+    runtime_epoch INTEGER NOT NULL,
+    capability_id TEXT NOT NULL,
+    profile_revision TEXT,
+    profile_digest TEXT,
+    release_digest TEXT,
+    target_kind TEXT NOT NULL,
+    target_id TEXT,
+    provider_account_ref TEXT,
+    pod_id TEXT,
+    storage_json TEXT,
+    mounts_json TEXT,
+    resolved_target_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('prepared', 'claimed', 'released', 'stale')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 CREATE TABLE timelines (
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),

@@ -4,6 +4,9 @@ import json
 import os
 from pathlib import Path
 import stat
+import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -17,10 +20,12 @@ from banodoco_local.bootstrap import (
     _rollback_failed_bootstrap,
     bootstrap,
     connect,
+    down,
     doctor,
     restart,
 )
 from banodoco_local.paths import RuntimePaths
+from runtime_protocol.store import RealmStore
 
 
 PROFILE = SourceProfile(
@@ -83,8 +88,11 @@ class FakeBoundary:
         self.calls.append("create")
         self.creates.append(kwargs)
         realm_root = kwargs["realm_root"]
-        realm_root.mkdir(parents=True, exist_ok=False)
-        (realm_root / "realm.sqlite3").touch()
+        RealmStore.initialize(
+            realm_root,
+            realm_id=kwargs["realm_id"],
+            display_name=kwargs["display_name"],
+        ).close()
         return {"state": "created", "realm_id": kwargs["realm_id"], "root": str(realm_root)}
 
     def connect(self, **kwargs):
@@ -97,6 +105,16 @@ class FakeBoundary:
     def validate_owner(self, **kwargs):
         return self.valid_owner
 
+    def endpoint_metadata(self, **_kwargs):
+        if not self.starts:
+            return {}
+        pid = max(self.alive) if self.alive else self.next_pid - 1
+        return {
+            "runtime_instance_id": f"instance-{pid}",
+            "realm_id": str(self.starts[-1]["realm_id"]),
+            "status": "ok",
+        }
+
     def is_pid_alive(self, pid):
         return pid in self.alive
 
@@ -104,6 +122,11 @@ class FakeBoundary:
         self.restart_calls += 1
         self.alive.discard(kwargs["pid"])
         return self.start(realm_id="ignored", realm_root=Path(tempfile.mkdtemp()) / "realm", owner_lock=Path("/tmp/lock"), source_profile=PROFILE)
+
+    def stop_owner(self, **kwargs):
+        self.restart_calls += 1
+        self.alive.discard(kwargs["pid"])
+        return {"status": "stopped"}
 
 
 class BootstrapTests(unittest.TestCase):
@@ -116,14 +139,37 @@ class BootstrapTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def _configure(self, *, realm_id="configured-realm"):
+        self.paths.ensure_support_dirs()
+        root = self.paths.realms_dir / realm_id
+        self.boundary.create(
+            realm_id=realm_id,
+            realm_root=root,
+            display_name="Astrid Workspace",
+            source_profile=PROFILE,
+        )
+        self.paths.catalog_path.write_text(json.dumps({
+            "version": 1,
+            "selected_realm_id": realm_id,
+            "realms": [{
+                "realm_id": realm_id,
+                "display_name": "Astrid Workspace",
+                "data_root": str(root),
+            }],
+            "source_profiles": {},
+        }))
+        self.boundary.calls.clear()
+        self.boundary.creates.clear()
+        return root
+
     def test_first_launch_writes_catalog_discovery_without_synthesizing_activation(self):
+        self._configure()
         result = bootstrap(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "started")
         self.assertEqual(result.credential_file, self.paths.credentials_dir / "astrid.json")
         self.assertEqual(len(self.boundary.starts), 1)
-        self.assertEqual(self.boundary.calls[:2], ["create", "start"])
-        self.assertEqual(len(self.boundary.creates), 1)
-        self.assertEqual(self.boundary.creates[0]["realm_id"], result.realm_id)
+        self.assertEqual(self.boundary.calls, ["start"])
+        self.assertEqual(len(self.boundary.creates), 0)
         self.assertEqual(result.realm_id, json.loads(self.paths.discovery_path.read_text())["active_realm"])
         catalog = json.loads(self.paths.catalog_path.read_text())
         self.assertEqual(catalog["selected_realm_id"], result.realm_id)
@@ -141,6 +187,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
 
     def test_second_launch_reconnects_same_owner_and_actor(self):
+        self._configure()
         first = bootstrap(self.paths, self.boundary, self.config)
         discovery_before = self.paths.discovery_path.read_bytes()
         updated = SourceProfile(
@@ -161,6 +208,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(catalog["source_profiles"]["astrid"], updated.as_dict())
 
     def test_stale_discovery_restarts_without_second_realm(self):
+        self._configure()
         first = bootstrap(self.paths, self.boundary, self.config)
         self.boundary.alive.clear()
         second = bootstrap(self.paths, self.boundary, self.config)
@@ -169,12 +217,133 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(json.loads(self.paths.catalog_path.read_text())["selected_realm_id"], first.realm_id)
 
     def test_restart_reuses_selected_realm(self):
+        self._configure()
         first = bootstrap(self.paths, self.boundary, self.config)
         self.boundary.alive.clear()
         result = restart(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "restarted")
         self.assertEqual(result.realm_id, first.realm_id)
         self.assertEqual(self.boundary.restart_calls, 1)
+
+    def test_restart_and_down_share_unreconciled_attempt_refusal(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        timestamp = "2026-09-24T00:00:00Z"
+        connection = sqlite3.connect(root / "realm.sqlite3")
+        connection.execute(
+            "INSERT INTO projects(id, realm_id, slug, name, metadata_json, created_at, updated_at) "
+            "VALUES ('p', 'configured-realm', 'p', 'P', '{}', ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO runs(id, project_id, capability, spec_json, status, created_at, updated_at) "
+            "VALUES ('r', 'p', 'test', '{}', 'running', ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO tasks(id, run_id, capability, spec_json, status, created_at, updated_at) "
+            "VALUES ('t', 'r', 'test', '{}', 'queued', ?, ?)",
+            (timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) "
+            "VALUES ('a', 't', 'l', 1, 'e', '2000-01-01T00:00:00Z', 0, 1)"
+        )
+        connection.commit()
+        connection.close()
+        with self.assertRaisesRegex(BootstrapError, "active or unreconciled"):
+            restart(self.paths, self.boundary, self.config)
+        with self.assertRaisesRegex(BootstrapError, "active or unreconciled"):
+            down(self.paths, self.boundary)
+        self.assertEqual(self.boundary.restart_calls, 0)
+
+    def test_down_refuses_wrong_endpoint_instance_without_signal(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        self.boundary.endpoint_metadata = lambda **_kwargs: {
+            "runtime_instance_id": "different-instance",
+            "realm_id": "configured-realm",
+            "status": "degraded",
+        }
+        with self.assertRaisesRegex(BootstrapError, "endpoint identity"):
+            down(self.paths, self.boundary)
+        self.assertEqual(self.boundary.restart_calls, 0)
+        self.assertTrue(self.paths.discovery_path.exists())
+
+    def test_down_accepts_degraded_but_identity_matching_endpoint(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        original = self.boundary.endpoint_metadata()
+        self.boundary.endpoint_metadata = lambda **_kwargs: {**original, "status": "degraded"}
+        result = down(self.paths, self.boundary)
+        self.assertEqual(result["status"], "stopped")
+        self.assertFalse(self.paths.discovery_path.exists())
+
+    def test_down_refuses_wrong_discovery_root_without_signal(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        wrong = Path(self.temp.name) / "wrong-realm"
+        wrong.mkdir()
+        discovery = json.loads(self.paths.discovery_path.read_text())
+        discovery["realm_root"] = str(wrong.resolve())
+        self.paths.discovery_path.write_text(json.dumps(discovery))
+        with self.assertRaisesRegex(BootstrapError, "discovery realm root"):
+            down(self.paths, self.boundary)
+        self.assertEqual(self.boundary.restart_calls, 0)
+
+    def test_down_holds_bootstrap_mutex_through_stop_owner(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        observed = []
+
+        def fenced_stop(**kwargs):
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import fcntl,sys; f=open(sys.argv[1],'a+'); "
+                    "\ntry: fcntl.flock(f.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)"
+                    "\nexcept BlockingIOError: raise SystemExit(7)"
+                    "\nraise SystemExit(0)",
+                    str(self.paths.bootstrap_lock_path),
+                ],
+                check=False,
+            )
+            observed.append(probe.returncode)
+            self.boundary.alive.discard(kwargs["pid"])
+
+        self.boundary.stop_owner = fenced_stop
+        result = down(self.paths, self.boundary)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(observed, [7])
+
+    def test_down_never_cleans_up_new_owner_published_during_stop(self):
+        root = self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+        replacement = {
+            "pid": 49999,
+            "endpoint": "http://127.0.0.1:49999",
+            "runtime_instance_id": "replacement-instance",
+            "process_birth_id": "replacement-birth",
+            "active_realm": "configured-realm",
+            "realm_root": str(root.resolve()),
+        }
+
+        def replace_owner(**kwargs):
+            self.boundary.alive.discard(kwargs["pid"])
+            self.paths.discovery_path.write_text(json.dumps(replacement))
+            self.paths.instance_lock_path.write_text(json.dumps({
+                **replacement, "realm_id": "configured-realm",
+            }))
+
+        self.boundary.stop_owner = replace_owner
+        with self.assertRaisesRegex(BootstrapError, "changed during stop"):
+            down(self.paths, self.boundary)
+        self.assertEqual(json.loads(self.paths.discovery_path.read_text()), replacement)
+        self.assertEqual(
+            json.loads(self.paths.instance_lock_path.read_text())["runtime_instance_id"],
+            "replacement-instance",
+        )
 
     def test_legacy_collision_refuses_parallel_empty_realm_with_exact_action(self):
         legacy = self.paths.home / ".astrid"
@@ -186,7 +355,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(self.paths.catalog_path.exists())
 
     def test_incompatible_live_owner_fails_closed_without_mutation(self):
-        self.paths.runtime_support.mkdir(parents=True)
+        self._configure(realm_id="realm")
+        self.paths.runtime_support.mkdir(parents=True, exist_ok=True)
         self.paths.discovery_path.write_text(json.dumps({
             "protocol_version": "old", "schema_version": "old", "active_realm": "realm", "pid": 99,
         }))
@@ -198,6 +368,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(self.boundary.starts), 0)
 
     def test_duplicate_owner_refuses_when_lock_validation_fails(self):
+        self._configure()
         bootstrap(self.paths, self.boundary, self.config)
         self.boundary.valid_owner = False
         with self.assertRaises(DuplicateOwnerError):
@@ -231,23 +402,25 @@ class BootstrapTests(unittest.TestCase):
                 raise AssertionError("selected existing realm was provisioned")
 
         boundary = ExistingBoundary()
-        with self.assertRaisesRegex(BootstrapError, "existing realm is missing"):
+        with self.assertRaisesRegex(BootstrapError, "Realm-root identity is unavailable"):
             bootstrap(self.paths, boundary, self.config)
-        self.assertEqual(boundary.calls, ["start"])
+        self.assertEqual(boundary.calls, [])
         self.assertFalse(self.paths.realms_dir.joinpath("existing-realm").exists())
 
-    def test_fresh_realm_handoff_failure_rolls_back_created_realm(self):
+    def test_configured_realm_handoff_failure_preserves_explicit_selection(self):
         class FailingHandoffBoundary(FakeBoundary):
             def start(self, **kwargs):
                 super().start(**kwargs)
                 raise RuntimeError("admission handoff failed")
 
         boundary = FailingHandoffBoundary()
+        self.boundary = boundary
+        root = self._configure()
         with self.assertRaisesRegex(RuntimeError, "admission handoff failed"):
             bootstrap(self.paths, boundary, self.config)
-        self.assertEqual(boundary.calls[:2], ["create", "start"])
-        self.assertFalse(list(self.paths.realms_dir.iterdir()) if self.paths.realms_dir.exists() else ())
-        self.assertFalse(self.paths.catalog_path.exists())
+        self.assertEqual(boundary.calls, ["start"])
+        self.assertTrue(root.is_dir())
+        self.assertTrue(self.paths.catalog_path.exists())
         self.assertFalse(self.paths.discovery_path.exists())
         self.assertFalse(self.paths.instance_lock_path.exists())
 

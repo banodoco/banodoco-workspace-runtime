@@ -20,6 +20,8 @@
     "attempt_id": { "type": ["string", "null"] },
     "runtime_epoch": { "type": "integer", "minimum": 1 },
     "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+    "execution_request": { "$ref": "#/definitions/ExecutionRequest" },
+    "execution_binding": { "$ref": "#/definitions/ExecutionBinding" },
     "required_facts": { "$ref": "#/definitions/RequiredFacts" },
     "spec": { "type": "object", "additionalProperties": true },
     "generation_intent": { "type": "object", "additionalProperties": true },
@@ -37,6 +39,65 @@
     ,"result": { "type": "object", "additionalProperties": true }
   },
   "definitions": {
+    "ExecutionTarget": {
+      "type": "object", "additionalProperties": true,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["default", "profile", "machine", "runpod"] },
+        "id": { "type": "string" }, "profile_alias": { "type": "string" },
+        "machine_id": { "type": "string" }, "pod_id": { "type": "string" },
+        "provider_account_ref": { "type": "string" },
+        "profile_revision": { "type": "string" }, "profile_digest": { "type": "string" },
+        "release_digest": { "type": "string" }, "storage": { "type": "object" },
+        "mounts": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "ExecutionRequest": {
+      "type": "object", "additionalProperties": true,
+      "required": ["target"],
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "target": { "$ref": "#/definitions/ExecutionTarget" },
+        "inputs": { "type": "array", "items": { "type": "object" } },
+        "workflow": { "type": "object" }, "execution": { "type": "object" },
+        "retry_policy": { "type": "object" }, "lifecycle": { "type": "object" },
+        "limits": { "type": "object" }, "checks": { "type": "object" }
+      }
+    },
+    "ExecutionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["binding_id", "task_id", "run_id", "session_id", "runtime_epoch", "capability_id", "target_kind", "resolved_target", "status"],
+      "properties": {
+        "binding_id": { "type": "string", "minLength": 1 }, "task_id": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 }, "attempt_id": { "type": ["string", "null"] },
+        "lease_id": { "type": ["string", "null"] }, "fence": { "type": "integer", "minimum": 0 },
+        "executor_id": { "type": ["string", "null"] }, "session_id": { "type": "string", "minLength": 1 },
+        "runtime_epoch": { "type": "integer", "minimum": 1 }, "capability_id": { "type": "string", "minLength": 1 },
+        "profile_revision": { "type": ["string", "null"] }, "profile_digest": { "type": ["string", "null"] },
+        "release_digest": { "type": ["string", "null"] }, "target_kind": { "type": "string" },
+        "target_id": { "type": ["string", "null"] }, "provider_account_ref": { "type": ["string", "null"] },
+        "pod_id": { "type": ["string", "null"] }, "storage": { "type": ["object", "null"] },
+        "mounts": { "type": ["array", "null"], "items": { "type": "object" } }, "resolved_target": { "$ref": "#/definitions/ExecutionTarget" },
+        "actual_target": { "$ref": "#/definitions/ExecutionTarget" },
+        "verification": { "$ref": "#/definitions/ExecutionBindingVerification" },
+        "executor_incarnation": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "status": { "type": "string", "enum": ["prepared", "claimed", "released", "stale"] },
+        "created_at": { "type": "string" }, "updated_at": { "type": "string" }
+      },
+      "allOf": [{
+        "if": { "properties": { "status": { "enum": ["claimed", "released", "stale"] } } },
+        "then": { "required": ["attempt_id", "lease_id", "executor_id", "actual_target", "verification", "executor_incarnation"] }
+      }]
+    },
+    "ExecutionBindingVerification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method", "evidence_digest", "verified"],
+      "properties": {
+        "method": { "type": "string", "const": "credential_claim" },
+        "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "verified": { "type": "boolean", "const": true }
+      }
+    },
     "RequiredFacts": {
       "type": "object", "additionalProperties": false,
       "properties": {

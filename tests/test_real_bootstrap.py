@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 
-from banodoco_local import BootstrapConfig, LocalRuntimeBoundary, RuntimePaths, SourceProfile, bootstrap
+from banodoco_local import BootstrapConfig, LocalRuntimeBoundary, RuntimePaths, SourceProfile, bootstrap, configure_workspace
 from banodoco_local.bootstrap import restart
 from banodoco_workspace_client import WorkspaceClient
 
@@ -19,11 +19,21 @@ def _config() -> BootstrapConfig:
     return BootstrapConfig(source_profile=profile)
 
 
+def _configure(paths, boundary):
+    config = _config()
+    configure_workspace(
+        paths, boundary, config, mode="create",
+        realm_root=paths.realms_dir / "explicit-realm", realm_id="explicit-realm",
+    )
+    return config
+
+
 def test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client(tmp_path):
     paths = RuntimePaths.sandbox(tmp_path)
     boundary = LocalRuntimeBoundary()
     try:
-        first = bootstrap(paths, boundary, _config())
+        config = _configure(paths, boundary)
+        first = bootstrap(paths, boundary, config)
         discovery = json.loads(paths.discovery_path.read_text())
         assert first.status == "started"
         assert discovery["protocol_version"] == "workspace.v1"
@@ -55,7 +65,8 @@ def test_concurrent_reconnect_survives_restricted_pid_identity_probe(tmp_path, m
     paths = RuntimePaths.sandbox(tmp_path)
     boundary = LocalRuntimeBoundary()
     try:
-        first = bootstrap(paths, boundary, _config())
+        config = _configure(paths, boundary)
+        first = bootstrap(paths, boundary, config)
 
         def deny_signal(_pid, _signal):
             raise PermissionError("operation not permitted")
@@ -76,7 +87,8 @@ def test_real_subprocess_restart_preserves_realm_and_credential(tmp_path):
     paths = RuntimePaths.sandbox(tmp_path)
     boundary = LocalRuntimeBoundary()
     try:
-        first = bootstrap(paths, boundary, _config())
+        config = _configure(paths, boundary)
+        first = bootstrap(paths, boundary, config)
         token_before = json.loads((paths.credentials_dir / "astrid.json").read_text())["token"]
         result = restart(paths, boundary, _config())
         assert result.status == "restarted"
@@ -92,7 +104,8 @@ def test_real_subprocess_stale_discovery_recovers_without_new_realm(tmp_path):
     paths = RuntimePaths.sandbox(tmp_path)
     boundary = LocalRuntimeBoundary()
     try:
-        first = bootstrap(paths, boundary, _config())
+        config = _configure(paths, boundary)
+        first = bootstrap(paths, boundary, config)
         assert boundary._process is not None
         os.kill(boundary._process.pid, 9)
         boundary._process.wait(timeout=3)

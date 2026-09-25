@@ -6,7 +6,10 @@ from .store import (
     GENERATION_INTENT_STORAGE_KEY,
     OBJECT_ID_RE,
     RealmStore,
+    execution_placement_matches,
     normalize_execution_facts,
+    normalize_verified_execution_placement,
+    _normalize_execution_target,
     public_task_spec,
 )
 from .util import atomic_json_write
@@ -37,6 +40,7 @@ OBJECT_MAX_BYTES = 64 * 1024 * 1024
 MEDIA_IMPORT_CAPABILITY = "runtime.media.import.v1"
 MEDIA_IMPORT_EXECUTOR = "runtime-host-media-import"
 MEDIA_IMPORT_CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(MEDIA_IMPORT_CAPABILITY.encode()).hexdigest()
+TARGETED_EXECUTION_BINDING_CAPABILITY = "execution_binding.targeted.v1"
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
@@ -540,7 +544,7 @@ class RuntimeService:
                 live = False
                 self._verified = False
                 self._admission_failure = {"reason": "runtime_liveness_failed"}
-        return {"status": "ok" if self._verified and live else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"]}
+        return {"status": "ok" if self._verified and live else "degraded", "protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "runtime_epoch": self._runtime_state["runtime_epoch"], "runtime_session_id": self.runtime_session_id}
 
     def _assert_mutation_admitted(self):
         if not self._verified:
@@ -575,7 +579,7 @@ class RuntimeService:
         excess = sorted(set(requested) - negotiated)
         if excess:
             raise AuthorizationError("credential cannot negotiate requested scopes", details={"scopes": excess})
-        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested}
+        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY]}
 
     @staticmethod
     def _assert_executor_identity(identity, executor_id):
@@ -596,10 +600,34 @@ class RuntimeService:
             return
         raise AuthorizationError("worker credential is not bound to executor", details={"executor_id": executor_id, "actor_id": actor})
 
+    @staticmethod
+    def _trusted_execution_placement(identity):
+        if identity is None or identity.get("execution_binding") is None:
+            return None
+        try:
+            return normalize_verified_execution_placement(identity["execution_binding"])
+        except ValidationError as exc:
+            raise AuthorizationError("worker credential carries invalid execution placement") from exc
+
     def _assert_attempt_identity(self, row, identity):
         if not row:
             return
         self._assert_executor_identity(identity, row["executor_id"])
+        if identity is None:
+            return
+        binding = self.store.execution_binding(row["task_id"])
+        if not binding or not binding.get("actual_target"):
+            return
+        placement = self._trusted_execution_placement(identity)
+        if placement is None:
+            raise AuthorizationError("worker credential has no execution placement")
+        if (
+            not execution_placement_matches(binding["resolved_target"], placement)
+            or binding.get("actual_target") != placement["actual"]
+            or binding.get("verification") != placement["verification"]
+            or binding.get("executor_incarnation") != placement["executor_incarnation"]
+        ):
+            raise AuthorizationError("worker credential does not match the fenced execution binding")
 
     @_verified_mutation
     def create_project(self, body, *, idempotency_key=None):
@@ -3998,6 +4026,26 @@ class RuntimeService:
         if capability == MEDIA_IMPORT_CAPABILITY and not _host_owned:
             raise AuthorizationError("runtime media import capability is host-owned")
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
+        execution_request = body.get("execution_request")
+        task_spec_value = body.get("spec", {})
+        if isinstance(task_spec_value, dict) and (
+            "execution_request" in task_spec_value
+            or (
+                isinstance(task_spec_value.get("spec"), dict)
+                and "execution_request" in task_spec_value["spec"]
+            )
+        ):
+            raise ValidationError("execution_request must be supplied through the first-class admission field")
+        if isinstance(task_spec_value, dict) and (
+            "execution_binding" in task_spec_value
+            or (
+                isinstance(task_spec_value.get("spec"), dict)
+                and "execution_binding" in task_spec_value["spec"]
+            )
+        ):
+            raise ValidationError("caller-supplied execution_binding is not accepted")
+        if isinstance(execution_request, dict) and "execution_binding" in execution_request:
+            raise ValidationError("caller-supplied execution_binding is not accepted")
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
         if "generation_intent" in body:
             if not isinstance(body["generation_intent"], dict):
@@ -4009,7 +4057,7 @@ class RuntimeService:
             task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
             task_spec["storage_estimate"] = self.store._validate_storage_estimate(body["storage_estimate"])
-        value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness)
+        value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_request=execution_request)
         return value
 
     def task(self, task_id):
@@ -4322,6 +4370,11 @@ class RuntimeService:
         if task.get("generation_intent") is not None:
             generation_intent = task["generation_intent"]
         resource = {"task_id": task["id"], "run_id": run["id"], "project_id": run.get("project_id"), "state": "succeeded" if task["status"] == "completed" else ("cancelled" if task["status"] == "cancelled" else task["status"]), "version": int(task.get("attempt", 0)) + 1, "capability_id": task["capability"], "capability_digest": task.get("capability_digest") or spec.get("capability_digest", "sha256:" + hashlib.sha256(task["capability"].encode()).hexdigest()), "schema_version": spec.get("schema_version", "1"), "input_object_ids": spec.get("input_object_ids", []), "spec": spec, "idempotency_key": run.get("idempotency_key") or task["id"], "created_at": task["created_at"], "updated_at": task["updated_at"], "attempt_id": task.get("attempt_id"), "runtime_epoch": int(task.get("runtime_epoch") or self.store._current_runtime_epoch())}
+        if task.get("execution_request") is not None:
+            resource["execution_request"] = dict(task["execution_request"])
+        binding = value.get("execution_binding") or self.store.execution_binding(task["id"])
+        if binding is not None:
+            resource["execution_binding"] = binding
         if generation_intent is not None:
             resource["generation_intent"] = generation_intent
         if "required_facts" in spec:
@@ -4386,6 +4439,11 @@ class RuntimeService:
             if replay is not None:
                 return replay
             status = current["task"]["status"]
+            if current["task"].get("waiting_reason") == "provider_state_unknown":
+                raise ConflictError(
+                    "provider/executor state must be reconciled by authorized checkpoint resume before retry",
+                    details={"status": status, "attempt_id": current["task"].get("attempt_id")},
+                )
             if status not in {"completed", "cancelled", "failed"}:
                 raise ConflictError("task is not retryable", details={"status": status})
             expected = (body or {}).get("expected_version")
@@ -4396,6 +4454,7 @@ class RuntimeService:
                 timestamp = now()
                 self.store._release_reservations(task_id, current["task"].get("lease_token"))
                 self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
+                self.store.reset_execution_attempt(task_id)
                 self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, current["run"]["id"]))
                 event_id = self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
                 self.store._refresh_continuations_for_predecessor(task_id)
@@ -4543,7 +4602,7 @@ class RuntimeService:
         body = _wire_object(
             body,
             required=("executor_id", "capability_ids", "runtime_epoch"),
-            allowed=("executor_id", "capability_ids", "runtime_epoch"),
+            allowed=("executor_id", "capability_ids", "runtime_epoch", "target"),
         )
         executor_id = _wire_string(body, "executor_id")
         capability_ids = body.get("capability_ids")
@@ -4552,9 +4611,14 @@ class RuntimeService:
         if not isinstance(capability_ids, list) or any(not isinstance(value, str) or not value for value in capability_ids) or len(set(capability_ids)) != len(capability_ids):
             raise ValidationError("capability_ids must be a list of unique non-empty strings")
         _wire_integer(body, "runtime_epoch", positive=True)
+        requested_target = None
+        if body.get("target") is not None:
+            requested_target = _normalize_execution_target(body["target"])
+        trusted_placement = self._trusted_execution_placement(identity)
         request_hash = hashlib.sha256(canonical_json({
             "executor_id": executor_id, "capability_ids": capability_ids,
-            "runtime_epoch": runtime_epoch,
+            "runtime_epoch": runtime_epoch, "target": requested_target,
+            "trusted_execution_placement": trusted_placement,
         }).encode()).hexdigest()
         # Epoch validation intentionally precedes the idempotency lookup: a
         # stale worker must never turn an old claim receipt into a live lease.
@@ -4569,12 +4633,57 @@ class RuntimeService:
         # claim attempt.
         self.store._reap_expired_leases()
         caps = set(capability_ids)
-        rows = self.store.conn.execute("SELECT id, capability FROM tasks WHERE status='queued' ORDER BY created_at, id").fetchall()
-        row = next((item for item in rows if not caps or item["capability"] in caps), None)
+        rows = self.store.conn.execute(
+            "SELECT id, capability, execution_request_json, spec_json, waiting_reason "
+            "FROM tasks WHERE status='queued' ORDER BY rowid"
+        ).fetchall()
+        row = None
+        selected_binding = None
+        for item in rows:
+            if caps and item["capability"] not in caps:
+                continue
+            binding = self.store.execution_binding(item["id"])
+            targeted_request = self.store._execution_request_from_row(item)
+            targeted = targeted_request is not None
+            if targeted:
+                if binding is None or requested_target is None:
+                    continue
+                if canonical_json(binding["resolved_target"]) != canonical_json(requested_target):
+                    continue
+                selected_binding = binding
+            row = item
+            break
         if row is None:
             # Persist the empty outcome too.  Otherwise a retry after another
             # task is admitted would silently claim new work.
             return self._command_record("task.claim", "claim", idempotency_key, request_hash, None, project_id="unscoped", with_receipt=False)
+        if row["waiting_reason"] == "provider_state_unknown":
+            value = self.store.get_task(row["id"])
+            result = {
+                "task": self._task_resource(value),
+                "waiting_reason": "provider_state_unknown",
+            }
+            return self._command_record(
+                "task.claim", "claim", idempotency_key, request_hash, result,
+                project_id="unscoped", with_receipt=False,
+            )
+        if selected_binding is not None:
+            if trusted_placement is None:
+                reason = "execution_binding_missing"
+            elif not execution_placement_matches(
+                selected_binding["resolved_target"], trusted_placement
+            ):
+                reason = "execution_binding_mismatch"
+            else:
+                reason = None
+            if reason is not None:
+                self.store._set_waiting_reason(row["id"], reason)
+                value = self.store.get_task(row["id"])
+                result = {"task": self._task_resource(value), "waiting_reason": reason}
+                return self._command_record(
+                    "task.claim", "claim", idempotency_key, request_hash, result,
+                    project_id="unscoped", with_receipt=False,
+                )
         attempt_id, lease_id = new_id(), new_id()
         value = self.store._claim_task(row["id"], executor_id, lease_id, runtime_epoch=epoch, _transactional=False)
         if value["task"]["status"] != "running":
@@ -4585,12 +4694,32 @@ class RuntimeService:
             expires = task.get("lease_expires_at") or now()
             self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, row["id"], lease_id, fence, executor_id, expires, epoch))
             self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, row["id"]))
+            binding = self.store.bind_execution_attempt(
+                row["id"], attempt_id=attempt_id, lease_id=lease_id,
+                fence=fence, executor_id=executor_id, runtime_epoch=epoch,
+                placement=trusted_placement,
+            )
+            if binding is not None:
+                self.store._append_event(
+                    value["run"]["id"], row["id"], "task.execution_bound",
+                    {
+                        "attempt_id": attempt_id,
+                        "lease_id": lease_id,
+                        "fence": fence,
+                        "runtime_epoch": epoch,
+                        "execution_binding": binding,
+                    },
+                )
             # Return the immutable admitted spec alongside the lease. Workers
             # must execute exactly what was claimed, without a racy second read.
             admitted_spec, generation_intent = public_task_spec(task.get("spec") or {})
             if task.get("generation_intent") is not None:
                 generation_intent = task["generation_intent"]
-            result = {"attempt_id": attempt_id, "task_id": row["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            result = {"attempt_id": attempt_id, "task_id": row["id"], "run_id": value["run"]["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            if task.get("execution_request") is not None:
+                result["execution_request"] = dict(task["execution_request"])
+            if binding is not None:
+                result["execution_binding"] = binding
             if generation_intent is not None:
                 result["generation_intent"] = generation_intent
             if task.get("expected_effect") is not None:
@@ -5724,6 +5853,7 @@ class RuntimeService:
             resource = {
                 "attempt_id": attempt["id"],
                 "task_id": attempt["task_id"],
+                "run_id": task_value["run"]["id"],
                 "project_id": task_value["run"].get("project_id"),
                 "lease_id": attempt["lease_id"],
                 "fence": attempt["fence"],
@@ -5734,6 +5864,9 @@ class RuntimeService:
             }
             if generation_intent is not None:
                 resource["generation_intent"] = generation_intent
+            binding = self.store.execution_binding(attempt["task_id"])
+            if binding is not None:
+                resource["execution_binding"] = binding
             return resource
 
         with self.store._mutex:
@@ -5755,10 +5888,21 @@ class RuntimeService:
             if sha256_bytes(checkpoint_bytes) != row["checkpoint_digest"]:
                 raise ConflictError("recovery checkpoint digest mismatch")
             checkpoint = json.loads(checkpoint_bytes.decode("utf-8"))
+            binding = self.store.execution_binding(row["task_id"])
+            placement = self._trusted_execution_placement(identity)
+            if binding is not None:
+                if placement is None:
+                    raise AuthorizationError("worker credential has no execution placement")
+                if not execution_placement_matches(binding["resolved_target"], placement):
+                    raise AuthorizationError("worker credential placement cannot resume this task")
+                self.store.reset_execution_attempt(row["task_id"], runtime_epoch=current)
             # Claim this exact task.  Never use claim_next here: a mismatch
             # must not consume an unrelated queued task.
             lease_id = new_id()
-            claim = self.store._claim_task(row["task_id"], row["executor_id"], lease_id, runtime_epoch=current)
+            claim = self.store._claim_task(
+                row["task_id"], row["executor_id"], lease_id,
+                runtime_epoch=current, allow_provider_recovery=True,
+            )
             task = claim["task"]
             if task.get("status") != "running" or task.get("id") != row["task_id"]:
                 raise ConflictError("checkpoint task is not queued for resume")
@@ -5766,6 +5910,23 @@ class RuntimeService:
             with self.store._transaction():
                 self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, row["task_id"], lease_id, task["lease_fence"], row["executor_id"], task["lease_expires_at"], current))
                 self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=? AND status='running'", (attempt_id, row["task_id"]))
+                resumed_binding = self.store.bind_execution_attempt(
+                    row["task_id"], attempt_id=attempt_id, lease_id=lease_id,
+                    fence=task["lease_fence"], executor_id=row["executor_id"],
+                    runtime_epoch=current, placement=placement,
+                ) if binding is not None else None
+                if resumed_binding is not None:
+                    self.store._append_event(
+                        task["run_id"], row["task_id"], "task.execution_bound",
+                        {
+                            "attempt_id": attempt_id,
+                            "lease_id": lease_id,
+                            "fence": task["lease_fence"],
+                            "runtime_epoch": current,
+                            "execution_binding": resumed_binding,
+                            "recovery": "checkpoint_authorized_resume",
+                        },
+                    )
             resumed_attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": resumed_attempt["id"], "task_id": row["task_id"], "runtime_epoch": current, "command": "resume", "status": "resumed", "checkpoint_digest": "sha256:" + row["checkpoint_digest"], "checkpoint": checkpoint}
             with self.store._transaction():
