@@ -291,6 +291,8 @@ class BootstrapResult:
     worker_actor: str | None = field(default=None, compare=False)
     worker_scopes: tuple[str, ...] = field(default=(), compare=False)
     source_checkout: str | None = field(default=None, compare=False)
+    realm_root: Path | None = field(default=None, compare=False)
+    support_root: Path | None = field(default=None, compare=False)
 
     @property
     def ready(self) -> bool:
@@ -882,6 +884,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
                 paths.discovery_path, paths.credentials_dir / "astrid.json",
                 worker.get("worker_credential_file"), worker.get("worker_actor"),
                 worker.get("worker_scopes", ()), source.source_checkout,
+                selected_root, paths.app_support,
             )
         # A dead advertisement is ephemeral support state.  Remove it before
         # starting so a crash cannot be mistaken for a live owner.
@@ -1000,6 +1003,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         paths.credentials_dir / "astrid.json",
         worker.get("worker_credential_file"), worker.get("worker_actor"),
         worker.get("worker_scopes", ()), source.source_checkout,
+        realm_root, paths.app_support,
     )
 
 
@@ -1037,6 +1041,7 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         paths.credentials_dir / "astrid.json",
         worker.get("worker_credential_file"), worker.get("worker_actor"),
         worker.get("worker_scopes", ()), source.source_checkout,
+        _canonical_realm_root(str(realm["data_root"])), paths.app_support,
     )
 
 
@@ -1169,6 +1174,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         result.discovery_path, result.credential_file,
         result.worker_credential_file, result.worker_actor,
         result.worker_scopes, result.source_checkout,
+        result.realm_root, result.support_root,
     )
 
 

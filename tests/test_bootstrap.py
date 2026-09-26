@@ -25,6 +25,7 @@ from banodoco_local.bootstrap import (
     restart,
 )
 from banodoco_local.paths import RuntimePaths
+from banodoco_local.cli import _json_value
 from runtime_protocol.store import RealmStore
 
 
@@ -163,9 +164,14 @@ class BootstrapTests(unittest.TestCase):
         return root
 
     def test_first_launch_writes_catalog_discovery_without_synthesizing_activation(self):
-        self._configure()
+        realm_root = self._configure()
         result = bootstrap(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "started")
+        self.assertEqual(result.realm_root, realm_root.resolve())
+        self.assertEqual(result.support_root, self.paths.app_support)
+        serialized = _json_value(result)
+        self.assertEqual(serialized["realm_root"], str(realm_root.resolve()))
+        self.assertEqual(serialized["support_root"], str(self.paths.app_support))
         self.assertEqual(result.credential_file, self.paths.credentials_dir / "astrid.json")
         self.assertEqual(len(self.boundary.starts), 1)
         self.assertEqual(self.boundary.calls, ["start"])
