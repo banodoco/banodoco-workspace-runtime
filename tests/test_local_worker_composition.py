@@ -117,6 +117,48 @@ def test_factory_installed_mode_uses_verified_package_without_checkout(
     assert composition.preparer.config["pack_root"] == str(packs.resolve())
 
 
+def test_factory_installed_mode_preserves_virtualenv_host_launch_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document, _source, support, packs = _profile_document(tmp_path)
+    base_python = tmp_path / "base-python"
+    base_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    base_python.chmod(0o755)
+    virtualenv_python = tmp_path / "astrid-venv" / "bin" / "python"
+    virtualenv_python.parent.mkdir(parents=True)
+    virtualenv_python.symlink_to(base_python)
+    document["host_executable"] = str(virtualenv_python)
+    document["launch_mode"] = "installed"
+    document.pop("source_checkout")
+    observed: dict[str, Path] = {}
+
+    def installed_pack_root(host: Path) -> Path:
+        observed["host"] = host
+        return packs.resolve()
+
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._installed_astrid_pack_root",
+        installed_pack_root,
+    )
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    composition = load_local_worker_composition(
+        path,
+        workspace_uuid="realm",
+        realm_root=tmp_path / "realm",
+        support_root=support,
+        runtime_instance_id="instance",
+    )
+
+    lexical = Path(os.path.abspath(virtualenv_python))
+    profile = composition.profiles["astrid"]
+    assert observed["host"] == lexical
+    assert Path(composition.preparer.config["host_python"]) == lexical
+    assert profile.host_executable == base_python.resolve()
+    assert profile.host_executable != lexical
+
+
 def test_factory_installed_mode_rejects_source_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -565,6 +565,20 @@ def _path(value: Any, label: str, *, directory: bool | None = None) -> Path:
     return target
 
 
+def _executable_path(value: Any, label: str) -> Path:
+    """Validate an executable while preserving a virtualenv's lexical path."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"worker profile {label} is required")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise ValidationError(f"worker profile {label} must be absolute")
+    target = Path(os.path.abspath(candidate))
+    if not target.is_file() or not os.access(target, os.X_OK):
+        raise ValidationError(f"worker profile {label} must be an existing executable file")
+    return target
+
+
 def _installed_astrid_pack_root(host_executable: Path) -> Path:
     """Resolve Astrid's packaged pack root without cwd or PYTHONPATH input."""
     script = (
@@ -610,7 +624,8 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
     if unknown:
         raise ValidationError("worker profile contains unsupported fields: " + ", ".join(unknown))
     worker_executable = _path(raw.get("worker_executable"), "worker_executable", directory=False)
-    host_executable = _path(raw.get("host_executable"), "host_executable", directory=False)
+    host_launch_executable = _executable_path(raw.get("host_executable"), "host_executable")
+    host_executable = host_launch_executable.resolve()
     engine_executable = _path(raw.get("engine_executable"), "engine_executable", directory=False)
     listener_executable = _path(raw.get("engine_listener_executable"), "engine_listener_executable", directory=False)
     worker_environment = _path(raw.get("worker_environment"), "worker_environment", directory=True)
@@ -661,7 +676,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         if raw.get("source_checkout") not in {None, ""}:
             raise ValidationError("installed worker profile must not select a source_checkout")
         source_checkout = None
-        installed_pack_root = _installed_astrid_pack_root(host_executable)
+        installed_pack_root = _installed_astrid_pack_root(host_launch_executable)
         if pack_root != installed_pack_root:
             raise ValidationError(
                 "worker profile pack_root does not match the installed Astrid package"
@@ -671,7 +686,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
     capability_path = _path(capability, "capability_matrix", directory=False) if capability else None
     support = Path(support_root).resolve()
     config = {
-        "host_python": str(host_executable),
+        "host_python": str(host_launch_executable),
         "launch_mode": launch_mode,
         "source_checkout": str(source_checkout) if source_checkout is not None else None,
         "pack_root": str(pack_root),
