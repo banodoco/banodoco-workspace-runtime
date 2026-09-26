@@ -5700,8 +5700,13 @@ class RuntimeService:
             supplied_fence = int(body.get("fence", 0))
         except (TypeError, ValueError) as exc:
             raise LeaseError("attempt fence is invalid") from exc
-        if row["lease_id"] != body.get("lease_id") or int(row["fence"]) != supplied_fence:
+        if row["lease_id"] != body.get("lease_id"):
             raise LeaseError("attempt lease is stale or already settled")
+        if int(row["fence"]) != supplied_fence:
+            raise LeaseError(
+                "attempt fence is stale",
+                details={"expected": int(row["fence"]), "actual": supplied_fence},
+            )
         if not allow_expired and row["lease_expires_at"]:
             try:
                 if datetime.fromisoformat(row["lease_expires_at"]) <= datetime.now(timezone.utc):

@@ -169,6 +169,37 @@ def test_project_patch_and_run_cancel_retry_are_durable_and_idempotent(daemon, t
     assert [event.event_type for event in events][-2:] == ["task.retried", "run.retried"]
     second = worker.claim_task(executor_id="mutation-worker", capability_ids=["render.basic"], idempotency_key="mutation-claim-2", runtime_epoch=worker.health().runtime_epoch)
     assert second["fence"] > first["fence"] and second["attempt_id"] != first["attempt_id"]
+    with pytest.raises(ApiError) as stale_fence:
+        worker.settle_attempt(
+            second["attempt_id"],
+            {
+                "lease_id": second["lease_id"],
+                "fence": first["fence"],
+                "runtime_epoch": second["runtime_epoch"],
+                "outputs": [],
+            },
+            idempotency_key="mutation-stale-f1-fence",
+        )
+    assert stale_fence.value.status == 409
+    assert stale_fence.value.code == "lease_fenced"
+    assert stale_fence.value.message == "attempt fence is stale"
+    assert stale_fence.value.details == {
+        "expected": second["fence"],
+        "actual": first["fence"],
+    }
+    after_stale_fence = client.get_task(failed.task_id)
+    assert after_stale_fence.state == "running"
+    assert after_stale_fence.attempt_id == second["attempt_id"]
+    assert worker.settle_attempt(
+        second["attempt_id"],
+        {
+            "lease_id": second["lease_id"],
+            "fence": second["fence"],
+            "runtime_epoch": second["runtime_epoch"],
+            "outputs": [],
+        },
+        idempotency_key="mutation-current-f2-settle",
+    ).state == "succeeded"
 
     daemon.stop()
     restarted = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
