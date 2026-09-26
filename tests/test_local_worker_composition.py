@@ -91,6 +91,54 @@ def test_factory_derives_runtime_identity_and_roots(tmp_path: Path) -> None:
     assert composition.preparer.config["runtime_instance_id"] == "instance-2"
 
 
+def test_factory_installed_mode_uses_verified_package_without_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document, _source, support, packs = _profile_document(tmp_path)
+    document["launch_mode"] = "installed"
+    document.pop("source_checkout")
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._installed_astrid_pack_root",
+        lambda _host: packs.resolve(),
+    )
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    composition = load_local_worker_composition(
+        path,
+        workspace_uuid="realm",
+        realm_root=tmp_path / "realm",
+        support_root=support,
+        runtime_instance_id="instance",
+    )
+
+    assert composition.preparer.config["launch_mode"] == "installed"
+    assert composition.preparer.config["source_checkout"] is None
+    assert composition.preparer.config["pack_root"] == str(packs.resolve())
+
+
+def test_factory_installed_mode_rejects_source_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document, _source, support, packs = _profile_document(tmp_path)
+    document["launch_mode"] = "installed"
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._installed_astrid_pack_root",
+        lambda _host: packs.resolve(),
+    )
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="must not select a source_checkout"):
+        load_local_worker_composition(
+            path,
+            workspace_uuid="realm",
+            realm_root=tmp_path / "realm",
+            support_root=support,
+            runtime_instance_id="instance",
+        )
+
+
 def test_factory_rejects_unknown_authority_fields(tmp_path: Path) -> None:
     document, _source, support, _packs = _profile_document(tmp_path)
     document["realm_root"] = "/attacker/realm"

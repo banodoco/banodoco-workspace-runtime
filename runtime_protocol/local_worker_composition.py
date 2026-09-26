@@ -565,6 +565,32 @@ def _path(value: Any, label: str, *, directory: bool | None = None) -> Path:
     return target
 
 
+def _installed_astrid_pack_root(host_executable: Path) -> Path:
+    """Resolve Astrid's packaged pack root without cwd or PYTHONPATH input."""
+    script = (
+        "import importlib.metadata as m, json, pathlib, astrid; "
+        "root=pathlib.Path(astrid.__file__).resolve().parent; "
+        "direct=m.distribution('astrid').read_text('direct_url.json'); "
+        "editable=bool(direct and json.loads(direct).get('dir_info',{}).get('editable')); "
+        "print(json.dumps({'pack_root':str(root / 'packs'),'editable':editable}))"
+    )
+    try:
+        completed = subprocess.run(
+            [str(host_executable), "-I", "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        )
+        value = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, TypeError) as exc:
+        raise ValidationError("installed Astrid package origin could not be verified") from exc
+    if not isinstance(value, Mapping) or value.get("editable") is not False:
+        raise ValidationError("installed Astrid package must be a non-editable artifact")
+    return _path(value.get("pack_root"), "installed Astrid pack_root", directory=True)
+
+
 def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, realm_root: Path, support_root: Path, runtime_instance_id: str) -> LocalWorkerComposition:
     target = _path(str(path), "path", directory=False)
     try:
@@ -577,7 +603,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         "profile_id", "machine_id", "engine_endpoint", "worker_environment", "worker_executable", "host_executable",
         "engine_executable", "engine_listener_executable", "worker_artifact_digest", "host_artifact_digest",
         "engine_artifact_digest", "engine_listener_artifact_digest", "session_config_digest", "profile_revision",
-        "profile_digest", "release_digest", "source_checkout", "pack_root", "boot_manifest_path",
+        "profile_digest", "release_digest", "launch_mode", "source_checkout", "pack_root", "boot_manifest_path",
         "boot_manifest_hash", "capability_matrix", "environment", "worker_timeout_seconds",
     }
     unknown = sorted(set(raw) - allowed)
@@ -622,17 +648,32 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
     )
     if profile.engine_endpoint != f"http://127.0.0.1:{engine_port}":
         raise ValidationError("worker profile engine_endpoint does not match the Worker launch port")
-    source_checkout = _path(raw.get("source_checkout"), "source_checkout", directory=True)
+    launch_mode = str(raw.get("launch_mode") or "editable").strip()
+    if launch_mode not in {"editable", "installed"}:
+        raise ValidationError("worker profile launch_mode must be 'editable' or 'installed'")
     pack_root = _path(raw.get("pack_root"), "pack_root", directory=True)
-    if not pack_root.is_relative_to(source_checkout):
-        raise ValidationError("worker profile pack_root must be inside source_checkout")
+    source_checkout: Path | None
+    if launch_mode == "editable":
+        source_checkout = _path(raw.get("source_checkout"), "source_checkout", directory=True)
+        if not pack_root.is_relative_to(source_checkout):
+            raise ValidationError("worker profile pack_root must be inside source_checkout")
+    else:
+        if raw.get("source_checkout") not in {None, ""}:
+            raise ValidationError("installed worker profile must not select a source_checkout")
+        source_checkout = None
+        installed_pack_root = _installed_astrid_pack_root(host_executable)
+        if pack_root != installed_pack_root:
+            raise ValidationError(
+                "worker profile pack_root does not match the installed Astrid package"
+            )
     boot_manifest_path = _path(raw.get("boot_manifest_path"), "boot_manifest_path", directory=False)
     capability = raw.get("capability_matrix")
     capability_path = _path(capability, "capability_matrix", directory=False) if capability else None
     support = Path(support_root).resolve()
     config = {
         "host_python": str(host_executable),
-        "source_checkout": str(source_checkout),
+        "launch_mode": launch_mode,
+        "source_checkout": str(source_checkout) if source_checkout is not None else None,
         "pack_root": str(pack_root),
         "runtime_endpoint": "http://127.0.0.1:0",
         "credential_file": str(support / "credentials" / "astrid-pack-host.token"),

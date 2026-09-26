@@ -61,6 +61,33 @@ def test_real_subprocess_fresh_launch_reconnect_and_scoped_generated_client(tmp_
         boundary.stop()
 
 
+def test_installed_mode_launches_without_product_source_checkout(tmp_path):
+    paths = RuntimePaths.sandbox(tmp_path)
+    boundary = LocalRuntimeBoundary()
+    config = BootstrapConfig()
+    try:
+        configure_workspace(
+            paths,
+            boundary,
+            config,
+            mode="create",
+            realm_root=paths.realms_dir / "installed-realm",
+            realm_id="installed-realm",
+        )
+        result = bootstrap(paths, boundary, config)
+        persisted = json.loads(
+            (paths.source_profiles_dir / "astrid.json").read_text(encoding="utf-8")
+        )
+        assert result.status == "started"
+        assert result.source_checkout == ""
+        assert persisted["mode"] == "installed"
+        assert persisted["source_checkout"] == ""
+        assert Path(persisted["runtime_module_origin"]).is_file()
+        assert persisted["runtime_artifact_sha256"].startswith("sha256:")
+    finally:
+        boundary.stop()
+
+
 def test_concurrent_reconnect_survives_restricted_pid_identity_probe(tmp_path, monkeypatch):
     paths = RuntimePaths.sandbox(tmp_path)
     boundary = LocalRuntimeBoundary()

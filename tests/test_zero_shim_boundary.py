@@ -2,12 +2,13 @@
 
 import inspect
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from banodoco_local import cli
-from banodoco_local.bootstrap import SourceProfile
+from banodoco_local.bootstrap import BootstrapError, SourceProfile
 from banodoco_local.runtime_boundary import LocalRuntimeBoundary
 from runtime_protocol.backup import verify_backup
 
@@ -107,6 +108,23 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path):
     assert "cwd" not in captured["kwargs"]
     assert "env" not in captured["kwargs"]
     assert "PYTHONPATH" not in captured["kwargs"]
+
+
+def test_installed_profile_uses_module_artifact_provenance_without_product_checkout(tmp_path):
+    profile = replace(
+        SourceProfile.installed(),
+        source_checkout=str(tmp_path / "product-checkout-that-does-not-exist"),
+    )
+
+    LocalRuntimeBoundary._validate_source(profile)
+    assert profile.mode == "installed"
+    assert Path(profile.runtime_module_origin).is_file()
+    assert profile.runtime_artifact_sha256.startswith("sha256:")
+
+    with pytest.raises(BootstrapError, match="artifact digest changed"):
+        LocalRuntimeBoundary._validate_source(
+            replace(profile, runtime_artifact_sha256="sha256:" + "0" * 64)
+        )
 
 
 def test_wait_endpoint_does_not_adopt_incumbent_discovery(monkeypatch, tmp_path):

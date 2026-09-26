@@ -457,6 +457,7 @@ class BootstrapTests(unittest.TestCase):
     def test_doctor_is_side_effect_free(self):
         report = doctor(self.paths, self.boundary)
         self.assertFalse(report["healthy"])
+        self.assertEqual(report["state"], "stopped")
         self.assertFalse(self.paths.runtime_support.exists())
 
     def test_source_manifest_is_validated_and_recorded(self):

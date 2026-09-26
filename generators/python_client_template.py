@@ -87,6 +87,7 @@ class ApiError(RuntimeError):
 class Handshake:
     protocol: str
     schema_digest: str
+    component_manifest_sha256: str
     session_id: str
     actor_id: str
     realm_id: str
@@ -589,7 +590,7 @@ class WorkspaceClient:
         payload = {"protocol": PROTOCOL, "client_name": client_name, "client_version": client_version, "requested_scopes": requested_scopes}
         _, _, body = self._request("POST", "/v1/handshake", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
         value = self._json(body)
-        result = Handshake(protocol=value["protocol"], schema_digest=value["schema_digest"], session_id=value["session_id"], actor_id=value["actor_id"], realm_id=value["realm_id"], scopes=tuple(value["scopes"]), capabilities=tuple(value.get("capabilities") or ()))
+        result = Handshake(protocol=value["protocol"], schema_digest=value["schema_digest"], component_manifest_sha256=value["component_manifest_sha256"], session_id=value["session_id"], actor_id=value["actor_id"], realm_id=value["realm_id"], scopes=tuple(value["scopes"]), capabilities=tuple(value.get("capabilities") or ()))
         self.handshake_info = result
         return result
 

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -108,8 +110,13 @@ class RuntimeBoundary(Protocol):
 @dataclass(frozen=True)
 class SourceProfile:
     profile: str
-    runtime_checkout: str
-    source_checkout: str
+    runtime_checkout: str = ""
+    source_checkout: str = ""
+    mode: str = "editable"
+    runtime_module: str = "runtime_protocol"
+    runtime_module_origin: str = ""
+    runtime_artifact_sha256: str = ""
+    runtime_distribution_version: str = ""
     runtime_environment: str | None = None
     worker_profile: str | None = None
     runtime_command: tuple[str, ...] = ()
@@ -127,7 +134,9 @@ class SourceProfile:
             "profile", "runtime_checkout", "source_checkout", "runtime_environment",
             "worker_profile",
             "runtime_command", "protocol_version", "schema_version", "capability_digest",
-            "source_digest", "lock_digest",
+            "source_digest", "lock_digest", "mode", "runtime_module",
+            "runtime_module_origin", "runtime_artifact_sha256",
+            "runtime_distribution_version",
         }
         unknown = sorted(set(value) - allowed)
         if unknown:
@@ -138,20 +147,23 @@ class SourceProfile:
         profile = str(value.get("profile", ""))
         if profile != expected_profile:
             raise BootstrapError(f"Source profile must be {expected_profile!r}, got {profile!r}.")
-        if "runtime_checkout" not in value:
-            raise BootstrapError(
-                "Source profile is incomplete; configure the pinned runtime_checkout "
-                "in the editable source manifest."
-            )
+        mode = str(value.get("mode") or "editable")
+        if mode not in {"installed", "editable"}:
+            raise BootstrapError("Source profile mode must be 'installed' or 'editable'.")
         runtime_checkout = str(value.get("runtime_checkout", ""))
-        if not runtime_checkout or not Path(runtime_checkout).expanduser().is_absolute():
-            raise BootstrapError("Source profile runtime_checkout must be an explicit absolute pinned checkout path.")
         source_checkout = str(value.get("source_checkout", ""))
-        if not source_checkout:
-            raise BootstrapError(
-                "Source profile is incomplete; configure source_checkout "
-                "in the editable source manifest."
-            )
+        if mode == "editable":
+            if not runtime_checkout or not Path(runtime_checkout).expanduser().is_absolute():
+                raise BootstrapError("Source profile runtime_checkout must be an explicit absolute pinned checkout path.")
+            if not source_checkout:
+                raise BootstrapError(
+                    "Source profile is incomplete; configure source_checkout "
+                    "in the editable source manifest."
+                )
+        else:
+            for label, raw in (("runtime_checkout", runtime_checkout), ("source_checkout", source_checkout)):
+                if raw and not Path(raw).expanduser().is_absolute():
+                    raise BootstrapError(f"Installed source profile {label} provenance must be absolute when present.")
         command = value.get("runtime_command", ())
         if isinstance(command, str):
             command = (command,)
@@ -165,6 +177,11 @@ class SourceProfile:
             profile=profile,
             runtime_checkout=runtime_checkout,
             source_checkout=source_checkout,
+            mode=mode,
+            runtime_module=str(value.get("runtime_module") or "runtime_protocol"),
+            runtime_module_origin=str(value.get("runtime_module_origin") or ""),
+            runtime_artifact_sha256=str(value.get("runtime_artifact_sha256") or ""),
+            runtime_distribution_version=str(value.get("runtime_distribution_version") or ""),
             runtime_environment=(str(value["runtime_environment"]) if value.get("runtime_environment") else None),
             worker_profile=(str(value["worker_profile"]) if value.get("worker_profile") else None),
             runtime_command=tuple(str(part) for part in command),
@@ -188,11 +205,37 @@ class SourceProfile:
             raise BootstrapError(f"Source profile manifest is missing or invalid: {target}")
         return cls.from_mapping(raw, expected_profile=expected_profile)
 
+    @classmethod
+    def installed(cls, *, profile: str = "astrid") -> "SourceProfile":
+        """Describe the imported Runtime artifact without consulting a checkout."""
+        spec = importlib.util.find_spec("runtime_protocol")
+        if spec is None or not spec.origin:
+            raise BootstrapError("Installed runtime_protocol module is unavailable.")
+        origin = Path(spec.origin).resolve(strict=True)
+        if not origin.is_file():
+            raise BootstrapError("Installed runtime_protocol module origin is not a file.")
+        try:
+            version = importlib.metadata.version("banodoco-workspace-runtime")
+        except importlib.metadata.PackageNotFoundError:
+            version = "unpackaged"
+        return cls(
+            profile=profile,
+            mode="installed",
+            runtime_module_origin=str(origin),
+            runtime_artifact_sha256="sha256:" + hashlib.sha256(origin.read_bytes()).hexdigest(),
+            runtime_distribution_version=version,
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "profile": self.profile,
+            "mode": self.mode,
             "runtime_checkout": self.runtime_checkout,
             "source_checkout": self.source_checkout,
+            "runtime_module": self.runtime_module,
+            "runtime_module_origin": self.runtime_module_origin,
+            "runtime_artifact_sha256": self.runtime_artifact_sha256,
+            "runtime_distribution_version": self.runtime_distribution_version,
             "runtime_environment": self.runtime_environment,
             "worker_profile": self.worker_profile,
             "runtime_command": list(self.runtime_command),
@@ -224,6 +267,8 @@ class BootstrapConfig:
         if self.source_profile is not None:
             return self.source_profile
         manifest = self.source_manifest or (paths.source_profiles_dir / f"{self.profile}.json")
+        if self.source_manifest is None and not manifest.exists():
+            return SourceProfile.installed(profile=self.profile)
         return SourceProfile.load(manifest, expected_profile=self.profile)
 
 
@@ -306,6 +351,20 @@ def _validate_source_profile(source: SourceProfile, *, expected_profile: str = "
     """Reject source metadata that attempts to become runtime authority."""
     if not isinstance(source, SourceProfile) or source.profile != expected_profile:
         raise BootstrapError(f"Source profile must be {expected_profile!r}.")
+    if source.mode == "installed":
+        if source.runtime_module != "runtime_protocol":
+            raise BootstrapError("Installed source profile runtime module must be runtime_protocol.")
+        origin = Path(str(source.runtime_module_origin or "")).expanduser()
+        if not origin.is_absolute() or _has_symlink_component(origin):
+            raise BootstrapError("Installed source profile module origin must be absolute and symlink-free.")
+        digest = str(source.runtime_artifact_sha256 or "")
+        if len(digest) != 71 or not digest.startswith("sha256:") or any(ch not in "0123456789abcdef" for ch in digest[7:]):
+            raise BootstrapError("Installed source profile artifact digest must be a SHA-256 identity.")
+        if source.runtime_command:
+            raise BootstrapError("Source profile runtime_command is not permitted; runtime launch is fixed by the installed runtime.")
+        return
+    if source.mode != "editable":
+        raise BootstrapError("Source profile mode is unsupported.")
     checkout = str(source.runtime_checkout or "")
     checkout_path = Path(checkout).expanduser()
     source_path = Path(str(source.source_checkout or "")).expanduser()
@@ -1163,4 +1222,17 @@ def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict
             elif not boundary.health(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", ""))):
                 report["healthy"] = False
                 report["issues"].append("runtime_unhealthy")
+    issues = set(report["issues"])
+    if report["healthy"]:
+        report["state"] = "healthy"
+    elif "stale_discovery" in issues:
+        report["state"] = "stale"
+    elif "discovery_identity" in issues:
+        report["state"] = "mismatched"
+    elif "runtime_unhealthy" in issues:
+        report["state"] = "failed"
+    elif {"catalog_missing", "realm_root_missing"} & issues or not report["discovery_present"]:
+        report["state"] = "stopped"
+    else:
+        report["state"] = "failed"
     return report

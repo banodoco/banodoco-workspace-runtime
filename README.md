@@ -17,15 +17,29 @@ The runtime owns durable structured state, task/lease semantics, capability regi
 
 ## Run it
 
-The local launcher accepts an absolute `--data-root` support directory on
-lifecycle commands, or `BANODOCO_LOCAL_DATA_ROOT`. This directory directly
-contains the installation's `runtime/` and `credentials/` trees.
-`banodoco-local relocate --data-root /old/support --destination /new/support --plan`
+The canonical product launcher is `astrid-local`. It accepts an absolute
+`--data-root` support directory on lifecycle commands, or
+`ASTRID_LOCAL_DATA_ROOT`. This directory directly contains the installation's
+`runtime/` and `credentials/` trees.
+`astrid-local relocate --data-root /old/support --destination /new/support --plan`
 previews a same-filesystem move of that complete support tree. Execution uses
 `--confirm "RELOCATE <realm-id>"`, verifies the owner before stopping it,
 cold-starts at the new location, and restores the old tree if cutover fails.
 The optional backup path is recorded in the plan; relocation does not perform
 a backup/restore or migrate a legacy realm.
+
+`banodoco-local` and `astrid-runtime` remain compatibility aliases during the
+launcher migration and print a deprecation warning. A legacy-only
+`BANODOCO_LOCAL_DATA_ROOT` is accepted with a warning; if it conflicts with
+`ASTRID_LOCAL_DATA_ROOT`, resolution fails closed. Prefer the canonical
+`ASTRID_LOCAL_*` names in new configuration.
+
+The installed Astrid profile records module origin, artifact digest, distribution
+version, support root, and realm identity as bounded provenance. It does not
+require an Astrid or Runtime checkout or a `PYTHONPATH` injection. An editable
+source profile is a development-only compatibility path and must be explicit.
+The closeout uses Python 3.11.16 for Astrid/Runtime; the Worker qualification
+environment is Python 3.10.21 and is supervised by Runtime.
 
 Local consumers can resolve a project object through
 `get_project_object_location(project_id, object_id)` in Python or
@@ -35,10 +49,27 @@ CAS path. Paths are valid for the local runtime host at lookup time; task and
 managed-output receipts remain portable and do not embed them.
 
 ```bash
-python3 -m runtime_protocol doctor --root .runtime --json
-python3 -m runtime_protocol create --root .runtime
-python3 -m runtime_protocol start --root .runtime
+astrid-local --provenance
+astrid-local up --profile astrid --data-root "$PWD/.astrid-data" --json
+astrid-local status --data-root "$PWD/.astrid-data" --json
+astrid-local doctor --data-root "$PWD/.astrid-data" --json
 ```
+
+The `runtime_protocol` module commands remain low-level protocol/developer
+operations. They do not replace the product launcher or its ownership checks.
+
+For a selected Astrid workspace, Runtime can start the owner-verified local
+Worker host:
+
+```bash
+astrid-local start-worker --profile astrid \
+  --data-root "$PWD/.astrid-data" \
+  --expected-workspace-uuid <workspace-uuid> --json
+```
+
+The Astrid gateway exposes the same operation as `python -m astrid worker start
+--json`. Both paths use the selected Runtime workspace and report a typed
+diagnostic; they do not launch the production GPU/RunPod worker.
 
 Backups are verified before publication into a new inactive sibling. Replacement
 requires support custody outside the movable realm root; the default in-root

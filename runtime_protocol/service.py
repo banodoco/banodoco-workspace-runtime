@@ -30,7 +30,7 @@ from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from .errors import AuthorizationError, ConflictError, NotFoundError, ValidationError, LeaseError, InvalidRequestError, RealmAdmissionError
-from .contract_metadata import PROTOCOL, SCHEMA_DIGEST
+from .contract_metadata import COMPONENT_MANIFEST_SHA256, PROTOCOL, SCHEMA_DIGEST
 from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain_at, open_directory_chain as _open_directory_chain, pin_directory as _pin_directory, write_bytes_at as _write_bytes_at
 from .shot_dependencies import analyze_invalidation
 from .timeline_inspection import inspect as inspect_timeline_closure
@@ -581,7 +581,16 @@ class RuntimeService:
         excess = sorted(set(requested) - negotiated)
         if excess:
             raise AuthorizationError("credential cannot negotiate requested scopes", details={"scopes": excess})
-        return {"protocol": PROTOCOL, "schema_digest": SCHEMA_DIGEST, "session_id": new_id(), "actor_id": actor, "realm_id": self.realm["id"], "scopes": requested, "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY]}
+        return {
+            "protocol": PROTOCOL,
+            "schema_digest": SCHEMA_DIGEST,
+            "component_manifest_sha256": COMPONENT_MANIFEST_SHA256,
+            "session_id": new_id(),
+            "actor_id": actor,
+            "realm_id": self.realm["id"],
+            "scopes": requested,
+            "capabilities": [TARGETED_EXECUTION_BINDING_CAPABILITY],
+        }
 
     @staticmethod
     def _assert_executor_identity(identity, executor_id):

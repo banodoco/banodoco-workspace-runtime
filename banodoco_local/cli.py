@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 
 from . import __version__
+from .compatibility import canonical_value
 from .bootstrap import (
     BootstrapConfig,
     BootstrapError,
@@ -37,7 +38,7 @@ class UnconfiguredBoundary:
     """Prevent accidental authority creation when no generated client is wired."""
 
     def start(self, **kwargs):
-        raise BootstrapError("No runtime client is configured. Set BANODOCO_LOCAL_SOURCE_MANIFEST and provide the runtime client.")
+        raise BootstrapError("No runtime client is configured. Set ASTRID_LOCAL_SOURCE_MANIFEST and provide the runtime client.")
 
     def connect(self, **kwargs):
         raise BootstrapError("No runtime client is configured.")
@@ -188,14 +189,14 @@ def _emit(value: Any, *, json_mode: bool) -> None:
 
 
 def _paths(args: argparse.Namespace) -> RuntimePaths:
-    home = args.home if getattr(args, "home", None) else os.environ.get("BANODOCO_LOCAL_HOME")
+    home = args.home if getattr(args, "home", None) else canonical_value("ASTRID_LOCAL_HOME")
     return RuntimePaths.current_mac(home, data_root=getattr(args, "data_root", None))
 
 
 def _config(args: argparse.Namespace, paths: RuntimePaths) -> BootstrapConfig:
     manifest = getattr(args, "source_manifest", None)
     if manifest is None:
-        configured = os.environ.get("BANODOCO_LOCAL_SOURCE_MANIFEST")
+        configured = canonical_value("ASTRID_LOCAL_SOURCE_MANIFEST")
         manifest = Path(configured) if configured else None
     return BootstrapConfig(profile=getattr(args, "profile", "astrid"), display_name=getattr(args, "display_name", "Astrid Workspace"), source_manifest=manifest)
 
@@ -354,6 +355,9 @@ def main(argv: list[str] | None = None) -> int:
                     result["health"] = _typed_health(paths)
                 except Exception as exc:
                     result["health_error"] = str(exc)
+            result["state"] = str(result["support"].get("state") or "failed")
+            if result.get("health_error"):
+                result["state"] = "failed"
             _emit(result, json_mode=args.json)
             return 0 if result["support"].get("healthy") and not result.get("stale_discovery") else 1
         if args.command == "start-worker":
@@ -402,8 +406,8 @@ def main(argv: list[str] | None = None) -> int:
             _emit(value, json_mode=args.json)
             return 0
         if args.command == "reboot":
-            if args.reboot_command == "reboot" and os.environ.get("BANODOCO_LOCAL_ENABLE_REAL_REBOOT") != "1":
-                raise BootstrapError("real reboot is safe-disabled; set BANODOCO_LOCAL_ENABLE_REAL_REBOOT=1 in an explicitly configured test/host environment")
+            if args.reboot_command == "reboot" and canonical_value("ASTRID_LOCAL_ENABLE_REAL_REBOOT") != "1":
+                raise BootstrapError("real reboot is safe-disabled; set ASTRID_LOCAL_ENABLE_REAL_REBOOT=1 in an explicitly configured test/host environment")
             value = _client(paths).request_reboot(checkpoint_id=args.checkpoint_id, nonce=args.nonce, authorization=args.authorization, runtime_epoch=args.runtime_epoch, command=args.reboot_command)
             _emit(value, json_mode=args.json)
             return 0

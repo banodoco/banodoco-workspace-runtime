@@ -11,8 +11,9 @@ dependencies = []
 
 [project.scripts]
 banodoco-runtime = "runtime_protocol.cli:main"
-banodoco-local = "banodoco_local.cli:main"
-astrid-runtime = "banodoco_local.cli:main"
+astrid-local = "banodoco_local.entrypoint:main"
+banodoco-local = "banodoco_local.entrypoint:main"
+astrid-runtime = "banodoco_local.entrypoint:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -7,6 +7,8 @@ real loopback daemon process and a generated-client-shaped connection.
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,20 +24,21 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .bootstrap import BootstrapError, SourceProfile
+from .compatibility import canonical_value
 
 
 PROTOCOL_VERSION = "workspace.v1"
 WIRE_PROTOCOL = PROTOCOL_VERSION
 SCHEMA_VERSION = "workspace-schema-v1"
 WAIT_SECONDS = 10.0
-ADMISSION_TIMEOUT_ENV = "BANODOCO_RUNTIME_ADMISSION_TIMEOUT_SECONDS"
+ADMISSION_TIMEOUT_ENV = "ASTRID_RUNTIME_ADMISSION_TIMEOUT_SECONDS"
 DEFAULT_ADMISSION_TIMEOUT_SECONDS = 120.0
 STARTUP_WAIT_MARGIN_SECONDS = 5.0
 
 
 def _admission_timeout_from_environment() -> float:
     """Read the bounded startup integrity budget from the install environment."""
-    raw = os.environ.get(ADMISSION_TIMEOUT_ENV)
+    raw = canonical_value(ADMISSION_TIMEOUT_ENV)
     if raw in (None, ""):
         return DEFAULT_ADMISSION_TIMEOUT_SECONDS
     try:
@@ -152,6 +155,30 @@ class LocalRuntimeBoundary:
         checkout path is provenance for the editable source profile, never an
         import or launch fallback for the neutral runtime.
         """
+        if source.mode == "installed":
+            if source.runtime_module != "runtime_protocol":
+                raise BootstrapError("Installed source profile runtime module must be runtime_protocol.")
+            spec = importlib.util.find_spec(source.runtime_module)
+            if spec is None or not spec.origin:
+                raise BootstrapError("Installed Runtime module is unavailable.")
+            actual = Path(spec.origin).resolve(strict=True)
+            expected = Path(source.runtime_module_origin).expanduser()
+            LocalRuntimeBoundary._validate_path(expected, "installed Runtime module origin")
+            if expected.is_symlink() or not expected.is_file() or expected.resolve(strict=True) != actual:
+                raise BootstrapError("Installed Runtime module origin changed.")
+            digest = "sha256:" + hashlib.sha256(actual.read_bytes()).hexdigest()
+            if digest != source.runtime_artifact_sha256:
+                raise BootstrapError("Installed Runtime artifact digest changed.")
+            if source.runtime_environment:
+                raise BootstrapError("Installed source profile cannot redirect to another runtime environment.")
+            if source.worker_profile:
+                worker_profile = Path(source.worker_profile).expanduser()
+                LocalRuntimeBoundary._validate_path(worker_profile, "worker profile")
+                if worker_profile.is_symlink() or not worker_profile.is_file():
+                    raise BootstrapError(f"Configured worker profile is unavailable: {worker_profile}")
+            return
+        if source.mode != "editable":
+            raise BootstrapError("Source profile mode is unsupported.")
         runtime_checkout = Path(source.runtime_checkout).expanduser()
         if not runtime_checkout.is_absolute():
             raise BootstrapError("Source profile must provide an absolute pinned runtime_checkout.")

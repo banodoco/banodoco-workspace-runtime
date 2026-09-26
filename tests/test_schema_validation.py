@@ -28,6 +28,20 @@ def test_core_fixtures_validate_against_closed_schemas() -> None:
     validate("worker.json", "settlement.json", definition="Settlement")
 
 
+def test_handshake_requires_component_manifest_digest_without_self_reference() -> None:
+    schema = json.loads((ROOT / "contract/schemas/handshake-response.json").read_text())
+    fixture = json.loads((ROOT / "conformance/fixtures/handshake.json").read_text())
+    component_bytes = (ROOT / "contract/component-manifest.json").read_bytes()
+    component = json.loads(component_bytes)
+    embedded = next(item["value"] for item in component["fixtures"] if item["name"] == "handshake.json")
+
+    assert fixture == embedded
+    assert not list(Draft202012Validator(schema).iter_errors(fixture))
+    assert fixture["component_manifest_sha256"] != "sha256:" + hashlib.sha256(component_bytes).hexdigest()
+    missing = {key: value for key, value in fixture.items() if key != "component_manifest_sha256"}
+    assert list(Draft202012Validator(schema).iter_errors(missing))
+
+
 def test_health_schema_has_exact_closed_runtime_identity_contract() -> None:
     schema = json.loads((ROOT / "contract/schemas/health.json").read_text())
     fields = ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id"]
@@ -52,6 +66,13 @@ def test_closed_schemas_reject_unknown_fields() -> None:
     schema = json.loads((ROOT / "contract/schemas/project.json").read_text())
     instance = json.loads((ROOT / "conformance/fixtures/project.json").read_text())
     instance["product_private_field"] = True
+    assert list(Draft202012Validator(schema).iter_errors(instance))
+
+
+def test_task_schema_rejects_unknown_state() -> None:
+    schema = json.loads((ROOT / "contract/schemas/task.json").read_text())
+    instance = json.loads((ROOT / "conformance/fixtures/task.json").read_text())
+    instance["state"] = "legacy_unknown"
     assert list(Draft202012Validator(schema).iter_errors(instance))
 
 

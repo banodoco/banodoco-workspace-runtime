@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 
+from .compatibility import canonical_value
 
-DATA_ROOT_ENV = "BANODOCO_LOCAL_DATA_ROOT"
+
+DATA_ROOT_ENV = "ASTRID_LOCAL_DATA_ROOT"
 
 
 @dataclass(frozen=True)
@@ -44,7 +46,7 @@ class RuntimePaths:
         ``Library/Application Support`` tree below the checkout.
         """
         home_path = Path(home or os.environ.get("HOME", "~")).expanduser()
-        configured_root = data_root if data_root is not None else os.environ.get(DATA_ROOT_ENV)
+        configured_root = data_root if data_root is not None else canonical_value(DATA_ROOT_ENV)
         if configured_root:
             app_support = Path(configured_root).expanduser()
             if not app_support.is_absolute():

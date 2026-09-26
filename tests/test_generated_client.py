@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from banodoco_workspace_client import ApiError, Capability, ClaimWaiting, WorkspaceClient
 from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.contract_metadata import COMPONENT_MANIFEST_SHA256, SCHEMA_DIGEST
 from runtime_protocol.store import RealmStore
 
 
@@ -23,7 +24,7 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
         if path == "/v1/health":
             return 200, {}, json.dumps({"status": "ok", "protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "runtime_epoch": 1, "runtime_session_id": "runtime-session-1", "runtime_instance_id": "runtime-instance-1"}).encode()
         if path == "/v1/handshake":
-            return 200, {}, json.dumps({"protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "session_id": "session-1", "actor_id": "actor-1", "realm_id": "realm-1", "scopes": ["realm:read", "project:write"]}).encode()
+            return 200, {}, json.dumps({"protocol": "workspace.v1", "schema_digest": "sha256:" + "a" * 64, "component_manifest_sha256": "sha256:" + "b" * 64, "session_id": "session-1", "actor_id": "actor-1", "realm_id": "realm-1", "scopes": ["realm:read", "project:write"]}).encode()
         if path == "/v1/projects" and method == "POST":
             return 201, {}, json.dumps({"data": {"project_id": "project-1", "realm_id": "realm-1", "name": "Neutral", "version": 1, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}, "receipt": {"receipt_id": "runtime-command-1", "command_kind": "project.create", "idempotency_key": "create-1", "request_hash": "sha256:" + "a" * 64, "project_id": "project-1", "project_seq": [1, 1], "event_ids": [], "result": {}, "created_at": "2026-01-01T00:00:00Z"}}).encode()
         raise AssertionError((method, path))
@@ -35,6 +36,7 @@ def test_generated_client_smoke_and_scoped_handshake() -> None:
     assert health.runtime_instance_id == "runtime-instance-1"
     session = client.handshake("second-product", "0.1.0", ["realm:read", "project:write"])
     assert session.realm_id == "realm-1"
+    assert session.component_manifest_sha256 == "sha256:" + "b" * 64
     project = client.create_project("Neutral", idempotency_key="create-1")
     assert project.project_id == "project-1"
     assert project.receipt["command_kind"] == "project.create"
@@ -72,6 +74,20 @@ def test_connected_register_executor_response_uses_generated_capability_parser(t
             idempotency_key="admit-after-register",
         )
         assert task["capability_id"] == capability.capability_id
+    finally:
+        daemon.stop()
+
+
+def test_connected_handshake_declares_generated_contract_identity(tmp_path: Path) -> None:
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support").start()
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        session = client.handshake("contract-identity-test", "1", ["handshake"])
+        assert session.schema_digest == SCHEMA_DIGEST
+        assert session.component_manifest_sha256 == COMPONENT_MANIFEST_SHA256
+        assert session.realm_id == daemon.service.realm["id"]
     finally:
         daemon.stop()
 
