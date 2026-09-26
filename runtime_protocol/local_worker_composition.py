@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import ipaddress
 from pathlib import Path
 import platform
+import re
 import select
 import signal
 import socket
@@ -40,6 +41,7 @@ from .local_worker import (
 
 CONTROL_VERSION = "reigh.local-worker-control/v1"
 CONTROL_FRAME_LIMIT = 64 * 1024
+_SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 PROFILE_FIELDS = (
     "profile_id", "workspace_uuid", "realm_root", "support_root", "machine_id",
     "worker_executable", "host_executable", "engine_executable",
@@ -503,7 +505,14 @@ class OSProcessInspector:
         if not all(isinstance(item, Mapping) for item in (worker_data, host_data, engine_data, listener_data)):
             raise ConflictError("Worker process report is incomplete")
         worker = self._identity(int(worker_data["pid"]), str(worker_data["birth_id"]), self.profile.worker_executable, self.profile.worker_artifact_digest, parent_pid=os.getpid(), session_owner=True)
-        host = self._identity(int(host_data["pid"]), str(host_data["birth_id"]), self.profile.host_executable, self.profile.host_artifact_digest, parent_pid=worker.pid, session_owner=True)
+        host = self._identity(
+            int(host_data["pid"]),
+            str(host_data["birth_id"]),
+            self.profile.host_os_executable or self.profile.host_executable,
+            self.profile.host_os_artifact_digest or self.profile.host_artifact_digest,
+            parent_pid=worker.pid,
+            session_owner=True,
+        )
         engine = self._identity(int(engine_data["pid"]), str(engine_data["birth_id"]), self.profile.engine_executable, self.profile.engine_artifact_digest, parent_pid=worker.pid, session_owner=True)
         listener = self._identity(int(listener_data["pid"]), str(listener_data["birth_id"]), self.profile.engine_listener_executable, self.profile.engine_listener_artifact_digest, parent_pid=engine.pid, session_owner=False)
         reported_socket_owner = int(binding.get("socket_owner_pid", -1))
@@ -579,6 +588,25 @@ def _executable_path(value: Any, label: str) -> Path:
     return target
 
 
+def _canonical_executable_path(value: Any, label: str) -> Path:
+    """Validate an OS identity pin that must already be canonical."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"worker profile {label} is required")
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        raise ValidationError(f"worker profile {label} must be absolute")
+    try:
+        target = candidate.resolve(strict=True)
+        if candidate.is_symlink() or target != candidate:
+            raise ValidationError(f"worker profile {label} must be canonical and not symlinked")
+    except OSError as exc:
+        raise ValidationError(f"worker profile {label} must be an existing executable file") from exc
+    if not target.is_file() or not os.access(target, os.X_OK):
+        raise ValidationError(f"worker profile {label} must be an existing executable file")
+    return target
+
+
 def _installed_astrid_pack_root(host_executable: Path) -> Path:
     """Resolve Astrid's packaged pack root without cwd or PYTHONPATH input."""
     script = (
@@ -619,6 +647,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         "engine_artifact_digest", "engine_listener_artifact_digest", "session_config_digest", "profile_revision",
         "profile_digest", "release_digest", "launch_mode", "source_checkout", "pack_root", "boot_manifest_path",
         "boot_manifest_hash", "capability_matrix", "environment", "worker_timeout_seconds",
+        "host_os_executable", "host_os_artifact_digest",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -626,8 +655,45 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
     worker_executable = _path(raw.get("worker_executable"), "worker_executable", directory=False)
     host_launch_executable = _executable_path(raw.get("host_executable"), "host_executable")
     host_executable = host_launch_executable.resolve()
+    host_artifact_digest = str(raw.get("host_artifact_digest") or "")
+    if _file_digest(host_executable) != host_artifact_digest:
+        raise ValidationError("worker profile host_artifact_digest does not match host_executable")
     engine_executable = _path(raw.get("engine_executable"), "engine_executable", directory=False)
     listener_executable = _path(raw.get("engine_listener_executable"), "engine_listener_executable", directory=False)
+    host_os_path_present = "host_os_executable" in raw
+    host_os_digest_present = "host_os_artifact_digest" in raw
+    host_os_executable_raw = raw.get("host_os_executable")
+    host_os_digest_raw = raw.get("host_os_artifact_digest")
+    if host_os_path_present != host_os_digest_present:
+        raise ValidationError(
+            "worker profile host_os_executable and host_os_artifact_digest must be provided together"
+        )
+    if host_os_path_present and (
+        not isinstance(host_os_executable_raw, str)
+        or not host_os_executable_raw.strip()
+        or not isinstance(host_os_digest_raw, str)
+        or not host_os_digest_raw.strip()
+    ):
+        raise ValidationError(
+            "worker profile host_os_executable and host_os_artifact_digest cannot be empty"
+        )
+    if host_os_digest_present and not _SHA256_DIGEST.fullmatch(str(host_os_digest_raw)):
+        raise ValidationError(
+            "worker profile host_os_artifact_digest must be a sha256 digest"
+        )
+    host_os_executable = (
+        _canonical_executable_path(host_os_executable_raw, "host_os_executable")
+        if host_os_path_present
+        else None
+    )
+    host_os_artifact_digest = str(host_os_digest_raw) if host_os_digest_present else None
+    if (
+        host_os_executable is not None
+        and _file_digest(host_os_executable) != host_os_artifact_digest
+    ):
+        raise ValidationError(
+            "worker profile host_os_artifact_digest does not match host_os_executable"
+        )
     worker_environment = _path(raw.get("worker_environment"), "worker_environment", directory=True)
     environment = raw.get("environment", {})
     if not isinstance(environment, Mapping) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in environment.items()):
@@ -653,13 +719,15 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         engine_listener_executable=listener_executable,
         engine_endpoint=_engine_endpoint(str(raw.get("engine_endpoint") or "")),
         worker_artifact_digest=str(raw.get("worker_artifact_digest") or ""),
-        host_artifact_digest=str(raw.get("host_artifact_digest") or ""),
+        host_artifact_digest=host_artifact_digest,
         engine_artifact_digest=str(raw.get("engine_artifact_digest") or ""),
         engine_listener_artifact_digest=str(raw.get("engine_listener_artifact_digest") or ""),
         session_config_digest=str(raw.get("session_config_digest") or ""),
         profile_revision=str(raw.get("profile_revision") or ""),
         profile_digest=str(raw.get("profile_digest") or ""),
         release_digest=str(raw.get("release_digest") or ""),
+        host_os_executable=host_os_executable,
+        host_os_artifact_digest=host_os_artifact_digest,
     )
     if profile.engine_endpoint != f"http://127.0.0.1:{engine_port}":
         raise ValidationError("worker profile engine_endpoint does not match the Worker launch port")

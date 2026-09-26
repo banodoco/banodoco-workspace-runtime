@@ -32,6 +32,14 @@ def _content_digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
 def _profile_document(tmp_path: Path) -> tuple[dict[str, object], Path, Path, Path]:
     source = tmp_path / "astrid"
     packs = source / "astrid" / "packs"
@@ -51,7 +59,7 @@ def _profile_document(tmp_path: Path) -> tuple[dict[str, object], Path, Path, Pa
         "engine_executable": str(Path(sys.executable).resolve()),
         "engine_listener_executable": str(Path(sys.executable).resolve()),
         "worker_artifact_digest": _digest("1"),
-        "host_artifact_digest": _digest("2"),
+        "host_artifact_digest": _file_digest(Path(sys.executable).resolve()),
         "engine_artifact_digest": _digest("3"),
         "engine_listener_artifact_digest": _digest("4"),
         "session_config_digest": _digest("5"),
@@ -128,6 +136,7 @@ def test_factory_installed_mode_preserves_virtualenv_host_launch_path(
     virtualenv_python.parent.mkdir(parents=True)
     virtualenv_python.symlink_to(base_python)
     document["host_executable"] = str(virtualenv_python)
+    document["host_artifact_digest"] = _file_digest(base_python)
     document["launch_mode"] = "installed"
     document.pop("source_checkout")
     observed: dict[str, Path] = {}
@@ -157,6 +166,167 @@ def test_factory_installed_mode_preserves_virtualenv_host_launch_path(
     assert Path(composition.preparer.config["host_python"]) == lexical
     assert profile.host_executable == base_python.resolve()
     assert profile.host_executable != lexical
+
+
+def test_factory_preserves_distinct_host_os_identity_without_exposing_it_to_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document, _source, support, packs = _profile_document(tmp_path)
+    kernel_host = tmp_path / "framework" / "Python"
+    kernel_host.parent.mkdir()
+    kernel_host.write_text("kernel-host", encoding="utf-8")
+    kernel_host.chmod(0o755)
+    document["host_os_executable"] = str(kernel_host)
+    document["host_os_artifact_digest"] = _content_digest(b"kernel-host")
+    document["launch_mode"] = "installed"
+    document.pop("source_checkout")
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._installed_astrid_pack_root",
+        lambda _host: packs.resolve(),
+    )
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    composition = load_local_worker_composition(
+        path,
+        workspace_uuid="realm",
+        realm_root=tmp_path / "realm",
+        support_root=support,
+        runtime_instance_id="instance",
+    )
+
+    profile = composition.profiles["astrid"]
+    assert profile.host_os_executable == kernel_host.resolve()
+    assert profile.host_os_artifact_digest == _content_digest(b"kernel-host")
+    assert "host_os_executable" not in CrossProcessWorkerPreparer._profile_payload(profile)
+    assert "host_os_artifact_digest" not in CrossProcessWorkerPreparer._profile_payload(profile)
+
+
+@pytest.mark.parametrize("missing", ["host_os_executable", "host_os_artifact_digest"])
+def test_factory_rejects_incomplete_host_os_identity(tmp_path: Path, missing: str) -> None:
+    document, _source, support, _packs = _profile_document(tmp_path)
+    kernel_host = tmp_path / "kernel-host"
+    kernel_host.write_text("kernel-host", encoding="utf-8")
+    kernel_host.chmod(0o755)
+    document["host_os_executable"] = str(kernel_host)
+    document["host_os_artifact_digest"] = _content_digest(b"kernel-host")
+    document.pop(missing)
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="must be provided together"):
+        load_local_worker_composition(
+            path,
+            workspace_uuid="realm",
+            realm_root=tmp_path / "realm",
+            support_root=support,
+            runtime_instance_id="instance",
+        )
+
+
+@pytest.mark.parametrize("empty", ["", None])
+def test_factory_rejects_present_empty_host_os_identity(tmp_path: Path, empty) -> None:
+    document, _source, support, _packs = _profile_document(tmp_path)
+    document["host_os_executable"] = empty
+    document["host_os_artifact_digest"] = empty
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="cannot be empty"):
+        load_local_worker_composition(
+            path,
+            workspace_uuid="realm",
+            realm_root=tmp_path / "realm",
+            support_root=support,
+            runtime_instance_id="instance",
+        )
+
+
+def test_factory_rejects_noncanonical_host_os_identity(tmp_path: Path) -> None:
+    document, _source, support, _packs = _profile_document(tmp_path)
+    kernel_host = tmp_path / "framework" / "Python"
+    kernel_host.parent.mkdir()
+    kernel_host.write_text("kernel-host", encoding="utf-8")
+    kernel_host.chmod(0o755)
+    document["host_os_executable"] = str(kernel_host.parent / ".." / "framework" / "Python")
+    document["host_os_artifact_digest"] = _content_digest(b"kernel-host")
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="canonical and not symlinked"):
+        load_local_worker_composition(
+            path,
+            workspace_uuid="realm",
+            realm_root=tmp_path / "realm",
+            support_root=support,
+            runtime_instance_id="instance",
+        )
+
+
+def test_factory_rejects_non_sha256_host_os_digest(tmp_path: Path) -> None:
+    document, _source, support, _packs = _profile_document(tmp_path)
+    kernel_host = tmp_path / "kernel-host"
+    kernel_host.write_text("kernel-host", encoding="utf-8")
+    kernel_host.chmod(0o755)
+    document["host_os_executable"] = str(kernel_host)
+    document["host_os_artifact_digest"] = "sha256:not-a-digest"
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="must be a sha256 digest"):
+        load_local_worker_composition(
+            path,
+            workspace_uuid="realm",
+            realm_root=tmp_path / "realm",
+            support_root=support,
+            runtime_instance_id="instance",
+        )
+
+
+@pytest.mark.parametrize("digest_field", ["host_artifact_digest", "host_os_artifact_digest"])
+def test_factory_rejects_host_identity_digest_mismatch(
+    tmp_path: Path, digest_field: str
+) -> None:
+    document, _source, support, _packs = _profile_document(tmp_path)
+    kernel_host = tmp_path / "kernel-host"
+    kernel_host.write_text("kernel-host", encoding="utf-8")
+    kernel_host.chmod(0o755)
+    document["host_os_executable"] = str(kernel_host)
+    document["host_os_artifact_digest"] = _content_digest(b"kernel-host")
+    document[digest_field] = _digest("f")
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match=f"{digest_field} does not match"):
+        load_local_worker_composition(
+            path,
+            workspace_uuid="realm",
+            realm_root=tmp_path / "realm",
+            support_root=support,
+            runtime_instance_id="instance",
+        )
+
+
+def test_factory_rejects_symlinked_host_os_identity(tmp_path: Path) -> None:
+    document, _source, support, _packs = _profile_document(tmp_path)
+    kernel_host = tmp_path / "kernel-host"
+    kernel_host.write_text("kernel-host", encoding="utf-8")
+    kernel_host.chmod(0o755)
+    symlink = tmp_path / "kernel-host-link"
+    symlink.symlink_to(kernel_host)
+    document["host_os_executable"] = str(symlink)
+    document["host_os_artifact_digest"] = _content_digest(b"kernel-host")
+    path = tmp_path / "worker-profile.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(Exception, match="canonical and not symlinked"):
+        load_local_worker_composition(
+            path,
+            workspace_uuid="realm",
+            realm_root=tmp_path / "realm",
+            support_root=support,
+            runtime_instance_id="instance",
+        )
 
 
 def test_factory_installed_mode_rejects_source_checkout(
@@ -342,6 +512,75 @@ def _patch_inspector_os(monkeypatch, inspector):
         "runtime_protocol.local_worker_composition._owner_machine_id",
         lambda: "owner-machine",
     )
+
+
+def test_inspector_uses_distinct_host_os_executable_pin(tmp_path, monkeypatch):
+    profile, handle = _inspector_fixture(tmp_path)
+    profile = LocalWorkerProfile(
+        **{
+            **profile.__dict__,
+            "host_os_executable": Path("/framework/Python"),
+            "host_os_artifact_digest": _digest("9"),
+        }
+    )
+    inspector = OSProcessInspector(profile)
+    observed: dict[int, tuple[Path, str]] = {}
+
+    def identity(pid, birth, executable, digest, **kwargs):
+        observed[pid] = (executable, digest)
+        parents = {100: os.getpid(), 101: 100, 102: 100, 103: 102}
+        groups = {100: 100, 101: 101, 102: 102, 103: 102}
+        return ProcessIdentity(
+            pid, birth, os.getuid(), parents[pid], groups[pid], groups[pid], executable, digest
+        )
+
+    monkeypatch.setattr(inspector, "_identity", identity)
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._listening_socket_owner",
+        lambda pid, endpoint: (pid, endpoint),
+    )
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._owner_machine_id",
+        lambda: "owner-machine",
+    )
+
+    result = inspector.observe(handle)
+
+    assert observed[101] == (Path("/framework/Python"), _digest("9"))
+    assert result.host.executable == Path("/framework/Python")
+
+
+def test_inspector_rejects_live_host_path_that_disagrees_with_os_pin(tmp_path, monkeypatch):
+    profile, _handle = _inspector_fixture(tmp_path)
+    expected = tmp_path / "framework" / "Python"
+    expected.parent.mkdir()
+    expected.write_text("expected", encoding="utf-8")
+    wrong = tmp_path / "other" / "Python"
+    wrong.parent.mkdir()
+    wrong.write_text("wrong", encoding="utf-8")
+    inspector = OSProcessInspector(profile)
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition.process_birth_identity", lambda _pid: "birth"
+    )
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._ps",
+        lambda _pid, field: str(os.getuid()) if field == "uid" else str(os.getpid()),
+    )
+    monkeypatch.setattr("runtime_protocol.local_worker_composition.os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("runtime_protocol.local_worker_composition.os.getsid", lambda pid: pid)
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition._actual_executable", lambda _pid: wrong
+    )
+
+    with pytest.raises(ConflictError, match="executable identity"):
+        inspector._identity(
+            101,
+            "birth",
+            expected,
+            _content_digest(b"expected"),
+            parent_pid=os.getpid(),
+            session_owner=True,
+        )
 
 
 def test_inspector_derives_machine_and_session_from_owner_facts(tmp_path, monkeypatch):

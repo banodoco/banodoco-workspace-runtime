@@ -50,6 +50,13 @@ class LocalWorkerProfile:
     profile_revision: str
     profile_digest: str
     release_digest: str
+    # Framework interpreters can launch through one executable artifact while
+    # the kernel reports a different executable for the live process (notably
+    # macOS Python.framework).  These optional pins preserve both identities:
+    # host_executable remains the launch artifact shared with the Worker ABI,
+    # while the OS pins are used for independent live-process observation.
+    host_os_executable: Path | None = None
+    host_os_artifact_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -273,6 +280,13 @@ class LocalWorkerLauncher:
             "engine_listener_executable",
         ):
             _absolute_pin(Path(getattr(profile, field)), field)
+        if (profile.host_os_executable is None) != (profile.host_os_artifact_digest is None):
+            raise ValidationError(
+                "host_os_executable and host_os_artifact_digest must be provided together"
+            )
+        if profile.host_os_executable is not None:
+            _absolute_pin(Path(profile.host_os_executable), "host_os_executable")
+            _require_digest(str(profile.host_os_artifact_digest), "host_os_artifact_digest")
         if _engine_endpoint(profile.engine_endpoint) != profile.engine_endpoint:
             raise ValidationError("engine_endpoint must be canonical")
         for field in (
@@ -367,7 +381,8 @@ class LocalWorkerLauncher:
         )
         self._validate_process(
             observed.host, label="host", parent_pid=observed.worker.pid,
-            executable=profile.host_executable, artifact_digest=profile.host_artifact_digest,
+            executable=profile.host_os_executable or profile.host_executable,
+            artifact_digest=profile.host_os_artifact_digest or profile.host_artifact_digest,
         )
         self._validate_process(
             observed.engine, label="engine", parent_pid=observed.worker.pid,

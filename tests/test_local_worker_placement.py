@@ -66,7 +66,12 @@ def _process(pid, parent, executable, digest, *, group=None, session=None) -> Pr
 
 def _observation(profile: LocalWorkerProfile, runtime_pid: int, *, base=1000) -> LocalWorkerObservation:
     worker = _process(base, runtime_pid, profile.worker_executable, profile.worker_artifact_digest)
-    host = _process(base + 1, base, profile.host_executable, profile.host_artifact_digest)
+    host = _process(
+        base + 1,
+        base,
+        profile.host_os_executable or profile.host_executable,
+        profile.host_os_artifact_digest or profile.host_artifact_digest,
+    )
     engine = _process(base + 2, base, profile.engine_executable, profile.engine_artifact_digest)
     engine_listener = _process(
         base + 3,
@@ -229,6 +234,41 @@ def test_owner_transaction_issues_only_after_two_observations_then_activates(tmp
     assert observed.engine_listener.session_id == observed.engine.pid
     token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
     assert store.load(token)["execution_binding"]["executor_incarnation"] == result["executor_incarnation"]
+
+
+def test_owner_transaction_requires_distinct_host_os_pin_when_present(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = replace(
+        _profile(tmp_path, workspace_uuid),
+        host_os_executable=tmp_path / "framework" / "Python",
+        host_os_artifact_digest=_digest("9"),
+    )
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    inspector = FakeInspector(store, observed)
+
+    result = _launcher(store, profile, preparer, inspector, 77).start("astrid", workspace_uuid)
+
+    assert result["state"] == "active"
+    assert store.actor_metadata(WORKER_ACTOR)["local_launch_receipt"]["host"]["executable"] == str(
+        profile.host_os_executable
+    )
+
+    launch_identity = replace(
+        observed.host,
+        executable=profile.host_executable,
+        artifact_digest=profile.host_artifact_digest,
+    )
+    stale_observation = replace(observed, host=launch_identity)
+    with pytest.raises(ConflictError, match="host executable pin"):
+        _launcher(
+            CredentialStore(tmp_path / "credentials-stale"),
+            profile,
+            FakePreparer(CredentialStore(tmp_path / "prep-stale"), stale_observation),
+            FakeInspector(CredentialStore(tmp_path / "inspect-stale"), stale_observation),
+            77,
+        ).start("astrid", workspace_uuid)
 
 
 @pytest.mark.parametrize(
