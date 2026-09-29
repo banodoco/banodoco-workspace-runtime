@@ -44,6 +44,24 @@ def _legacy_document(connection, project_id: str, timeline_id: str) -> dict[str,
     except (TypeError, json.JSONDecodeError):
         result.update({"legacy_shape": True, "invalid": True})
         return result
+    # A completed cutover leaves a small, non-authoritative tombstone in the
+    # historical document row.  The immutable parent-composition head is the
+    # only serving authority; the tombstone exists solely to make the
+    # one-time migration/recovery state explicit without retaining a second
+    # editable timeline shape.
+    if (
+        isinstance(content, dict)
+        and content.get("canonical_cutover")
+        and isinstance(content.get("canonical_cutover"), dict)
+        and isinstance(content["canonical_cutover"].get("head_revision_id"), str)
+    ):
+        result.update({
+            "legacy_shape": False,
+            "invalid": False,
+            "cutover": "canonical_head_tombstone",
+            "canonical_head_revision_id": content["canonical_cutover"]["head_revision_id"],
+        })
+        return result
     config = content.get("config") if isinstance(content, dict) else None
     clips = config.get("clips", []) if isinstance(config, dict) else []
     groups = config.get("pinnedShotGroups", []) if isinstance(config, dict) else []

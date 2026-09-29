@@ -79,6 +79,25 @@ def test_active_head_audit_reports_canonical_closure_and_legacy_shell(tmp_path):
         service.close()
 
 
+def test_active_head_audit_accepts_canonical_cutover_tombstone(tmp_path):
+    service, project_id, _ = _service(tmp_path)
+    try:
+        service.store.conn.execute(
+            "UPDATE project_documents SET content_json=?, version=? WHERE id=? AND project_id=?",
+            ('{"canonical_cutover":{"head_revision_id":"parent-1","replacement":"inspectTimeline"}}',
+             2, "timeline:main", project_id),
+        )
+        report = audit_active_timeline_heads(service.store.conn, project_id=project_id)
+        assert report["status"] == "ok"
+        assert report["migration_required_count"] == 0
+        item = report["items"][0]
+        assert item["status"] == "available"
+        assert item["legacy"]["cutover"] == "canonical_head_tombstone"
+        assert item["legacy"]["canonical_head_revision_id"] == "parent-1"
+    finally:
+        service.close()
+
+
 def test_public_timeline_document_routes_are_retired(tmp_path):
     service, project_id, root = _service(tmp_path)
     service.close()
