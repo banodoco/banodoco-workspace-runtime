@@ -436,10 +436,123 @@ def test_generation_variant_append_is_atomic_and_replays_deterministically(realm
         assert appended["variant_type"] == "magic_edit"
         assert appended["object_id"] == _digest(output)
         assert appended["metadata"]["source_task_id"] == fixture["task"]["task"]["id"]
+        assert appended["metadata"].get("is_primary") is None
+        assert first["data"]["result"]["generation_variant"]["previous_primary_variant_id"] == fixture["source_variant_id"]
+        assert first["data"]["result"]["generation_variant"]["new_primary_variant_id"] == fixture["source_variant_id"]
         assert service.store.conn.execute(
             "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
             (fixture["project"]["id"], _digest(output).removeprefix("sha256:")),
         ).fetchone()
+    finally:
+        service.close()
+
+
+def test_generation_variant_append_promote_demotes_previous_primary_atomically(realm_root):
+    service = RuntimeService(realm_root)
+    try:
+        fixture = _setup(service, slug="promote")
+        first = _settle(
+            service,
+            fixture["attempt"],
+            [_output(b"preserved-image")],
+            key="preserve-settle",
+            effect=fixture["effect"],
+        )
+        promote_effect = {
+            **fixture["effect"],
+            "expected_version": 2,
+            "payload": {
+                **fixture["effect"]["payload"],
+                "variant_type": "promoted_edit",
+                "primary_policy": "promote",
+            },
+        }
+        task = service.create_task(
+            {
+                "capability_id": CAPABILITY,
+                "capability_digest": _digest(CAPABILITY),
+                "project": fixture["project"]["id"],
+                "input_object_ids": [fixture["source_object_id"]],
+                "settlement_effect": promote_effect,
+                "idempotency_key": "promote-task",
+            }
+        )
+        attempt = service.claim_next(
+            {
+                "executor_id": "worker-promote",
+                "capability_ids": [CAPABILITY],
+                "runtime_epoch": service.health()["runtime_epoch"],
+            },
+            idempotency_key="promote-claim",
+        )
+        output = b"promoted-image"
+        promoted = _settle(
+            service,
+            attempt,
+            [_output(output)],
+            key="promote-settle",
+            effect=promote_effect,
+        )
+        result = promoted["data"]["result"]["generation_variant"]
+        assert result["previous_primary_variant_id"] == fixture["source_variant_id"]
+        assert result["new_primary_variant_id"] == result["variant_id"]
+        assert result["previous_primary_object_id"] == fixture["effect"]["payload"]["source_object_id"]
+        assert result["new_primary_object_id"] == _digest(output)
+        assert service.get_generation(fixture["generation_id"])["version"] == 3
+        variants = service.list_variants(fixture["generation_id"])["items"]
+        by_id = {variant["variant_id"]: variant for variant in variants}
+        assert by_id[fixture["source_variant_id"]]["metadata"]["is_primary"] is False
+        assert by_id[result["variant_id"]]["metadata"]["is_primary"] is True
+        assert len([v for v in variants if v["metadata"].get("is_primary") is True]) == 1
+        assert task["task"]["id"] != fixture["task"]["task"]["id"]
+        # The first append used preserve and remained non-primary.
+        first_result = first["data"]["result"]["generation_variant"]
+        assert first_result["new_primary_variant_id"] == fixture["source_variant_id"]
+    finally:
+        service.close()
+
+
+def test_generation_variant_append_rejects_unknown_primary_policy_before_admission(realm_root):
+    service = RuntimeService(realm_root)
+    try:
+        effect = {
+            "effect_type": "generation.variant.append",
+            "target_id": "generation-policy",
+            "expected_version": 1,
+            "payload": {
+                "source_variant_id": "source-policy",
+                "source_object_id": "sha256:" + ("0" * 64),
+                "variant_type": "edit",
+                "output_name": "generated_images",
+                "output_ordinal": 0,
+                "primary_policy": "replace",
+            },
+        }
+        with pytest.raises(ValidationError, match="preserve or promote"):
+            service.store._validate_settlement_effect(effect)
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("media_type", ["video/mp4", "application/octet-stream"])
+def test_generation_variant_append_rejects_mismatched_or_unknown_media_family(realm_root, media_type):
+    service = RuntimeService(realm_root)
+    try:
+        fixture = _setup(service, slug="media-family-" + media_type.replace("/", "-"))
+        output = _output(b"wrong-media-family")
+        output["media_type"] = media_type
+        with pytest.raises(ConflictError, match="media families"):
+            _settle(
+                service,
+                fixture["attempt"],
+                [output],
+                key="media-family-settle-" + media_type.replace("/", "-"),
+                effect=fixture["effect"],
+            )
+        digest = _digest(b"wrong-media-family").removeprefix("sha256:")
+        assert not service.cas.path_for(digest).exists()
+        assert service.get_generation(fixture["generation_id"])["version"] == 1
+        assert len(service.list_variants(fixture["generation_id"])["items"]) == 1
     finally:
         service.close()
 

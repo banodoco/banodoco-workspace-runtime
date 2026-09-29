@@ -271,7 +271,7 @@
         "variant_type": { "type": "string", "minLength": 1, "maxLength": 128 },
         "output_name": { "type": "string", "minLength": 1, "maxLength": 512 },
         "output_ordinal": { "type": "integer", "const": 0 },
-        "primary_policy": { "type": "string", "const": "preserve" }
+        "primary_policy": { "type": "string", "enum": ["preserve", "promote"] }
       }
     },
     "GenerationCreateWithVariantEffect": {

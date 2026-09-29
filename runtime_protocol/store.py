@@ -2850,6 +2850,19 @@ class RealmStore:
                 return row
         return rows[0]
 
+    @staticmethod
+    def _media_family(media_type):
+        """Return the supported media family for a MIME type.
+
+        Generation variants are intentionally checked using the object/output
+        metadata already present at settlement.  Do not infer a family from a
+        generation type or from a filename: unknown media types fail closed.
+        """
+        if not isinstance(media_type, str) or "/" not in media_type:
+            return None
+        family = media_type.split("/", 1)[0].strip().lower()
+        return family if family in {"image", "video", "audio"} else None
+
     def _validate_generation_publish_v1_effect(self, effect, *, project_id=None, result=None):
         """Validate the exact GEN D1 multi-output publication effect."""
         if set(effect) != {"effect_type", "target_id", "payload"}:
@@ -3214,8 +3227,8 @@ class RealmStore:
         output_ordinal = payload["output_ordinal"]
         if isinstance(output_ordinal, bool) or not isinstance(output_ordinal, int) or output_ordinal != 0:
             raise ValidationError("output_ordinal must be zero for generation.variant.append")
-        if payload["primary_policy"] != "preserve":
-            raise ValidationError("primary_policy must be preserve")
+        if payload["primary_policy"] not in {"preserve", "promote"}:
+            raise ValidationError("primary_policy must be preserve or promote")
 
         # Shape-only validation is used at admission/settlement request
         # parsing. The ownership and custody checks require the task project
@@ -3288,6 +3301,21 @@ class RealmStore:
                 "generation.variant.append output selector did not resolve exactly one object",
                 details={"output_name": output_name, "output_ordinal": output_ordinal},
             )
+        source_object = self.conn.execute(
+            "SELECT media_type FROM objects WHERE digest=?", (source_digest,)
+        ).fetchone()
+        source_family = self._media_family(source_object["media_type"] if source_object else None)
+        output_family = self._media_family(selected.get("media_type"))
+        if source_family is None or output_family is None or source_family != output_family:
+            raise ConflictError(
+                "generation variant source and output media families must match",
+                details={
+                    "source_media_type": source_object["media_type"] if source_object else None,
+                    "output_media_type": selected.get("media_type"),
+                    "source_family": source_family,
+                    "output_family": output_family,
+                },
+            )
         primary_variant = self._generation_primary_variant(generation["id"])
         primary_source_object_id = "sha256:" + primary_variant["object_id"]
         thumbnails = self._validate_thumbnail_outputs(
@@ -3297,6 +3325,7 @@ class RealmStore:
         )
         return {
             "creative_output": selected,
+            "primary_variant": primary_variant,
             "primary_source_object_id": primary_source_object_id,
             "thumbnail": thumbnails.get(primary_source_object_id),
             "variant_thumbnail": thumbnails.get(selected["digest"]),
@@ -3741,6 +3770,15 @@ class RealmStore:
                 generation_metadata["thumbnail"] = self._thumbnail_metadata_descriptor(
                     plan["thumbnail"], plan["primary_source_object_id"]
                 )
+            previous_primary = plan["primary_variant"]
+            previous_primary_variant_id = previous_primary["id"]
+            previous_primary_object_id = "sha256:" + previous_primary["object_id"]
+            promote = payload["primary_policy"] == "promote"
+            new_primary_variant_id = None
+            new_primary_object_id = None
+            if promote:
+                new_primary_variant_id = variant_id
+                new_primary_object_id = output["digest"]
             changed = self.conn.execute(
                 "UPDATE generations SET metadata_json=?, version=version+1, updated_at=? WHERE id=? AND project_id=? AND version=?",
                 (canonical_json(generation_metadata), timestamp, str(effect["target_id"]), str(project_id), int(effect["expected_version"])),
@@ -3755,6 +3793,23 @@ class RealmStore:
                 "output_ordinal": payload["output_ordinal"],
                 "primary_policy": payload["primary_policy"],
             }
+            if promote:
+                # Primary is represented on variant metadata for compatibility
+                # with existing generation reads. Clear every explicit marker
+                # before inserting the new one inside the same transaction.
+                rows = self.conn.execute(
+                    "SELECT id, metadata_json FROM generation_variants WHERE generation_id=?",
+                    (str(effect["target_id"]),),
+                ).fetchall()
+                for row in rows:
+                    variant_metadata = json.loads(row["metadata_json"])
+                    if variant_metadata.get("is_primary") is True:
+                        variant_metadata["is_primary"] = False
+                        self.conn.execute(
+                            "UPDATE generation_variants SET metadata_json=? WHERE id=?",
+                            (canonical_json(variant_metadata), row["id"]),
+                        )
+                metadata["is_primary"] = True
             thumbnail = (
                 self._thumbnail_metadata_descriptor(plan["variant_thumbnail"], output["digest"])
                 if plan["variant_thumbnail"] is not None else None
@@ -3781,6 +3836,10 @@ class RealmStore:
                 "variant_type": payload["variant_type"],
                 "metadata": metadata,
                 "created_at": timestamp,
+                "previous_primary_variant_id": previous_primary_variant_id,
+                "new_primary_variant_id": new_primary_variant_id or previous_primary_variant_id,
+                "previous_primary_object_id": previous_primary_object_id,
+                "new_primary_object_id": new_primary_object_id or previous_primary_object_id,
             }
         target = effect.get("target_id")
         current = self._project(str(target))
