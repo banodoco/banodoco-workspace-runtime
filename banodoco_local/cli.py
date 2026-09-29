@@ -216,7 +216,10 @@ def _credential(paths: RuntimePaths) -> str:
     return token
 
 
-def _client(paths: RuntimePaths):
+BACKUP_TRANSPORT_TIMEOUT_SECONDS = 900.0
+
+
+def _client(paths: RuntimePaths, *, timeout: float | None = None):
     _validate_support_paths(paths)
     discovery = _read_support_json(paths.discovery_path)
     if not discovery or not discovery.get("endpoint"):
@@ -225,7 +228,8 @@ def _client(paths: RuntimePaths):
         from banodoco_workspace_client import WorkspaceClient
     except ImportError as exc:
         raise BootstrapError("The installed generated workspace client is unavailable; install banodoco-workspace-client.") from exc
-    return WorkspaceClient(_validate_loopback_endpoint(str(discovery["endpoint"])), _credential(paths))
+    kwargs = {} if timeout is None else {"timeout": timeout}
+    return WorkspaceClient(_validate_loopback_endpoint(str(discovery["endpoint"])), _credential(paths), **kwargs)
 
 
 def _typed_health(paths: RuntimePaths) -> Mapping[str, Any]:
@@ -365,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(result, json_mode=args.json)
             return 0
         if args.command == "backup":
-            _emit(_client(paths).create_backup(str(args.destination.expanduser().resolve())), json_mode=args.json)
+            _emit(_client(paths, timeout=BACKUP_TRANSPORT_TIMEOUT_SECONDS).create_backup(str(args.destination.expanduser().resolve())), json_mode=args.json)
             return 0
         if args.command == "restore":
             _emit(_client(paths).restore_backup(str(args.backup.expanduser().resolve()), str(args.destination.expanduser().resolve())), json_mode=args.json)

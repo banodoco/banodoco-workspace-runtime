@@ -19,6 +19,12 @@ from pathlib import Path
 import stat
 from typing import Any, Mapping
 
+# Backup verification hashes a complete immutable realm candidate, which can
+# be substantially larger than the live admission probe.  Keep this budget
+# separate from the normal startup/doctor timeout so a valid large backup is
+# not rejected merely because the default five-second integrity probe expires.
+BACKUP_INTEGRITY_TIMEOUT_SECONDS = 300.0
+
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import canonical_json, now
 from .dirfd import (
@@ -343,7 +349,11 @@ def _reject_sqlite_sidecars(root_fd: int, *, label: str) -> None:
         raise ConflictError(f"{label} contains an unmanifested SQLite sidecar", details={"file": name})
 
 
-def _inspect_consolidated_realm(root_fd: int) -> tuple[dict, dict]:
+def _inspect_consolidated_realm(
+    root_fd: int,
+    *,
+    timeout_seconds: float = BACKUP_INTEGRITY_TIMEOUT_SECONDS,
+) -> tuple[dict, dict]:
     """Run the full RealmStore doctor logic over an immutable descriptor DB."""
     from .store import RealmStore
 
@@ -362,7 +372,7 @@ def _inspect_consolidated_realm(root_fd: int) -> tuple[dict, dict]:
     inspector.conn = connection
     inspector._mutex = threading.RLock()
     try:
-        report = inspector.integrity_report()
+        report = inspector.integrity_report(timeout_seconds=timeout_seconds)
         if not report.get("ok"):
             raise ConflictError("realm failed integrity checks", details=report)
         realm = inspector.realm

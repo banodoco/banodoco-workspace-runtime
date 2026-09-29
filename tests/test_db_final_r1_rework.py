@@ -124,6 +124,26 @@ def test_backup_candidate_is_verified_before_publication(tmp_path, monkeypatch):
         service.close()
 
 
+def test_backup_candidate_uses_dedicated_integrity_timeout(tmp_path, monkeypatch):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    seen = []
+    original = RealmStore.integrity_report
+
+    def record_timeout(store, *args, **kwargs):
+        seen.append(kwargs.get("timeout_seconds"))
+        return original(store, *args, **kwargs)
+
+    monkeypatch.setattr(RealmStore, "integrity_report", record_timeout)
+    try:
+        service.backup(tmp_path / "backup")
+        assert seen
+        assert all(value == backup_module.BACKUP_INTEGRITY_TIMEOUT_SECONDS for value in seen)
+    finally:
+        service.close()
+
+
 def test_replacement_epoch_floor_survives_restarts_and_fences_stale_worker(tmp_path):
     active = tmp_path / "active"
     support = tmp_path / "support"
