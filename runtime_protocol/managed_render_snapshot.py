@@ -146,7 +146,13 @@ def expand_shot_clips(
                 )
 
             child_at = finite_float(child_clip.get("at", 0.0), f"Sub-clip {child_id} at")
-            child_hold = finite_float(child_clip.get("hold", 0.0), f"Sub-clip {child_id} hold")
+            has_duration_ms = "duration_ms" in child_clip
+            if "hold" in child_clip:
+                child_hold = finite_float(child_clip["hold"], f"Sub-clip {child_id} hold")
+            elif has_duration_ms:
+                child_hold = finite_float(child_clip["duration_ms"], f"Sub-clip {child_id} duration_ms") / 1000.0
+            else:
+                child_hold = 0.0
             speed = finite_float(child_clip.get("speed", 1.0), f"Sub-clip {child_id} speed")
             if speed <= 0.0:
                 raise ShotExpansionError(f"Sub-clip {child_id} inside sub-timeline {child_ref} has invalid speed")
@@ -161,12 +167,12 @@ def expand_shot_clips(
             if child_hold < 0.0:
                 raise ShotExpansionError(f"Sub-clip {child_id} must not have a negative hold")
             if child_hold <= 0.0 and source_to > source_from:
-                child_hold = (source_to - source_from) / speed
+                child_hold = source_to - source_from
             if child_hold <= 0.0:
                 raise ShotExpansionError(f"Sub-clip {child_id} must have a positive duration")
 
             raw_at = parent_at + child_at
-            raw_end = raw_at + child_hold
+            raw_end = raw_at + child_hold / speed
             visible_at = max(raw_at, parent_at)
             visible_end = min(raw_end, parent_end)
             if visible_end <= visible_at:
@@ -177,8 +183,10 @@ def expand_shot_clips(
             expanded = dict(child_clip)
             expanded["id"] = f"{occurrence_id}--{child_id}"
             expanded["at"] = visible_at
-            if "hold" in expanded or not has_source_from:
-                expanded["hold"] = visible_duration
+            if has_duration_ms:
+                expanded.pop("duration_ms", None)
+            if "hold" in expanded or has_duration_ms or not has_source_from:
+                expanded["hold"] = visible_duration * speed
             if has_source_from:
                 expanded["from"] = source_from + left_trim * speed
                 expanded["to"] = expanded["from"] + visible_duration * speed

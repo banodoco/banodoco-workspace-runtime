@@ -1,0 +1,301 @@
+{
+  "matrix_version": 1,
+  "authorities": {
+    "publication_envelope_and_shot_payload": "workspace-runtime",
+    "timeline_config_and_ordinary_clips": "@banodoco/timeline-schema",
+    "name_normalization": "consumer read adapter; top-level name then provenance name/title then metadata name/title then stable shot identity",
+    "media_kind_normalization": "consumer read adapter using authoritative Runtime managed-media media_type; image/video/audio MIME families else unknown",
+    "audio_playback": "actual child timeline audio clips and bindings; legacy aggregate audio is optional read compatibility only",
+    "write_preservation": "consumer successor-revision writer preserves unknown payload fields and legacy aliases while new renames use top-level name",
+    "canonical_read_failure": "surface the error; never return stale success or route to legacy data after a failed canonical read",
+    "historical_revisions": "immutable-no-rewrite"
+  },
+  "composition_shapes": [
+    {
+      "id": "empty-silent",
+      "read_normalization": "valid empty composition; no shot or audio is synthesized",
+      "write_preservation": "write the empty arrays and canonical TimelineConfig app bag unchanged",
+      "publication": {
+        "project_id": "project-1",
+        "timeline_id": "timeline-1",
+        "expected_head": null,
+        "parent_revision_id": "parent-empty",
+        "parent_composition": {
+          "config": {
+            "tracks": [],
+            "clips": [],
+            "app": {
+              "com.example.empty": {
+                "keep": [1, { "future": true }]
+              }
+            }
+          },
+          "registry": {},
+          "clips": [],
+          "occurrences": []
+        },
+        "shot_revisions": [],
+        "internal_timeline_revisions": []
+      }
+    },
+    {
+      "id": "ordinary-only-title-card",
+      "read_normalization": "valid ordinary-clip-only composition owned by canonical TimelineConfig semantics",
+      "write_preservation": "preserve title-card text, timing, and app extension fields unchanged",
+      "publication": {
+        "project_id": "project-1",
+        "timeline_id": "timeline-1",
+        "expected_head": "parent-empty",
+        "parent_revision_id": "parent-title",
+        "parent_composition": {
+          "config": {
+            "tracks": [
+              { "id": "V1", "kind": "visual", "label": "Titles" }
+            ],
+            "clips": [
+              {
+                "id": "title-1",
+                "at": 0,
+                "track": "V1",
+                "clipType": "text",
+                "hold": 2,
+                "text": { "content": "Open core", "align": "center" },
+                "app": { "com.example.title": { "safeArea": 0.9 } }
+              }
+            ]
+          },
+          "registry": {},
+          "clips": [
+            {
+              "id": "title-1",
+              "at": 0,
+              "track": "V1",
+              "clipType": "text",
+              "hold": 2,
+              "text": { "content": "Open core", "align": "center" },
+              "app": { "com.example.title": { "safeArea": 0.9 } }
+            }
+          ],
+          "occurrences": []
+        },
+        "shot_revisions": [],
+        "internal_timeline_revisions": []
+      }
+    }
+  ],
+  "shot_payload_shapes": [
+    {
+      "id": "silent-canonical-name",
+      "shot_id": "shot-silent",
+      "read_normalization": {
+        "name": "Silent opening",
+        "audio_authority": "no-child-audio",
+        "legacy_audio": "absent"
+      },
+      "write_preservation": "write top-level name; keep audio and audio_bindings absent",
+      "payload": {
+        "name": "Silent opening",
+        "metadata": {},
+        "provenance": {},
+        "timing": { "duration_ms": 2000 },
+        "internal_timeline_revision_id": "internal-silent"
+      }
+    },
+    {
+      "id": "single-voiceover",
+      "shot_id": "shot-single-vo",
+      "read_normalization": {
+        "name": "Single VO",
+        "audio_authority": "child-clips-and-bindings",
+        "legacy_audio": "absent"
+      },
+      "write_preservation": "preserve the one binding; do not create an aggregate audio descriptor",
+      "payload": {
+        "name": "Single VO",
+        "metadata": {},
+        "provenance": {},
+        "assets": [
+          {
+            "asset_id": "voice-1",
+            "object_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "role": "audio"
+          }
+        ],
+        "audio_bindings": [
+          { "binding_id": "binding-1", "clip_id": "voice-clip-1", "asset_id": "voice-1" }
+        ],
+        "internal_timeline_revision_id": "internal-single-vo"
+      }
+    },
+    {
+      "id": "multi-voiceover",
+      "shot_id": "shot-multi-vo",
+      "read_normalization": {
+        "name": "shot-multi-vo",
+        "audio_authority": "child-clips-and-bindings",
+        "legacy_audio": "absent"
+      },
+      "write_preservation": "preserve both independent bindings; never collapse them into one aggregate descriptor",
+      "payload": {
+        "metadata": {},
+        "provenance": {},
+        "audio_bindings": [
+          { "binding_id": "binding-a", "clip_id": "voice-a", "asset": "voice-a" },
+          { "binding_id": "binding-b", "clip_id": "voice-b", "asset": "voice-b" }
+        ],
+        "internal_timeline_revision_id": "internal-multi-vo"
+      }
+    },
+    {
+      "id": "legacy-aggregate-audio",
+      "shot_id": "shot-legacy-audio",
+      "read_normalization": {
+        "name": "Legacy narration",
+        "audio_authority": "legacy-read-only-when-no-child-audio",
+        "legacy_audio": "present"
+      },
+      "write_preservation": "preserve the authored legacy descriptor verbatim; do not require it or convert it into bindings",
+      "payload": {
+        "metadata": { "title": "Legacy narration" },
+        "provenance": {},
+        "audio": {
+          "track_id": "legacy-track",
+          "object_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "scope": { "project_id": "project-1" },
+          "future_gain_curve": [0, 1]
+        },
+        "internal_timeline_revision_id": "internal-legacy-audio"
+      }
+    },
+    {
+      "id": "unknown-extensions",
+      "shot_id": "shot-extensions",
+      "read_normalization": {
+        "name": "Extension shot",
+        "audio_authority": "no-child-audio",
+        "legacy_audio": "absent"
+      },
+      "write_preservation": "preserve every unknown sibling and nested field byte-equivalently as JSON values",
+      "payload": {
+        "name": "Extension shot",
+        "metadata": {
+          "future": { "nested": [1, { "two": true }] }
+        },
+        "provenance": {
+          "producer": "fixture",
+          "opaque": { "keep": null }
+        },
+        "future_sibling": {
+          "mode": "not-yet-standard",
+          "payload": ["a", "b"]
+        },
+        "internal_timeline_revision_id": "internal-extensions"
+      }
+    }
+  ],
+  "name_normalization": [
+    {
+      "id": "top-level-wins",
+      "shot_id": "shot-name-1",
+      "payload": {
+        "name": "Canonical",
+        "provenance": { "name": "Old provenance", "title": "Old provenance title" },
+        "metadata": { "name": "Old metadata", "title": "Old metadata title" }
+      },
+      "expected": "Canonical",
+      "write_preservation": "preserve all aliases; new rename writes top-level name"
+    },
+    {
+      "id": "provenance-name",
+      "shot_id": "shot-name-2",
+      "payload": {
+        "provenance": { "name": "Provenance name" },
+        "metadata": { "title": "Metadata title" }
+      },
+      "expected": "Provenance name",
+      "write_preservation": "preserve the legacy alias; a later rename writes top-level name"
+    },
+    {
+      "id": "provenance-title",
+      "shot_id": "shot-name-3",
+      "payload": {
+        "provenance": { "title": "Provenance title" },
+        "metadata": { "name": "Metadata name" }
+      },
+      "expected": "Provenance title",
+      "write_preservation": "preserve the legacy alias; a later rename writes top-level name"
+    },
+    {
+      "id": "metadata-name",
+      "shot_id": "shot-name-4",
+      "payload": { "metadata": { "name": "Metadata name" } },
+      "expected": "Metadata name",
+      "write_preservation": "preserve the legacy alias; a later rename writes top-level name"
+    },
+    {
+      "id": "metadata-title",
+      "shot_id": "shot-name-5",
+      "payload": { "metadata": { "title": "Metadata title" } },
+      "expected": "Metadata title",
+      "write_preservation": "preserve the legacy alias; a later rename writes top-level name"
+    },
+    {
+      "id": "stable-shot-identity",
+      "shot_id": "shot-name-6",
+      "payload": { "metadata": {}, "provenance": {} },
+      "expected": "shot-name-6",
+      "write_preservation": "do not fabricate a name into an immutable historical payload"
+    }
+  ],
+  "media_kind_normalization": [
+    {
+      "id": "known-image",
+      "managed_media": { "media_type": "image/png" },
+      "payload_aliases": { "type": "image", "role": "image" },
+      "expected": "image",
+      "write_preservation": "preserve aliases unchanged"
+    },
+    {
+      "id": "known-video-conflicting-image-alias",
+      "managed_media": { "media_type": "video/mp4" },
+      "payload_aliases": { "type": "image", "media_kind": "image" },
+      "expected": "video",
+      "write_preservation": "preserve conflicting legacy aliases; authoritative managed metadata wins on read"
+    },
+    {
+      "id": "known-audio-without-alias",
+      "managed_media": { "media_type": "audio/wav" },
+      "payload_aliases": {},
+      "expected": "audio",
+      "write_preservation": "do not manufacture a payload alias"
+    },
+    {
+      "id": "unknown-authoritative-type",
+      "managed_media": { "media_type": "application/octet-stream" },
+      "payload_aliases": { "type": "image" },
+      "expected": "unknown",
+      "write_preservation": "preserve aliases unchanged; never default to image"
+    },
+    {
+      "id": "missing-authoritative-type",
+      "managed_media": {},
+      "payload_aliases": { "role": "image" },
+      "expected": "unknown",
+      "write_preservation": "preserve aliases unchanged; never default to image"
+    }
+  ],
+  "invalid_shot_payloads": [
+    { "id": "name-not-string", "payload": { "name": 42 } },
+    { "id": "metadata-not-map", "payload": { "metadata": [] } },
+    { "id": "assets-not-list", "payload": { "assets": {} } },
+    { "id": "invalid-present-media-entry", "payload": { "assets": ["not-an-object"] } },
+    { "id": "invalid-present-media-id", "payload": { "assets": [{ "object_id": 7 }] } },
+    { "id": "invalid-present-media-digest", "payload": { "assets": [{ "digest": "not-sha256" }] } },
+    { "id": "bindings-not-list", "payload": { "audio_bindings": {} } },
+    { "id": "legacy-audio-not-descriptor", "payload": { "audio": [] } },
+    { "id": "timing-not-map", "payload": { "timing": 1000 } },
+    { "id": "internal-link-empty", "payload": { "internal_timeline_revision_id": "" } }
+  ]
+}

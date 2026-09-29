@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 
 import pytest
@@ -442,6 +443,53 @@ def test_shot_expansion_namespaces_repeated_child_clip_ids_and_trims_left_window
     assert clips[0]["to"] == 2.0
     assert "source_clip_id" not in clips[0]
     assert clips[0]["app"]["astrid_shot_composition"]["source_clip_id"] == "shared-child-id"
+
+
+def test_shot_expansion_visible_time_vectors_apply_speed_once_and_preserve_source_geometry():
+    parent = {
+        "clips": [{
+            "id": "shot",
+            "clipType": "shot",
+            "at": 0,
+            "hold": 3,
+            "params": {"shot_id": "shot-1", "timeline_document_id": "child"},
+        }],
+    }
+    child = {
+        "clips": [
+            {"id": "hold-slow", "at": 0, "hold": 1, "speed": 0.5, "asset": "shared"},
+            {"id": "hold-fast", "at": 0, "hold": 4, "speed": 2, "asset": "shared"},
+            {"id": "duration-ms-fast", "at": 0, "duration_ms": 17, "speed": 2, "asset": "shared"},
+            {"id": "trim-slow", "at": 0, "from": 2, "to": 3, "speed": 0.5, "asset": "shared"},
+            {"id": "trim-fast", "at": 0, "from": 2, "to": 6, "speed": 2, "asset": "shared"},
+        ],
+    }
+    original = copy.deepcopy(child)
+    expanded, _ = expand_shot_clips(
+        parent,
+        {"assets": {}},
+        load_timeline=lambda _ref: (child, {"assets": {"shared": {"media_id": "media"}}}),
+    )
+    clips = {clip["app"]["astrid_shot_composition"]["source_clip_id"]: clip for clip in expanded["clips"]}
+
+    assert clips["hold-slow"]["hold"] / clips["hold-slow"]["speed"] == 2
+    assert clips["hold-fast"]["hold"] / clips["hold-fast"]["speed"] == 2
+    assert clips["duration-ms-fast"]["hold"] / clips["duration-ms-fast"]["speed"] == pytest.approx(0.0085)
+    assert "duration_ms" not in clips["duration-ms-fast"]
+    assert (clips["trim-slow"]["from"], clips["trim-slow"]["to"]) == (2, 3)
+    assert (clips["trim-fast"]["from"], clips["trim-fast"]["to"]) == (2, 6)
+    assert child == original
+
+    clipped, _ = expand_shot_clips(
+        {"clips": [{**parent["clips"][0], "hold": 0.75}]},
+        {"assets": {}},
+        load_timeline=lambda _ref: (
+            {"clips": [{"id": "hold-fast", "at": 0, "hold": 4, "speed": 2, "asset": "shared"}]},
+            {"assets": {"shared": {"media_id": "media"}}},
+        ),
+    )
+    assert clipped["clips"][0]["hold"] == 1.5
+    assert clipped["clips"][0]["hold"] / clipped["clips"][0]["speed"] == 0.75
 
 
 def test_shot_expansion_rejects_non_finite_or_non_positive_timing():

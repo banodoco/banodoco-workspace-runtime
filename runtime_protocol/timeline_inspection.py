@@ -6,6 +6,7 @@ only revision payloads already admitted by the runtime.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 from fractions import Fraction
@@ -15,6 +16,8 @@ from .util import canonical_json
 
 SCHEMA = "runtime.timeline.declared_inputs/v1"
 MAX_OCCURRENCES = 500
+# A request returns at most 100 selected clips per page. A pinned child may be
+# larger; selectors and pagination must be applied before presentation limits.
 MAX_SELECTED_CLIPS = 100
 MAX_CLOSURE_CLIPS = 2000
 
@@ -58,7 +61,7 @@ def normalize_options(raw):
         raw = {}
     if not isinstance(raw, dict):
         raise ValidationError("timeline inspection options must be an object")
-    allowed = {"revision_id", "occurrence", "shot", "clip", "asset", "track", "range", "neighbors", "detail", "limit", "formats"}
+    allowed = {"revision_id", "occurrence", "shot", "clip", "asset", "track", "range", "neighbors", "detail", "limit", "formats", "cursor"}
     extra = set(raw) - allowed
     if extra:
         raise ValidationError("unsupported timeline inspection options", details={"fields": sorted(extra)})
@@ -78,6 +81,10 @@ def normalize_options(raw):
     if not isinstance(detail, bool):
         raise ValidationError("detail must be a boolean")
     result.update(neighbors=neighbors, limit=limit, detail=detail)
+    cursor = raw.get("cursor")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 4096):
+        raise ValidationError("cursor must be a bounded string")
+    result["cursor"] = cursor
     interval = raw.get("range")
     if interval is not None:
         if isinstance(interval, str):
@@ -109,6 +116,25 @@ def _digest(payload):
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
+def _encode_cursor(scope, offset):
+    payload = canonical_json({"scope": scope, "offset": offset}).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_cursor(cursor):
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(raw)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValidationError("timeline inspection cursor is invalid") from exc
+    if (not isinstance(payload, dict) or set(payload) != {"scope", "offset"}
+            or not isinstance(payload["scope"], str)
+            or isinstance(payload["offset"], bool) or not isinstance(payload["offset"], int)
+            or payload["offset"] < 0):
+        raise ValidationError("timeline inspection cursor is invalid")
+    return payload["scope"], payload["offset"]
+
+
 def _asset(clip, registry):
     key = clip.get("asset", clip.get("asset_id"))
     assets = registry.get("assets", {}) if isinstance(registry, dict) else {}
@@ -132,13 +158,14 @@ def _clip(raw, registry, occurrence, start, end):
     if speed <= 0:
         raise ConflictError("pinned internal clip speed is invalid")
     if "duration_ms" in raw:
-        duration = _fraction(raw["duration_ms"], "clip duration", milliseconds=True)
+        source_duration = _fraction(raw["duration_ms"], "clip duration", milliseconds=True)
     elif "hold" in raw:
-        duration = _fraction(raw["hold"], "clip hold")
+        source_duration = _fraction(raw["hold"], "clip hold")
     elif "to_ms" in raw or "from_ms" in raw:
-        duration = (_fraction(raw.get("to_ms", 0), "clip to", milliseconds=True) - _fraction(raw.get("from_ms", 0), "clip from", milliseconds=True)) / speed
+        source_duration = _fraction(raw.get("to_ms", 0), "clip to", milliseconds=True) - _fraction(raw.get("from_ms", 0), "clip from", milliseconds=True)
     else:
-        duration = (_fraction(raw.get("to", 0), "clip to") - _fraction(raw.get("from", 0), "clip from")) / speed
+        source_duration = _fraction(raw.get("to", 0), "clip to") - _fraction(raw.get("from", 0), "clip from")
+    duration = source_duration / speed
     visible_end = min(absolute + duration, end)
     if duration < 0 or visible_end <= absolute or absolute >= end:
         return None
@@ -154,10 +181,9 @@ def inspect(connection, project_id, timeline_id, options):
     """Freeze one parent head and its pinned children under the caller's lock."""
     options = normalize_options(options)
     _row(connection, "SELECT id FROM timelines WHERE id=? AND project_id=?", (timeline_id, project_id), "timeline")
-    revision = options["revision_id"]
-    if revision is None:
-        head = connection.execute("SELECT revision_id FROM parent_composition_heads WHERE project_id=? AND timeline_id=?", (project_id, timeline_id)).fetchone()
-        revision = head["revision_id"] if head else None
+    head = connection.execute("SELECT revision_id FROM parent_composition_heads WHERE project_id=? AND timeline_id=?", (project_id, timeline_id)).fetchone()
+    head_revision = head["revision_id"] if head else None
+    revision = options["revision_id"] or head_revision
     if revision is None:
         raise NotFoundError("timeline has no parent composition revision")
     parent = _row(connection, "SELECT * FROM parent_composition_revisions WHERE id=? AND project_id=? AND timeline_id=?", (revision, project_id, timeline_id), "parent composition revision")
@@ -192,8 +218,8 @@ def inspect(connection, project_id, timeline_id, options):
             if isinstance(asset, dict) and isinstance(asset.get("asset_id"), str):
                 registry["assets"][asset["asset_id"]] = {"media_id": asset.get("object_id"), "content_sha256": asset.get("digest")}
         clips = internal_payload.get("clips", [])
-        if not isinstance(clips, list) or len(clips) > MAX_SELECTED_CLIPS:
-            raise ValidationError("pinned shot has too many clips; narrow the timeline")
+        if not isinstance(clips, list):
+            raise ConflictError("pinned shot clips are invalid")
         closure_clips += len(clips)
         if closure_clips > MAX_CLOSURE_CLIPS:
             raise ValidationError("timeline closure exceeds clip limit; narrow the revision")
@@ -209,17 +235,17 @@ def inspect(connection, project_id, timeline_id, options):
         children.append((identity, projected))
     snapshot_digest = _digest({"schema": SCHEMA, "parent": parent["content_digest"], "children": [row[0] for row in children]})
     target_indices = []
+    range_bounds = tuple(Fraction(*value) for value in options["range"]) if options["range"] else None
     for index, (occurrence, clips) in enumerate(children):
         if options["occurrence"] and occurrence["occurrence_id"] != options["occurrence"]: continue
         if options["shot"] and occurrence["shot_id"] != options["shot"]: continue
         matching = [clip for clip in clips if (not options["clip"] or clip["clip_id"] == options["clip"])
                     and (not options["asset"] or clip["asset_id"] == options["asset"] or clip["source_object_id"] == options["asset"])
-                    and (not options["track"] or clip["track_id"] == options["track"] or occurrence["track_id"] == options["track"])]
+                    and (not options["track"] or clip["track_id"] == options["track"] or occurrence["track_id"] == options["track"])
+                    and (not range_bounds or (Fraction(*clip["start"]) < range_bounds[1]
+                                              and Fraction(*clip["start"]) + Fraction(*clip["duration"]) > range_bounds[0]))]
         if any(options[key] for key in ("clip", "asset", "track")) and not matching: continue
-        if options["range"]:
-            range_start, range_end = (Fraction(*value) for value in options["range"])
-            start, duration = Fraction(*occurrence["start"]), Fraction(*occurrence["duration"])
-            if not (start < range_end and start + duration > range_start): continue
+        if range_bounds and not matching: continue
         target_indices.append(index)
     selected = set(target_indices)
     for index in target_indices:
@@ -227,16 +253,41 @@ def inspect(connection, project_id, timeline_id, options):
     rows = []
     for index in sorted(selected):
         occurrence, clips = children[index]
-        if index in target_indices:
-            clips = [clip for clip in clips if (not options["clip"] or clip["clip_id"] == options["clip"])
-                     and (not options["asset"] or clip["asset_id"] == options["asset"] or clip["source_object_id"] == options["asset"])
-                     and (not options["track"] or clip["track_id"] == options["track"] or occurrence["track_id"] == options["track"])]
+        clips = [clip for clip in clips if (index not in target_indices or not options["clip"] or clip["clip_id"] == options["clip"])
+                     and (index not in target_indices or not options["asset"] or clip["asset_id"] == options["asset"] or clip["source_object_id"] == options["asset"])
+                     and (index not in target_indices or not options["track"] or clip["track_id"] == options["track"] or occurrence["track_id"] == options["track"])
+                     and (not range_bounds or (Fraction(*clip["start"]) < range_bounds[1]
+                                               and Fraction(*clip["start"]) + Fraction(*clip["duration"]) > range_bounds[0]))]
         rows.append({"role": "target" if index in target_indices else "neighbor", "occurrence": occurrence, "clips": clips})
-    if sum(len(row["clips"]) for row in rows) > options["limit"]:
-        raise ValidationError("inspection exceeds clip limit; narrow selectors or neighbors")
+    scope = _digest({"project_id": project_id, "timeline_id": timeline_id, "head_revision_id": head_revision,
+                     "revision_id": revision, "snapshot_digest": snapshot_digest,
+                     "selectors": {key: value for key, value in options.items() if key != "cursor"}})
+    offset = 0
+    if options["cursor"] is not None:
+        cursor_scope, offset = _decode_cursor(options["cursor"])
+        if cursor_scope != scope:
+            raise ValidationError("timeline inspection cursor does not match current head or query")
+    total_clips = sum(len(row["clips"]) for row in rows)
+    if offset > total_clips:
+        raise ValidationError("timeline inspection cursor position is invalid")
+    end_offset = min(total_clips, offset + options["limit"])
+    page_rows = []
+    position = 0
+    for row in rows:
+        row_start = position
+        row_end = row_start + len(row["clips"])
+        position = row_end
+        if row_end <= offset or row_start >= end_offset:
+            continue
+        clips = row["clips"][max(0, offset - row_start):min(len(row["clips"]), end_offset - row_start)]
+        page_rows.append({**row, "clips": clips})
+    if total_clips == 0:
+        page_rows = rows
+    next_cursor = _encode_cursor(scope, end_offset) if end_offset < total_clips else None
     return {"schema": SCHEMA, "evidence_kind": "declared_inputs", "render_requested": False,
             "source_pixels": "not_requested", "waveforms": "not_requested", "project_id": project_id,
             "timeline_id": timeline_id, "revision_id": revision, "parent_content_digest": parent["content_digest"],
-            "snapshot_digest": "sha256:" + snapshot_digest, "selectors": options,
+            "snapshot_digest": "sha256:" + snapshot_digest,
+            "selectors": {key: value for key, value in options.items() if key != "cursor"},
             "selection_status": "selected" if target_indices else "selector_miss", "target_count": len(target_indices),
-            "selected": rows}
+            "selected": page_rows, "next_cursor": next_cursor}

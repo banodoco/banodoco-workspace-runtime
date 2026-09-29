@@ -288,6 +288,32 @@ def test_publication_preserves_opaque_parent_and_occurrence_fields(tmp_path):
         service.close()
 
 
+def test_publication_preserves_open_shot_payload_without_manufacturing_legacy_audio(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        body = _publication(project_id)
+        payload = body["shot_revisions"][0]["payload"]
+        payload["name"] = "Open payload"
+        payload["metadata"]["future_nested"] = {"values": [1, {"two": True}]}
+        payload["future_sibling"] = {"mode": "opaque", "value": None}
+        payload.pop("audio_bindings")
+
+        published = service.publish_parent_composition(
+            project_id, "main", body, idempotency_key="open-shot-payload"
+        )
+        reread = service.get_project_shot_revision(
+            project_id, "shot-1", "shot-rev-1"
+        )
+
+        assert reread["content_digest"] == published["data"]["content_digests"]["shot-rev-1"]
+        assert reread["payload"]["name"] == "Open payload"
+        assert reread["payload"]["metadata"]["future_nested"] == {"values": [1, {"two": True}]}
+        assert reread["payload"]["future_sibling"] == {"mode": "opaque", "value": None}
+        assert "audio" not in reread["payload"]
+    finally:
+        service.close()
+
+
 def test_missing_selected_media_rejects_publication_without_identity_leak(tmp_path):
     service, project_id = _service(tmp_path)
     try:

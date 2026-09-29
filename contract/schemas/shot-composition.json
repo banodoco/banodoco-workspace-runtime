@@ -2,6 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://banodoco.dev/workspace/v1/schemas/shot-composition.json",
   "title": "Canonical one-level shot composition publication",
+  "description": "Runtime-owned immutable publication envelope. Nested TimelineConfig and ordinary timeline-clip semantics remain owned by @banodoco/timeline-schema and are intentionally not duplicated here.",
+  "x-banodoco-owner": "workspace-runtime",
+  "x-banodoco-canonical-timeline-owner": "@banodoco/timeline-schema",
+  "x-banodoco-generated-boundary": "Materialize or reference the pinned TimelineConfig schema during generation; do not maintain a second TimelineConfig or TimelineClip definition in this schema.",
   "type": "object",
   "additionalProperties": false,
   "required": ["project_id", "timeline_id", "expected_head", "parent_composition"],
@@ -17,29 +21,158 @@
     "dependency_manifest": { "$ref": "#/$defs/DependencyManifest" }
   },
   "$defs": {
+    "OpenMap": {
+      "type": "object",
+      "additionalProperties": true
+    },
     "ParentComposition": {
       "type": "object",
+      "additionalProperties": true,
       "required": ["config", "registry", "clips", "occurrences"],
-      "properties": { "config": { "type": "object" }, "registry": { "type": "object" }, "clips": { "type": "array" }, "occurrences": { "type": "array", "items": { "$ref": "#/$defs/Occurrence" } } }
+      "properties": {
+        "config": {
+          "$ref": "timeline-config.schema.json",
+          "description": "Canonical TimelineConfig, materialized from the pinned @banodoco/timeline-schema package.",
+          "x-banodoco-schema-owner": "@banodoco/timeline-schema#TimelineConfig",
+          "x-banodoco-schema-sha256": "5592a6bb4376b9b9b84d66897b17f058eed5f0176d3c9ead262e19283fc86f25"
+        },
+        "registry": {
+          "type": "object",
+          "description": "Runtime-managed media registry carried by the publication envelope; Runtime-specific and outside the canonical TimelineConfig owned by @banodoco/timeline-schema.",
+          "x-banodoco-schema-owner": "workspace-runtime#ManagedMediaRegistry",
+          "additionalProperties": true
+        },
+        "clips": {
+          "type": "array",
+          "description": "Ordinary timeline clips. Clip field semantics are owned by @banodoco/timeline-schema."
+        },
+        "occurrences": { "type": "array", "items": { "$ref": "#/$defs/Occurrence" } }
+      }
     },
     "Occurrence": {
       "type": "object",
+      "additionalProperties": true,
       "required": ["occurrence_id", "shot_id", "shot_revision_id", "placement", "duration_ms", "track"],
-      "properties": { "occurrence_id": { "type": "string", "minLength": 1 }, "shot_id": { "type": "string", "minLength": 1 }, "shot_revision_id": { "type": "string", "minLength": 1 }, "placement": { "type": "object" }, "source_offset": {}, "duration_ms": { "type": "integer", "exclusiveMinimum": 0 }, "speed": {}, "track": { "type": "string", "minLength": 1 }, "transform": { "type": "object" }, "gain": { "type": "number" }, "mute": { "type": "boolean" }, "provenance": { "type": "object" } }
+      "properties": {
+        "occurrence_id": { "type": "string", "minLength": 1 },
+        "shot_id": { "type": "string", "minLength": 1 },
+        "shot_revision_id": { "type": "string", "minLength": 1 },
+        "placement": { "type": "object", "additionalProperties": true },
+        "source_offset": {},
+        "duration_ms": { "type": "integer", "exclusiveMinimum": 0 },
+        "speed": {},
+        "track": { "type": "string", "minLength": 1 },
+        "transform": { "type": "object", "additionalProperties": true },
+        "gain": { "type": "number" },
+        "mute": { "type": "boolean" },
+        "provenance": { "$ref": "#/$defs/OpenMap" }
+      }
     },
     "ShotRevisionInput": {
       "type": "object",
+      "additionalProperties": true,
       "required": ["shot_id", "revision_id", "internal_timeline_revision_id", "payload"],
-      "properties": { "shot_id": { "type": "string", "minLength": 1 }, "revision_id": { "type": "string", "minLength": 1 }, "internal_timeline_revision_id": { "type": "string", "minLength": 1 }, "content_digest": { "type": "string" }, "payload": { "type": "object" } }
+      "properties": {
+        "shot_id": { "type": "string", "minLength": 1 },
+        "revision_id": { "type": "string", "minLength": 1 },
+        "internal_timeline_revision_id": { "type": "string", "minLength": 1 },
+        "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "payload": { "$ref": "#/$defs/ShotPayload" }
+      }
+    },
+    "ShotPayload": {
+      "type": "object",
+      "description": "Open shot payload. Only the cross-consumer core is typed; all unknown sibling and nested extension fields remain lossless.",
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Canonical name for new writes. Reads may fall back through provenance/metadata name/title aliases and then stable shot identity."
+        },
+        "metadata": { "$ref": "#/$defs/OpenMap" },
+        "provenance": { "$ref": "#/$defs/OpenMap" },
+        "assets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ShotAsset" }
+        },
+        "audio_bindings": {
+          "type": "array",
+          "description": "Actual child audio bindings; authoritative with child audio clips for playback. Optional and never derived from the legacy aggregate audio descriptor.",
+          "items": { "$ref": "#/$defs/OpenBinding" }
+        },
+        "text_bindings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/OpenBinding" }
+        },
+        "audio": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Optional legacy aggregate audio descriptor. Read when present, preserve as authored, and never require, fabricate, or collapse it from child audio clips/bindings."
+        },
+        "timing": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Open timing metadata. Visible-duration semantics remain at the canonical timeline/consumer boundary."
+        },
+        "internal_timeline_revision_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Immutable link to the child timeline revision."
+        }
+      }
+    },
+    "ShotAsset": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "asset_id": { "type": "string", "minLength": 1 },
+        "object_id": { "type": "string", "minLength": 1 },
+        "media_id": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "role": { "type": "string", "minLength": 1 },
+        "type": { "type": "string", "minLength": 1 },
+        "media_kind": { "type": "string", "minLength": 1 },
+        "scope": { "$ref": "#/$defs/OpenMap" }
+      }
+    },
+    "OpenBinding": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "binding_id": { "type": "string", "minLength": 1 },
+        "clip_id": { "type": "string", "minLength": 1 },
+        "track_id": { "type": "string", "minLength": 1 },
+        "asset": { "type": "string", "minLength": 1 },
+        "asset_id": { "type": "string", "minLength": 1 },
+        "media_id": { "type": "string", "minLength": 1 },
+        "object_id": { "type": "string", "minLength": 1 }
+      }
     },
     "InternalTimelineRevisionInput": {
       "type": "object",
+      "additionalProperties": true,
       "required": ["timeline_id", "revision_id", "payload"],
-      "properties": { "timeline_id": { "type": "string", "minLength": 1 }, "revision_id": { "type": "string", "minLength": 1 }, "content_digest": { "type": "string" }, "payload": { "type": "object" } }
+      "properties": {
+        "timeline_id": { "type": "string", "minLength": 1 },
+        "revision_id": { "type": "string", "minLength": 1 },
+        "content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "payload": {
+          "$ref": "timeline-config.schema.json",
+          "description": "Carries the canonical TimelineConfig fields owned by @banodoco/timeline-schema.",
+          "x-banodoco-schema-owner": "@banodoco/timeline-schema#TimelineConfig",
+          "x-banodoco-schema-sha256": "5592a6bb4376b9b9b84d66897b17f058eed5f0176d3c9ead262e19283fc86f25"
+        }
+      }
     },
     "DependencyManifest": {
       "type": "object",
-      "properties": { "media": { "type": "array" }, "shots": { "type": "array" }, "internal_timelines": { "type": "array" }, "timelines": { "type": "array" } }
+      "properties": {
+        "media": { "type": "array" },
+        "shots": { "type": "array" },
+        "internal_timelines": { "type": "array" },
+        "timelines": { "type": "array" }
+      }
     }
   }
 }

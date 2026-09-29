@@ -52,6 +52,16 @@ def _publication(project, *, revision="parent-1", expected_head=None, offset=0):
     }
 
 
+def _with_clips(publication, clips):
+    publication["internal_timeline_revisions"][0]["payload"]["clips"] = clips
+    return publication
+
+
+def _clip(clip_id, at_ms=0, duration_ms=500):
+    return {"id": clip_id, "clip_type": "text", "track": "picture", "at_ms": at_ms,
+            "duration_ms": duration_ms, "text": clip_id}
+
+
 def test_pinned_inspection_and_neighbor_order(tmp_path):
     service, project, _ = _service(tmp_path)
     try:
@@ -92,6 +102,148 @@ def test_selector_miss_validation_and_project_scope(tmp_path):
         foreign = service.create_project({"slug": "foreign", "name": "Foreign"}, idempotency_key="foreign")
         with pytest.raises(NotFoundError):
             service.inspect_timeline(foreign["id"], "main", {})
+    finally:
+        service.close()
+
+
+def test_selection_and_range_filter_before_presentation_limit(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = publication["parent_composition"]["occurrences"][:2]
+        publication["parent_composition"]["occurrences"][0].update(shot_id="shot-unrelated", shot_revision_id="shot-rev-unrelated")
+        publication["parent_composition"]["occurrences"][1].update(shot_id="shot-selected", shot_revision_id="shot-rev-selected")
+        internal = publication["internal_timeline_revisions"][0]
+        internal["payload"]["clips"] = [_clip(f"dense-selected-{index}") for index in range(101)]
+        unrelated_internal = {**internal, "revision_id": "internal-unrelated", "payload": {
+            **internal["payload"], "clips": [_clip(f"dense-unrelated-{index}") for index in range(101)]
+        }}
+        internal["revision_id"] = "internal-selected"
+        publication["internal_timeline_revisions"].append(unrelated_internal)
+        shot = publication["shot_revisions"][0]
+        publication["shot_revisions"] = [
+            {**shot, "shot_id": "shot-selected", "revision_id": "shot-rev-selected", "internal_timeline_revision_id": "internal-selected"},
+            {**shot, "shot_id": "shot-unrelated", "revision_id": "shot-rev-unrelated", "internal_timeline_revision_id": "internal-unrelated"},
+        ]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-dense")
+        selected = service.inspect_timeline(project, "main", {"occurrence": "second", "limit": 1})
+        assert selected["target_count"] == 1
+        assert [clip["clip_id"] for row in selected["selected"] for clip in row["clips"]] == ["dense-selected-0"]
+        assert selected["next_cursor"]
+        next_page = service.inspect_timeline(project, "main", {
+            "occurrence": "second", "limit": 1, "cursor": selected["next_cursor"],
+        })
+        assert [clip["clip_id"] for row in next_page["selected"] for clip in row["clips"]] == ["dense-selected-1"]
+        assert selected["next_cursor"] is not None
+
+        range_publication = _publication(project, revision="parent-2", expected_head="parent-1")
+        range_publication["internal_timeline_revisions"][0]["revision_id"] = "internal-2"
+        range_publication["shot_revisions"][0]["revision_id"] = "shot-rev-2"
+        range_publication["shot_revisions"][0]["internal_timeline_revision_id"] = "internal-2"
+        for occurrence in range_publication["parent_composition"]["occurrences"]:
+            occurrence["shot_revision_id"] = "shot-rev-2"
+            occurrence["duration_ms"] = 4000
+        _with_clips(range_publication, [_clip("ends-at-one", 0, 1000), _clip("overlaps", 1000, 1000), _clip("gap", 2500, 500)])
+        service.publish_parent_composition(project, "main", range_publication, idempotency_key="publish-range")
+        ranged = service.inspect_timeline(project, "main", {"occurrence": "first", "range": "1..2", "limit": 10})
+        assert [clip["clip_id"] for row in ranged["selected"] for clip in row["clips"]] == ["overlaps"]
+    finally:
+        service.close()
+
+
+def test_visible_time_vectors_apply_speed_once_clip_to_occurrence_and_keep_half_open_ranges(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = publication["parent_composition"]["occurrences"][:1]
+        publication["parent_composition"]["occurrences"][0]["duration_ms"] = 3000
+        _with_clips(publication, [
+            {"id": "hold-plain", "clip_type": "text", "track": "picture", "at": 0.125, "hold": 0.5, "speed": 1},
+            {"id": "duration-ms-fast", "clip_type": "text", "track": "picture", "at_ms": 1, "duration_ms": 17, "speed": 2},
+            {"id": "trim-slow", "clip_type": "media", "track": "picture", "at": 0.1, "from": 2, "to": 3, "speed": 0.5},
+            {"id": "trim-fast", "clip_type": "media", "track": "picture", "at": 0.1, "from": 2, "to": 6, "speed": 2},
+            {"id": "hold-fast-clipped", "clip_type": "text", "track": "picture", "at": 2.25, "hold": 4, "speed": 2},
+            {"id": "hold-slow-clipped", "clip_type": "text", "track": "picture", "at": 1.75, "hold": 1, "speed": 0.5},
+            {"id": "adjacent", "clip_type": "text", "track": "picture", "at": 0.625, "hold": 0.25, "speed": 1},
+        ])
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-visible-time")
+
+        result = service.inspect_timeline(project, "main", {"occurrence": "first", "limit": 20})
+        clips = {clip["clip_id"]: clip for row in result["selected"] for clip in row["clips"]}
+        assert {
+            clip_id: (clip["start"], clip["duration"])
+            for clip_id, clip in clips.items()
+        } == {
+            "hold-plain": ([1, 8], [1, 2]),
+            "duration-ms-fast": ([1, 1000], [17, 2000]),
+            "trim-slow": ([1, 10], [2, 1]),
+            "trim-fast": ([1, 10], [2, 1]),
+            "hold-fast-clipped": ([9, 4], [3, 4]),
+            "hold-slow-clipped": ([7, 4], [5, 4]),
+            "adjacent": ([5, 8], [1, 4]),
+        }
+        assert clips["trim-slow"]["source_from"] == 2
+        assert clips["trim-slow"]["source_to"] == 3
+        assert clips["trim-fast"]["source_from"] == 2
+        assert clips["trim-fast"]["source_to"] == 6
+
+        ending_at_boundary = service.inspect_timeline(
+            project, "main", {"clip": "hold-plain", "range": "0.625..0.875"},
+        )
+        starting_at_boundary = service.inspect_timeline(
+            project, "main", {"clip": "adjacent", "range": "0.625..0.875"},
+        )
+        assert ending_at_boundary["selection_status"] == "selector_miss"
+        assert starting_at_boundary["selection_status"] == "selected"
+    finally:
+        service.close()
+
+
+def test_inspection_continuation_is_stable_bounded_and_query_bound(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = publication["parent_composition"]["occurrences"][:1]
+        _with_clips(publication, [_clip(f"clip-{index}") for index in range(7)])
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-pages")
+        options = {"occurrence": "first", "limit": 3}
+        first = service.inspect_timeline(project, "main", options)
+        second = service.inspect_timeline(project, "main", {**options, "cursor": first["next_cursor"]})
+        third = service.inspect_timeline(project, "main", {**options, "cursor": second["next_cursor"]})
+        flatten = lambda page: [clip["clip_id"] for row in page["selected"] for clip in row["clips"]]
+        assert flatten(first) == ["clip-0", "clip-1", "clip-2"]
+        assert flatten(second) == ["clip-3", "clip-4", "clip-5"]
+        assert flatten(third) == ["clip-6"]
+        assert first["next_cursor"] and second["next_cursor"] and third["next_cursor"] is None
+        assert all(len(flatten(page)) <= options["limit"] for page in (first, second, third))
+        for changed in ({"occurrence": "other", "limit": 3}, {"occurrence": "first", "limit": 2},
+                        {"occurrence": "first", "range": "0..1", "limit": 3}):
+            with pytest.raises(ValidationError, match="cursor does not match"):
+                service.inspect_timeline(project, "main", {**changed, "cursor": first["next_cursor"]})
+
+        later = _publication(project, revision="parent-2", expected_head="parent-1")
+        later.pop("internal_timeline_revisions")
+        later.pop("shot_revisions")
+        service.publish_parent_composition(project, "main", later, idempotency_key="publish-new-head")
+        with pytest.raises(ValidationError, match="cursor does not match"):
+            service.inspect_timeline(project, "main", {**options, "cursor": first["next_cursor"]})
+    finally:
+        service.close()
+
+
+def test_inspection_retains_global_closure_safety_cap(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        template = publication["parent_composition"]["occurrences"][0]
+        publication["parent_composition"]["occurrences"] = [
+            {**template, "occurrence_id": f"occ-{index}", "placement": {"start_ms": index * 1000}}
+            for index in range(21)
+        ]
+        _with_clips(publication, [_clip(f"clip-{index}") for index in range(100)])
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-too-many")
+        with pytest.raises(ValidationError, match="closure exceeds clip limit"):
+            service.inspect_timeline(project, "main", {"limit": 1})
     finally:
         service.close()
 

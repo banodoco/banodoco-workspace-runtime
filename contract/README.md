@@ -1,5 +1,25 @@
 # Workspace protocol contracts
 
+## Timeline shot composition boundary
+
+The separately versioned shot-composition contract in
+`schemas/shot-composition.json` is Runtime-owned. It defines publication
+identity, exact-head/CAS context, dependencies, occurrences, and the known
+shot-payload core. The payload stays open so consumers can preserve opaque app
+extensions. Runtime-managed media metadata owns media identity and kind, and
+the schema marks `ManagedMediaRegistry` as a Runtime-specific registry.
+
+Nested `TimelineConfig` and clip semantics belong to the pinned
+`@banodoco/timeline-schema` package. Runtime materializes that package's JSON
+Schema and references it from the parent config and internal-timeline payload;
+the shot envelope does not carry a second hand-maintained config definition.
+Audio is optional in the shot payload. Nested timeline audio clips/bindings
+remain authoritative, and a legacy aggregate descriptor is read-only when
+present. Unknown payload fields are preserved by consumers. Visible clip
+duration is source duration divided once by positive speed, with parent
+occurrence duration acting as a visible interval cap; renderer frame rounding
+is checked against the shared vectors.
+
 `openapi/workspace-v1.yaml` is the canonical HTTP contract for the neutral
 workspace runtime.  The schemas under `schemas/` are the closed JSON Schema
 definitions referenced by the OpenAPI document.  They intentionally contain no
