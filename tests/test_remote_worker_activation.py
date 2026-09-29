@@ -208,6 +208,26 @@ def test_parked_host_remains_unclaimable_until_private_ack_and_owner_activation(
         service.close()
 
 
+def test_readiness_failure_revokes_enabled_worker_before_claim(tmp_path):
+    service, task_id, ref, credentials, preparer, _inspector, launcher = _fixture(tmp_path)
+    try:
+        parked = launcher.park(ref, target=OLD)
+
+        def not_ready(_handle):
+            preparer.calls.append("await_ready")
+            raise ConflictError("required H3 capability is unavailable")
+
+        preparer.await_ready = not_ready
+        with pytest.raises(ConflictError, match="required H3 capability"):
+            launcher.activate(service._task_resource(service.store.get_task(task_id)), ref, parked)
+        assert preparer.calls[-2:] == ["await_ready", "abort"]
+        assert credentials.actor_metadata("host") is None
+        waiting = _claim(service, OLD, {"actor": "host", "scopes": ["worker:execute"]}, "after-failed-ready")
+        assert waiting["waiting_reason"] in {"execution_binding_missing", "remote_activation_missing"}
+    finally:
+        service.close()
+
+
 @pytest.mark.parametrize("field,bad", [
     ("process", {"pid": 12345, "birth_id": "changed", "pgid": 12345, "sid": 12345}),
     ("model_root", "/wrong/models"),
