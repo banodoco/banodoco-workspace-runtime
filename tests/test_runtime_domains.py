@@ -228,62 +228,45 @@ def test_generated_python_client_exercises_versioned_domains_on_real_daemon(tmp_
         daemon.stop()
 
 
-def test_timeline_document_is_one_atomic_runtime_command(tmp_path, monkeypatch):
+def test_timeline_document_command_is_retired_after_canonical_cutover(tmp_path, monkeypatch):
     RealmStore.initialize(tmp_path / "realm").close()
     daemon = RuntimeDaemon(tmp_path / "realm", support_root=tmp_path / "support").start()
     try:
         client = WorkspaceClient(daemon.endpoint, daemon.token)
         project = client.create_project("Composition", idempotency_key="composition-project")
-        result = client.create_timeline_document(
-            project.project_id,
-            "composition",
-            config={"tracks": []},
-            registry={"assets": {}},
-            idempotency_key="composition-timeline",
-            slug=None,
-            name=None,
-        )
-        assert result["slug"] == "composition" and result["name"] == "composition"
-        assert result["receipt"]["command_kind"] == "timeline_document.create"
-        assert len(result["receipt"]["event_ids"]) == 1
-        assert client.get_project_timeline(project.project_id, "composition")["config"] == {"tracks": []}
-
-        # Replaying is served by the runtime ledger, not a client repair loop.
-        replay = client.create_timeline_document(
-            project.project_id,
-            "composition",
-            config={"tracks": []},
-            registry={"assets": {}},
-            idempotency_key="composition-timeline",
-        )
-        assert replay == result
-        assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id='composition'").fetchone()[0] == 1
-        assert len(client.list_timelines(project.project_id)[0]) == 1
-
-        original = daemon.service._command_record
-        monkeypatch.setattr(daemon.service, "_command_record", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("receipt write failed")))
-        with pytest.raises(ApiError):
-            client.create_timeline_document(project.project_id, "faulted", config={}, registry={}, idempotency_key="faulted")
-        assert daemon.service.store.conn.execute("SELECT 1 FROM timelines WHERE id='faulted'").fetchone() is None
-        assert daemon.service.store.conn.execute("SELECT 1 FROM project_documents WHERE id='timeline:faulted'").fetchone() is None
-        monkeypatch.setattr(daemon.service, "_command_record", original)
+        with pytest.raises(ApiError) as error:
+            client.create_timeline_document(
+                project.project_id,
+                "composition",
+                config={"tracks": []},
+                registry={"assets": {}},
+                idempotency_key="composition-timeline",
+                slug=None,
+                name=None,
+            )
+        assert error.value.status == 410
+        assert error.value.code == "retired_route"
     finally:
         daemon.stop()
 
 
-def test_timeline_document_replay_survives_runtime_restart(tmp_path):
+def test_timeline_document_replay_is_retired_after_runtime_restart(tmp_path):
     root, support = tmp_path / "realm", tmp_path / "support"
     RealmStore.initialize(root).close()
     first = RuntimeDaemon(root, support_root=support).start()
     client = WorkspaceClient(first.endpoint, first.token)
     project = client.create_project("Restart", idempotency_key="restart-project")
-    result = client.create_timeline_document(project.project_id, "restart-timeline", config={"tracks": []}, registry={}, idempotency_key="restart-timeline")
+    with pytest.raises(ApiError) as error:
+        client.create_timeline_document(project.project_id, "restart-timeline", config={"tracks": []}, registry={}, idempotency_key="restart-timeline")
+    assert error.value.status == 410
+    assert error.value.code == "retired_route"
     first.stop()
     second = RuntimeDaemon(root, support_root=support).start()
     try:
-        replay = WorkspaceClient(second.endpoint, second.token).create_timeline_document(project.project_id, "restart-timeline", config={"tracks": []}, registry={}, idempotency_key="restart-timeline")
-        assert replay == result
-        assert second.service.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id='restart-timeline'").fetchone()[0] == 1
+        with pytest.raises(ApiError) as replay_error:
+            WorkspaceClient(second.endpoint, second.token).create_timeline_document(project.project_id, "restart-timeline", config={"tracks": []}, registry={}, idempotency_key="restart-timeline")
+        assert replay_error.value.status == 410
+        assert replay_error.value.code == "retired_route"
     finally:
         second.stop()
 
