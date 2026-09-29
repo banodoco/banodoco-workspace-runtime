@@ -558,6 +558,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ClaimTask' } } } }
       responses: { '200': { description: Fenced attempt or a typed waiting result, content: { application/json: { schema: { oneOf: [ { $ref: './schemas/worker.json#/definitions/AttemptFence' }, { $ref: './schemas/worker.json#/definitions/ClaimWaiting' } ] } } } }, '204': { description: No task available } }
+  /v1/delegated-tasks:
+    post:
+      operationId: admitDelegatedTask
+      description: Admit one child task under a live worker-owned parent authority.
+      parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/DelegatedTaskAdmission' } } } }
+      responses: { '201': { description: Admitted delegated task with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/tasks/{task_id}:
     get:
       operationId: getTask
@@ -575,6 +582,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: '#/components/schemas/ExpectedVersion' } } } }
       responses: { '200': { description: Retry requested with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } } }
+  /v1/tasks/{task_id}/placement-recovery:
+    post:
+      operationId: recoverTaskPlacement
+      description: Owner-authorized versioned effective-placement recovery for one immutable targeted task.
+      parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PlacementRecovery' } } } }
+      responses: { '200': { description: Durable placement-recovery decision and task projection, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/runs/{run_id}:
     get:
       operationId: getRun
@@ -669,6 +683,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Settlement' } } } }
       responses: { '200': { description: Settled with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/child-authority:
+    post:
+      operationId: issueChildAuthority
+      description: Issue a short-lived authority for a child admission under the live parent attempt fence.
+      parameters: [ { $ref: '#/components/parameters/AttemptId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/ChildAuthorityRequest' } } } }
+      responses: { '200': { description: Child admission authority, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/ChildAuthority' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/prepare-reboot:
     post:
       operationId: prepareReboot
@@ -822,6 +843,38 @@ components:
       type: object
       additionalProperties: false
       properties: { expected_version: { type: integer, minimum: 1 } }
+    PlacementRecovery:
+      type: object
+      additionalProperties: false
+      required: [schema_version, expected_task_version, expected_placement_version, expected_original_target, expected_current_target, replacement_target, reason, loss_evidence, qualification]
+      properties:
+        schema_version: { type: integer, const: 1 }
+        expected_task_version: { type: integer, minimum: 1 }
+        expected_placement_version: { type: integer, minimum: 0 }
+        expected_original_target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+        expected_current_target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+        replacement_target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+        reason: { type: string, minLength: 1, maxLength: 1024 }
+        loss_evidence:
+          type: object
+          additionalProperties: false
+          required: [source, status, target, observed_at, evidence_digest, no_active_work]
+          properties:
+            source: { type: string, minLength: 1 }
+            status: { type: string, const: absent }
+            target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+            observed_at: { type: string, format: date-time }
+            evidence_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            no_active_work: { type: boolean, const: true }
+        qualification:
+          type: object
+          additionalProperties: false
+          required: [target, verified, evidence_digest, executor_incarnation]
+          properties:
+            target: { $ref: './schemas/worker.json#/definitions/ExecutionTarget' }
+            verified: { type: boolean, const: true }
+            evidence_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+            executor_incarnation: { type: string, minLength: 1, maxLength: 256 }
     AdmitTask:
       type: object
       additionalProperties: false
@@ -837,6 +890,7 @@ components:
         generation_intent: { type: object, additionalProperties: true, description: Opaque producer intent; GEN owns its semantics. }
         settlement_effect: { $ref: './schemas/worker.json#/definitions/Effect' }
         storage_estimate: { $ref: '#/components/schemas/StorageEstimate' }
+        child_delegation: { $ref: './schemas/worker.json#/definitions/ChildDelegationPolicy', description: Parent-owned authorization policy for staged child admission. }
     StorageEstimate:
       type: object
       additionalProperties: false

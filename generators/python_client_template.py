@@ -1026,7 +1026,7 @@ class WorkspaceClient:
         status, response_headers, body = self._request("HEAD", f"/v1/objects/{_path_part(object_id)}", headers=headers, expected=(200, 206))
         return ByteResponse(body, status, response_headers)
 
-    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None, project_id: str | None = None, spec: Mapping[str, Any] | None = None, generation_intent: Mapping[str, Any] | None = None, storage_estimate: Mapping[str, int] | None = None, required_facts: Mapping[str, Any] | None = None, execution_request: Mapping[str, Any] | None = None) -> MutationResult:
+    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None, project_id: str | None = None, spec: Mapping[str, Any] | None = None, generation_intent: Mapping[str, Any] | None = None, storage_estimate: Mapping[str, int] | None = None, required_facts: Mapping[str, Any] | None = None, execution_request: Mapping[str, Any] | None = None, child_delegation: Mapping[str, Any] | None = None) -> MutationResult:
         payload: dict[str, Any] = {"capability_id": capability_id, "capability_digest": capability_digest, "schema_version": schema_version, "input_object_ids": input_object_ids}
         if settlement_effect is not None:
             payload["settlement_effect"] = settlement_effect
@@ -1036,6 +1036,7 @@ class WorkspaceClient:
         if storage_estimate is not None: payload["storage_estimate"] = dict(storage_estimate)
         if required_facts is not None: payload["required_facts"] = dict(required_facts)
         if execution_request is not None: payload["execution_request"] = dict(execution_request)
+        if child_delegation is not None: payload["child_delegation"] = dict(child_delegation)
         _, _, body = self._request("POST", "/v1/tasks", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
         return self._mutation_json(body)
 
@@ -1098,6 +1099,15 @@ class WorkspaceClient:
         _, _, body = self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/heartbeat", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})
         return self._mutation_json(body)
 
+    def issue_child_authority(self, attempt_id: str, *, lease_id: str, fence: int, runtime_epoch: int) -> Mapping[str, Any]:
+        payload = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch}
+        return self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/child-authority", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
+
+    def admit_delegated_task(self, *, authority: str, task: Mapping[str, Any], idempotency_key: str) -> MutationResult:
+        payload = {"authority": authority, "task": dict(task)}
+        _, _, body = self._request("POST", "/v1/delegated-tasks", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
+        return self._mutation_json(body)
+
     def prepare_reboot(self, attempt_id: str, *, lease_id: str, fence: int, runtime_epoch: int) -> RecoveryAuthorization:
         payload: dict[str, Any] = {"lease_id": lease_id, "fence": fence, "runtime_epoch": runtime_epoch}
         return RecoveryAuthorization.from_json(self._json(self._request("POST", f"/v1/attempts/{_path_part(attempt_id)}/prepare-reboot", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2]))
@@ -1125,6 +1135,14 @@ class WorkspaceClient:
 
     def retry_task(self, task_id: str, *, idempotency_key: str, expected_version: int | None = None) -> MutationResult:
         return self._task_transition("retry", task_id, idempotency_key=idempotency_key, expected_version=expected_version)
+
+    def recover_task_placement(self, task_id: str, recovery: Mapping[str, Any], *, idempotency_key: str) -> MutationResult:
+        _, _, body = self._request(
+            "POST", f"/v1/tasks/{_path_part(task_id)}/placement-recovery",
+            body=json.dumps(dict(recovery), separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key},
+        )
+        return self._mutation_json(body)
 
     def _task_transition(self, action: str, task_id: str, *, idempotency_key: str, expected_version: int | None) -> MutationResult:
         payload = {} if expected_version is None else {"expected_version": expected_version}

@@ -19,8 +19,10 @@ import json
 import sqlite3
 import base64
 import copy
+import hmac
 import os
 import re
+import secrets
 import subprocess
 import uuid
 import stat
@@ -43,6 +45,9 @@ MEDIA_IMPORT_CAPABILITY = "runtime.media.import.v1"
 MEDIA_IMPORT_EXECUTOR = "runtime-host-media-import"
 MEDIA_IMPORT_CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(MEDIA_IMPORT_CAPABILITY.encode()).hexdigest()
 TARGETED_EXECUTION_BINDING_CAPABILITY = "execution_binding.targeted.v1"
+QUALIFIED_REMOTE_CAPABILITY = "h3_av.transform"
+PLACEMENT_RECOVERY_SCHEMA_VERSION = 1
+PLACEMENT_LOSS_EVIDENCE_MAX_AGE_SECONDS = 15 * 60
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
@@ -61,6 +66,27 @@ SUPPORTED_COMPOSITION_EFFECTS = frozenset({
 
 
 LEGACY_MANAGED_OUTPUT_PREFIXES = frozenset({"images", "videos", "audio"})
+
+
+def _canonical_execution_input_filename(value, field):
+    """Validate the filename carried by a delegated execution input.
+
+    Runtime resolves the object identity from the producer association, but
+    the filename remains part of the worker-facing execution contract.  Keep
+    it a flat, non-empty basename so the worker and Runtime normalize the
+    same descriptor.
+    """
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 512
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValidationError(f"{field} must be a non-empty safe basename")
+    path = Path(value)
+    if path.is_absolute() or path.name != value or ".." in path.parts:
+        raise ValidationError(f"{field} must be a non-empty safe basename")
+    return value
 
 
 def _canonical_managed_output_filename(value):
@@ -413,6 +439,7 @@ class RuntimeService:
             self.cas = ContentAddressedStore(self.store.cas_root)
             self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
             self.runtime_session_id = new_id()
+            self._child_authority_key = secrets.token_bytes(32)
             self._runtime_state = self.store.begin_runtime_session(
                 self.runtime_session_id, epoch_floor=runtime_epoch_floor
             )
@@ -611,23 +638,299 @@ class RuntimeService:
         except ValidationError as exc:
             raise AuthorizationError("worker credential carries invalid execution placement") from exc
 
+    def _placement_recovery_qualification_matches(self, task_id, placement):
+        recovery = self.store.placement_recovery(task_id)
+        if recovery is None:
+            return True
+        qualification = recovery.get("qualification")
+        return bool(
+            placement is not None
+            and isinstance(qualification, dict)
+            and placement.get("actual") == recovery.get("replacement_target")
+            and placement.get("verification", {}).get("evidence_digest")
+            == qualification.get("evidence_digest")
+            and placement.get("executor_incarnation")
+            == qualification.get("executor_incarnation")
+        )
+
+    def _remote_activation_history(self, task_id, activation_id=None):
+        rows = self.store.conn.execute(
+            "SELECT id, kind, payload_json FROM events WHERE task_id=? "
+            "AND kind IN ('task.remote_activation_qualified', 'task.remote_activation_revoked') "
+            "ORDER BY id", (str(task_id),),
+        ).fetchall()
+        history = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if activation_id is None or payload.get("activation_id") == activation_id:
+                history.append((row["kind"], payload))
+        return history
+
+    def _latest_remote_activation(self, task_id):
+        row = self.store.conn.execute(
+            "SELECT kind, payload_json FROM events WHERE task_id=? "
+            "AND kind IN ('task.remote_activation_qualified', 'task.remote_activation_revoked') "
+            "ORDER BY id DESC LIMIT 1", (str(task_id),),
+        ).fetchone()
+        if row is None or row["kind"] != "task.remote_activation_qualified":
+            return None
+        return json.loads(row["payload_json"])
+
+    def _task_requires_remote_activation(self, task_id):
+        row = self.store.conn.execute(
+            "SELECT capability, execution_request_json, spec_json FROM tasks WHERE id=?",
+            (str(task_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            request = json.loads(row["execution_request_json"] or "null")
+        except (TypeError, json.JSONDecodeError):
+            request = None
+        if (row["capability"] == QUALIFIED_REMOTE_CAPABILITY
+                and isinstance(request, dict)
+                and isinstance(request.get("target"), dict)
+                and request["target"].get("kind") == "runpod"):
+            return True
+        try:
+            spec = json.loads(row["spec_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return False
+        lineage = spec.get("delegated_parent") if isinstance(spec, dict) else None
+        parent_id = lineage.get("parent_task_id") if isinstance(lineage, dict) else None
+        if not parent_id:
+            return False
+        return any(
+            kind == "task.remote_activation_qualified"
+            for kind, _payload in self._remote_activation_history(parent_id)
+        )
+
+    def _activation_scope_matches(self, task_id, activation, placement):
+        task = self.store.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (str(task_id),)
+        ).fetchone()
+        owner_id = str(activation.get("task_id") or "")
+        if task is None or not owner_id or activation.get("run_id") is None:
+            return False
+        owner = self.store.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (owner_id,)
+        ).fetchone()
+        if owner is None or owner["run_id"] != activation.get("run_id"):
+            return False
+        if str(task["id"]) == owner_id:
+            return task["run_id"] == activation.get("run_id")
+        try:
+            spec = json.loads(task["spec_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return False
+        lineage = spec.get("delegated_parent")
+        authorized = activation.get("authorized_child_lineage")
+        if not isinstance(lineage, dict) or not isinstance(authorized, dict):
+            return False
+        parent = self.store.conn.execute(
+            "SELECT * FROM tasks WHERE id=?", (lineage.get("parent_task_id"),)
+        ).fetchone()
+        if (authorized.get("parent_task_id") != owner_id
+                or authorized.get("parent_run_id") != activation.get("run_id")
+                or authorized.get("max_depth") != 1
+                or lineage.get("parent_task_id") != owner_id
+                or parent is None
+                or parent["run_id"] != activation.get("run_id")):
+            return False
+        try:
+            from .remote_worker_deployment import deployment_binding_from_task
+            parent_binding = deployment_binding_from_task(
+                self._task_resource(self.store.get_task(owner_id))
+            )
+        except (TypeError, ValueError, KeyError):
+            return False
+        current_attempt = self.store.conn.execute(
+            "SELECT * FROM attempts WHERE id=? AND task_id=?",
+            (lineage.get("parent_attempt_id"), owner_id),
+        ).fetchone()
+        return bool(
+            parent["status"] == "running"
+            and parent["attempt_id"] == lineage.get("parent_attempt_id")
+            and parent["lease_token"] == lineage.get("parent_lease_id")
+            and int(parent["lease_fence"] or 0) == int(lineage.get("parent_fence") or 0)
+            and int(parent["runtime_epoch"] or 0) == int(lineage.get("runtime_epoch") or 0)
+            and parent["executor_id"] == lineage.get("executor_id")
+            and current_attempt is not None
+            and not int(current_attempt["settled"] or 0)
+            and current_attempt["lease_id"] == lineage.get("parent_lease_id")
+            and int(current_attempt["fence"] or 0) == int(lineage.get("parent_fence") or 0)
+            and int(current_attempt["runtime_epoch"] or 0) == int(lineage.get("runtime_epoch") or 0)
+            and current_attempt["executor_id"] == lineage.get("executor_id")
+            and lineage.get("executor_id") == activation.get("credential_actor")
+            and lineage.get("parent_placement") == placement
+            and lineage.get("parent_effective_target") == activation.get("effective_target")
+            and lineage.get("parent_effective_target") == parent_binding.placement.effective_target
+            and lineage.get("parent_placement_version") == authorized.get("placement_version")
+            and lineage.get("parent_placement_version") == parent_binding.placement.placement_version
+            and authorized.get("effective_target") == placement.get("actual")
+            and authorized.get("effective_target") == parent_binding.placement.effective_target
+            and lineage.get("parent_task_id") == authorized.get("parent_task_id")
+        )
+
+    def _activation_allows_child(self, parent, activation, effective_target, placement_version):
+        authorized = activation.get("authorized_child_lineage") if isinstance(activation, dict) else None
+        return bool(
+            isinstance(authorized, dict)
+            and authorized.get("parent_task_id") == parent["id"]
+            and authorized.get("parent_run_id") == parent["run_id"]
+            and authorized.get("max_depth") == 1
+            and authorized.get("placement_version") == placement_version
+            and authorized.get("effective_target") == effective_target
+        )
+
+    def _remote_activation_matches(self, task_id, identity, placement, *, require_fresh=True):
+        """Check current activation; freshness applies only before claim/admission."""
+        if not isinstance(identity, dict) or not isinstance(placement, dict):
+            return False
+        supplied = identity.get("qualified_activation")
+        owner_id = str(supplied.get("task_id") or "") if isinstance(supplied, dict) else ""
+        recorded = self._latest_remote_activation(owner_id) if owner_id else None
+        if not isinstance(supplied, dict) or not isinstance(recorded, dict):
+            return False
+        if supplied != recorded or identity.get("actor") != recorded.get("credential_actor"):
+            return False
+        if recorded.get("runtime_session_id") != self.runtime_session_id:
+            return False
+        if recorded.get("runtime_epoch") != self.store._current_runtime_epoch():
+            return False
+        try:
+            expiry = datetime.fromisoformat(recorded["expires_at"].replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if require_fresh and (expiry.tzinfo is None or expiry <= datetime.now(timezone.utc)):
+            return False
+        if (recorded.get("task_id") != owner_id
+                or recorded.get("executor_incarnation") != placement.get("executor_incarnation")
+                or recorded.get("evidence_digest") != placement.get("verification", {}).get("evidence_digest")
+                or recorded.get("effective_target") != placement.get("actual")):
+            return False
+        if not self._activation_scope_matches(task_id, recorded, placement):
+            return False
+        from .remote_worker_deployment import deployment_binding_from_task
+        try:
+            binding = deployment_binding_from_task(
+                self._task_resource(self.store.get_task(owner_id))
+            )
+        except (TypeError, ValueError, KeyError):
+            return False
+        return recorded.get("binding_digest") == binding.digest()
+
+    @_durable_mutation
+    def record_remote_activation(self, task_id, qualification, *, identity=None):
+        """Commit a privately acknowledged, independently observed activation."""
+        actor = self._require_placement_recovery_owner(identity)
+        if actor != "owner":
+            raise AuthorizationError("remote activation requires the Runtime owner actor")
+        if not isinstance(qualification, dict):
+            raise ValidationError("remote activation qualification is required")
+        required = {
+            "activation_id", "task_id", "run_id", "credential_actor",
+            "binding_digest", "deployment_digest", "evidence_digest",
+            "effective_target", "executor_incarnation", "runtime_session_id",
+            "runtime_epoch", "expires_at", "observation_digest",
+            "authorized_child_lineage",
+        }
+        if set(qualification) != required or qualification.get("task_id") != str(task_id):
+            raise ValidationError("remote activation qualification has an invalid shape")
+        from .remote_worker_deployment import deployment_binding_from_task
+        task = self._task_resource(self.store.get_task(task_id))
+        binding = deployment_binding_from_task(task)
+        if (qualification["run_id"] != binding.admission_identity.run_id
+                or qualification["binding_digest"] != binding.digest()
+                or qualification["effective_target"] != binding.placement.effective_target
+                or qualification["runtime_session_id"] != self.runtime_session_id
+                or qualification["runtime_epoch"] != self.store._current_runtime_epoch()):
+            raise ConflictError("remote activation is stale or foreign to the admitted task")
+        lineage = qualification["authorized_child_lineage"]
+        expected_lineage = {
+            "parent_task_id": binding.admission_identity.task_id,
+            "parent_run_id": binding.admission_identity.run_id,
+            "max_depth": 1,
+            "placement_version": binding.placement.placement_version,
+            "effective_target": binding.placement.effective_target,
+        }
+        if lineage != expected_lineage:
+            raise ConflictError("remote activation child lineage is not explicitly authorized")
+        for field in ("binding_digest", "deployment_digest", "evidence_digest", "observation_digest"):
+            self._placement_evidence_digest(qualification[field], field)
+        try:
+            expiry = datetime.fromisoformat(qualification["expires_at"].replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as exc:
+            raise ValidationError("remote activation expiry is invalid") from exc
+        if expiry.tzinfo is None or expiry <= datetime.now(timezone.utc):
+            raise ConflictError("remote activation has expired")
+        if not all(isinstance(qualification[field], str) and qualification[field] for field in
+                   ("activation_id", "credential_actor", "executor_incarnation")):
+            raise ValidationError("remote activation identity is incomplete")
+        latest = self._latest_remote_activation(task_id)
+        history = self._remote_activation_history(task_id, qualification.get("activation_id"))
+        if history:
+            if any(kind == "task.remote_activation_revoked" for kind, _payload in history):
+                raise ConflictError("remote activation generation is permanently revoked")
+            if any(kind == "task.remote_activation_qualified" and payload == qualification for kind, payload in history):
+                return qualification
+            raise ConflictError("remote activation generation was already used")
+        if latest is not None:
+            raise ConflictError("another remote activation is already qualified")
+        self.store._append_event(
+            task["run_id"], str(task_id), "task.remote_activation_qualified", qualification
+        )
+        return qualification
+
+    @_durable_mutation
+    def revoke_remote_activation(self, task_id, activation_id, *, identity=None):
+        actor = self._require_placement_recovery_owner(identity)
+        if actor != "owner":
+            raise AuthorizationError("remote activation revocation requires the Runtime owner actor")
+        latest = self._latest_remote_activation(task_id)
+        if latest is None or latest.get("activation_id") != activation_id:
+            raise ConflictError("remote activation is no longer current")
+        task = self.store.get_task(task_id)
+        self.store._append_event(
+            task["run"]["id"], str(task_id), "task.remote_activation_revoked",
+            {"activation_id": activation_id, "revoked_at": now()},
+        )
+
     def _assert_attempt_identity(self, row, identity):
         if not row:
             return
         self._assert_executor_identity(identity, row["executor_id"])
         if identity is None:
             return
+        qualified_identity = (
+            isinstance(identity, dict)
+            and isinstance(identity.get("qualified_activation"), dict)
+        )
         binding = self.store.execution_binding(row["task_id"])
         if not binding or not binding.get("actual_target"):
+            if qualified_identity:
+                raise AuthorizationError("qualified credential is not bound to this admitted task")
             return
         placement = self._trusted_execution_placement(identity)
         if placement is None:
             raise AuthorizationError("worker credential has no execution placement")
+        if ((self._task_requires_remote_activation(row["task_id"])
+             or qualified_identity)
+                and not self._remote_activation_matches(
+                    row["task_id"], identity, placement, require_fresh=False
+                )):
+            raise AuthorizationError("remote activation is missing, revoked, or stale")
         if (
             not execution_placement_matches(binding["resolved_target"], placement)
             or binding.get("actual_target") != placement["actual"]
             or binding.get("verification") != placement["verification"]
             or binding.get("executor_incarnation") != placement["executor_incarnation"]
+            or not self._placement_recovery_qualification_matches(row["task_id"], placement)
         ):
             raise AuthorizationError("worker credential does not match the fenced execution binding")
 
@@ -4063,8 +4366,91 @@ class RuntimeService:
                           key_fn=lambda row: (str(row["created_at"]), str(row["from_digest"]), str(row["to_digest"]), str(row["kind"]), int(row["ordinal"])),
                           resource_fn=lambda row: {"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]})
 
+    @staticmethod
+    def _child_policy(value):
+        required = {"capabilities", "targets", "input_object_ids"}
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"stages", "final_publication"}:
+            raise ValidationError("child_delegation requires capabilities, targets, and input_object_ids")
+        capabilities = value["capabilities"]
+        if not isinstance(capabilities, list) or not capabilities or len(capabilities) > 32:
+            raise ValidationError("child_delegation.capabilities must be a non-empty bounded list")
+        normalized_caps = []
+        for item in capabilities:
+            if not isinstance(item, dict) or set(item) != {"capability_id", "capability_digest"}:
+                raise ValidationError("child_delegation capability must pin id and digest")
+            if not isinstance(item["capability_id"], str) or not item["capability_id"] or not isinstance(item["capability_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", item["capability_digest"]):
+                raise ValidationError("child_delegation capability identity is invalid")
+            normalized_caps.append(dict(item))
+        targets = value["targets"]
+        if not isinstance(targets, list) or not targets or len(targets) > 32:
+            raise ValidationError("child_delegation.targets must be a non-empty bounded list")
+        normalized_targets = [_normalize_execution_target(target) for target in targets]
+        inputs = value["input_object_ids"]
+        if not isinstance(inputs, list) or len(inputs) > 256 or any(not isinstance(item, str) or not item.startswith("sha256:") or not OBJECT_ID_RE.fullmatch(item) for item in inputs):
+            raise ValidationError("child_delegation.input_object_ids must contain sha256 object IDs")
+        if len({canonical_json(item) for item in normalized_targets}) != len(normalized_targets) or len(set(inputs)) != len(inputs) or len({item["capability_id"] for item in normalized_caps}) != len(normalized_caps):
+            raise ValidationError("child_delegation entries must be unique")
+        policy = {"capabilities": normalized_caps, "targets": normalized_targets, "input_object_ids": inputs}
+        if "stages" in value:
+            stages = value["stages"]
+            if not isinstance(stages, list) or not stages or len(stages) > 16:
+                raise ValidationError("child_delegation.stages must be a non-empty bounded list")
+            normalized_stages = []
+            preceding = set()
+            for stage in stages:
+                if not isinstance(stage, dict) or set(stage) != {"name", "capability_id", "capability_digest", "target", "inputs"}:
+                    raise ValidationError("each child stage requires name, capability, target, and inputs")
+                name = stage["name"]
+                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) or name in preceding:
+                    raise ValidationError("child stage name is invalid or repeated")
+                capability = {"capability_id": stage["capability_id"], "capability_digest": stage["capability_digest"]}
+                target = _normalize_execution_target(stage["target"])
+                if capability not in normalized_caps or target not in normalized_targets:
+                    raise ValidationError("child stage capability or target is outside policy")
+                declared_inputs = stage["inputs"]
+                if not isinstance(declared_inputs, list) or len(declared_inputs) > 256:
+                    raise ValidationError("child stage inputs must be a bounded ordered list")
+                names = set()
+                for ref in declared_inputs:
+                    if not isinstance(ref, dict) or not isinstance(ref.get("name"), str) or not ref["name"] or len(ref["name"]) > 128 or ref["name"] in names:
+                        raise ValidationError("child stage input names must be unique non-empty strings")
+                    names.add(ref["name"])
+                    if set(ref) == {"name", "root_object_id"}:
+                        if ref["root_object_id"] not in inputs:
+                            raise ValidationError("child stage root input is outside parent policy")
+                    elif set(ref) == {"name", "producer_stage", "output_port"}:
+                        if (not isinstance(ref["producer_stage"], str) or ref["producer_stage"] not in preceding
+                                or not isinstance(ref["output_port"], str) or not ref["output_port"] or len(ref["output_port"]) > 255):
+                            raise ValidationError("child stage producer must be an earlier declared stage and port")
+                    else:
+                        raise ValidationError("child stage input must name a root object or producer stage and port")
+                normalized_stages.append({**stage, "target": target, "inputs": [dict(ref) for ref in declared_inputs]})
+                preceding.add(name)
+            policy["stages"] = normalized_stages
+        if "final_publication" in value:
+            final = value["final_publication"]
+            if "stages" not in policy or not isinstance(final, dict) or set(final) != {"stage", "verify_stage", "verify_output_port", "effect"}:
+                raise ValidationError("final_publication requires a declared stage, verify source, and effect")
+            if final["stage"] != policy["stages"][-1]["name"] or final["verify_stage"] not in [stage["name"] for stage in policy["stages"][:-1]]:
+                raise ValidationError("final publication must follow its declared verify stage")
+            final_inputs = policy["stages"][-1]["inputs"]
+            matches = [ref for ref in final_inputs if ref.get("producer_stage") == final["verify_stage"] and ref.get("output_port") == final["verify_output_port"]]
+            if len(final_inputs) != 1 or len(matches) != 1:
+                raise ValidationError("final publication must consume exactly one declared verify output")
+            effect = final["effect"]
+            if not isinstance(effect, dict) or effect.get("effect_type") != "generation.publish_v1":
+                raise ValidationError("final publication requires generation.publish_v1")
+            groups = effect.get("payload", {}).get("groups") if isinstance(effect.get("payload"), dict) else None
+            selectors = [selector for group in groups for selector in group.get("selectors", [])] if isinstance(groups, list) and all(isinstance(group, dict) and isinstance(group.get("selectors"), list) for group in groups) else []
+            if any(not isinstance(selector, dict) for selector in selectors):
+                raise ValidationError("final publication effect selectors must be objects")
+            if len(selectors) != 1 or selectors[0].get("output_port") != final["verify_output_port"]:
+                raise ValidationError("final publication effect must select the verified output port")
+            policy["final_publication"] = dict(final)
+        return policy
+
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False, _host_owned=False):
+    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
         capability = body.get("capability_id")
@@ -4073,6 +4459,13 @@ class RuntimeService:
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
         execution_request = body.get("execution_request")
         task_spec_value = body.get("spec", {})
+        if not isinstance(task_spec_value, dict):
+            raise ValidationError("task spec must be an object")
+        reserved = {"child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs"}
+        if set(task_spec_value) & {"child_delegation", "delegated_parent"} or set(body) & (reserved - {"child_delegation"}):
+            raise ValidationError("delegation fields must use Runtime admission authority")
+        if _delegated_lineage is not None and "child_delegation" in body:
+            raise ValidationError("delegated children cannot delegate further")
         if isinstance(task_spec_value, dict) and (
             "execution_request" in task_spec_value
             or (
@@ -4092,6 +4485,21 @@ class RuntimeService:
         if isinstance(execution_request, dict) and "execution_binding" in execution_request:
             raise ValidationError("caller-supplied execution_binding is not accepted")
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
+        if "child_delegation" in body:
+            task_spec["child_delegation"] = self._child_policy(body["child_delegation"])
+            final = task_spec["child_delegation"].get("final_publication")
+            if final is not None:
+                project = self.store.get_project(body.get("project")) if body.get("project") else None
+                if project is None:
+                    raise ValidationError("final publication requires a project-scoped parent")
+                self.store._validate_settlement_effect(final["effect"], project_id=project["id"])
+        if _delegated_lineage is not None:
+            task_spec["delegated_parent"] = dict(_delegated_lineage)
+        if _delegated_stage is not None:
+            task_spec["delegated_stage"] = _delegated_stage
+            task_spec["delegated_inputs"] = list(_delegated_inputs or [])
+        if _verified_publication_source is not None:
+            task_spec["verified_publication_source"] = dict(_verified_publication_source)
         if "generation_intent" in body:
             if not isinstance(body["generation_intent"], dict):
                 raise ValidationError("generation_intent must be an object")
@@ -4104,6 +4512,259 @@ class RuntimeService:
             task_spec["storage_estimate"] = self.store._validate_storage_estimate(body["storage_estimate"])
         value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_request=execution_request)
         return value
+
+    def _live_delegating_parent(self, attempt_id, lease, *, identity):
+        row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        self._assert_attempt_identity(row, identity)
+        self._validate_attempt_lease(row, lease, self.store._current_runtime_epoch())
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+        if not task or task["status"] != "running" or task["attempt_id"] != attempt_id or task["lease_token"] != row["lease_id"] or int(task["lease_fence"]) != int(row["fence"]):
+            raise LeaseError("parent attempt is no longer live")
+        policy = json.loads(task["spec_json"]).get("child_delegation")
+        if policy is None:
+            raise AuthorizationError("parent task has no child delegation policy")
+        policy = self._child_policy(policy)
+        project = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0]
+        return row, task, project, policy
+
+    def _child_identity_digest(self, identity):
+        if identity is None:
+            raise AuthorizationError("authenticated worker identity is required")
+        return sha256_bytes(canonical_json({
+            "actor": identity.get("actor"),
+            "placement": self._trusted_execution_placement(identity),
+        }).encode())
+
+    @_verified_mutation
+    def issue_child_authority(self, attempt_id, body, *, identity):
+        body = _wire_object(body, required=("lease_id", "fence", "runtime_epoch"), allowed=("lease_id", "fence", "runtime_epoch"))
+        _wire_string(body, "lease_id")
+        _wire_integer(body, "fence")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        row, task, project, policy = self._live_delegating_parent(attempt_id, body, identity=identity)
+        recovery = self.store.placement_recovery(task["id"])
+        effective_target = self.store.effective_execution_target(task["id"])
+        payload = {
+            "version": 1, "realm_id": self.realm["id"], "session_id": self.runtime_session_id,
+            "parent_task_id": task["id"], "parent_attempt_id": attempt_id,
+            "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]),
+            "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"],
+            "project_id": project, "expires_at": row["lease_expires_at"],
+            "policy_digest": sha256_bytes(canonical_json(policy).encode()),
+            "identity_digest": self._child_identity_digest(identity),
+            "effective_target": effective_target,
+            "placement_version": int(recovery.get("placement_version", 0)) if recovery else 0,
+        }
+        encoded = base64.urlsafe_b64encode(canonical_json(payload).encode()).decode().rstrip("=")
+        signature = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+        return {"authority": encoded + "." + signature, "expires_at": row["lease_expires_at"], "parent_task_id": task["id"], "parent_attempt_id": attempt_id}
+
+    def _decode_child_authority(self, token):
+        if not isinstance(token, str) or len(token) > 8192 or token.count(".") != 1:
+            raise AuthorizationError("invalid child authority")
+        encoded, supplied = token.split(".", 1)
+        expected = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(supplied, expected):
+            raise AuthorizationError("invalid child authority")
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AuthorizationError("invalid child authority") from exc
+        if not isinstance(payload, dict) or payload.get("version") != 1 or payload.get("realm_id") != self.realm["id"] or payload.get("session_id") != self.runtime_session_id:
+            raise AuthorizationError("child authority belongs to another runtime session")
+        return payload
+
+    def _delegated_stage_rows(self, project, lineage):
+        """Read the already admitted siblings under the same parent fence."""
+        rows = self.store.conn.execute(
+            "SELECT t.id, t.status, t.attempt_id, t.spec_json FROM tasks t "
+            "JOIN runs r ON r.id=t.run_id WHERE r.project_id IS ? "
+            "AND json_extract(t.spec_json, '$.delegated_parent.parent_attempt_id')=?",
+            (project, lineage["parent_attempt_id"]),
+        ).fetchall()
+        stages = {}
+        for row in rows:
+            spec = json.loads(row["spec_json"])
+            recorded = spec.get("delegated_parent")
+            if not isinstance(recorded, dict) or any(recorded.get(key) != lineage[key] for key in ("parent_task_id", "parent_attempt_id", "parent_lease_id", "parent_fence", "runtime_epoch", "executor_id", "parent_placement", "parent_effective_target", "parent_placement_version", "project_id")):
+                continue
+            name = spec.get("delegated_stage")
+            if name in stages:
+                raise ConflictError("delegated stage has duplicate admissions")
+            if name is not None:
+                stages[name] = row
+        return stages
+
+    def _resolve_delegated_stage_inputs(self, declared, supplied, *, siblings, project, lineage):
+        if not isinstance(supplied, list) or len(supplied) != len(declared):
+            raise ValidationError("input_refs must match the declared stage order")
+        object_ids, resolved = [], []
+        for expected, ref in zip(declared, supplied):
+            if not isinstance(ref, dict) or ref.get("name") != expected["name"]:
+                raise ValidationError("input_refs must match the declared stage order")
+            if "root_object_id" in expected:
+                if set(ref) != {"name", "root_object_id"} or ref["root_object_id"] != expected["root_object_id"]:
+                    raise AuthorizationError("root input is outside the declared stage policy")
+                object_id = expected["root_object_id"]
+                resolved.append({"name": ref["name"], "root_object_id": object_id, "object_id": object_id})
+            else:
+                if set(ref) != {"name", "producer_task_id", "association_id", "output_port"} or ref["output_port"] != expected["output_port"]:
+                    raise AuthorizationError("producer input is outside the declared stage policy")
+                producer = siblings.get(expected["producer_stage"])
+                if producer is None or producer["id"] != ref["producer_task_id"] or producer["status"] != "completed":
+                    raise ConflictError("declared producer stage is not settled")
+                association = self.store.get_managed_output(ref["association_id"])
+                if (association["task_id"] != producer["id"] or association["attempt_id"] != producer["attempt_id"]
+                        or association["project_id"] != project or association["output_port"] != expected["output_port"]
+                        or association["durability"] != "durable" or association["lifecycle"]["state"] not in {"available", "promoted"}):
+                    raise AuthorizationError("managed output does not match the declared live lineage and port")
+                attempt = self.store.conn.execute("SELECT settled, runtime_epoch FROM attempts WHERE id=? AND task_id=?", (association["attempt_id"], producer["id"])).fetchone()
+                if not attempt or not attempt["settled"] or int(attempt["runtime_epoch"]) != lineage["runtime_epoch"]:
+                    raise ConflictError("producer managed output is not settled in the parent epoch")
+                object_id = association["object_id"]
+                resolved.append({"name": ref["name"], "producer_stage": expected["producer_stage"], "producer_task_id": producer["id"], "producer_attempt_id": producer["attempt_id"], "association_id": association["association_id"], "output_port": association["output_port"], "object_id": object_id})
+            object_ids.append(object_id)
+        if len(set(object_ids)) != len(object_ids):
+            raise ValidationError("resolved delegated inputs must have unique object IDs")
+        return object_ids, resolved
+
+    @_durable_mutation
+    def admit_delegated_child(self, body, *, idempotency_key, identity):
+        body = _wire_object(body, required=("authority", "task"), allowed=("authority", "task"))
+        payload = self._decode_child_authority(body["authority"])
+        if payload.get("identity_digest") != self._child_identity_digest(identity):
+            raise AuthorizationError("child authority is bound to another worker identity")
+        lease = {"lease_id": payload.get("parent_lease_id"), "fence": payload.get("parent_fence"), "runtime_epoch": payload.get("runtime_epoch")}
+        row, parent, project, policy = self._live_delegating_parent(payload.get("parent_attempt_id"), lease, identity=identity)
+        recovery = self.store.placement_recovery(parent["id"])
+        placement_version = int(recovery.get("placement_version", 0)) if recovery else 0
+        effective_target = self.store.effective_execution_target(parent["id"])
+        activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
+        if self._task_requires_remote_activation(parent["id"]) or isinstance(activation, dict):
+            placement = self._trusted_execution_placement(identity)
+            if not self._remote_activation_matches(
+                parent["id"], identity, placement, require_fresh=True
+            ):
+                raise AuthorizationError("remote activation is missing, expired, revoked, or foreign")
+            if not self._activation_allows_child(parent, activation, effective_target, placement_version):
+                raise AuthorizationError("qualified credential is not authorized for this child lineage")
+        if (payload.get("parent_task_id") != parent["id"] or payload.get("executor_id") != row["executor_id"]
+                or payload.get("project_id") != project or payload.get("expires_at") != row["lease_expires_at"]
+                or payload.get("policy_digest") != sha256_bytes(canonical_json(policy).encode())
+                or payload.get("effective_target") != effective_target
+                or payload.get("placement_version") != placement_version):
+            raise AuthorizationError("child authority no longer matches parent attempt")
+        task = _wire_object(body["task"], required=("capability_id", "capability_digest"), allowed=("capability_id", "capability_digest", "input_object_ids", "input_refs", "stage", "schema_version", "spec", "execution_request", "generation_intent", "required_facts", "storage_estimate"))
+        if {"capability_id": task["capability_id"], "capability_digest": task["capability_digest"]} not in policy["capabilities"]:
+            raise AuthorizationError("child capability is outside parent policy")
+        idempotency_key = require_idempotency_key(idempotency_key)
+        stages = policy.get("stages")
+        stage_name = task.get("stage")
+        request = task.get("execution_request")
+        if request is not None and not isinstance(request, dict):
+            raise ValidationError("execution_request must be an object")
+        resolved_inputs = None
+        verified_source = None
+        if stages is None:
+            if stage_name is not None or "input_refs" in task:
+                raise ValidationError("parent policy does not declare child stages")
+            inputs = task.get("input_object_ids")
+            if not isinstance(inputs, list) or any(item not in policy["input_object_ids"] for item in inputs):
+                raise AuthorizationError("child inputs are outside parent policy")
+        else:
+            if "input_object_ids" in task or not isinstance(stage_name, str):
+                raise ValidationError("staged child requires stage and input_refs, not bare input_object_ids")
+            stage_by_name = {item["name"]: (index, item) for index, item in enumerate(stages)}
+            if stage_name not in stage_by_name:
+                raise AuthorizationError("child stage is outside parent policy")
+            index, stage = stage_by_name[stage_name]
+            if {"capability_id": task["capability_id"], "capability_digest": task["capability_digest"]} != {"capability_id": stage["capability_id"], "capability_digest": stage["capability_digest"]}:
+                raise AuthorizationError("child capability does not match declared stage")
+            supplied_target = _normalize_execution_target(request.get("target")) if request is not None else {"kind": "default"}
+            if supplied_target not in (stage["target"], effective_target):
+                raise AuthorizationError("child target does not match declared stage")
+            lineage_keys = {"parent_task_id": parent["id"], "parent_attempt_id": row["id"], "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]), "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"], "parent_placement": self._trusted_execution_placement(identity), "parent_effective_target": effective_target, "parent_placement_version": placement_version, "project_id": project}
+            siblings = self._delegated_stage_rows(project, lineage_keys)
+            existing = siblings.get(stage_name)
+            if existing is not None:
+                old_key = self.store.conn.execute("SELECT r.idempotency_key FROM runs r JOIN tasks t ON t.run_id=r.id WHERE t.id=?", (existing["id"],)).fetchone()[0]
+                if old_key != idempotency_key:
+                    raise ConflictError("delegated stage was already admitted")
+            if any(item["name"] not in siblings or siblings[item["name"]]["status"] != "completed" for item in stages[:index]):
+                raise ConflictError("delegated stages must be admitted once and completed in order")
+            inputs, resolved_inputs = self._resolve_delegated_stage_inputs(stage["inputs"], task.get("input_refs"), siblings=siblings, project=project, lineage=lineage_keys)
+            final = policy.get("final_publication")
+            if final is not None and stage_name == final["stage"]:
+                verified_source = next(ref for ref in resolved_inputs if ref.get("producer_stage") == final["verify_stage"] and ref.get("output_port") == final["verify_output_port"])
+        target = _normalize_execution_target(request.get("target")) if isinstance(request, dict) else {"kind": "default"}
+        if target not in policy["targets"] and target != effective_target:
+            raise AuthorizationError("child target is outside parent policy")
+        if stages is not None and request is not None:
+            if "inputs" in request:
+                raise ValidationError("staged child execution_request.inputs are resolved by Runtime")
+            child_spec = task.get("spec", {})
+            spec_inputs = child_spec.get("inputs") if isinstance(child_spec, dict) else None
+            if not isinstance(spec_inputs, dict):
+                raise ValidationError("staged child spec must declare its managed input descriptors")
+            canonical_inputs = []
+            for ref in resolved_inputs:
+                name = ref["name"]
+                descriptor = spec_inputs.get(name)
+                if not isinstance(descriptor, dict):
+                    raise ValidationError(
+                        "staged child spec is missing its managed input descriptor",
+                        details={"name": name},
+                    )
+                supplied_object_id = descriptor.get("object_id") or descriptor.get("digest")
+                if supplied_object_id != ref["object_id"]:
+                    raise AuthorizationError(
+                        "staged child input descriptor disagrees with the Runtime-resolved object",
+                        details={"name": name},
+                    )
+                filename = _canonical_execution_input_filename(
+                    descriptor.get("filename"),
+                    f"staged child input {name!r}.filename",
+                )
+                required = descriptor.get("required", True)
+                if type(required) is not bool:
+                    raise ValidationError(
+                        f"staged child input {name!r}.required must be a boolean"
+                    )
+                canonical = {
+                    "name": name,
+                    "object_id": ref["object_id"],
+                    "filename": filename,
+                    "required": required,
+                }
+                digest = descriptor.get("digest")
+                if digest is not None:
+                    if digest != ref["object_id"]:
+                        raise AuthorizationError(
+                            "staged child input descriptor digest disagrees with the Runtime-resolved object",
+                            details={"name": name},
+                        )
+                    canonical["digest"] = digest
+                canonical_inputs.append(canonical)
+            request = dict(request)
+            request["inputs"] = canonical_inputs
+        if request is not None:
+            request = dict(request)
+            request["target"] = effective_target
+        child_spec = task.get("spec", {})
+        if not isinstance(child_spec, dict) or "runtime_dependencies" in child_spec:
+            raise ValidationError("delegated child spec cannot use runtime_dependencies")
+        lineage = {"parent_task_id": parent["id"], "parent_attempt_id": row["id"], "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]), "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"], "parent_placement": self._trusted_execution_placement(identity), "parent_effective_target": effective_target, "parent_placement_version": placement_version, "project_id": project}
+        admitted = dict(task)
+        admitted.pop("stage", None)
+        admitted.pop("input_refs", None)
+        admitted["input_object_ids"] = inputs
+        if request is not None:
+            admitted["execution_request"] = request
+        if verified_source is not None:
+            admitted["settlement_effect"] = policy["final_publication"]["effect"]
+        admitted["project"] = project
+        admitted["idempotency_key"] = idempotency_key
+        return self.create_task(admitted, enforce_readiness=True, _delegated_lineage=lineage, _delegated_stage=stage_name, _delegated_inputs=resolved_inputs, _verified_publication_source=verified_source)
 
     def task(self, task_id):
         return self.store.get_task(task_id)
@@ -4444,6 +5105,333 @@ class RuntimeService:
                 resource["progress"] = payload
         return resource
 
+    @staticmethod
+    def _require_placement_recovery_owner(identity):
+        scopes = set(identity.get("scopes", [])) if isinstance(identity, dict) else set()
+        actor = identity.get("actor") if isinstance(identity, dict) else None
+        if not isinstance(actor, str) or not actor or "admin" not in scopes:
+            raise AuthorizationError("placement recovery requires owner authority")
+        return actor
+
+    @staticmethod
+    def _placement_evidence_digest(value, field):
+        if not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValidationError(f"{field} must be a sha256 digest")
+        return value
+
+    def _validate_placement_loss_evidence(self, value, *, current_target):
+        value = _wire_object(
+            value,
+            required=(
+                "source", "status", "target", "observed_at",
+                "evidence_digest", "no_active_work",
+            ),
+            allowed=(
+                "source", "status", "target", "observed_at",
+                "evidence_digest", "no_active_work",
+            ),
+        )
+        if not isinstance(value["source"], str) or not value["source"].strip():
+            raise ValidationError("loss_evidence.source is required")
+        if value["status"] != "absent":
+            raise ConflictError("old placement loss is not established")
+        if value["no_active_work"] is not True:
+            raise ConflictError("old placement has unknown active work")
+        target = _normalize_execution_target(value["target"])
+        if target != current_target:
+            raise ConflictError(
+                "loss evidence does not match the current effective placement",
+                details={"expected": current_target, "actual": target},
+            )
+        observed_at = value["observed_at"]
+        if not isinstance(observed_at, str) or not observed_at:
+            raise ValidationError("loss_evidence.observed_at is required")
+        try:
+            observed = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValidationError("loss_evidence.observed_at is invalid") from exc
+        if observed.tzinfo is None:
+            raise ValidationError("loss_evidence.observed_at must include a timezone")
+        age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+        if age < -60 or age > PLACEMENT_LOSS_EVIDENCE_MAX_AGE_SECONDS:
+            raise ConflictError(
+                "loss evidence is stale",
+                details={"maximum_age_seconds": PLACEMENT_LOSS_EVIDENCE_MAX_AGE_SECONDS},
+            )
+        return {
+            "source": value["source"].strip(),
+            "status": "absent",
+            "target": target,
+            "observed_at": observed_at,
+            "evidence_digest": self._placement_evidence_digest(
+                value["evidence_digest"], "loss_evidence.evidence_digest"
+            ),
+            "no_active_work": True,
+        }
+
+    def _validate_replacement_qualification(self, value, *, replacement_target):
+        value = _wire_object(
+            value,
+            required=("target", "verified", "evidence_digest", "executor_incarnation"),
+            allowed=("target", "verified", "evidence_digest", "executor_incarnation"),
+        )
+        target = _normalize_execution_target(value["target"])
+        if target != replacement_target:
+            raise ConflictError(
+                "replacement qualification targets a different placement",
+                details={"expected": replacement_target, "actual": target},
+            )
+        if value["verified"] is not True:
+            raise AuthorizationError("replacement placement is not qualified")
+        incarnation = value["executor_incarnation"]
+        if not isinstance(incarnation, str) or not incarnation.strip() or len(incarnation) > 256:
+            raise ValidationError("qualification.executor_incarnation is invalid")
+        return {
+            "target": target,
+            "verified": True,
+            "evidence_digest": self._placement_evidence_digest(
+                value["evidence_digest"], "qualification.evidence_digest"
+            ),
+            "executor_incarnation": incarnation.strip(),
+        }
+
+    def _delegated_children(self, parent_task_id):
+        children = []
+        for row in self.store.conn.execute(
+            "SELECT id, run_id, status, waiting_reason, attempt_id, spec_json "
+            "FROM tasks ORDER BY rowid"
+        ).fetchall():
+            try:
+                lineage = json.loads(row["spec_json"]).get("delegated_parent")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(lineage, dict) and lineage.get("parent_task_id") == parent_task_id:
+                children.append((row, lineage))
+        return children
+
+    def _assert_placement_recovery_quiescent(self, task, children):
+        if task["status"] not in {"failed", "cancelled"}:
+            raise ConflictError(
+                "task must be terminal before placement recovery",
+                details={"status": task["status"]},
+            )
+        if task["waiting_reason"] == "provider_state_unknown":
+            raise ConflictError("old placement has unknown active work")
+        unsettled = self.store.conn.execute(
+            "SELECT id FROM attempts WHERE task_id=? AND settled=0 ORDER BY rowid",
+            (task["id"],),
+        ).fetchall()
+        if unsettled:
+            raise ConflictError(
+                "old placement has unknown active work",
+                details={"attempt_ids": [row["id"] for row in unsettled]},
+            )
+        if self.store.conn.execute(
+            "SELECT 1 FROM reservations WHERE task_id=? AND released_at IS NULL LIMIT 1",
+            (task["id"],),
+        ).fetchone():
+            raise ConflictError("old placement still owns an active reservation")
+        binding = self.store.execution_binding(task["id"])
+        if binding is None:
+            raise ConflictError("task has no targeted execution binding")
+        if binding["status"] == "claimed":
+            raise ConflictError("old placement still has a claimed execution binding")
+        for child, _lineage in children:
+            child_unsettled = self.store.conn.execute(
+                "SELECT id FROM attempts WHERE task_id=? AND settled=0 ORDER BY rowid",
+                (child["id"],),
+            ).fetchall()
+            child_binding = self.store.execution_binding(child["id"])
+            if (
+                child["status"] in {"running", "cancel_requested"}
+                or child["waiting_reason"] == "provider_state_unknown"
+                or child_unsettled
+                or (child_binding is not None and child_binding["status"] == "claimed")
+                or self.store.conn.execute(
+                    "SELECT 1 FROM reservations WHERE task_id=? AND released_at IS NULL LIMIT 1",
+                    (child["id"],),
+                ).fetchone()
+            ):
+                raise ConflictError(
+                    "delegated child has unknown active work",
+                    details={"child_task_id": child["id"]},
+                )
+        return binding
+
+    @_durable_mutation
+    def recover_task_placement(self, task_id, body, *, idempotency_key=None, identity=None):
+        """Authorize one exact effective-placement revision without rewriting admission."""
+        actor = self._require_placement_recovery_owner(identity)
+        idempotency_key = require_idempotency_key(idempotency_key)
+        body = _wire_object(
+            body,
+            required=(
+                "schema_version", "expected_task_version", "expected_placement_version",
+                "expected_original_target", "expected_current_target", "replacement_target",
+                "reason", "loss_evidence", "qualification",
+            ),
+            allowed=(
+                "schema_version", "expected_task_version", "expected_placement_version",
+                "expected_original_target", "expected_current_target", "replacement_target",
+                "reason", "loss_evidence", "qualification",
+            ),
+        )
+        if body["schema_version"] != PLACEMENT_RECOVERY_SCHEMA_VERSION:
+            raise ValidationError("placement recovery schema_version is unsupported")
+        for field in ("expected_task_version", "expected_placement_version"):
+            if isinstance(body[field], bool) or not isinstance(body[field], int) or body[field] < 0:
+                raise ValidationError(f"{field} must be a non-negative integer")
+        reason = body["reason"]
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 1024:
+            raise ValidationError("placement recovery reason is invalid")
+        request_hash = hashlib.sha256(
+            canonical_json({"task_id": str(task_id), "body": body}).encode()
+        ).hexdigest()
+        current = self.store.get_task(task_id)
+        project_id = current["run"].get("project_id") or "unscoped"
+        replay = self._command_replay(
+            "task.placement_recover", str(task_id), idempotency_key, request_hash,
+            project_id=project_id,
+        )
+        if replay is not None:
+            return replay
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        request = self.store._execution_request_from_row(task)
+        if request is None:
+            raise ConflictError("placement recovery requires a targeted task")
+        original_target = _normalize_execution_target(body["expected_original_target"])
+        if original_target != request["target"]:
+            raise ConflictError("original immutable placement does not match admission")
+        latest = self.store.placement_recovery(task_id)
+        placement_version = int(latest.get("placement_version", 0)) if latest else 0
+        current_target = self.store.effective_execution_target(task_id)
+        expected_current = _normalize_execution_target(body["expected_current_target"])
+        if expected_current != current_target:
+            raise ConflictError(
+                "current effective placement changed",
+                details={"expected": expected_current, "actual": current_target},
+            )
+        if body["expected_placement_version"] != placement_version:
+            raise ConflictError(
+                "stale placement version",
+                details={"expected": body["expected_placement_version"], "actual": placement_version},
+            )
+        task_version = int(task["attempt"] or 0) + 1
+        if body["expected_task_version"] != task_version:
+            raise ConflictError(
+                "stale task version",
+                details={"expected": body["expected_task_version"], "actual": task_version},
+            )
+        replacement = _normalize_execution_target(body["replacement_target"])
+        if current_target.get("kind") != "runpod" or replacement.get("kind") != "runpod":
+            raise ValidationError("placement recovery currently supports exact RunPod targets")
+        if replacement["provider_account_ref"] != current_target["provider_account_ref"]:
+            raise AuthorizationError("replacement target belongs to a different provider account")
+        if replacement == current_target:
+            raise ConflictError("replacement target must differ from the lost placement")
+        loss = self._validate_placement_loss_evidence(
+            body["loss_evidence"], current_target=current_target
+        )
+        qualification = self._validate_replacement_qualification(
+            body["qualification"], replacement_target=replacement
+        )
+        children = self._delegated_children(str(task_id))
+        binding = self._assert_placement_recovery_quiescent(task, children)
+        timestamp = now()
+        decision = {
+            "schema_version": PLACEMENT_RECOVERY_SCHEMA_VERSION,
+            "placement_version": placement_version + 1,
+            "task_id": str(task_id),
+            "run_id": current["run"]["id"],
+            "task_version": task_version,
+            "original_target": request["target"],
+            "previous_effective_target": current_target,
+            "replacement_target": replacement,
+            "reason": reason.strip(),
+            "owner_actor": actor,
+            "loss_evidence": loss,
+            "qualification": qualification,
+            "superseded_binding": {
+                "binding_id": binding["binding_id"],
+                "attempt_id": binding.get("attempt_id"),
+                "lease_id": binding.get("lease_id"),
+                "fence": int(binding.get("fence") or 0),
+                "executor_id": binding.get("executor_id"),
+                "executor_incarnation": binding.get("executor_incarnation"),
+            },
+            "created_at": timestamp,
+        }
+        decision["decision_digest"] = "sha256:" + sha256_bytes(
+            canonical_json(decision).encode()
+        )
+        event_ids = []
+        for child, lineage in children:
+            if child["status"] == "queued":
+                self.store.conn.execute(
+                    "UPDATE tasks SET status='cancelled', waiting_reason='parent_placement_recovered', "
+                    "lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, updated_at=? WHERE id=?",
+                    (timestamp, child["id"]),
+                )
+                self.store.conn.execute(
+                    "UPDATE runs SET status='cancelled', updated_at=? WHERE id=?",
+                    (timestamp, child["run_id"]),
+                )
+                self.store.conn.execute(
+                    "UPDATE execution_bindings SET status='stale', updated_at=? "
+                    "WHERE task_id=? AND status='prepared'",
+                    (timestamp, child["id"]),
+                )
+            event_ids.append(self.store._append_event(
+                child["run_id"], child["id"], "task.parent_placement_fenced",
+                {
+                    "parent_task_id": str(task_id),
+                    "parent_attempt_id": lineage.get("parent_attempt_id"),
+                    "placement_version": placement_version + 1,
+                    "replacement_target": replacement,
+                },
+            ))
+        updated = self.store.conn.execute(
+            "UPDATE execution_bindings SET attempt_id=NULL, lease_id=NULL, fence=0, "
+            "executor_id=NULL, session_id=(SELECT boot_id FROM runtime_lifecycle WHERE id=1), "
+            "runtime_epoch=?, resolved_target_json=?, status='prepared', updated_at=? "
+            "WHERE task_id=? AND status IN ('prepared', 'released', 'stale')",
+            (
+                self.store._current_runtime_epoch(),
+                canonical_json({"selected": replacement}),
+                timestamp,
+                str(task_id),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise ConflictError("execution binding changed during placement recovery")
+        self.store.conn.execute(
+            "UPDATE tasks SET updated_at=? WHERE id=?", (timestamp, str(task_id))
+        )
+        parent_event = self.store._append_event(
+            current["run"]["id"], str(task_id), "task.placement_recovered", decision
+        )
+        event_ids.append(parent_event)
+        previous_activation = self._latest_remote_activation(task_id)
+        if previous_activation is not None:
+            event_ids.append(self.store._append_event(
+                current["run"]["id"], str(task_id), "task.remote_activation_revoked",
+                {"activation_id": previous_activation["activation_id"],
+                 "reason": "placement_recovered", "revoked_at": timestamp},
+            ))
+        result = {
+            "task": self._task_resource(self.store.get_task(task_id)),
+            "placement_recovery": decision,
+        }
+        event_seq = self.store.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id=?", (current["run"]["id"],)
+        ).fetchone()[0]
+        return self._command_record(
+            "task.placement_recover", str(task_id), idempotency_key, request_hash, result,
+            project_id=project_id, event_ids=event_ids,
+            primary_stream_id=current["run"]["id"], resulting_stream_seq=event_seq,
+            created_at=timestamp,
+        )
+
     @_verified_mutation
     def cancel(self, task_id):
         return self.store.cancel_task(task_id)
@@ -4498,7 +5486,11 @@ class RuntimeService:
             with self.store._transaction():
                 timestamp = now()
                 self.store._release_reservations(task_id, current["task"].get("lease_token"))
-                self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task_id))
+                # A retry is a new queue admission attempt for the same
+                # immutable task/request.  Keep the task id, spec, and input
+                # objects stable, but reset the queue-age anchor so a prior
+                # failed wait cannot make every retry fail before execution.
+                self.store.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, created_at=?, updated_at=? WHERE id=?", (timestamp, timestamp, task_id))
                 self.store.reset_execution_attempt(task_id)
                 self.store.conn.execute("UPDATE runs SET status='queued', updated_at=? WHERE id=?", (timestamp, current["run"]["id"]))
                 event_id = self.store._append_event(current["run"]["id"], task_id, "task.retried", {"from_status": status, "attempt": version})
@@ -4672,6 +5664,23 @@ class RuntimeService:
             "task.claim", "claim", idempotency_key, request_hash, with_receipt=False,
         )
         if replayed:
+            if isinstance(replay, dict) and replay.get("task_id"):
+                replay_capability = self.store.conn.execute(
+                    "SELECT capability FROM tasks WHERE id=?", (replay["task_id"],)
+                ).fetchone()
+                qualified_identity = (
+                    isinstance(identity, dict)
+                    and isinstance(identity.get("qualified_activation"), dict)
+                )
+                if (replay_capability is not None and (
+                        self._task_requires_remote_activation(replay["task_id"])
+                        or qualified_identity
+                    )
+                        and not self._remote_activation_matches(
+                            replay["task_id"], identity, trusted_placement,
+                            require_fresh=not bool(replay.get("attempt_id")),
+                        )):
+                    raise AuthorizationError("remote activation is missing, revoked, or stale")
             return replay
         # Reap before selecting work. Otherwise an expired running task is
         # invisible to the queued-task query and reclaim waits for another
@@ -4712,13 +5721,30 @@ class RuntimeService:
                 "task.claim", "claim", idempotency_key, request_hash, result,
                 project_id="unscoped", with_receipt=False,
             )
-        if selected_binding is not None:
+        qualified_identity = (
+            isinstance(identity, dict)
+            and isinstance(identity.get("qualified_activation"), dict)
+        )
+        if selected_binding is not None or qualified_identity:
             if trusted_placement is None:
+                reason = "execution_binding_missing"
+            elif selected_binding is None:
                 reason = "execution_binding_missing"
             elif not execution_placement_matches(
                 selected_binding["resolved_target"], trusted_placement
             ):
                 reason = "execution_binding_mismatch"
+            elif not self._placement_recovery_qualification_matches(
+                row["id"], trusted_placement
+            ):
+                reason = "execution_qualification_mismatch"
+            elif (
+                self._task_requires_remote_activation(row["id"])
+                or qualified_identity
+            ) and not self._remote_activation_matches(
+                row["id"], identity, trusted_placement, require_fresh=True
+            ):
+                reason = "remote_activation_missing"
             else:
                 reason = None
             if reason is not None:
@@ -4825,6 +5851,33 @@ class RuntimeService:
                 raise ValidationError("declared settlement effect is required")
             if effect is not None:
                 self.store._validate_settlement_effect(effect)
+            admitted_spec = json.loads(task["spec_json"])
+            verified_source = admitted_spec.get("verified_publication_source")
+            if verified_source is not None:
+                lineage = admitted_spec["delegated_parent"]
+                self._live_delegating_parent(lineage["parent_attempt_id"], {
+                    "lease_id": lineage["parent_lease_id"], "fence": lineage["parent_fence"],
+                    "runtime_epoch": lineage["runtime_epoch"],
+                }, identity=None)
+                association = self.store.get_managed_output(verified_source["association_id"])
+                producer = self.store.conn.execute("SELECT status, attempt_id FROM tasks WHERE id=?", (verified_source["producer_task_id"],)).fetchone()
+                if (association["task_id"] != verified_source["producer_task_id"]
+                        or association["attempt_id"] != verified_source["producer_attempt_id"]
+                        or association["project_id"] != project_id
+                        or association["object_id"] != verified_source["object_id"]
+                        or association["output_port"] != verified_source["output_port"]
+                        or association["durability"] != "durable"
+                        or association["lifecycle"]["state"] not in {"available", "promoted"}
+                        or producer is None or producer["status"] != "completed"
+                        or producer["attempt_id"] != verified_source["producer_attempt_id"]):
+                    raise ConflictError("verified publication source is no longer available")
+                outputs = body.get("outputs")
+                if (not isinstance(outputs, list) or len(outputs) != 1 or not isinstance(outputs[0], dict)
+                        or outputs[0].get("digest") != verified_source["object_id"]
+                        or outputs[0].get("output_port") != verified_source["output_port"]
+                        or outputs[0].get("kind", "object") != "object"
+                        or outputs[0].get("durability", "durable") != "durable"):
+                    raise AuthorizationError("final publication must use the declared verified output")
             staged = self._stage_outputs(
                 attempt_id,
                 body.get("outputs", []),
@@ -5940,6 +6993,8 @@ class RuntimeService:
                     raise AuthorizationError("worker credential has no execution placement")
                 if not execution_placement_matches(binding["resolved_target"], placement):
                     raise AuthorizationError("worker credential placement cannot resume this task")
+                if not self._placement_recovery_qualification_matches(row["task_id"], placement):
+                    raise AuthorizationError("worker credential qualification cannot resume this task")
                 self.store.reset_execution_attempt(row["task_id"], runtime_epoch=current)
             # Claim this exact task.  Never use claim_next here: a mismatch
             # must not consume an unrelated queued task.
