@@ -1080,6 +1080,14 @@ class WorkspaceClient:
         items, next_cursor = self._page(value)
         return list(items), next_cursor
 
+    def get_source_frame_thumbnail(self, project_id: str, source_object_id: str, source_time_seconds: float, *, recipe_version: int = 1) -> Mapping[str, Any] | None:
+        query = f"?source_object_id={_path_part(source_object_id)}&source_time_seconds={float(source_time_seconds):.6f}&recipe_version={int(recipe_version)}"
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/thumbnails/source-frame" + query)[2])
+        return value.get("thumbnail")
+
+    def ensure_source_frame_thumbnail(self, project_id: str, thumbnail: Mapping[str, Any], *, idempotency_key: str) -> MutationResult:
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/thumbnails/source-frame", body=json.dumps(dict(thumbnail), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
+
     def get_object(self, object_id: str, *, byte_range: tuple[int, int | None] | None = None) -> ByteResponse:
         headers: dict[str, str] = {}
         if byte_range:
