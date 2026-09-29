@@ -528,6 +528,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             resource = self.runtime._task_resource(value)
             project_id = value["run"].get("project_id") or "unscoped"
             return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, body.get("idempotency_key"), project_id=project_id)})
+        if path == ["v1", "delegated-tasks"] and method == "POST":
+            identity = self._identity("worker:execute")
+            key = self._idempotency_key()
+            value = self.runtime.admit_delegated_child(self._project_mutation_body(), idempotency_key=key, identity=identity)
+            resource = self.runtime._task_resource(value)
+            project_id = value["run"].get("project_id") or "unscoped"
+            return self._send(201, {"data": resource, "receipt": self.runtime.committed_receipt("task.create", project_id, key, project_id=project_id)})
         if path == ["v1", "tasks", "claim"] and method == "POST":
             identity = self._identity("worker:execute")
             key = self.headers.get("Idempotency-Key")
@@ -563,6 +570,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.update_managed_output_lifecycle(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
+            if method == "POST" and action == "placement-recovery":
+                identity = self._identity("admin")
+                key = self._idempotency_key()
+                value = self.runtime.recover_task_placement(
+                    task_id, self._body(), idempotency_key=key, identity=identity
+                )
+                return self._send(200, value)
             self._identity("tasks:write")
             if method == "POST" and action == "cancel":
                 key = self._idempotency_key()
@@ -581,6 +595,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
             identity = self._identity("worker:execute")
             action = path[3]
+            if action == "child-authority":
+                return self._send(200, self.runtime.issue_child_authority(path[2], self._project_mutation_body(), identity=identity))
             if action == "prepare-reboot":
                 body = self._project_mutation_body()
                 # generated clients intentionally do not duplicate it in the

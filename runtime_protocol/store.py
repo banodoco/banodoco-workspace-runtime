@@ -2128,7 +2128,51 @@ class RealmStore:
         else:
             # Read compatibility for bindings admitted before I-05.
             value["resolved_target"] = resolved
+        value["effective_target"] = value["resolved_target"]
+        value["placement_version"] = 0
+        value["recovery_decision_digest"] = None
+        task = self.conn.execute(
+            "SELECT execution_request_json, spec_json FROM tasks WHERE id=?", (str(task_id),)
+        ).fetchone()
+        request = self._execution_request_from_row(task) if task else None
+        if request is not None:
+            value["original_target"] = request["target"]
+        recovery = self.placement_recovery(task_id)
+        if recovery is not None:
+            value["effective_target"] = recovery["replacement_target"]
+            value["placement_recovery"] = recovery
+            value["placement_version"] = int(recovery["placement_version"])
+            value["recovery_decision_digest"] = recovery["decision_digest"]
         return value
+
+    def placement_recovery(self, task_id):
+        """Return the latest append-only placement recovery decision.
+
+        Recovery authority is recorded in the task event stream rather than
+        smuggled into the immutable task request or represented by a mutable
+        binding alone.  The command receipt provides exact replay semantics;
+        this event is the durable, versioned decision consumed by retry,
+        claim, and delegated child admission.
+        """
+        row = self.conn.execute(
+            "SELECT payload_json FROM events WHERE task_id=? "
+            "AND kind='task.placement_recovered' ORDER BY id DESC LIMIT 1",
+            (str(task_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(row["payload_json"])
+        return value if isinstance(value, dict) else None
+
+    def effective_execution_target(self, task_id):
+        recovery = self.placement_recovery(task_id)
+        if recovery is not None:
+            return recovery["replacement_target"]
+        task = self.conn.execute(
+            "SELECT execution_request_json, spec_json FROM tasks WHERE id=?", (str(task_id),)
+        ).fetchone()
+        request = self._execution_request_from_row(task) if task else None
+        return request["target"] if request is not None else None
 
     def bind_execution_attempt(
         self, task_id, *, attempt_id, lease_id, fence, executor_id,
@@ -2163,13 +2207,7 @@ class RealmStore:
     def reset_execution_attempt(self, task_id, *, runtime_epoch=None, status="prepared"):
         if runtime_epoch is None:
             runtime_epoch = self._current_runtime_epoch()
-        task = self.conn.execute(
-            "SELECT execution_request_json, spec_json FROM tasks WHERE id=?", (str(task_id),)
-        ).fetchone()
-        selected = None
-        request = self._execution_request_from_row(task) if task else None
-        if request is not None:
-            selected = request["target"]
+        selected = self.effective_execution_target(task_id)
         self.conn.execute(
             "UPDATE execution_bindings SET attempt_id=NULL, lease_id=NULL, fence=0, executor_id=NULL, session_id=(SELECT boot_id FROM runtime_lifecycle WHERE id=1), runtime_epoch=?, resolved_target_json=COALESCE(?, resolved_target_json), status=?, updated_at=? WHERE task_id=? AND status IN ('claimed', 'released', 'stale')",
             (
@@ -4519,6 +4557,8 @@ class RealmStore:
                 for task in eligible:
                     self._release_reservations(task["id"], task["lease_token"])
                     self.reset_execution_attempt(task["id"])
+                    # A retry starts a fresh bounded queue wait while
+                    # preserving the task identity and immutable request.
                     self.conn.execute("UPDATE tasks SET status='queued', lease_token=NULL, executor_id=NULL, lease_expires_at=NULL, waiting_reason=NULL, result_json=NULL, attempt_id=NULL, updated_at=? WHERE id=?", (timestamp, task["id"]))
                     self._append_event(run_id, task["id"], "task.retried", {"from_status": "failed", "attempt": int(task["attempt"] or 0) + 1, "reason": "run.retry"})
                     self._refresh_continuations_for_predecessor(task["id"])
