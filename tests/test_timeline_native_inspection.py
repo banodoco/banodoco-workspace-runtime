@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from pathlib import Path
 
 import pytest
@@ -294,3 +295,69 @@ def test_daemon_generated_client_without_executor_catalog(tmp_path):
         assert daemon.service.store.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     finally:
         daemon.stop()
+
+
+def test_canonical_head_names_and_parent_targets_are_distinct_from_occurrences(tmp_path):
+    fixture = json.loads((Path(__file__).parents[1] / "conformance/fixtures/canonical-timeline-parity.json").read_text())
+    assert len(fixture["legacy_shells"]) == 6
+    assert len(fixture["canonical_occurrences"]) == 9
+    service, project, _ = _service(tmp_path)
+    try:
+        media_id = service.ingest(project, b"canonical-parity-media", idempotency_key="canonical-parity-media")["data"]["digest"]
+        publication = _publication(project)
+        base_occurrence = publication["parent_composition"]["occurrences"][0]
+        base_shot = publication["shot_revisions"][0]
+        base_internal = publication["internal_timeline_revisions"][0]
+        publication["parent_composition"]["occurrences"] = []
+        publication["shot_revisions"] = []
+        publication["internal_timeline_revisions"] = []
+        for index, item in enumerate(fixture["canonical_occurrences"]):
+            shot_id = f"shot-{index + 1}"
+            revision_id = f"shot-rev-{index + 1}"
+            internal_id = f"internal-{index + 1}"
+            publication["parent_composition"]["occurrences"].append({
+                **base_occurrence,
+                "occurrence_id": item["occurrence_id"],
+                "shot_id": shot_id,
+                "shot_revision_id": revision_id,
+                "placement": {"start_ms": item["start_ms"]},
+                "duration_ms": item["duration_ms"],
+            })
+            publication["shot_revisions"].append({
+                **base_shot,
+                "shot_id": shot_id,
+                "revision_id": revision_id,
+                "internal_timeline_revision_id": internal_id,
+                "payload": {"name": item["name"], "assets": [], "audio_bindings": [], "text_bindings": []},
+            })
+            publication["internal_timeline_revisions"].append({
+                **base_internal,
+                "revision_id": internal_id,
+                "payload": {"tracks": [{"id": "picture"}], "clips": [{"id": f"child-{index + 1}", "clip_type": "media", "track": "picture", "at_ms": 0, "duration_ms": item["duration_ms"]}], "registry": {}, "assets": []},
+            })
+        publication["parent_composition"]["registry"] = {"assets": {"media-1": {"media_id": media_id, "type": "image"}}}
+        publication["parent_composition"]["clips"] = [
+            {"id": effect["clip_id"], "clip_type": "effect", "track": "effects", "at_ms": 100, "duration_ms": 400, "asset": "media-1" if "source_object_id" in effect else None, "parameters": effect["parameters"], "elementRef": effect["element_ref"]}
+            for effect in fixture["parent_effects"]
+        ]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-parity")
+        result = service.inspect_timeline(project, "main", {})
+        assert result["representation"] == "canonical_head"
+        assert result["authority"] == "runtime_parent_composition"
+        assert result["is_current_head"] is True
+        assert result["head_revision_id"] == result["revision_id"] == "parent-1"
+        assert result["head_content_digest"] == result["parent_content_digest"]
+        assert result["occurrence_count"] == 9
+        assert [row["occurrence"]["name"] for row in result["selected"]] == [item["name"] for item in fixture["canonical_occurrences"]]
+        assert result["parent_clip_count"] == result["parent_clip_target_count"] == 2
+        assert {clip["clip_id"] for clip in result["selected_parent_clips"]} == {"effect-with-source", "effect-code-only"}
+        assert all("occurrence_id" not in clip and "shot_id" not in clip for clip in result["selected_parent_clips"])
+        assert result["selected_clip_count"] == 11
+        selected = service.inspect_timeline(project, "main", {"clip": "effect-code-only"})
+        assert selected["target_count"] == 0
+        assert [clip["clip_id"] for clip in selected["selected_parent_clips"]] == ["effect-code-only"]
+        view = service.create_timeline_view(project, "main", {"clip": "effect-code-only", "formats": ["md"]})
+        assert view["inspection"]["authority"] == "runtime_parent_composition"
+        assert [clip["clip_id"] for clip in view["inspection"]["selected_parent_clips"]] == ["effect-code-only"]
+    finally:
+        service.close()

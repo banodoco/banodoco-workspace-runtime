@@ -27,10 +27,13 @@ def test_typescript_conformance_generator_is_byte_stable(tmp_path: Path) -> None
     assert "class WorkspaceClient" in client_source
     assert "async call(" in client_source
     assert "Authorization" in client_source
+    from generators.generate import contract_digest
+    assert f'export const SCHEMA_DIGEST = "{contract_digest()}" as const;' in client_source
     assert (first / "fixture-handshake.json").read_bytes() == (root / "conformance" / "fixtures" / "handshake.json").read_bytes()
     check = [*command, "--check", "--source-root", str(root), "--fixture-root", str(root / "conformance" / "fixtures")]
     assert subprocess.run(check, capture_output=True, text=True).returncode == 0
     assert manifest["operations"]
+    assert manifest["schema_digest"] == contract_digest()
 
 
 def test_typescript_generator_check_rejects_client_and_manifest_mutation(tmp_path: Path) -> None:

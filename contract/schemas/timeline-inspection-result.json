@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/timeline-inspection-result.json",
+  "title": "Canonical current-head timeline inspection",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "evidence_kind", "render_requested", "representation", "authority",
+    "project_id", "timeline_id", "revision_id", "head_revision_id", "is_current_head",
+    "parent_content_digest", "head_content_digest", "snapshot_digest", "selectors",
+    "selection_status", "target_count", "occurrence_count", "parent_clip_count",
+    "parent_clip_target_count", "selected_clip_count", "selected", "selected_parent_clips",
+    "next_cursor"
+  ],
+  "properties": {
+    "schema": { "const": "runtime.timeline.declared_inputs/v1" },
+    "evidence_kind": { "const": "declared_inputs" },
+    "render_requested": { "const": false },
+    "representation": { "enum": ["canonical_head", "canonical_revision"] },
+    "authority": { "const": "runtime_parent_composition" },
+    "source_pixels": { "const": "not_requested" },
+    "waveforms": { "const": "not_requested" },
+    "project_id": { "type": "string", "minLength": 1 },
+    "timeline_id": { "type": "string", "minLength": 1 },
+    "revision_id": { "type": "string", "minLength": 1 },
+    "head_revision_id": { "type": ["string", "null"] },
+    "is_current_head": { "type": "boolean" },
+    "parent_content_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "head_content_digest": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
+    "snapshot_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "selectors": { "type": "object", "additionalProperties": true },
+    "selection_status": { "enum": ["selected", "selector_miss"] },
+    "target_count": { "type": "integer", "minimum": 0 },
+    "occurrence_count": { "type": "integer", "minimum": 0 },
+    "parent_clip_count": { "type": "integer", "minimum": 0 },
+    "parent_clip_target_count": { "type": "integer", "minimum": 0 },
+    "selected_clip_count": { "type": "integer", "minimum": 0 },
+    "selected": { "type": "array", "items": { "$ref": "#/$defs/SelectionRow" } },
+    "selected_parent_clips": { "type": "array", "items": { "$ref": "#/$defs/ParentClip" } },
+    "next_cursor": { "type": ["string", "null"] }
+  },
+  "$defs": {
+    "Rational": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "Occurrence": {
+      "type": "object", "additionalProperties": true,
+      "required": ["ordinal", "occurrence_id", "shot_id", "shot_revision_id", "name", "start", "duration"],
+      "properties": {
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "occurrence_id": { "type": "string", "minLength": 1 },
+        "shot_id": { "type": "string", "minLength": 1 },
+        "shot_revision_id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "start": { "$ref": "#/$defs/Rational" },
+        "duration": { "$ref": "#/$defs/Rational" },
+        "track_id": { "type": ["string", "null"] },
+        "text_bindings": { "type": "array" },
+        "audio_bindings": { "type": "array" }
+      }
+    },
+    "Clip": {
+      "type": "object", "additionalProperties": true,
+      "required": ["clip_id", "clip_type", "start", "duration", "speed"],
+      "properties": {
+        "clip_id": { "type": "string", "minLength": 1 },
+        "occurrence_id": { "type": "string", "minLength": 1 },
+        "shot_id": { "type": "string", "minLength": 1 },
+        "track_id": { "type": ["string", "null"] },
+        "clip_type": { "type": "string", "minLength": 1 },
+        "start": { "$ref": "#/$defs/Rational" },
+        "duration": { "$ref": "#/$defs/Rational" },
+        "speed": { "$ref": "#/$defs/Rational" },
+        "source_object_id": { "type": ["string", "null"] },
+        "content_digest": { "type": ["string", "null"] }
+      }
+    },
+    "ParentClip": {
+      "allOf": [
+        { "$ref": "#/$defs/Clip" },
+        { "type": "object", "required": ["target_kind", "parameters"], "properties": {
+          "target_kind": { "const": "parent_clip" },
+          "parameters": { "type": "object", "additionalProperties": true },
+          "element_ref": { "type": ["string", "object", "null"] }
+        } }
+      ]
+    },
+    "SelectionRow": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "occurrence", "clips"],
+      "properties": {
+        "role": { "enum": ["target", "neighbor"] },
+        "occurrence": { "$ref": "#/$defs/Occurrence" },
+        "clips": { "type": "array", "items": { "$ref": "#/$defs/Clip" } }
+      }
+    }
+  }
+}

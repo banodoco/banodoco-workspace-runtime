@@ -234,7 +234,7 @@ paths:
       operationId: inspectTimeline
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/TimelineId' } ]
       requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/timeline-inspection.json' } } } }
-      responses: { '200': { description: Metadata-only inspection of the pinned timeline closure, content: { application/json: { schema: { type: object } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+      responses: { '200': { description: Canonical current-head metadata-only inspection of the pinned timeline closure, content: { application/json: { schema: { $ref: './schemas/timeline-inspection-result.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
   /v1/projects/{project_id}/timelines/{timeline_id}/views:
     post:
       operationId: createTimelineView
@@ -589,6 +589,27 @@ paths:
       parameters: [ { $ref: '#/components/parameters/TaskId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PlacementRecovery' } } } }
       responses: { '200': { description: Durable placement-recovery decision and task projection, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/{task_id}/remote-activation:
+    post:
+      operationId: recordRemoteActivation
+      description: Record one owner-qualified remote activation on the resident Runtime service. Requires the owner actor with admin scope.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteActivationQualification' } } } }
+      responses: { '200': { description: Recorded qualification, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteActivationQualification' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/{task_id}/remote-credential:
+    post:
+      operationId: controlRemoteCredential
+      description: Owner-only resident credential generation, enablement, verification, or revocation for an already admitted remote task.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteCredentialControl' } } } }
+      responses: { '200': { description: Credential control result, content: { application/json: { schema: { type: object } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/tasks/{task_id}/remote-activation/revoke:
+    post:
+      operationId: revokeRemoteActivation
+      description: Revoke the current remote activation generation. Requires the owner actor with admin scope.
+      parameters: [ { $ref: '#/components/parameters/TaskId' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RevokeRemoteActivation' } } } }
+      responses: { '204': { description: Current activation revoked }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/runs/{run_id}:
     get:
       operationId: getRun
@@ -843,6 +864,49 @@ components:
       type: object
       additionalProperties: false
       properties: { expected_version: { type: integer, minimum: 1 } }
+    RemoteActivationQualification:
+      type: object
+      additionalProperties: false
+      required: [activation_id, task_id, run_id, credential_actor, binding_digest, deployment_digest, evidence_digest, effective_target, executor_incarnation, runtime_session_id, runtime_epoch, expires_at, observation_digest, authorized_child_lineage]
+      properties:
+        activation_id: { type: string, minLength: 1 }
+        task_id: { type: string, minLength: 1 }
+        run_id: { type: string, minLength: 1 }
+        credential_actor: { type: string, minLength: 1 }
+        binding_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        deployment_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        evidence_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        effective_target: { $ref: './schemas/task.json#/definitions/ExecutionTarget' }
+        executor_incarnation: { type: string, minLength: 1 }
+        runtime_session_id: { type: string, minLength: 1 }
+        runtime_epoch: { type: integer, minimum: 1 }
+        expires_at: { type: string, format: date-time }
+        observation_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        authorized_child_lineage:
+          type: object
+          additionalProperties: false
+          required: [parent_task_id, parent_run_id, max_depth, placement_version, effective_target]
+          properties:
+            parent_task_id: { type: string, minLength: 1 }
+            parent_run_id: { type: string, minLength: 1 }
+            max_depth: { type: integer, const: 1 }
+            placement_version: { type: integer, minimum: 0 }
+            effective_target: { $ref: './schemas/task.json#/definitions/ExecutionTarget' }
+    RevokeRemoteActivation:
+      type: object
+      additionalProperties: false
+      required: [activation_id]
+      properties:
+        activation_id: { type: string, minLength: 1 }
+    RemoteCredentialControl:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action: { type: string, enum: [provision, enable, verify, revoke] }
+        activation_id: { type: string, minLength: 1 }
+        qualification: { $ref: '#/components/schemas/RemoteActivationQualification' }
+        placement: { type: object }
     PlacementRecovery:
       type: object
       additionalProperties: false

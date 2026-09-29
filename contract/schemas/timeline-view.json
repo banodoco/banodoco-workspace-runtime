@@ -5,7 +5,7 @@
   "type": "object",
   "required": ["inspection", "evidence_kind", "render_requested", "formats", "artifacts"],
   "properties": {
-    "inspection": { "type": "object" },
+    "inspection": { "$ref": "timeline-inspection-result.json" },
     "evidence_kind": { "const": "declared_inputs" },
     "render_requested": { "const": false },
     "formats": { "type": "object" },

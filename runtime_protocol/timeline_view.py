@@ -29,6 +29,24 @@ def markdown(inspection):
     ]
     if inspection["selection_status"] == "selector_miss":
         lines += ["No occurrence or clip matched the selectors.", ""]
+    parent_clips = inspection.get("selected_parent_clips", [])
+    if parent_clips:
+        lines += [
+            "## Parent-level clips",
+            "",
+            "These clips belong to the canonical parent composition and have no shot occurrence identity.",
+            "",
+            "| Clip | Track | Type | Start | Duration | Source | Trim | Speed | Text |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for clip in parent_clips:
+            source = clip["source_object_id"] or clip["content_digest"] or clip["asset_id"] or "unresolved"
+            trim = f"{clip['source_from']}..{clip['source_to']}"
+            lines.append("| " + " | ".join(_cell(value) for value in (
+                clip["clip_id"], clip["track_id"], clip["clip_type"], _seconds(clip["start"]),
+                _seconds(clip["duration"]), source, trim, _seconds(clip["speed"]), clip["text"],
+            )) + " |")
+        lines.append("")
     for row in inspection["selected"]:
         occurrence = row["occurrence"]
         lines += [
@@ -96,6 +114,7 @@ def png(inspection):
         return f"{value:.3f}".rstrip("0").rstrip(".") + "s"
 
     all_clips = [(row, clip) for row in inspection.get("selected", []) for clip in row.get("clips", [])]
+    all_clips += [(None, clip) for clip in inspection.get("selected_parent_clips", [])]
     # Keep images bounded even when a large closure is selected. Markdown and
     # the inspection JSON retain all selected rows.
     displayed = all_clips[:40]
@@ -104,7 +123,7 @@ def png(inspection):
     for number, (row, clip) in enumerate(displayed, 1):
         start = seconds(clip["start"])
         end = start + seconds(clip["duration"])
-        occurrence = str(row["occurrence"]["occurrence_id"])
+        occurrence = str(row["occurrence"]["occurrence_id"]) if row else "parent"
         track = str(clip.get("track_id") or "unassigned")
         group = (occurrence, track)
         lane = next((i for i, value in enumerate(lanes)

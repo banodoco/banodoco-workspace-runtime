@@ -1144,6 +1144,29 @@ class WorkspaceClient:
         )
         return self._mutation_json(body)
 
+    def record_remote_activation(self, task_id: str, qualification: Mapping[str, Any]) -> Mapping[str, Any]:
+        _, _, body = self._request(
+            "POST", f"/v1/tasks/{_path_part(task_id)}/remote-activation",
+            body=json.dumps(dict(qualification), separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return self._json(body)
+
+    def control_remote_credential(self, task_id: str, control: Mapping[str, Any]) -> Mapping[str, Any]:
+        _, _, body = self._request(
+            "POST", f"/v1/tasks/{_path_part(task_id)}/remote-credential",
+            body=json.dumps(dict(control), separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return self._json(body)
+
+    def revoke_remote_activation(self, task_id: str, activation_id: str) -> None:
+        self._request(
+            "POST", f"/v1/tasks/{_path_part(task_id)}/remote-activation/revoke",
+            body=json.dumps({"activation_id": activation_id}, separators=(",", ":")).encode(),
+            headers={"Content-Type": "application/json"}, expected=(204,),
+        )
+
     def _task_transition(self, action: str, task_id: str, *, idempotency_key: str, expected_version: int | None) -> MutationResult:
         payload = {} if expected_version is None else {"expected_version": expected_version}
         _, _, body = self._request("POST", f"/v1/tasks/{_path_part(task_id)}/{action}", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})

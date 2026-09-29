@@ -9,7 +9,7 @@
  */
 import { readFileSync, mkdirSync, writeFileSync, lstatSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve, join } from "node:path";
+import { dirname, resolve, join, relative } from "node:path";
 import { createHash } from "node:crypto";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -54,6 +54,30 @@ function jsonInput(path, label, canonical = true) {
 
 function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+// This is the Runtime health/handshake schema digest.  CONTRACT_SHA256 and
+// SCHEMA_MANIFEST_SHA256 below remain useful provenance for the conformance
+// bundle, but neither is the digest that consumers compare with /v1/health.
+// Keep this framing byte-for-byte identical to generators/generate.py.
+function runtimeSchemaDigest(contractPath, contractBytes, schemaPath, schemaManifest) {
+  const inputs = [{ path: contractPath, bytes: contractBytes }];
+  for (const schema of schemaManifest.schemas ?? []) {
+    const path = resolve(dirname(schemaPath), schema);
+    inputs.push({ path, bytes: regular(path, "contract input").bytes });
+  }
+  const hash = createHash("sha256");
+  for (const input of inputs) {
+    const name = relative(ROOT, input.path).split("\\").join("/");
+    if (!name || name.startsWith("../") || name === "..") throw new Error("contract inputs must be contained by the Runtime source root");
+    const nameBytes = Buffer.from(name, "utf8");
+    const nameLength = Buffer.alloc(4);
+    const dataLength = Buffer.alloc(8);
+    nameLength.writeUInt32BE(nameBytes.length);
+    dataLength.writeBigUInt64BE(BigInt(input.bytes.length));
+    hash.update(nameLength).update(nameBytes).update(dataLength).update(input.bytes);
+  }
+  return `sha256:${hash.digest("hex")}`;
 }
 
 function componentPath(schemaPath, explicit) {
@@ -139,13 +163,14 @@ function validateManifest(manifest, schema) {
   return clientDefinition(manifest);
 }
 
-function renderClient(componentDigest, contractDigest, schemaDigest, operationIds) {
+function renderClient(componentDigest, contractDigest, schemaDigest, runtimeDigest, operationIds) {
   return `/** Generated TypeScript client; do not edit by hand.\n *\n * Rendered from the shared component manifest and OpenAPI operation projection.\n */
 export const PROTOCOL = "workspace.v1" as const;
 export const GENERATOR = "${GENERATOR}" as const;
 export const COMPONENT_MANIFEST_SHA256 = "${componentDigest}" as const;
 export const CONTRACT_SHA256 = "${contractDigest}" as const;
 export const SCHEMA_MANIFEST_SHA256 = "${schemaDigest}" as const;
+export const SCHEMA_DIGEST = "${runtimeDigest}" as const;
 export const OPERATIONS = ${JSON.stringify(operationIds)} as const;
 export type HeadersLike = Record<string, string>;
 export type Transport = (method: string, path: string, headers: HeadersLike, body?: Uint8Array) => Promise<{ status: number; headers: HeadersLike; body: Uint8Array }>;
@@ -297,13 +322,14 @@ export class WorkspaceClient {
 `;
 }
 
-function renderMetadata(componentDigest, contractDigest, schemaDigest, operationIds) {
+function renderMetadata(componentDigest, contractDigest, schemaDigest, runtimeDigest, operationIds) {
   return `/** Generated TypeScript client metadata; do not edit by hand. */
 export const GENERATOR = "${GENERATOR}" as const;
 export const PROTOCOL = "workspace.v1" as const;
 export const COMPONENT_MANIFEST_SHA256 = "${componentDigest}" as const;
 export const CONTRACT_SHA256 = "${contractDigest}" as const;
 export const SCHEMA_MANIFEST_SHA256 = "${schemaDigest}" as const;
+export const SCHEMA_DIGEST = "${runtimeDigest}" as const;
 export const OPERATIONS = ${JSON.stringify(operationIds)} as const;
 `;
 }
@@ -318,15 +344,16 @@ function fixtureBytes(manifest) {
   return result;
 }
 
-function renderFiles(manifest, componentBytes, contract, schemaBytes) {
+function renderFiles(manifest, componentBytes, contractPath, contract, schemaPath, schemaBytes, schemaManifest) {
   const client = clientDefinition(manifest);
   const componentDigest = digest(componentBytes);
   const contractDigest = digest(contract);
   const schemaDigest = digest(schemaBytes);
+  const runtimeDigest = runtimeSchemaDigest(contractPath, contract, schemaPath, schemaManifest);
   const operationIds = operations(contract);
   const files = {
-    [safeRelative(client.output, "client output")]: Buffer.from(renderClient(componentDigest, contractDigest, schemaDigest, operationIds), "utf8"),
-    [safeRelative(client.metadata_output, "metadata output")]: Buffer.from(renderMetadata(componentDigest, contractDigest, schemaDigest, operationIds), "utf8"),
+    [safeRelative(client.output, "client output")]: Buffer.from(renderClient(componentDigest, contractDigest, schemaDigest, runtimeDigest, operationIds), "utf8"),
+    [safeRelative(client.metadata_output, "metadata output")]: Buffer.from(renderMetadata(componentDigest, contractDigest, schemaDigest, runtimeDigest, operationIds), "utf8"),
     ...fixtureBytes(manifest),
     "component-manifest.json": componentBytes,
   };
@@ -340,6 +367,7 @@ function renderFiles(manifest, componentBytes, contract, schemaBytes) {
     operations: operationIds,
     protocol: manifest.protocol,
     schema_manifest_sha256: schemaDigest,
+    schema_digest: runtimeDigest,
     schema_version: 1,
   }), null, 2)}\n`, "utf8");
   return files;
@@ -382,7 +410,7 @@ function main() {
   const client = validateManifest(componentInput.value, schemaInput.value);
   const sourceRoot = resolve(argument("--source-root", false) ?? ROOT);
   const sourcePaths = validateClientSources(sourceRoot, client);
-  const files = renderFiles(componentInput.value, componentInput.bytes, contractInput.bytes, schemaInput.bytes);
+  const files = renderFiles(componentInput.value, componentInput.bytes, contractInput.path, contractInput.bytes, schemaInput.path, schemaInput.bytes, schemaInput.value);
   const fixtureRoot = argument("--fixture-root", false);
   if (process.argv.includes("--check")) return checkFiles(sourceRoot, files, client, fixtureRoot ? resolve(fixtureRoot) : undefined, sourcePaths);
   const outputRoot = argument("--output-root");

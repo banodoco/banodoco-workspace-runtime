@@ -570,6 +570,20 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.update_managed_output_lifecycle(association_id, self._project_mutation_body(), idempotency_key=self._idempotency_key()))
         if len(path) == 4 and path[:2] == ["v1", "tasks"]:
             task_id, action = path[2:]
+            if method == "POST" and action == "remote-credential":
+                identity = self._identity("admin")
+                if identity.get("actor") != "owner":
+                    raise AuthorizationError("resident remote credential control requires the daemon owner")
+                daemon = getattr(self.server, "daemon_runtime", None)
+                if daemon is None:
+                    raise ConflictError("resident credential owner is unavailable")
+                return self._send(200, daemon.remote_credential_control(task_id, self._project_mutation_body(), identity=identity))
+            if method == "POST" and action == "remote-activation":
+                identity = self._identity("admin")
+                qualification = self._project_mutation_body()
+                return self._send(200, self.runtime.record_remote_activation(
+                    task_id, qualification, identity=identity
+                ))
             if method == "POST" and action == "placement-recovery":
                 identity = self._identity("admin")
                 key = self._idempotency_key()
@@ -592,6 +606,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 task = self.runtime.store.get_task(task_id)
                 query = parse_qs(urlsplit(self.path).query)
                 return self._send(200, self.runtime.events_page(task["run"]["id"], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
+        if len(path) == 5 and path[:2] == ["v1", "tasks"] and path[3:] == ["remote-activation", "revoke"] and method == "POST":
+            identity = self._identity("admin")
+            body = self._project_mutation_body()
+            if set(body) != {"activation_id"} or not isinstance(body["activation_id"], str) or not body["activation_id"]:
+                raise ProtocolError("activation_id is the only accepted revocation field")
+            self.runtime.revoke_remote_activation(path[2], body["activation_id"], identity=identity)
+            return self._send(204, body=b"")
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
             identity = self._identity("worker:execute")
             action = path[3]
