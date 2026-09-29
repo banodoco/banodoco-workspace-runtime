@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import sqlite3
 import shutil
 import time
 from pathlib import Path
@@ -143,11 +144,21 @@ def main(argv=None):
     if args.command == "audit-timelines":
         from .timeline_cutover import audit_active_timeline_heads
 
-        store = RealmStore(args.root)
+        # This command is deliberately read-only and must also work while the
+        # resident daemon owns the realm.  Opening RealmStore would acquire
+        # the writer lock and rerun the full startup-integrity budget, which
+        # is both unnecessary for an audit and can time out on a large realm.
+        root = Path(args.root).expanduser().resolve()
+        database = root / "realm.sqlite3"
+        if not database.is_file() or database.is_symlink():
+            print(json.dumps({"status": "unavailable", "reason": "realm database is unavailable", "root": str(root)}, sort_keys=True))
+            return 1
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30.0)
+        connection.row_factory = sqlite3.Row
         try:
-            result = audit_active_timeline_heads(store.conn, project_id=args.project_id)
+            result = audit_active_timeline_heads(connection, project_id=args.project_id)
         finally:
-            store.close()
+            connection.close()
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("status") == "ok" else 1
     if args.command == "upgrade":
