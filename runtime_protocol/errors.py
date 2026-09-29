@@ -47,6 +47,13 @@ class NotFoundError(RuntimeErrorBase):
     status = 404
 
 
+class RetiredRouteError(RuntimeErrorBase):
+    """A public compatibility route removed by the canonical timeline cutover."""
+
+    code = "retired_route"
+    status = 410
+
+
 class OwnerBusyError(ConflictError):
     code = "owner_busy"
 

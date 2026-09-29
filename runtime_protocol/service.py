@@ -990,6 +990,13 @@ class RuntimeService:
                 result.update({"slug": content.get("slug", timeline_id), "name": content.get("name", timeline_id), "config_version": int(document["version"]), "config": content.get("config", {}), "registry": content.get("registry", {})})
         return result
 
+    def _timeline_public_resource(self, timeline_id):
+        """Expose timeline identity/head metadata without legacy document bytes."""
+        resource = self._timeline_resource(timeline_id)
+        for key in ("config", "registry", "config_version", "revision_id", "content_digest"):
+            resource.pop(key, None)
+        return resource
+
     def _legacy_timeline_payload(self, timeline_id):
         """Return the lossless canonical bytes for the legacy timeline projection."""
         resource = self._timeline_resource(timeline_id)
@@ -1455,7 +1462,7 @@ class RuntimeService:
         rows = self.store.conn.execute("SELECT id, created_at FROM timelines WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
         return _page_rows(rows, scope=f"timelines:{project['id']}", cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
-                          resource_fn=lambda row: self._timeline_resource(row["id"]))
+                          resource_fn=lambda row: self._timeline_public_resource(row["id"]))
 
     def _shot_resource(self, row):
         state = self.store.conn.execute("SELECT version, archived_at FROM timeline_shot_state WHERE id=?", (row["id"],)).fetchone()
@@ -3417,7 +3424,13 @@ class RuntimeService:
 
     def list_documents(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project = self.store.get_project(project_id)
-        rows = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? ORDER BY created_at, id", (project["id"],)).fetchall()
+        # Timeline composition documents are immutable recovery material, not
+        # a public document authority. Keep ordinary project documents
+        # listable while forcing timeline callers through inspectTimeline.
+        rows = self.store.conn.execute(
+            "SELECT * FROM project_documents WHERE project_id=? AND id NOT LIKE 'timeline:%' ORDER BY created_at, id",
+            (project["id"],),
+        ).fetchall()
         return _page_rows(rows, scope=f"documents:{project['id']}", cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
                           resource_fn=self._document_resource)

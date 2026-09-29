@@ -85,6 +85,12 @@ def _parser():
     export.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     export.add_argument("--destination")
     export.add_argument("--json", action="store_true")
+    audit = sub.add_parser(
+        "audit-timelines",
+        help="read-only audit of active canonical timeline heads and legacy shells",
+    )
+    audit.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    audit.add_argument("--project-id")
     purge = sub.add_parser("purge", help="irreversibly remove a tombstoned realm (offline only)")
     purge.add_argument("--root", required=True)
     purge.add_argument("--confirm", required=True)
@@ -134,6 +140,16 @@ def main(argv=None):
             result["next_action"] = "banodoco-runtime create --root <realm>"
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("ok") else 1
+    if args.command == "audit-timelines":
+        from .timeline_cutover import audit_active_timeline_heads
+
+        store = RealmStore(args.root)
+        try:
+            result = audit_active_timeline_heads(store.conn, project_id=args.project_id)
+        finally:
+            store.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("status") == "ok" else 1
     if args.command == "upgrade":
         try:
             result = upgrade_realm(

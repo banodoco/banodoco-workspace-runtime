@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import hashlib
 import math
 import os
@@ -20,7 +21,6 @@ from pathlib import Path
 from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestError, LeaseError, NotFoundError, OwnerBusyError, RealmAdmissionError, ValidationError
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .dirfd import remove_tree_at
-from .managed_render_snapshot import ShotExpansionError, expand_shot_clips
 from .util import canonical_json, new_id, now
 
 try:
@@ -1272,189 +1272,27 @@ class RealmStore:
         if not isinstance(assets, dict):
             raise ValidationError("canonical timeline registry assets must be an object")
 
-        # Resolve every child through this same project-scoped Runtime before
-        # expanding. The renderer must receive only the resulting immutable
-        # snapshot; it must never reopen the project to resolve a shot.
-        child_cache = {}
-        child_records = []
-        shot_records = {}
-        shot_occurrences = []
-
-        def load_child(child_ref):
-            cached = child_cache.get(child_ref)
-            if cached is not None:
-                return cached["config"], cached["registry"]
-            child_rows = self.conn.execute(
-                "SELECT t.id, t.archived_at, d.content_json, d.version "
-                "FROM timelines t JOIN project_documents d "
-                "ON d.id=('timeline:' || t.id) AND d.project_id=t.project_id "
-                "WHERE t.project_id=? AND (t.id=? OR json_extract(d.content_json, '$.slug')=?)",
-                (project_id, str(child_ref), str(child_ref)),
-            ).fetchall()
-            if not child_rows:
-                raise NotFoundError(
-                    "shot child timeline is not in the selected project",
-                    details={"project_id": project_id, "timeline_ref": child_ref},
-                )
-            if len(child_rows) != 1:
-                raise ConflictError("shot child timeline reference is ambiguous within the selected project")
-            child_row = child_rows[0]
-            if child_row["archived_at"]:
-                raise ConflictError(
-                    "shot child timeline is archived",
-                    details={"timeline_id": child_row["id"], "timeline_ref": child_ref},
-                )
-            child_content = json.loads(child_row["content_json"])
-            if (
-                not isinstance(child_content, dict)
-                or not isinstance(child_content.get("config"), dict)
-                or not isinstance(child_content.get("registry"), dict)
-            ):
-                raise ValidationError(f"shot child timeline {child_ref!r} has an invalid snapshot")
-            child_config = child_content["config"]
-            child_registry = child_content["registry"]
-            record = {
-                "timeline_id": str(child_row["id"]),
-                "timeline_ulid": str(child_row["id"]),
-                "slug": str(child_content.get("slug") or child_row["id"]),
-                "config_version": int(child_row["version"]),
-                "config_hash": hashlib.sha256(canonical_json(child_config).encode()).hexdigest(),
-                "registry_hash": hashlib.sha256(canonical_json(child_registry).encode()).hexdigest(),
-            }
-            child_cache[child_ref] = {
-                "config": child_config,
-                "registry": child_registry,
-                "record": record,
-            }
-            child_records.append(record)
-            return child_config, child_registry
-
+        # The old render admission path expanded ``clipType: "shot"`` by
+        # reopening mutable child documents.  Canonical composition publication
+        # already freezes the parent/child closure; accepting the old shape here
+        # would silently reintroduce a second timeline authority.  Keep the
+        # authored legacy bytes available for offline migration/recovery, but
+        # fail closed at the public render boundary.
         raw_clips = config.get("clips", [])
         if not isinstance(raw_clips, list):
             raise ValidationError("canonical timeline config clips must be a list")
-        for index, clip in enumerate(raw_clips):
-            if not isinstance(clip, dict) or clip.get("clipType") != "shot":
-                continue
-            if clip.get("shot_occurrence_id"):
-                raise ValidationError(
-                    f"canonical timeline {timeline_ref!r} shot clip at index {index} "
-                    "contains caller-authored shot_occurrence_id"
-                )
-            shot_params = clip.get("params")
-            shot_id = shot_params.get("shot_id") if isinstance(shot_params, dict) else None
-            child_ref = shot_params.get("timeline_document_id") if isinstance(shot_params, dict) else None
-            if not isinstance(shot_id, str) or not shot_id:
-                raise ValidationError(
-                    f"canonical timeline {timeline_ref!r} shot clip at index {index} "
-                    "is missing a registered shot_id"
-                )
-            if not isinstance(child_ref, str) or not child_ref:
-                raise ValidationError(
-                    f"canonical timeline {timeline_ref!r} shot {shot_id!r} "
-                    "is missing timeline_document_id"
-                )
-            shot_row = self.conn.execute(
-                "SELECT id, name, version, archived_at FROM project_shots "
-                "WHERE id=? AND project_id=?",
-                (shot_id, project_id),
-            ).fetchone()
-            if not shot_row:
-                raise ValidationError(
-                    f"canonical timeline {timeline_ref!r} references unregistered shot {shot_id!r}"
-                )
-            if shot_row["archived_at"]:
-                raise ConflictError(
-                    "render shot reference is archived",
-                    details={"shot_id": shot_id, "timeline_ref": timeline_ref},
-                )
-            child_config, child_registry = load_child(child_ref)
-            child_record = child_cache[child_ref]["record"]
-            binding_rows = self.conn.execute(
-                "SELECT id, kind, slot, media_digest, event_stream_id, head_seq "
-                "FROM shot_text_bindings WHERE project_id=? AND shot_id=? ORDER BY id",
-                (project_id, shot_id),
-            ).fetchall()
-            bindings = []
-            for binding in binding_rows:
-                identity = {
-                    "schema": "workspace.shot.text_binding.identity/v1",
-                    "project_id": str(project_id),
-                    "shot_id": shot_id,
-                    "kind": str(binding["kind"]),
-                    "slot": binding["slot"],
-                }
-                expected_binding_id = str(uuid.uuid5(uuid.NAMESPACE_URL, canonical_json(identity)))
-                if str(binding["id"]) != expected_binding_id:
-                    raise ConflictError("text binding identity is corrupt")
-                expected_stream = expected_binding_id + ":shot.text_binding"
-                if str(binding["event_stream_id"]) != expected_stream:
-                    raise ConflictError("text binding stream identity is corrupt")
-                media = self.conn.execute(
-                    "SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest "
-                    "WHERE o.digest=? AND po.project_id=? AND po.relation='managed'",
-                    (binding["media_digest"], project_id),
-                ).fetchone()
-                if media is None:
-                    raise ConflictError("bound text media is missing")
-                bindings.append({
-                    "binding_id": expected_binding_id,
-                    "project_id": str(project_id),
-                    "shot_id": shot_id,
-                    "kind": str(binding["kind"]),
-                    "slot": binding["slot"],
-                    "media_id": "sha256:" + str(media["digest"]),
-                    "event_stream_id": expected_stream,
-                    "head": int(binding["head_seq"]),
-                    "content_hash": "sha256:" + str(media["digest"]),
-                    "mime_type": str(media["media_type"]),
-                    "byte_size": int(media["size"]),
-                })
-            shot_records.setdefault(
-                shot_id,
-                {
-                    "shot_id": shot_id,
-                    "name": str(shot_row["name"] or shot_id),
-                    "version": int(shot_row["version"]),
-                    "text_bindings": bindings,
-                },
+        legacy_shots = [
+            str(clip.get("id", index))
+            for index, clip in enumerate(raw_clips)
+            if isinstance(clip, dict) and clip.get("clipType") == "shot"
+        ]
+        if legacy_shots:
+            raise ConflictError(
+                "legacy clipType 'shot' render admission is retired; publish a canonical parent composition",
+                details={"clip_ids": legacy_shots, "replacement": "publishParentComposition"},
             )
-            shot_occurrences.append(
-                {
-                    "shot_occurrence_id": f"shot-occ-{len(shot_occurrences):04d}-{shot_id}",
-                    "shot_id": shot_id,
-                    "name": str(shot_row["name"] or shot_id),
-                    "at": float(clip.get("at", 0)),
-                    "hold": float(clip.get("hold", 0)),
-                    "source_index": index,
-                    "timeline_document_id": child_ref,
-                    "timeline_id": child_record["timeline_id"],
-                    "timeline_version": child_record["config_version"],
-                }
-            )
-
-        try:
-            expanded_config, expanded_registry = expand_shot_clips(
-                config,
-                registry,
-                load_timeline=load_child,
-            )
-        except (ShotExpansionError, TypeError, ValueError, OverflowError) as exc:
-            raise ValidationError(str(exc)) from exc
-
-        occurrence_names = {
-            item["shot_occurrence_id"]: item["name"] for item in shot_occurrences
-        }
-        for flat_clip in expanded_config.get("clips", []):
-            if not isinstance(flat_clip, dict):
-                continue
-            occurrence_id = flat_clip.get("shot_occurrence_id")
-            if occurrence_id is not None:
-                name = occurrence_names.get(occurrence_id)
-                if name is None:
-                    raise ValidationError(
-                        f"expanded clip {flat_clip.get('id', '?')} has an unknown shot occurrence"
-                    )
-                flat_clip["shot_name"] = name
+        expanded_config = copy.deepcopy(config)
+        expanded_registry = copy.deepcopy(registry)
 
         expanded_assets = expanded_registry.get("assets", {})
         if not isinstance(expanded_assets, dict):
@@ -1534,13 +1372,6 @@ class RealmStore:
             "materialized_registry_hash": materialized_registry_hash,
             "managed_media_admissions": managed_media,
         }
-        if shot_occurrences:
-            authority["expansion"] = {
-                "children": child_records,
-                "shots": [shot_records[key] for key in sorted(shot_records)],
-                "occurrences": shot_occurrences,
-                "expanded_config_hash": expanded_config_hash,
-            }
         frozen["timeline_snapshot"] = {"config": expanded_config, "registry": expanded_registry}
         inputs["timeline_ref"] = timeline_ref
         inputs["timeline_authority"] = authority

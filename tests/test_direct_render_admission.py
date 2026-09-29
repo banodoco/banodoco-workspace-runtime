@@ -141,7 +141,7 @@ def test_direct_managed_render_rejects_stale_scope_and_path_injection(tmp_path):
         service.close()
 
 
-def test_direct_managed_render_expands_registered_shot_before_claim(tmp_path):
+def test_direct_managed_render_rejects_legacy_shot_before_claim(tmp_path):
     root = tmp_path / "realm"
     RealmStore.initialize(root).close()
     service = RuntimeService(root)
@@ -209,42 +209,24 @@ def test_direct_managed_render_expands_registered_shot_before_claim(tmp_path):
             idempotency_key="parent-timeline",
         )
 
-        admitted = service.create_task({
-            "project": project["id"],
-            "capability_id": "rendering.render",
-            "capability_digest": capability_digest,
-            "input_object_ids": [],
-            "idempotency_key": "shot-render",
-            "spec": {
-                "family": "rendering.render",
-                "params": {
-                    "timeline_ref": "main",
-                    "selector": "rendering.remotion",
-                    "output_name": "shot-render.mp4",
-                    "profile": {},
+        with pytest.raises(ConflictError, match="legacy clipType 'shot'"):
+            service.create_task({
+                "project": project["id"],
+                "capability_id": "rendering.render",
+                "capability_digest": capability_digest,
+                "input_object_ids": [],
+                "idempotency_key": "shot-render",
+                "spec": {
+                    "family": "rendering.render",
+                    "params": {
+                        "timeline_ref": "main",
+                        "selector": "rendering.remotion",
+                        "output_name": "shot-render.mp4",
+                        "profile": {},
+                    },
                 },
-            },
-        })
-
-        task = admitted["task"]
-        frozen = task["spec"]["spec"]
-        clips = frozen["timeline_snapshot"]["config"]["clips"]
-        assert len(clips) == 1
-        assert clips[0]["clipType"] == "media"
-        assert clips[0]["at"] == 1.0
-        assert clips[0]["shot_occurrence_id"] == "shot-occ-0000-shot-1"
-        assert clips[0]["shot_name"] == "Opening shot"
-        assert "shot" not in {clip.get("clipType") for clip in clips}
-        assert frozen["timeline_snapshot"]["registry"]["assets"]["child-source"]["content_sha256"] == source_id
-        assert task["spec"]["input_object_ids"] == [source_id]
-        assert frozen["inputs"]["selector"] == "rendering.remotion"
-        assert frozen["inputs"]["output_name"] == "shot-render.mp4"
-        assert frozen["inputs"]["profile"] == {}
-
-        authority = frozen["inputs"]["timeline_authority"]
-        assert authority["expansion"]["shots"][0]["version"] == 1
-        assert authority["expansion"]["children"][0]["timeline_id"] == "shot-child"
-        assert authority["materialized_registry_hash"] != authority["registry_hash"]
+            })
+        assert service.list_project_tasks(project["id"])["items"] == []
     finally:
         service.close()
 
@@ -355,7 +337,7 @@ def test_direct_managed_render_rejects_nested_shot_before_queueing(tmp_path):
             idempotency_key="main",
         )
 
-        with pytest.raises(ValidationError, match="nested shot"):
+        with pytest.raises(ConflictError, match="legacy clipType 'shot'"):
             service.create_task({
                 "project": project["id"],
                 "capability_id": "rendering.render",

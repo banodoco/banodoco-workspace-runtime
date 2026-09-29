@@ -7,7 +7,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
-from .errors import RuntimeErrorBase, AuthorizationError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError
+from .errors import RuntimeErrorBase, AuthorizationError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
 from .service import validate_idempotency_key
 
 
@@ -228,13 +228,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 return self._send(200, self.runtime.list_timelines(path[2], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if len(path) == 5 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and method == "GET":
             self._identity("projects:read")
-            return self._send(200, self.runtime.get_project_timeline(path[2], path[4]))
+            raise RetiredRouteError(
+                "mutable timeline-document output is retired; use inspectTimeline for the current canonical head",
+                details={"replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/inspect"},
+            )
         if len(path) == 4 and path[:2] == ["v1", "projects"] and path[3] == "timeline-documents" and method == "POST":
             self._identity("projects:write")
-            key = self.headers.get("Idempotency-Key")
-            if not key:
-                raise ProtocolError("Idempotency-Key header is required")
-            return self._send(201, self.runtime.create_timeline_document(path[2], self._body(), idempotency_key=key))
+            raise RetiredRouteError(
+                "timeline-document creation is retired; publish a canonical parent composition",
+                details={"replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions"},
+            )
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "POST":
             self._identity("projects:write")
             return self._send(200, self.runtime.publish_parent_composition(path[2], path[4], self._project_mutation_body(), idempotency_key=self._idempotency_key()))
@@ -332,9 +335,24 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
                     return self._send(200, self.runtime.list_documents(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
-                if method == "POST": return self._send(201, self.runtime.create_document(selector, self._body(), idempotency_key=self._idempotency_key()))
+                if method == "POST":
+                    body = self._body()
+                    if isinstance(body, dict) and (
+                        str(body.get("document_id", "")).startswith("timeline:")
+                        or body.get("kind") == "timeline.composition"
+                    ):
+                        raise RetiredRouteError(
+                            "timeline documents are retired; publish a canonical parent composition",
+                            details={"replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions"},
+                        )
+                    return self._send(201, self.runtime.create_document(selector, body, idempotency_key=self._idempotency_key()))
             if len(path) == 5 and path[3] == "documents" and method in ("GET", "PATCH"):
                 self._identity("projects:read" if method == "GET" else "projects:write")
+                if path[4].startswith("timeline:"):
+                    raise RetiredRouteError(
+                        "timeline-document reads and CAS writes are retired; use inspectTimeline and canonical publication",
+                        details={"replacement": "POST /v1/projects/{project_id}/timelines/{timeline_id}/inspect"},
+                    )
                 if method == "GET": return self._send(200, self.runtime.get_document(selector, path[4]))
                 return self._send(200, self.runtime.update_document(selector, path[4], self._body(), idempotency_key=self._idempotency_key()))
             if len(path) == 4 and path[3] == "media-imports" and method == "POST":
