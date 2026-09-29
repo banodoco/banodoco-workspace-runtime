@@ -4372,6 +4372,115 @@ class RuntimeService:
         result = {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "ordinal": ordinal, "metadata": metadata, "created_at": created_at}
         return self._command_record("media_relation.create", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
 
+    @staticmethod
+    def _source_frame_thumbnail_descriptor(body):
+        if not isinstance(body, dict) or set(body) != {"object_id", "source_object_id", "recipe_version", "selection"}:
+            raise ValidationError("source-frame thumbnail requires object_id, source_object_id, recipe_version, and selection")
+        descriptor = copy.deepcopy(body)
+        for field in ("object_id", "source_object_id"):
+            value = descriptor[field]
+            if not isinstance(value, str) or not OBJECT_ID_RE.fullmatch(value) or not value.startswith("sha256:"):
+                raise ValidationError(f"thumbnail {field} must be a canonical sha256 object id")
+        if isinstance(descriptor["recipe_version"], bool) or not isinstance(descriptor["recipe_version"], int) or descriptor["recipe_version"] != 1:
+            raise ValidationError("thumbnail recipe_version is unsupported")
+        selection = descriptor["selection"]
+        if not isinstance(selection, dict) or set(selection) != {"kind", "source_time_seconds"} or selection.get("kind") != "source_frame":
+            raise ValidationError("thumbnail selection must identify a source_frame and source_time_seconds")
+        source_time = selection.get("source_time_seconds")
+        if isinstance(source_time, bool) or not isinstance(source_time, (int, float)) or not math.isfinite(float(source_time)) or not 0 <= float(source_time) <= 4_000_000_000:
+            raise ValidationError("thumbnail source_time_seconds must be finite and in [0, 4000000000]")
+        normalized_time = round(float(source_time), 6)
+        if normalized_time != float(source_time):
+            raise ValidationError("thumbnail source_time_seconds must be normalized to six decimal places")
+        descriptor["selection"]["source_time_seconds"] = normalized_time
+        return descriptor
+
+    @staticmethod
+    def _source_frame_thumbnail_identity(descriptor):
+        time_micros = int(round(float(descriptor["selection"]["source_time_seconds"]) * 1_000_000))
+        return (1 << 62) + time_micros * 1_000 + int(descriptor["recipe_version"])
+
+    def get_source_frame_thumbnail(self, project, *, source_object_id, source_time_seconds, recipe_version=1):
+        project_id = self.store.get_project(project)["id"]
+        if not isinstance(source_object_id, str) or not OBJECT_ID_RE.fullmatch(source_object_id) or not source_object_id.startswith("sha256:"):
+            raise ValidationError("thumbnail source_object_id must be a canonical sha256 object id")
+        source_digest = source_object_id.removeprefix("sha256:")
+        owned = self.store.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, source_digest),
+        ).fetchone()
+        if not owned:
+            raise NotFoundError("thumbnail source object is outside the project")
+        descriptor = self._source_frame_thumbnail_descriptor({
+            "object_id": "sha256:" + "0" * 64,
+            "source_object_id": source_object_id,
+            "recipe_version": recipe_version,
+            "selection": {"kind": "source_frame", "source_time_seconds": source_time_seconds},
+        })
+        source = descriptor["source_object_id"].removeprefix("sha256:")
+        rows = self.store.conn.execute(
+            "SELECT from_digest, metadata_json FROM media_relations "
+            "WHERE project_id=? AND to_digest=? AND kind='derived_from' AND ordinal=? "
+            "ORDER BY created_at, from_digest",
+            (project_id, source, self._source_frame_thumbnail_identity(descriptor)),
+        ).fetchall()
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            if metadata.get("thumbnail") == descriptor | {"object_id": "sha256:" + row["from_digest"]}:
+                return {"thumbnail": descriptor | {"object_id": "sha256:" + row["from_digest"]}}
+        return {"thumbnail": None}
+
+    @_durable_mutation
+    def ensure_source_frame_thumbnail(self, project, body, *, idempotency_key=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        project_id = self.store.get_project(project)["id"]
+        descriptor = self._source_frame_thumbnail_descriptor(body)
+        source = descriptor["source_object_id"].removeprefix("sha256:")
+        thumbnail = descriptor["object_id"].removeprefix("sha256:")
+        if source == thumbnail:
+            raise ValidationError("thumbnail source and image objects must be distinct")
+        ordinal = self._source_frame_thumbnail_identity(descriptor)
+        for digest in (source, thumbnail):
+            if not self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone():
+                raise NotFoundError("thumbnail source or image object not found")
+            if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
+                raise NotFoundError("thumbnail source or image object is outside the project")
+        source_row = self.store.conn.execute("SELECT media_type FROM objects WHERE digest=?", (source,)).fetchone()
+        if not str(source_row["media_type"]).lower().startswith("video/"):
+            raise ConflictError("source-frame thumbnail source object must be video")
+        image = self.store.conn.execute("SELECT media_type FROM objects WHERE digest=?", (thumbnail,)).fetchone()
+        if not image or str(image["media_type"]).lower() != "image/jpeg":
+            raise ConflictError("source-frame thumbnail object must be image/jpeg")
+        aggregate_id = f"{source}:{ordinal}:{descriptor['recipe_version']}"
+        request_hash = hashlib.sha256(canonical_json({"project_id": project_id, "thumbnail": descriptor}).encode()).hexdigest()
+        replay = self._command_replay("thumbnail.source_frame.ensure", aggregate_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        candidates = self.store.conn.execute(
+            "SELECT from_digest, metadata_json, created_at FROM media_relations "
+            "WHERE project_id=? AND to_digest=? AND kind='derived_from' AND ordinal=? "
+            "ORDER BY created_at, from_digest",
+            (project_id, source, ordinal),
+        ).fetchall()
+        existing = None
+        for candidate in candidates:
+            candidate_thumbnail = json.loads(candidate["metadata_json"]).get("thumbnail")
+            if isinstance(candidate_thumbnail, dict) and all(
+                candidate_thumbnail.get(key) == descriptor.get(key)
+                for key in ("source_object_id", "recipe_version", "selection")
+            ):
+                existing = {"thumbnail": candidate_thumbnail}
+                break
+        if existing:
+            result = existing["thumbnail"]
+        else:
+            metadata = {"thumbnail": descriptor}
+            self.store.conn.execute(
+                "INSERT INTO media_relations VALUES (?, ?, ?, 'derived_from', ?, ?, ?)",
+                (project_id, thumbnail, source, ordinal, canonical_json(metadata), now()),
+            )
+            result = descriptor
+        return self._command_record("thumbnail.source_frame.ensure", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
+
     def list_media_relations(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project_id = self.store.get_project(project)["id"]
         rows = self.store.conn.execute("SELECT * FROM media_relations WHERE project_id=? ORDER BY created_at, from_digest, to_digest, kind, ordinal", (project_id,)).fetchall()
