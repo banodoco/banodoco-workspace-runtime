@@ -9,6 +9,9 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
+import time
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -16,16 +19,27 @@ import pytest
 from runtime_protocol.errors import ConflictError
 from runtime_protocol.local_worker import LocalWorkerProfile, ProcessIdentity
 from runtime_protocol.local_worker_composition import (
+    CONTROL_VERSION,
     CrossProcessWorkerPreparer,
     OSProcessInspector,
     _PreparedWorker,
+    _AdoptedWorkerProcess,
+    _actual_executable,
+    _argv_digest,
+    _process_argv,
+    _ps,
     _listening_socket_owner,
     load_local_worker_composition,
 )
+from runtime_protocol.catalog import process_birth_identity
 
 
 def _digest(char: str) -> str:
     return "sha256:" + char * 64
+
+
+def test_argv_digest_preserves_argument_boundaries() -> None:
+    assert _argv_digest([b"a b", b"c"]) != _argv_digest([b"a", b"b c"])
 
 
 def _content_digest(value: bytes) -> str:
@@ -708,3 +722,249 @@ def test_control_probe_rejects_buffered_data_from_closed_peer(tmp_path, monkeypa
         assert preparer.control_alive(handle) is False
     finally:
         parent.close()
+
+
+def _worker_ack(request, *, status="prepared", phase="paused", bad_hash=False):
+    value = {
+        "version": CONTROL_VERSION,
+        "command": f"{request['command']}_ack",
+        "handoff_id": request["handoff_id"],
+        "status": status,
+        "nonce_digest": request["nonce_digest"],
+        "sealed_record_digest": request["sealed_record_digest"],
+        "host_ack": {"status": status},
+        "worker_phase": phase,
+    }
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    value["ack_sha256"] = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    if bad_hash:
+        value["ack_sha256"] = _digest("0")
+    return value
+
+
+def test_handoff_command_requires_exact_binders_phase_and_ack_hash(tmp_path, monkeypatch):
+    profile, _ = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    for bad_hash in (False, True):
+        parent, peer = socket.socketpair()
+        handle = _PreparedWorker(Worker(), "birth", parent, {}, tmp_path / "session/config.json")
+        preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+        monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+        payload = {
+            "version": CONTROL_VERSION,
+            "command": "handoff_prepare",
+            "handoff_id": "handoff-1",
+            "nonce_digest": _digest("a"),
+            "sealed_record_digest": _digest("b"),
+            "deadline_monotonic": 123.0,
+            "deadline_unix_ms": 456,
+            "old_runtime": {},
+            "receipt_evidence_digest": _digest("c"),
+            "credential_generation": {},
+        }
+
+        def worker_reply():
+            request = json.loads(peer.recv(65536).split(b"\n", 1)[0])
+            response = _worker_ack(request, bad_hash=bad_hash)
+            peer.sendall(
+                json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+                + b"\n"
+            )
+
+        thread = threading.Thread(target=worker_reply)
+        thread.start()
+        try:
+            if bad_hash:
+                with pytest.raises(ConflictError, match="acknowledgement is invalid"):
+                    preparer.handoff_command(handle, payload)
+            else:
+                response = preparer.handoff_command(handle, payload)
+                assert response["worker_phase"] == "paused"
+                assert response["handoff_id"] == payload["handoff_id"]
+        finally:
+            thread.join(1)
+            parent.close()
+            peer.close()
+
+
+def test_exported_control_descriptor_preserves_channel_after_a_releases_copy(
+    tmp_path, monkeypatch
+):
+    profile, _ = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    parent, peer = socket.socketpair()
+    handle = _PreparedWorker(Worker(), "birth", parent, {}, tmp_path / "session/config.json")
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    preparer._active = handle
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+    exported = preparer.export_control_descriptor(handle)
+    adopted = socket.socket(fileno=exported)
+    try:
+        assert os.get_inheritable(adopted.fileno()) is False
+        preparer.release_exported(handle)
+        assert handle.closed is True
+        assert preparer.current_handle() is None
+        adopted.sendall(b"custody")
+        assert peer.recv(7) == b"custody"
+    finally:
+        adopted.close()
+        peer.close()
+
+
+@pytest.mark.parametrize("worker_dies_first", [False, True])
+def test_adopted_unresponsive_worker_fallback_cleans_each_verified_nonchild_group(
+    tmp_path, worker_dies_first
+):
+    support = tmp_path / "support"
+    session = support / "engine-session"
+    session.mkdir(parents=True)
+    (session / "config.json").write_text("{}", encoding="utf-8")
+    state_path = tmp_path / "graph.json"
+    listener_ready = tmp_path / "listener-ready.json"
+    listener_script = tmp_path / "listener.py"
+    engine_script = tmp_path / "engine.py"
+    host_script = tmp_path / "host.py"
+    worker_script = tmp_path / "worker.py"
+    broker_script = tmp_path / "broker.py"
+    listener_script.write_text(textwrap.dedent("""
+        import json,os,signal,socket,sys,time
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        sock=socket.socket();sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        sock.bind(('127.0.0.1',0));sock.listen(4)
+        open(sys.argv[1],'w').write(json.dumps({'pid':os.getpid(),'port':sock.getsockname()[1]}))
+        while True: time.sleep(1)
+    """), encoding="utf-8")
+    engine_script.write_text(textwrap.dedent("""
+        import json,os,signal,subprocess,sys,time
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        child=subprocess.Popen([sys.executable,sys.argv[1],sys.argv[2]])
+        while not os.path.exists(sys.argv[2]): time.sleep(.01)
+        while True: time.sleep(1)
+    """), encoding="utf-8")
+    host_script.write_text("import signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nexec('while True: time.sleep(1)')\n", encoding="utf-8")
+    worker_script.write_text(textwrap.dedent("""
+        import json,os,signal,subprocess,sys,time
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        host=subprocess.Popen([sys.executable,sys.argv[1]],start_new_session=True)
+        engine=subprocess.Popen([sys.executable,sys.argv[2],sys.argv[3],sys.argv[4]],start_new_session=True)
+        while not os.path.exists(sys.argv[4]): time.sleep(.01)
+        listener=json.load(open(sys.argv[4]))
+        open(sys.argv[5],'w').write(json.dumps({'worker':os.getpid(),'host':host.pid,'engine':engine.pid,'listener':listener['pid'],'port':listener['port']}))
+        while True: time.sleep(1)
+    """), encoding="utf-8")
+    broker_script.write_text(textwrap.dedent("""
+        import subprocess,sys,time,os
+        worker=subprocess.Popen([sys.executable,*sys.argv[1:]],start_new_session=True)
+        while not os.path.exists(sys.argv[-1]): time.sleep(.01)
+    """), encoding="utf-8")
+    subprocess.run(
+        [
+            sys.executable, str(broker_script), str(worker_script),
+            str(host_script), str(engine_script), str(listener_script),
+            str(listener_ready), str(state_path),
+        ],
+        check=True,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and int(_ps(state["worker"], "ppid")) != 1:
+        time.sleep(.02)
+
+    def identity(name, parent):
+        pid = int(state[name])
+        executable = _actual_executable(pid)
+        return {
+            "pid": pid,
+            "birth_id": process_birth_identity(pid),
+            "uid": int(_ps(pid, "uid")),
+            "parent_pid": int(parent),
+            "process_group": os.getpgid(pid),
+            "session_id": os.getsid(pid),
+            "executable": str(executable),
+            "artifact_digest": _file_digest(executable),
+            "command_line": _ps(pid, "command"),
+            "argv_digest": _argv_digest(_process_argv(pid)),
+        }
+
+    receipt = {
+        "worker": identity("worker", 1),
+        "host": identity("host", state["worker"]),
+        "engine": identity("engine", state["worker"]),
+        "engine_listener": identity("listener", state["engine"]),
+        "cleanup_groups": [
+            {"role": "generic_pack_host", "leader": "host", "members": ["host"]},
+            {
+                "role": "engine",
+                "leader": "engine",
+                "members": ["engine", "engine_listener"],
+            },
+            {"role": "worker", "leader": "worker", "members": ["worker"]},
+        ],
+        "engine_binding": {"socket_owner_pid": state["listener"]},
+    }
+    profile, _ = _inspector_fixture(tmp_path)
+    profile = __import__("dataclasses").replace(
+        profile, engine_endpoint=f"http://127.0.0.1:{state['port']}"
+    )
+    preparer = CrossProcessWorkerPreparer(
+        profile=profile,
+        config={"support_root": str(support)},
+        environment={"ASTRID_VIBECOMFY_SESSION_DIR": str(session)},
+        cleanup_timeout_seconds=.4,
+    )
+    control, peer = socket.socketpair()
+    handle = _PreparedWorker(
+        _AdoptedWorkerProcess(state["worker"], receipt["worker"]["birth_id"]),
+        receipt["worker"]["birth_id"],
+        control,
+        {},
+        session / "config.json",
+        activated=True,
+        adopted=True,
+        receipt=receipt,
+    )
+    preparer._active = handle
+    try:
+        if worker_dies_first:
+            os.killpg(int(state["worker"]), signal.SIGKILL)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and process_birth_identity(state["worker"]):
+                time.sleep(.02)
+            assert process_birth_identity(state["worker"]) is None
+        preparer.abort(handle)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and any(
+            process_birth_identity(state[name]) is not None
+            for name in ("host", "engine", "listener", "worker")
+        ):
+            time.sleep(.02)
+        assert all(process_birth_identity(state[name]) is None for name in ("host", "engine", "listener", "worker"))
+        assert not session.exists()
+        probe = socket.socket()
+        try:
+            assert probe.connect_ex(("127.0.0.1", state["port"])) != 0
+        finally:
+            probe.close()
+    finally:
+        peer.close()
+        for name in ("host", "engine", "worker"):
+            pid = int(state[name])
+            if process_birth_identity(pid):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass

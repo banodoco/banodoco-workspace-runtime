@@ -26,6 +26,8 @@ import uuid
 from .io import atomic_write_json, owner_only, read_json, remove_file
 from .paths import RuntimePaths
 from runtime_protocol.lifecycle import interruption_fence
+from runtime_protocol.handoff_recovery import recover_aborted_predecessor_resolution
+from runtime_protocol.orderly_handoff import HandoffRecord, digest
 
 
 PROTOCOL_VERSION = "workspace.v1"
@@ -43,6 +45,124 @@ WORKER_SCOPES = (
     "objects:read",
     "objects:write",
 )
+_HANDOFF_REQUEST = "orderly-handoff-request.json"
+_HANDOFF_CLEANUP_GATE = "orderly-handoff-cleanup-uncertain.json"
+_HANDOFF_ACTIVE_OWNER = "orderly-handoff-adopted-owner.json"
+
+
+def _strict_owner_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    try:
+        observed = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(observed.st_mode):
+            raise BootstrapError(f"Runtime custody gate is invalid: {path.name}")
+        if observed.st_uid != os.getuid() or stat.S_IMODE(observed.st_mode) != 0o600:
+            raise BootstrapError(f"Runtime custody gate is not owner-only: {path.name}")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BootstrapError(f"Runtime custody gate is unreadable: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise BootstrapError(f"Runtime custody gate must be an object: {path.name}")
+    return value
+
+
+def _recover_aborted_predecessor_resolution(paths: RuntimePaths) -> None:
+    """Replay exact predecessor custody under launcher bootstrap ownership."""
+
+    try:
+        recover_aborted_predecessor_resolution(
+            paths.runtime_support,
+            bootstrap_lock_held=True,
+        )
+    except Exception as exc:
+        raise BootstrapError(
+            "Runtime startup is blocked by unresolved orderly handoff custody; "
+            "predecessor resolution replay failed closed."
+        ) from exc
+
+
+def _assert_orderly_handoff_start_allowed(
+    paths: RuntimePaths,
+    boundary: RuntimeBoundary,
+) -> dict[str, Any] | None:
+    """Fail closed before any launch/interrupt mutates support state."""
+
+    _recover_aborted_predecessor_resolution(paths)
+    for name in (_HANDOFF_REQUEST, _HANDOFF_CLEANUP_GATE):
+        gate = paths.runtime_support / name
+        if gate.exists() or gate.is_symlink():
+            raise BootstrapError(
+                "Runtime startup is blocked by unresolved orderly handoff custody; "
+                "operator audit and verified cleanup are required."
+            )
+    active_path = paths.runtime_support / _HANDOFF_ACTIVE_OWNER
+    active = _strict_owner_json(active_path)
+    if active is None:
+        return None
+    expected_keys = {
+        "version", "state", "handoff_id", "record_path", "record_digest",
+        "pid", "birth_id", "runtime_instance_id", "reference_digest",
+    }
+    try:
+        record_path = Path(str(active["record_path"]))
+        pid = int(active["pid"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BootstrapError("The adopted Runtime owner reference is invalid.") from exc
+    if (
+        set(active) != expected_keys
+        or active.get("version") != 1
+        or active.get("state") != "ADOPTED"
+        or not isinstance(active.get("handoff_id"), str)
+        or not active["handoff_id"]
+        or not record_path.is_absolute()
+        or record_path.parent != paths.runtime_support
+        or record_path.name != f"orderly-handoff-record-{active['handoff_id']}.json"
+        or not isinstance(active.get("record_digest"), str)
+        or not isinstance(active.get("birth_id"), str)
+        or not active["birth_id"]
+        or not isinstance(active.get("runtime_instance_id"), str)
+        or not active["runtime_instance_id"]
+        or active.get("reference_digest") != digest({
+            key: item for key, item in active.items() if key != "reference_digest"
+        })
+    ):
+        raise BootstrapError("The adopted Runtime owner reference is invalid.")
+    try:
+        record = HandoffRecord(record_path).read()
+    except Exception as exc:
+        raise BootstrapError(
+            "The adopted Runtime tombstone is invalid."
+        ) from exc
+    if (
+        record is None
+        or record.get("state") != "ADOPTED"
+        or record.get("handoff_id") != active["handoff_id"]
+        or record.get("record_digest") != active["record_digest"]
+    ):
+        raise BootstrapError("The adopted Runtime tombstone does not match its owner reference.")
+    alive = _pid_alive(boundary, pid)
+    birth_probe = getattr(boundary, "process_birth_identity", None)
+    observed_birth = birth_probe(pid) if alive and callable(birth_probe) else None
+    if alive and observed_birth == active["birth_id"]:
+        return active
+    atomic_write_json(
+        paths.runtime_support / _HANDOFF_CLEANUP_GATE,
+        {
+            "version": 1,
+            "state": "operator_audit_required",
+            "reason": "unexpected_post_adopted_owner_loss",
+            "handoff_id": active["handoff_id"],
+            "record_path": str(record_path),
+            "record_digest": active["record_digest"],
+            "owner_b_pid": pid,
+            "owner_b_birth_id": active["birth_id"],
+            "runtime_instance_id": active["runtime_instance_id"],
+        },
+    )
+    raise BootstrapError(
+        "The adopted Runtime owner was lost; operator audit and verified cleanup are required."
+    )
 LEGACY_NEXT_ACTION = (
     "Legacy realm roots are unsupported; preserve {legacy_root} and "
     "provision a fresh canonical realm before launching."
@@ -816,6 +936,7 @@ def _commit_source_profile_metadata(paths: RuntimePaths, source: SourceProfile, 
 def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig) -> BootstrapResult:
     if config.profile != "astrid":
         raise BootstrapError("Stage 1 supports only the astrid profile.")
+    _assert_orderly_handoff_start_allowed(paths, boundary)
     source = config.resolve_source_profile(paths)
     _validate_source_profile(source, expected_profile=config.profile)
     configure = getattr(boundary, "configure_source", None)
@@ -1064,9 +1185,15 @@ def _owner_record_matches(
     )
 
 
-def _interrupt_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
+def _interrupt_owner_locked(
+    paths: RuntimePaths,
+    boundary: RuntimeBoundary,
+    *,
+    preserve_worker: bool = False,
+) -> dict[str, Any]:
     """Identity-stop the owner while the caller holds the launcher mutex."""
     _validate_support_paths(paths)
+    active_handoff = _assert_orderly_handoff_start_allowed(paths, boundary)
     discovery = _read_support_json(paths.discovery_path)
     if not discovery:
         raise BootstrapError("No runtime owner is available to interrupt.")
@@ -1115,6 +1242,30 @@ def _interrupt_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> d
         or str(endpoint_identity.get("realm_id") or "") != realm_id
     ):
         raise BootstrapError("Runtime interruption refused: endpoint identity does not match the selected owner.")
+    if preserve_worker:
+        restart_owner = getattr(boundary, "restart", None)
+        if not callable(restart_owner):
+            raise BootstrapError("Runtime boundary lacks the orderly Worker handoff.")
+        try:
+            handle = restart_owner(
+                endpoint=endpoint,
+                pid=pid,
+                instance_id=instance_id,
+                process_birth_id=process_birth_id,
+                realm_id=realm_id,
+                owner_lock=paths.instance_lock_path,
+                discovery_path=paths.discovery_path,
+                require_health=True,
+                preserve_worker=True,
+            )
+        except Exception as exc:
+            raise BootstrapError(str(exc)) from exc
+        return {
+            "status": "restarted",
+            "realm_id": realm_id,
+            "realm_root": realm_root,
+            "handle": handle,
+        }
     stop_owner = getattr(boundary, "stop_owner", None)
     if not callable(stop_owner):
         raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
@@ -1147,6 +1298,48 @@ def _interrupt_owner_locked(paths: RuntimePaths, boundary: RuntimeBoundary) -> d
         remove_file(paths.discovery_path)
     if current_marker is not None:
         remove_file(paths.instance_lock_path)
+    if active_handoff is not None:
+        if (
+            int(active_handoff["pid"]) != pid
+            or active_handoff["birth_id"] != process_birth_id
+            or active_handoff["runtime_instance_id"] != instance_id
+        ):
+            raise BootstrapError(
+                "The adopted Runtime owner reference changed during stop."
+            )
+        cleanup_gate = paths.runtime_support / _HANDOFF_CLEANUP_GATE
+        if cleanup_gate.exists() or cleanup_gate.is_symlink():
+            raise BootstrapError(
+                "Normal stop left uncertain handoff cleanup; operator audit is required."
+            )
+        stop_receipt = {
+            "version": 1,
+            "state": "verified_normal_stop",
+            "handoff_id": active_handoff["handoff_id"],
+            "record_path": active_handoff["record_path"],
+            "record_digest": active_handoff["record_digest"],
+            "pid": pid,
+            "birth_id": process_birth_id,
+            "runtime_instance_id": instance_id,
+            "process_absent": not _pid_alive(boundary, pid),
+            "discovery_absent": not paths.discovery_path.exists(),
+            "owner_lock_absent": not paths.instance_lock_path.exists(),
+            "cleanup_gate_absent": True,
+        }
+        if not all(
+            stop_receipt[key] is True
+            for key in (
+                "process_absent", "discovery_absent", "owner_lock_absent",
+                "cleanup_gate_absent",
+            )
+        ):
+            raise BootstrapError("Normal stop cleanup proof is incomplete.")
+        atomic_write_json(
+            paths.runtime_support
+            / f"orderly-handoff-normal-stop-{active_handoff['handoff_id']}.json",
+            stop_receipt,
+        )
+        remove_file(paths.runtime_support / _HANDOFF_ACTIVE_OWNER)
     return {"status": "stopped", "realm_id": realm_id, "idle": idle}
 
 
@@ -1161,13 +1354,47 @@ def down(paths: RuntimePaths, boundary: RuntimeBoundary) -> dict[str, Any]:
     return _interrupt_owner(paths, boundary)
 
 
-def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapConfig | None = None) -> BootstrapResult:
+def restart(
+    paths: RuntimePaths,
+    boundary: RuntimeBoundary,
+    config: BootstrapConfig | None = None,
+    *,
+    preserve_worker: bool = False,
+) -> BootstrapResult:
     """Stop under the shared lifecycle fence, then explicitly start again."""
     config = config or BootstrapConfig()
     _validate_support_paths(paths)
     with _bootstrap_mutex(paths):
-        _interrupt_owner_locked(paths, boundary)
-        result = _bootstrap_locked(paths, boundary, config)
+        _assert_orderly_handoff_start_allowed(paths, boundary)
+        if preserve_worker:
+            source = config.resolve_source_profile(paths)
+            _validate_source_profile(source, expected_profile=config.profile)
+            configure = getattr(boundary, "configure_source", None)
+            if callable(configure):
+                configure(source)
+            restarted = _interrupt_owner_locked(paths, boundary, preserve_worker=True)
+            handle = restarted["handle"]
+            endpoint = _validate_loopback_endpoint(str(handle["endpoint"]))
+            realm_id = str(restarted["realm_id"])
+            catalog = _read_catalog(paths)
+            realm = _selected_realm(catalog)
+            if realm is None or str(realm.get("realm_id")) != realm_id:
+                raise BootstrapError("Orderly restart selected realm changed.")
+            actor_id, token = _credential(paths)
+            connection = boundary.connect(endpoint=endpoint, credential=token)
+            _provision_connection(connection, actor_id, token, realm_id)
+            worker = _worker_handoff(handle)
+            result = BootstrapResult(
+                "restarted", realm_id, str(realm.get("display_name", "Astrid Workspace")),
+                endpoint, actor_id, source.profile, ("worker graph preserved across owners",),
+                paths.discovery_path, paths.credentials_dir / "astrid.json",
+                worker.get("worker_credential_file"), worker.get("worker_actor"),
+                worker.get("worker_scopes", ()), source.source_checkout,
+                _canonical_realm_root(str(realm["data_root"])), paths.app_support,
+            )
+        else:
+            _interrupt_owner_locked(paths, boundary)
+            result = _bootstrap_locked(paths, boundary, config)
     return BootstrapResult(
         "restarted", result.realm_id, result.display_name, result.endpoint,
         result.actor_id, result.source_profile, result.diagnostics,

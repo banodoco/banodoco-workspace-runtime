@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 import uuid
@@ -108,6 +109,8 @@ class FakePreparer:
         self.operation_id = self.channel_id = None
         self.aborted = False
         self.handle = None
+        self.handoff_requests = []
+        self.handoff_acks = {}
 
     def prepare(self, _profile, *, operation_id, channel_id):
         assert self.store.actor_metadata(WORKER_ACTOR) is None
@@ -166,6 +169,76 @@ class FakePreparer:
 
     def current_handle(self):
         return self.handle
+
+    def handoff_command(self, _handle, payload):
+        self.handoff_requests.append(dict(payload))
+        command = payload["command"]
+        if command == "resume_prepare" and command in self.handoff_acks:
+            request, response = self.handoff_acks[command]
+            if request != dict(payload):
+                raise ConflictError("private Worker handoff replay changed")
+            return dict(response)
+        self.events.append(command)
+        phases = {
+            "handoff_prepare": ("prepared", "paused"),
+            "handoff_seal": ("sealed", "export_sealed"),
+            "handoff_adopt": ("prepared", "adopt_prepared"),
+            "handoff_commit": ("committed", "rebind_committed"),
+            "resume_prepare": ("prepared", "resume_armed"),
+            "resume_commit": ("committed", "resumed"),
+            "handoff_finalize": ("finalized", "finalized"),
+            "handoff_abort": ("cancelled", "owned"),
+        }
+        status, phase = phases[command]
+        host_ack = {"status": status}
+        if command == "handoff_prepare":
+            host_ack["registered_state"] = {
+                "executor_id": "astrid-pack-host",
+                "source_epoch": "source-1",
+                "runtime": payload["old_runtime"],
+                "capabilities": [],
+            }
+        elif command == "handoff_adopt":
+            host_ack["registered_state"] = {
+                **payload["registered_state"],
+                "runtime": payload["new_runtime"],
+            }
+        response = {
+            "version": payload["version"],
+            "command": f"{command}_ack",
+            "handoff_id": payload["handoff_id"],
+            "status": status,
+            "nonce_digest": payload["nonce_digest"],
+            "sealed_record_digest": payload["sealed_record_digest"],
+            "host_ack": host_ack,
+            "worker_phase": phase,
+            "ack_sha256": _digest("8"),
+        }
+        if command == "resume_prepare":
+            self.handoff_acks[command] = (dict(payload), dict(response))
+        return response
+
+    def export_control_descriptor(self, _handle):
+        self.events.append("export_control")
+        return os.open("/dev/null", os.O_RDONLY)
+
+    def release_exported(self, _handle):
+        self.events.append("release_exported")
+        if self.handle is _handle:
+            self.handle = None
+
+    def adopt_control_descriptor(self, descriptor, _receipt):
+        os.close(descriptor)
+        self.events.append("adopt_control")
+        self.handle = object()
+        return self.handle
+
+    def abort_adopted_descriptor(self, descriptor, _receipt):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        self.events.append("abort_adopted_descriptor")
 
 
 class FakeInspector:
@@ -236,6 +309,156 @@ def test_owner_transaction_issues_only_after_two_observations_then_activates(tmp
     assert store.load(token)["execution_binding"]["executor_incarnation"] == result["executor_incarnation"]
 
 
+def test_orderly_handoff_preserves_generation_and_incarnation_across_two_launchers(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer_a = FakePreparer(store, observed)
+    launcher_a = _launcher(store, profile, preparer_a, FakeInspector(store, observed), 77)
+    active = launcher_a.start("astrid", workspace_uuid)
+    metadata = store.actor_metadata(WORKER_ACTOR)
+    receipt = metadata["local_launch_receipt"]
+    generation = store.generation_snapshot(WORKER_ACTOR)
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+    old_runtime = {
+        "endpoint": "http://127.0.0.1:47111",
+        "protocol": "workspace.v1",
+        "schema_digest": _digest("1"),
+        "runtime_epoch": 1,
+        "runtime_instance_id": "runtime-a",
+        "runtime_session_id": "session-a",
+    }
+    common = {
+        "version": "reigh.local-worker-control/v2",
+        "handoff_id": "handoff-1",
+        "nonce_digest": _digest("2"),
+        "sealed_record_digest": _digest("3"),
+        "deadline_monotonic": time.monotonic() + 30,
+        "deadline_unix_ms": int(time.time() * 1000) + 30_000,
+    }
+    prepared = launcher_a.prepare_orderly_handoff(
+        {
+            **common,
+            "command": "handoff_prepare",
+            "old_owner": {"pid": 77, "birth_id": "birth-77"},
+            "old_runtime": old_runtime,
+            "receipt_evidence_digest": receipt["evidence_digest"],
+            "credential_generation": generation,
+        }
+    )
+    assert prepared["state"] == "host_paused"
+    assert store.load(token)["actor"] == WORKER_ACTOR
+    fenced = launcher_a.fence_orderly_handoff("handoff-1")
+    assert fenced["state"] == "PREPARED"
+    with pytest.raises(AuthorizationError):
+        store.load(token)
+    descriptor, exported = launcher_a.export_orderly_handoff("handoff-1")
+    launcher_a.seal_orderly_handoff(
+        "handoff-1",
+        {
+            "version": common["version"],
+            "command": "handoff_seal",
+            "handoff_id": common["handoff_id"],
+            "nonce": "private-nonce",
+            "nonce_digest": common["nonce_digest"],
+            "sealed_record_digest": common["sealed_record_digest"],
+            "export_sealed_digest": _digest("4"),
+            "export_record_digest": _digest("5"),
+            "export": exported,
+            "old_owner": {"pid": 77, "birth_id": "birth-77"},
+        },
+    )
+    launcher_a.release_exported_handoff("handoff-1")
+
+    new_runtime = {
+        **old_runtime,
+        "runtime_epoch": 2,
+        "runtime_instance_id": "runtime-b",
+        "runtime_session_id": "session-b",
+    }
+    preparer_b = FakePreparer(store, observed)
+    launcher_b = _launcher(
+        store,
+        profile,
+        preparer_b,
+        FakeInspector(store, observed, assert_unissued=False),
+        88,
+    )
+    adopted = launcher_b.adopt_orderly_handoff(
+        descriptor=descriptor,
+        profile_id="astrid",
+        receipt=exported["receipt"],
+        request={
+            **common,
+            "command": "handoff_adopt",
+            "nonce": "private-nonce",
+            "request_id": "handoff-1",
+            "old_owner": {"pid": 77, "birth_id": "birth-77"},
+            "new_owner": {"pid": 88, "birth_id": "birth-88"},
+            "export_sealed_digest": _digest("4"),
+            "export_record_digest": _digest("5"),
+            "adopter_record_digest": _digest("6"),
+            "old_runtime": old_runtime,
+            "new_runtime": new_runtime,
+            "endpoint": old_runtime["endpoint"],
+            "credential_file": str(store.path_for(WORKER_ACTOR)),
+            "credential_generation": generation,
+            "receipt_evidence_digest": receipt["evidence_digest"],
+            "executor_incarnation": receipt["executor_incarnation"],
+            "registered_state": exported["registered_state"],
+        },
+    )
+    assert adopted["state"] == "adopt_prepared"
+    with pytest.raises(AuthorizationError):
+        store.load(token)
+    launcher_b.commit_orderly_handoff("handoff-1", new_runtime=new_runtime)
+    assert store.load(token)["actor"] == WORKER_ACTOR
+    resume_prepared = launcher_b.resume_orderly_handoff(
+        "handoff-1", new_runtime=new_runtime, commit=False
+    )
+    replayed_resume_prepare = launcher_b.resume_orderly_handoff(
+        "handoff-1", new_runtime=new_runtime, commit=False
+    )
+    assert replayed_resume_prepare == resume_prepared
+    assert preparer_b.handoff_requests[-2:] == [
+        preparer_b.handoff_requests[-2],
+        preparer_b.handoff_requests[-2],
+    ]
+    assert replayed_resume_prepare["host_ack"] == resume_prepared["host_ack"]
+    with pytest.raises(ConflictError, match="replay changed"):
+        launcher_b.resume_orderly_handoff(
+            "handoff-1",
+            new_runtime={**new_runtime, "runtime_session_id": "changed-session"},
+            commit=False,
+        )
+    launcher_b.resume_orderly_handoff(
+        "handoff-1", new_runtime=new_runtime, commit=True
+    )
+    final_ack = launcher_b.finalize_orderly_handoff("handoff-1")
+    assert set(final_ack) == {
+        "request_digest", "worker_ack_digest", "host_ack_digest", "ack",
+    }
+    assert all(
+        str(final_ack[key]).startswith("sha256:")
+        for key in ("request_digest", "worker_ack_digest", "host_ack_digest")
+    )
+    assert final_ack["ack"]["worker_phase"] == "finalized"
+
+    assert store.generation_snapshot(WORKER_ACTOR) == generation
+    assert store.actor_metadata(WORKER_ACTOR)["local_launch_receipt"][
+        "executor_incarnation"
+    ] == active["executor_incarnation"]
+    assert preparer_b.events == [
+        "adopt_control",
+        "handoff_adopt",
+        "handoff_commit",
+        "resume_prepare",
+        "resume_commit",
+        "handoff_finalize",
+    ]
+
+
 def test_owner_transaction_requires_distinct_host_os_pin_when_present(tmp_path):
     workspace_uuid = str(uuid.uuid4())
     profile = replace(
@@ -254,7 +477,6 @@ def test_owner_transaction_requires_distinct_host_os_pin_when_present(tmp_path):
     assert store.actor_metadata(WORKER_ACTOR)["local_launch_receipt"]["host"]["executable"] == str(
         profile.host_os_executable
     )
-
     launch_identity = replace(
         observed.host,
         executable=profile.host_executable,
@@ -270,6 +492,105 @@ def test_owner_transaction_requires_distinct_host_os_pin_when_present(tmp_path):
             77,
         ).start("astrid", workspace_uuid)
 
+
+def test_failed_b_adoption_cleans_graph_and_latches_uncertainty_before_replacement(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher_a = _launcher(
+        store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77
+    )
+    launcher_a.start("astrid", workspace_uuid)
+    receipt = store.actor_metadata(WORKER_ACTOR)["local_launch_receipt"]
+    generation = store.generation_snapshot(WORKER_ACTOR)
+
+    class UncertainAdopter(FakePreparer):
+        cleanup_uncertain = None
+
+        def handoff_command(self, _handle, _payload):
+            raise ConflictError("injected adopter rejection")
+
+        def abort(self, _handle):
+            self.events.append("abort")
+            self.cleanup_uncertain = "injected cleanup uncertainty"
+            raise ConflictError(self.cleanup_uncertain)
+
+    preparer = UncertainAdopter(store, observed)
+    launcher_b = _launcher(
+        store, profile, preparer,
+        FakeInspector(store, observed, assert_unissued=False), 88,
+    )
+    descriptor = os.open("/dev/null", os.O_RDONLY)
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        launcher_b.adopt_orderly_handoff(
+            descriptor=descriptor,
+            profile_id="astrid",
+            receipt=receipt,
+            request={
+                "handoff_id": "handoff-failure",
+                "credential_generation": generation,
+            },
+        )
+    assert preparer.events == ["adopt_control", "abort"]
+    marker = profile.support_root / "orderly-handoff-cleanup-uncertain.json"
+    assert json.loads(marker.read_text())["state"] == "cleanup_uncertain"
+    before = list(preparer.events)
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        launcher_b.start("astrid", workspace_uuid)
+    assert preparer.events == before
+
+
+def test_adoption_failure_before_handle_return_uses_provisional_cleanup_custody(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    launcher_a = _launcher(
+        store, profile, FakePreparer(store, observed), FakeInspector(store, observed), 77
+    )
+    launcher_a.start("astrid", workspace_uuid)
+    receipt = store.actor_metadata(WORKER_ACTOR)["local_launch_receipt"]
+    generation = store.generation_snapshot(WORKER_ACTOR)
+
+    class FailsBeforeHandle(FakePreparer):
+        cleanup_uncertain = None
+
+        def adopt_control_descriptor(self, _descriptor, _receipt):
+            self.events.append("adopt_control_failed")
+            raise ConflictError("injected failure before handle return")
+
+        def abort_adopted_descriptor(self, descriptor, _receipt):
+            self.events.append("abort_adopted_descriptor")
+            os.close(descriptor)
+            self.cleanup_uncertain = "injected provisional cleanup uncertainty"
+            raise ConflictError(self.cleanup_uncertain)
+
+    preparer = FailsBeforeHandle(store, observed)
+    launcher_b = _launcher(
+        store, profile, preparer,
+        FakeInspector(store, observed, assert_unissued=False), 88,
+    )
+    descriptor = os.open("/dev/null", os.O_RDONLY)
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        launcher_b.adopt_orderly_handoff(
+            descriptor=descriptor,
+            profile_id="astrid",
+            receipt=receipt,
+            request={
+                "handoff_id": "handoff-pre-handle-failure",
+                "credential_generation": generation,
+            },
+        )
+    assert preparer.events == ["adopt_control_failed", "abort_adopted_descriptor"]
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    marker = profile.support_root / "orderly-handoff-cleanup-uncertain.json"
+    assert json.loads(marker.read_text())["state"] == "cleanup_uncertain"
+    before = list(preparer.events)
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        launcher_b.start("astrid", workspace_uuid)
+    assert preparer.events == before
 
 @pytest.mark.parametrize(
     "change, message",
@@ -721,11 +1042,13 @@ def test_shutdown_fences_auth_before_hung_abort_and_is_bounded(tmp_path, monkeyp
     monkeypatch.setattr(daemon, "_shutdown_http", shutdown_http.set)
 
     started = time.monotonic()
-    daemon.stop()
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        daemon.stop()
     elapsed = time.monotonic() - started
     try:
         assert elapsed < 1.5
         assert entered_abort.wait(timeout=1)
+        assert (daemon.support_root / "orderly-handoff-cleanup-uncertain.json").is_file()
         with pytest.raises(AuthorizationError):
             store.load(token)
     finally:

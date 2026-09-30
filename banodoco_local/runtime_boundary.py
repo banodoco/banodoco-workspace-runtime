@@ -11,13 +11,17 @@ import hashlib
 import importlib.util
 import json
 import os
+import fcntl
 from pathlib import Path
+import secrets
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.request
 from typing import Any, Mapping
@@ -25,6 +29,14 @@ from urllib.parse import urlsplit
 
 from .bootstrap import BootstrapError, SourceProfile
 from .compatibility import canonical_value
+from .custody_broker import (
+    ACTIVE_CAPABILITY_NAME,
+    CustodyError,
+    RoleBoundCustodyBroker,
+    custody_wrapper_argv,
+    publish_active_capability,
+    signal_sealed_capability,
+)
 
 
 PROTOCOL_VERSION = "workspace.v1"
@@ -34,6 +46,65 @@ WAIT_SECONDS = 10.0
 ADMISSION_TIMEOUT_ENV = "ASTRID_RUNTIME_ADMISSION_TIMEOUT_SECONDS"
 DEFAULT_ADMISSION_TIMEOUT_SECONDS = 120.0
 STARTUP_WAIT_MARGIN_SECONDS = 5.0
+
+
+class RuntimeCustodyLaunchUncertain(BootstrapError):
+    """A Runtime child exists but durable sealed custody publication failed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        process: subprocess.Popen[str],
+        broker: RoleBoundCustodyBroker,
+    ) -> None:
+        super().__init__(message)
+        self.process = process
+        self.broker = broker
+
+
+def _is_authenticated_active_work_refusal(
+    frame: object, *, transfer_version: str, handoff_id: str
+) -> bool:
+    """Recognize only the exact owner-A refusal frame after peer authentication."""
+
+    return frame == {
+        "version": transfer_version,
+        "command": "refused_active_work",
+        "handoff_id": handoff_id,
+    }
+
+
+def _validate_owner_a_export_offer(
+    frame: object,
+    *,
+    transfer_version: str,
+    handoff_id: str,
+    sealed_record_digest: str,
+) -> Mapping[str, Any]:
+    """Map exact active-work refusal and reject every malformed export frame."""
+
+    if _is_authenticated_active_work_refusal(
+        frame,
+        transfer_version=transfer_version,
+        handoff_id=handoff_id,
+    ):
+        raise BootstrapError(
+            "Runtime lifecycle refused while work is active or unreconciled."
+        )
+    if (
+        not isinstance(frame, Mapping)
+        or set(frame) != {
+            "version", "command", "handoff_id", "sealed_record_digest", "export",
+        }
+        or frame.get("version") != transfer_version
+        or frame.get("command") != "seal_export"
+        or frame.get("handoff_id") != handoff_id
+        or frame.get("sealed_record_digest") != sealed_record_digest
+        or not isinstance(frame.get("export"), Mapping)
+    ):
+        raise BootstrapError("Owner A export-seal request is invalid.")
+    return frame
 
 
 def _admission_timeout_from_environment() -> float:
@@ -146,6 +217,82 @@ class LocalRuntimeBoundary:
         self._display_name = "Astrid Workspace"
         self._bootstrap_credential: str | None = None
         self._detached_pid: int | None = None
+
+    @classmethod
+    def _custody_identity(cls, pid: int) -> Mapping[str, object] | None:
+        birth_id = cls.process_birth_identity(pid)
+        if birth_id is None:
+            return None
+        try:
+            uid_result = subprocess.run(
+                ["/bin/ps", "-ww", "-o", "uid=", "-p", str(pid)],
+                capture_output=True, text=True, check=False, timeout=1,
+            )
+            rendered_uid = uid_result.stdout.strip()
+            if uid_result.returncode or not rendered_uid.isdigit():
+                return None
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return {"pid": pid, "birth_id": birth_id, "uid": int(rendered_uid)}
+
+    def _spawn_custodied_runtime(
+        self,
+        argv: list[str],
+        *,
+        support_root: Path,
+        stdout,
+        pass_fds: tuple[int, ...] = (),
+    ) -> tuple[subprocess.Popen[str], RoleBoundCustodyBroker]:
+        """Spawn one Runtime owner and publish its sealed audit-token sidecar."""
+
+        custody_parent = support_root / "runtime-custody"
+        custody_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        custody_parent.chmod(0o700)
+        ledger_root = custody_parent / uuid.uuid4().hex
+        process: subprocess.Popen[str] | None = None
+        try:
+            broker = RoleBoundCustodyBroker(
+                role="runtime_owner",
+                identity_provider=self._custody_identity,
+                ledger_root=ledger_root,
+                timeout=min(10.0, self.admission_timeout_seconds),
+            )
+            child_environment = dict(os.environ)
+            child_environment.update(
+                broker.child_environment(argv, start_new_session=True)
+            )
+            process = subprocess.Popen(
+                custody_wrapper_argv(argv[0]),
+                stdout=stdout,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=child_environment,
+                start_new_session=False,
+                close_fds=True,
+                pass_fds=pass_fds,
+            )
+            # This boundary created the unreaped direct child and is its sole
+            # waiter.  Keep that authority explicit so handle-based cleanup
+            # cannot later be applied to an adopted or detached owner.
+            process._runtime_boundary_owner = self  # type: ignore[attr-defined]
+            process._runtime_boundary_sole_reaper = True  # type: ignore[attr-defined]
+            process._runtime_custody_broker = broker  # type: ignore[attr-defined]
+            publish_active_capability(
+                support_root / ACTIVE_CAPABILITY_NAME,
+                broker,
+            )
+            return process, broker
+        except (CustodyError, OSError) as exc:
+            if process is not None:
+                process._runtime_custody_broker = broker  # type: ignore[attr-defined]
+                raise RuntimeCustodyLaunchUncertain(
+                    "Runtime child exists but sealed custody publication failed; cleanup is uncertain.",
+                    process=process,
+                    broker=broker,
+                ) from exc
+            raise BootstrapError(
+                "Runtime audit-token custody admission failed; cleanup is uncertain."
+            ) from exc
 
     @staticmethod
     def _validate_source(source: SourceProfile) -> None:
@@ -372,7 +519,12 @@ class LocalRuntimeBoundary:
             # Preserve the daemon's structured startup failure on the existing
             # operator log boundary; successful stdout is only its one-line
             # launch record.
-            self._process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            self._process, _broker = self._spawn_custodied_runtime(
+                argv, support_root=support_root, stdout=log,
+            )
+        except RuntimeCustodyLaunchUncertain as exc:
+            self._process = exc.process
+            raise
         except Exception:
             log.close()
             token_file.unlink(missing_ok=True)
@@ -508,6 +660,26 @@ class LocalRuntimeBoundary:
     def _http_health(endpoint: str) -> bool:
         return LocalRuntimeBoundary._http_status(endpoint) == "ok"
 
+    @staticmethod
+    def _http_claim_admission(endpoint: str, bootstrap_credential: str) -> bool:
+        """Prove B's authenticated claim gate opened, not only its health route."""
+
+        request = urllib.request.Request(
+            str(endpoint).rstrip("/") + "/v1/doctor",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {bootstrap_credential}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=LocalRuntimeBoundary.HEALTH_TIMEOUT_SECONDS
+            ) as response:
+                value = json.loads(response.read().decode("utf-8"))
+            return response.status == 200 and isinstance(value, dict)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+
     def connect(self, *, endpoint: str, credential: str) -> RuntimeConnection:
         try:
             parsed = urlsplit(str(endpoint))
@@ -631,33 +803,285 @@ class LocalRuntimeBoundary:
         if pid <= 0:
             return False
         try:
-            os.kill(pid, 0)
-            return True
-        except PermissionError:
-            # EPERM means the kernel found a process but this sandbox/user is
-            # not permitted to signal it. Treat that as alive; callers use
-            # liveness to protect incumbent discovery and must not revoke a
-            # healthy owner merely because signaling is denied.
-            return True
-        except OSError:
+            result = subprocess.run(
+                ["/bin/ps", "-ww", "-o", "pid=", "-p", str(int(pid))],
+                capture_output=True, text=True, check=False, timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
             return False
+        return result.returncode == 0 and result.stdout.strip() == str(int(pid))
 
     @staticmethod
-    def _terminate(process: subprocess.Popen[str]):
+    def _process_parent_pid(pid: int) -> int | None:
+        try:
+            result = subprocess.run(
+                ["/bin/ps", "-ww", "-o", "ppid=", "-p", str(int(pid))],
+                capture_output=True, text=True, check=False, timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        rendered = result.stdout.strip()
+        return int(rendered) if result.returncode == 0 and rendered.isdigit() else None
+
+    def _assert_direct_child_termination_authority(
+        self, process: subprocess.Popen[str],
+    ) -> None:
+        if (
+            getattr(process, "_runtime_boundary_owner", None) is not self
+            or getattr(process, "_runtime_boundary_sole_reaper", False) is not True
+        ):
+            raise BootstrapError(
+                "Runtime direct-child cleanup refused: sole-reaper authority is absent."
+            )
+        observed_parent = self._process_parent_pid(process.pid)
+        if observed_parent != os.getpid():
+            if process.poll() is not None:
+                return
+            raise BootstrapError(
+                "Runtime direct-child cleanup refused: process is no longer a direct child."
+            )
+
+    def _terminate(self, process: subprocess.Popen[str]):
         if process.poll() is not None:
             return
+        self._assert_direct_child_termination_authority(process)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            process.terminate()
             process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
+        except ProcessLookupError:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self._assert_direct_child_termination_authority(process)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
+                process.kill()
+            except ProcessLookupError:
                 pass
             try:
                 process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+            except subprocess.TimeoutExpired as exc:
+                raise BootstrapError(
+                    "Runtime direct-child cleanup is uncertain after kill."
+                ) from exc
+
+    def _signal_registered_owner(
+        self,
+        *,
+        support: Path,
+        expected_pid: int,
+        expected_birth: str,
+        signum: int,
+    ) -> Mapping[str, object]:
+        """Signal one detached owner only through its sealed audit token."""
+
+        identity = self._custody_identity(expected_pid)
+        if identity is None or identity.get("birth_id") != expected_birth:
+            raise BootstrapError(
+                "Runtime sealed custody refused: selected owner identity changed."
+            )
+        try:
+            return signal_sealed_capability(
+                support / ACTIVE_CAPABILITY_NAME,
+                expected_identity=identity,
+                signum=signum,
+                identity_provider=self._custody_identity,
+            )
+        except CustodyError as exc:
+            raise BootstrapError(
+                "Runtime sealed custody is unavailable for the selected detached owner."
+            ) from exc
+
+    def _terminate_detached_owner(
+        self,
+        *,
+        support: Path,
+        expected_pid: int,
+        expected_birth: str,
+    ) -> None:
+        """Stop an adopted owner without any PID or process-group signal."""
+
+        self._signal_registered_owner(
+            support=support,
+            expected_pid=expected_pid,
+            expected_birth=expected_birth,
+            signum=signal.SIGTERM,
+        )
+        deadline = time.monotonic() + 5
+        while (
+            time.monotonic() < deadline
+            and self.process_birth_identity(expected_pid) == expected_birth
+        ):
+            time.sleep(0.05)
+        if self.process_birth_identity(expected_pid) == expected_birth:
+            self._signal_registered_owner(
+                support=support,
+                expected_pid=expected_pid,
+                expected_birth=expected_birth,
+                signum=signal.SIGKILL,
+            )
+
+    def _cleanup_failed_handoff_process(
+        self,
+        process: subprocess.Popen[str] | None,
+        *,
+        authenticated_admission_confirmed: bool,
+    ) -> None:
+        """Stop an unconfirmed adopter but preserve an admitted healthy B."""
+
+        if process is None or process.poll() is not None or authenticated_admission_confirmed:
+            return
+        broker = getattr(process, "_runtime_custody_broker", None)
+        if not isinstance(broker, RoleBoundCustodyBroker):
+            raise BootstrapError(
+                "Runtime adopter cleanup is uncertain: sealed audit-token custody is unavailable."
+            )
+        try:
+            broker.signal(signal.SIGTERM, expected_pid=process.pid)
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            broker.signal(signal.SIGKILL, expected_pid=process.pid)
+            process.wait(timeout=2)
+        except CustodyError as exc:
+            raise BootstrapError(
+                "Runtime adopter cleanup is uncertain: sealed audit-token signal failed."
+            ) from exc
+
+    @staticmethod
+    def _build_authenticated_handoff_result(
+        *, process, accepted, discovery, source, current
+    ) -> Mapping[str, Any]:
+        return {
+            "endpoint": discovery["endpoint"],
+            "pid": process.pid,
+            "process_birth_id": accepted["runtime_birth_id"],
+            "runtime_instance_id": accepted["runtime_instance_id"],
+            "coordinator_epoch": discovery.get("coordinator_epoch"),
+            "protocol_version": PROTOCOL_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "capability_digest": source.capability_digest,
+            "worker_credential_file": discovery.get("worker_credential_file"),
+            "worker_credential_pending": False,
+            "worker_actor": discovery.get("worker_actor"),
+            "worker_scopes": discovery.get("worker_scopes", ()),
+            "orderly_handoff": current.get("result"),
+            "handoff_record": str(current["_record_path"]),
+        }
+
+    def _report_authenticated_handoff(self, **kwargs) -> Mapping[str, Any]:
+        """Build the observational boundary result without revoking owner B."""
+
+        process = kwargs["process"]
+        try:
+            return self._build_authenticated_handoff_result(**kwargs)
+        except BaseException:
+            self._cleanup_failed_handoff_process(
+                process,
+                authenticated_admission_confirmed=True,
+            )
+            raise
+
+    def _retain_failed_adopter_gate(
+        self,
+        *,
+        support: Path,
+        record,
+        handoff_id: str,
+        process: subprocess.Popen[str] | None,
+        owner_b_birth_id: str | None,
+    ) -> bool:
+        """Persist the B-loss gate while the caller still holds the mutex."""
+
+        try:
+            retained = record.read()
+            if retained.get("state") not in {
+                "COMMITTED_ORPHAN", "FINALIZING", "ADOPTED",
+            }:
+                return False
+            marker = support / "orderly-handoff-cleanup-uncertain.json"
+            if not marker.exists() and not marker.is_symlink():
+                self._atomic_owner_json(marker, {
+                    "version": 1,
+                    "state": (
+                        "operator_audit_required"
+                        if retained.get("state") == "ADOPTED"
+                        else "cleanup_unverified_after_owner_b_loss"
+                    ),
+                    "handoff_id": handoff_id,
+                    "handoff_state": retained.get("state"),
+                    "record_path": str(record.path),
+                    "record_digest": retained.get("record_digest"),
+                    "owner_b_pid": process.pid if process is not None else None,
+                    "owner_b_birth_id": owner_b_birth_id,
+                })
+            return True
+        except Exception:
+            # The still-present request pointer is the independent startup
+            # gate when marker creation or record inspection fails.
+            return False
+
+    def _publish_active_adopted_owner(
+        self,
+        *,
+        support: Path,
+        record,
+        current: Mapping[str, Any],
+        process: subprocess.Popen[str],
+        accepted: Mapping[str, Any],
+    ) -> None:
+        """Publish the retained ADOPTED tombstone before transient gates clear."""
+
+        if current.get("state") != "ADOPTED":
+            raise BootstrapError("Runtime owner B is not durably ADOPTED.")
+        from runtime_protocol.orderly_handoff import digest
+
+        reference = {
+                "version": 1,
+                "state": "ADOPTED",
+                "handoff_id": current["handoff_id"],
+                "record_path": str(record.path),
+                "record_digest": current["record_digest"],
+                "pid": process.pid,
+                "birth_id": accepted["runtime_birth_id"],
+                "runtime_instance_id": accepted["runtime_instance_id"],
+        }
+        reference["reference_digest"] = digest(reference)
+        self._atomic_owner_json(
+            support / "orderly-handoff-adopted-owner.json", reference
+        )
+
+    @staticmethod
+    def _predecessor_active_reference_digest(
+        support: Path,
+        *,
+        expected_pid: int,
+        expected_birth: str,
+        expected_instance: str,
+    ) -> str | None:
+        from runtime_protocol.orderly_handoff import digest
+
+        path = support / "orderly-handoff-adopted-owner.json"
+        if not path.exists() and not path.is_symlink():
+            return None
+        try:
+            info = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+                raise BootstrapError("The active adopted-owner reference is invalid.")
+            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+                raise BootstrapError("The active adopted-owner reference is not owner-only.")
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BootstrapError("The active adopted-owner reference is unavailable.") from exc
+        if not isinstance(value, dict):
+            raise BootstrapError("The active adopted-owner reference is invalid.")
+        claimed = value.get("reference_digest")
+        unsigned = {key: item for key, item in value.items() if key != "reference_digest"}
+        if (
+            claimed != digest(unsigned)
+            or value.get("pid") != expected_pid
+            or value.get("birth_id") != expected_birth
+            or value.get("runtime_instance_id") != expected_instance
+        ):
+            raise BootstrapError("The active adopted-owner reference changed.")
+        return str(claimed)
 
     def stop(self, **_kwargs):
         if self._process:
@@ -695,6 +1119,7 @@ class LocalRuntimeBoundary:
         expected_instance = str(kwargs.get("instance_id", ""))
         expected_birth = str(kwargs.get("process_birth_id", ""))
         expected_realm = str(kwargs.get("realm_id", realm_id))
+        preserve_worker = bool(kwargs.get("preserve_worker", False))
         owner_lock = self._validate_path(Path(kwargs.get("owner_lock", support / "instance.lock")), "owner lock").resolve()
         discovery_path = self._validate_path(Path(kwargs.get("discovery_path", support / "discovery.json")), "runtime discovery").resolve()
 
@@ -763,20 +1188,30 @@ class LocalRuntimeBoundary:
         # here so an unhealthy daemon can be stopped without signaling a
         # reused PID or unrelated process group.
         validate_before_signal(require_health=require_health)
+        if preserve_worker:
+            if not start_after_stop:
+                raise BootstrapError("Worker preservation requires a replacement Runtime owner.")
+            return self._restart_preserving_worker(
+                source=source,
+                root=root,
+                support=support,
+                realm_id=realm_id,
+                owner_lock=owner_lock,
+                endpoint=endpoint,
+                expected_pid=expected_pid,
+                expected_birth=expected_birth,
+                expected_instance=expected_instance,
+            )
         if not self._process and getattr(self, "_detached_pid", None):
             detached = int(self._detached_pid)
             if detached != expected_pid:
                 raise BootstrapError("Runtime restart refused: adopted owner PID changed.")
             validate_before_signal(require_health=require_health)
-            os.killpg(detached, signal.SIGTERM)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and self.is_pid_alive(detached):
-                time.sleep(0.05)
-            if self.is_pid_alive(detached):
-                # Revalidate again before escalation; PID reuse or a changed
-                # group must never receive a signal from this boundary.
-                validate_before_signal(require_health=False)
-                os.killpg(detached, signal.SIGKILL)
+            self._terminate_detached_owner(
+                support=support,
+                expected_pid=detached,
+                expected_birth=expected_birth,
+            )
             self._detached_pid = None
         else:
             process = self._process
@@ -789,3 +1224,535 @@ class LocalRuntimeBoundary:
             self._bootstrap_credential = None
             return {"status": "stopped", "realm_id": realm_id, "pid": expected_pid}
         return self.start(realm_id=realm_id, realm_root=root, owner_lock=support / "instance.lock", source_profile=source)
+
+    @staticmethod
+    def _atomic_owner_json(path: Path, value: Mapping[str, Any]) -> None:
+        descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(dict(value), handle, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            path.chmod(0o600)
+            directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _create_owner_json_no_clobber(path: Path, value: Mapping[str, Any]) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError as exc:
+            raise BootstrapError(
+                "An unresolved orderly handoff request already exists."
+            ) from exc
+        try:
+            os.fchmod(descriptor, 0o600)
+            payload = json.dumps(
+                dict(value), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            os.write(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _observe_realm_flock_release(root: Path, deadline: float):
+        lock_path = root / "owner.lock"
+        handle = lock_path.open("a+")
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return handle
+                except BlockingIOError:
+                    time.sleep(0.02)
+            raise BootstrapError("Owner A did not release the realm flock before the handoff deadline.")
+        except BaseException:
+            handle.close()
+            raise
+
+    def _restart_preserving_worker(
+        self,
+        *,
+        source: SourceProfile,
+        root: Path,
+        support: Path,
+        realm_id: str,
+        owner_lock: Path,
+        endpoint: str,
+        expected_pid: int,
+        expected_birth: str,
+        expected_instance: str,
+    ) -> Mapping[str, Any]:
+        """Coordinate one fail-closed A-to-B descriptor handoff."""
+
+        if not hasattr(signal, "SIGUSR1") or not hasattr(socket, "SCM_RIGHTS"):
+            raise BootstrapError("Orderly Worker preservation is unsupported on this platform.")
+        from runtime_protocol.catalog import process_birth_identity
+        from runtime_protocol.local_worker_handoff import (
+            TRANSFER_VERSION,
+            peer_pid,
+            peer_uid,
+            receive_authority_transfer,
+            receive_frame,
+            send_frame,
+        )
+        from runtime_protocol.orderly_handoff import HandoffRecord, RECORD_VERSION, digest
+
+        deadline = time.monotonic() + min(self.wait_seconds, 30.0)
+        deadline_unix_ms = int((time.time() + max(0.1, deadline - time.monotonic())) * 1000)
+        health = self._http_health_payload(endpoint)
+        if not health:
+            raise BootstrapError("Orderly Worker handoff requires a healthy owner A.")
+        old_runtime = {
+            "endpoint": endpoint,
+            "protocol": health.get("protocol"),
+            "schema_digest": health.get("schema_digest"),
+            "runtime_epoch": health.get("runtime_epoch"),
+            "runtime_instance_id": expected_instance,
+            "runtime_session_id": health.get("runtime_session_id"),
+        }
+        handoff_id = uuid.uuid4().hex
+        predecessor_active_ref_digest = self._predecessor_active_reference_digest(
+            support,
+            expected_pid=expected_pid,
+            expected_birth=expected_birth,
+            expected_instance=expected_instance,
+        )
+        mutex_path = support / "orderly-handoff-coordinator.lock"
+        mutex_fd = os.open(
+            mutex_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        rendezvous = None
+        pointer_path = support / "orderly-handoff-request.json"
+        listener = None
+        channel = None
+        transfer = None
+        capability_parent = None
+        process = None
+        token_file = None
+        record = None
+        realm_custody = None
+        handoff_completed = False
+        try:
+            os.fchmod(mutex_fd, 0o600)
+            try:
+                fcntl.flock(mutex_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise BootstrapError("Another orderly Runtime restart coordinator is active.") from exc
+            rendezvous = Path(tempfile.mkdtemp(prefix=f"astrid-handoff-{os.getuid()}-"))
+            rendezvous.chmod(0o700)
+            socket_path = rendezvous / "coordinator.sock"
+            # Keep the exact authority record under the support root. The
+            # rendezvous socket is temporary, but a coordinator crash or hard
+            # B loss must leave a durable record that ordinary startup sees.
+            record = HandoffRecord(
+                support / f"orderly-handoff-record-{handoff_id}.json"
+            )
+            created = record.create({
+                "version": RECORD_VERSION,
+                "state": "OWNED",
+                "handoff_id": handoff_id,
+                "realm_id": realm_id,
+                "realm_root": str(root),
+                "support_root": str(support),
+                "deadline_monotonic": deadline,
+                "deadline_unix_ms": deadline_unix_ms,
+                "nonce_digest": None,
+                "sealed_record_digest": None,
+                "old_owner": {
+                    "pid": expected_pid,
+                    "birth_id": expected_birth,
+                    "runtime_instance_id": expected_instance,
+                    "runtime": old_runtime,
+                },
+                "export": None,
+                "export_sealed_digest": None,
+                "adopter": None,
+                "predecessor_active_ref_digest": predecessor_active_ref_digest,
+            })
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            socket_path.chmod(0o600)
+            listener.listen(1)
+            listener.settimeout(max(0.1, deadline - time.monotonic()))
+            coordinator_birth = process_birth_identity()
+            self._create_owner_json_no_clobber(pointer_path, {
+                "version": TRANSFER_VERSION,
+                "handoff_id": handoff_id,
+                "record_path": str(record.path),
+                "socket_path": str(socket_path),
+                "coordinator_pid": os.getpid(),
+                "coordinator_birth_id": coordinator_birth,
+            })
+            self._signal_registered_owner(
+                support=support,
+                expected_pid=expected_pid,
+                expected_birth=expected_birth,
+                signum=signal.SIGUSR1,
+            )
+            channel, _ = listener.accept()
+            channel.settimeout(max(0.1, deadline - time.monotonic()))
+            if peer_uid(channel) != os.getuid() or peer_pid(channel) != expected_pid:
+                raise BootstrapError("Owner A rendezvous identity is invalid.")
+            hello = receive_frame(channel)
+            if hello != {
+                "version": TRANSFER_VERSION,
+                "command": "owner_hello",
+                "handoff_id": handoff_id,
+                "owner_pid": expected_pid,
+                "owner_birth_id": expected_birth,
+                "record_digest": created["record_digest"],
+            }:
+                raise BootstrapError("Owner A handoff hello is invalid.")
+            send_frame(channel, {
+                "version": TRANSFER_VERSION,
+                "command": "seal_challenge",
+                "handoff_id": handoff_id,
+                "record_digest": created["record_digest"],
+            })
+            capability = receive_frame(channel)
+            if set(capability) != {"version", "command", "handoff_id", "nonce_digest"} or capability.get("version") != TRANSFER_VERSION or capability.get("command") != "seal_capability" or capability.get("handoff_id") != handoff_id:
+                raise BootstrapError("Owner A handoff capability frame is invalid.")
+            sealed = record.seal(
+                expected_record_digest=created["record_digest"],
+                nonce_sha256=str(capability["nonce_digest"]),
+            )
+            send_frame(channel, {
+                "version": TRANSFER_VERSION,
+                "command": "sealed",
+                "handoff_id": handoff_id,
+                "nonce_digest": sealed["nonce_digest"],
+                "sealed_record_digest": sealed["sealed_record_digest"],
+            })
+            export_offer = _validate_owner_a_export_offer(
+                receive_frame(channel),
+                transfer_version=TRANSFER_VERSION,
+                handoff_id=handoff_id,
+                sealed_record_digest=sealed["sealed_record_digest"],
+            )
+            export_bound = record.bind_export(
+                handoff_id=handoff_id,
+                sealed_record_digest=sealed["sealed_record_digest"],
+                expected_record_digest=sealed["record_digest"],
+                export=export_offer["export"],
+            )
+            send_frame(channel, {
+                "version": TRANSFER_VERSION,
+                "command": "export_sealed",
+                "handoff_id": handoff_id,
+                "export_sealed_digest": export_bound["export_sealed_digest"],
+                "export_record_digest": export_bound["record_digest"],
+            })
+            parsed = urlsplit(endpoint)
+            transfer = receive_authority_transfer(
+                channel,
+                expected_uid=os.getuid(),
+                expected_listener=(str(parsed.hostname), int(parsed.port)),
+            )
+            frame = transfer.frame
+            if (
+                frame.get("handoff_id") != handoff_id
+                or frame.get("nonce_digest") != sealed["nonce_digest"]
+                or frame.get("sealed_record_digest") != sealed["sealed_record_digest"]
+                or frame.get("old_runtime") != old_runtime
+                or not isinstance(frame.get("nonce"), str)
+                or not isinstance(frame.get("export"), Mapping)
+            ):
+                raise BootstrapError("Owner A authority transfer is invalid.")
+            if (
+                frame.get("export") != export_bound["export"]
+                or
+                frame.get("export_sealed_digest") != export_bound["export_sealed_digest"]
+                or frame.get("export_record_digest") != export_bound["record_digest"]
+            ):
+                raise BootstrapError("Owner A export seal is invalid.")
+            prepared_record = record.transition(
+                expected_state="OWNED",
+                new_state="PREPARED",
+                handoff_id=handoff_id,
+                sealed_record_digest=sealed["sealed_record_digest"],
+                expected_record_digest=export_bound["record_digest"],
+                updates={},
+            )
+            send_frame(channel, {
+                "version": TRANSFER_VERSION,
+                "command": "custody_accepted",
+                "handoff_id": handoff_id,
+                "sealed_record_digest": sealed["sealed_record_digest"],
+            })
+            released = receive_frame(channel)
+            if released != {
+                "version": TRANSFER_VERSION,
+                "command": "owner_released",
+                "handoff_id": handoff_id,
+                "owner_pid": expected_pid,
+            }:
+                raise BootstrapError("Owner A release acknowledgement is invalid.")
+            realm_custody = self._observe_realm_flock_release(root, deadline)
+            committed = record.transition(
+                expected_state="PREPARED",
+                new_state="COMMITTED_ORPHAN",
+                handoff_id=handoff_id,
+                sealed_record_digest=sealed["sealed_record_digest"],
+                expected_record_digest=prepared_record["record_digest"],
+                updates={"owner_a_released": True},
+            )
+            # B must acquire the real realm flock itself.  The coordinator has
+            # positively observed release; relinquish its observation handle
+            # immediately before spawning while retaining the coordinator mutex.
+            fcntl.flock(realm_custody.fileno(), fcntl.LOCK_UN)
+            realm_custody.close()
+            realm_custody = None
+
+            bootstrap_token = secrets.token_hex(32)
+            token_file = self._token_file(support, bootstrap_token)
+            argv = self._argv(
+                source,
+                realm_id=realm_id,
+                realm_root=root,
+                support_root=support,
+                display_name=self._display_name,
+                owner_lock=owner_lock,
+                token_file=token_file,
+            )
+            capability_parent, capability_child = socket.socketpair()
+            fixed = (198, 199, 200)
+            # Duplicate every source before touching a fixed target.  Without
+            # this relocation, an unusually high inherited source descriptor
+            # equal to a later target could be overwritten by an earlier
+            # dup2 and silently transfer the wrong authority to B.
+            relocated = [
+                fcntl.fcntl(
+                    source_fd,
+                    getattr(fcntl, "F_DUPFD_CLOEXEC", fcntl.F_DUPFD),
+                    max(fixed) + 1,
+                )
+                for source_fd in (
+                    transfer.worker_control_fd,
+                    transfer.listener_fd,
+                    capability_child.fileno(),
+                )
+            ]
+            try:
+                for source_fd, target_fd in zip(relocated, fixed):
+                    os.dup2(source_fd, target_fd, inheritable=True)
+            finally:
+                for source_fd in relocated:
+                    os.close(source_fd)
+            argv += [
+                "--handoff-record", str(record.path),
+                "--handoff-worker-fd", str(fixed[0]),
+                "--handoff-listener-fd", str(fixed[1]),
+                "--handoff-capability-fd", str(fixed[2]),
+            ]
+            log = (support / "runtime.log").open("ab")
+            try:
+                try:
+                    process, _broker = self._spawn_custodied_runtime(
+                        argv, support_root=support, stdout=log, pass_fds=fixed,
+                    )
+                except RuntimeCustodyLaunchUncertain as exc:
+                    process = exc.process
+                    raise
+            finally:
+                log.close()
+                capability_child.close()
+                for descriptor in fixed:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            capability_parent.settimeout(max(0.1, deadline - time.monotonic()))
+            send_frame(capability_parent, {
+                **frame,
+                "command": "adopt",
+                "committed_record_digest": committed["record_digest"],
+            })
+            accepted = receive_frame(capability_parent)
+            if (
+                set(accepted) != {
+                    "version", "command", "handoff_id", "runtime_pid",
+                    "runtime_birth_id", "runtime_instance_id",
+                }
+                or accepted.get("version") != TRANSFER_VERSION
+                or accepted.get("command") != "descriptors_accepted"
+                or accepted.get("handoff_id") != handoff_id
+                or int(accepted.get("runtime_pid", 0)) != process.pid
+                or accepted.get("runtime_birth_id") != self.process_birth_identity(process.pid)
+            ):
+                raise BootstrapError("Owner B descriptor acknowledgement is invalid.")
+            adopter = record.bind_adopter(
+                handoff_id=handoff_id,
+                sealed_record_digest=sealed["sealed_record_digest"],
+                expected_record_digest=committed["record_digest"],
+                adopter={
+                    "pid": process.pid,
+                    "birth_id": accepted["runtime_birth_id"],
+                    "runtime_instance_id": accepted["runtime_instance_id"],
+                },
+            )
+            send_frame(capability_parent, {
+                "version": TRANSFER_VERSION,
+                "command": "adopter_bound",
+                "handoff_id": handoff_id,
+                "adopter_record_digest": adopter["record_digest"],
+                "adopter": adopter["adopter"],
+            })
+            capability_parent.close()
+            capability_parent = None
+            transfer.close()
+            transfer = None
+            self._process = process
+            self._source, self._realm_root, self._support_root, self._realm_id = source, root, support, realm_id
+            self._bootstrap_credential = bootstrap_token
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise BootstrapError(f"Runtime owner B exited during handoff (see {support / 'runtime.log'}).")
+                current = record.read()
+                if current.get("state") == "ADOPTED":
+                    discovery = self._read_discovery(support)
+                    if (
+                        int(discovery.get("pid", 0)) == process.pid
+                        and discovery.get("worker_credential_pending") is False
+                        and self._http_health(str(discovery.get("endpoint") or ""))
+                        and self._http_claim_admission(
+                            str(discovery.get("endpoint") or ""), bootstrap_token
+                        )
+                    ):
+                        self._publish_active_adopted_owner(
+                            support=support,
+                            record=record,
+                            current=current,
+                            process=process,
+                            accepted=accepted,
+                        )
+                        # Authority is complete before result construction.
+                        # A later formatting/reporting exception is
+                        # observational and must not roll back healthy B.
+                        handoff_completed = True
+                        return self._report_authenticated_handoff(
+                            process=process,
+                            accepted=accepted,
+                            discovery=discovery,
+                            source=source,
+                            current={**current, "_record_path": record.path},
+                        )
+                if current.get("state") == "ABORTED":
+                    raise BootstrapError("Runtime owner B aborted the orderly Worker handoff.")
+                time.sleep(0.02)
+            raise BootstrapError("Runtime owner B did not adopt before the handoff deadline.")
+        except BaseException:
+            if transfer is not None:
+                transfer.close()
+            if record is not None and not handoff_completed:
+                self._retain_failed_adopter_gate(
+                    support=support,
+                    record=record,
+                    handoff_id=handoff_id,
+                    process=process,
+                    owner_b_birth_id=(
+                        accepted.get("runtime_birth_id")
+                        if isinstance(locals().get("accepted"), Mapping)
+                        else None
+                    ),
+                )
+            self._cleanup_failed_handoff_process(
+                process,
+                authenticated_admission_confirmed=handoff_completed,
+            )
+            # The coordinator can prove owner B exited, but it cannot by that
+            # fact alone prove every adopted Worker/host/engine/listener group
+            # disappeared.  B writes ABORTED only after RuntimeDaemon.stop()
+            # completes its receipt-bound graph cleanup.  Otherwise retain the
+            # custody state; it is deliberately fail-closed for operator audit.
+            raise
+        finally:
+            clear_pointer = handoff_completed
+            if not clear_pointer and record is not None:
+                try:
+                    retained = record.read()
+                    clear_pointer = retained.get("state") == "ABORTED"
+                    if (
+                        clear_pointer
+                        and retained.get("predecessor_active_ref_digest") is not None
+                    ):
+                        resolution_path = (
+                            support
+                            / f"orderly-handoff-predecessor-resolution-{handoff_id}.json"
+                        )
+                        try:
+                            resolution = json.loads(
+                                resolution_path.read_text(encoding="utf-8")
+                            )
+                            clear_pointer = bool(
+                                isinstance(resolution, dict)
+                                and resolution.get("state") == "COMPLETE"
+                                and resolution.get("handoff_id") == handoff_id
+                                and resolution.get("aborted_record_digest")
+                                == retained.get("record_digest")
+                                and resolution.get("predecessor_active_ref_digest")
+                                == retained.get("predecessor_active_ref_digest")
+                                and resolution.get("resolution_digest") == digest({
+                                    key: item for key, item in resolution.items()
+                                    if key != "resolution_digest"
+                                })
+                            )
+                        except Exception:
+                            clear_pointer = False
+                    if (
+                        not clear_pointer
+                        and process is None
+                        and retained.get("state") == "OWNED"
+                        and self.process_birth_identity(expected_pid) == expected_birth
+                        and self._http_health(endpoint)
+                    ):
+                        # A refused before custody transfer and remains the
+                        # positively identified healthy owner. This is the one
+                        # safe pre-export case where a retry gate may clear.
+                        clear_pointer = True
+                except Exception:
+                    clear_pointer = False
+            if clear_pointer:
+                pointer_path.unlink(missing_ok=True)
+            if realm_custody is not None:
+                try:
+                    fcntl.flock(realm_custody.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                realm_custody.close()
+            if capability_parent is not None:
+                capability_parent.close()
+            if channel is not None:
+                channel.close()
+            if listener is not None:
+                listener.close()
+            if token_file is not None and process is None:
+                token_file.unlink(missing_ok=True)
+            try:
+                fcntl.flock(mutex_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(mutex_fd)

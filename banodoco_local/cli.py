@@ -65,6 +65,11 @@ def parser() -> argparse.ArgumentParser:
     _read_args(status)
     restart_cmd = sub.add_parser("restart", help="restart the selected runtime owner")
     _profile_args(restart_cmd)
+    restart_cmd.add_argument(
+        "--preserve-worker",
+        action="store_true",
+        help="orderly quiescent restart preserving the verified local Worker graph",
+    )
     down_cmd = sub.add_parser("down", help="stop the selected runtime owner after lifecycle reconciliation")
     _profile_args(down_cmd)
     doc = sub.add_parser("doctor", help="read-only support-state diagnostics")
@@ -341,7 +346,16 @@ def main(argv: list[str] | None = None) -> int:
             if not realm or not discovery.get("pid"):
                 raise BootstrapError("No selected runtime owner to restart; run banodoco-local up --profile astrid.")
             boundary.prepare_restart(source_profile=source, realm_id=realm_id, realm_root=Path(str(realm["data_root"])), support_root=paths.runtime_support, pid=int(discovery["pid"]))
-            result = restart(paths, boundary, config) if args.command == "restart" else down(paths, boundary)
+            result = (
+                restart(
+                    paths,
+                    boundary,
+                    config,
+                    preserve_worker=bool(getattr(args, "preserve_worker", False)),
+                )
+                if args.command == "restart"
+                else down(paths, boundary)
+            )
             _emit(result, json_mode=args.json)
             return 0
         if args.command == "status":

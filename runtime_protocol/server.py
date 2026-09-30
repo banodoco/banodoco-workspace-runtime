@@ -1,14 +1,42 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
 import uuid
+from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
 from .errors import RuntimeErrorBase, AuthorizationError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError
+from .exception_capture import capture_exception
 from .service import validate_idempotency_key
+
+
+ADMISSION_READY = "ready"
+ADMISSION_HANDOFF_PENDING = "handoff_pending"
+ADMISSION_CLOSED = "closed"
+_ADMISSION_MODES = frozenset(
+    {ADMISSION_READY, ADMISSION_HANDOFF_PENDING, ADMISSION_CLOSED}
+)
+_HANDOFF_REGISTRATION_ROUTES = frozenset(
+    {("POST", "/v1/capabilities"), ("POST", "/v1/executors")}
+)
+
+
+def registration_body_digest(value) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ProtocolError("registration body must be canonical JSON") from exc
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -21,6 +49,55 @@ class RuntimeHTTPServer(ThreadingHTTPServer):
     # control-plane fan-in.
     request_queue_size = 64
     accepting_authenticated_requests = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.admission_mode = ADMISSION_READY
+        self.accepting_authenticated_requests = True
+        self.handoff_registration_actor: str | None = None
+        self.handoff_registration_body_digests: dict[str, frozenset[str]] = {}
+        self._admission_lock = threading.RLock()
+
+    def set_admission_mode(
+        self,
+        mode: str,
+        *,
+        registration_actor: str | None = None,
+        registration_bodies: dict[str, list[object] | tuple[object, ...]] | None = None,
+    ) -> None:
+        if mode not in _ADMISSION_MODES:
+            raise ValueError("runtime admission mode is invalid")
+        body_digests: dict[str, frozenset[str]] = {}
+        if mode == ADMISSION_HANDOFF_PENDING:
+            actor = str(registration_actor or "").strip()
+            if not actor:
+                raise ValueError("handoff-pending admission requires a registration actor")
+            for path, bodies in (registration_bodies or {}).items():
+                if ("POST", str(path)) not in _HANDOFF_REGISTRATION_ROUTES:
+                    raise ValueError("handoff-pending registration route is invalid")
+                body_digests[str(path)] = frozenset(
+                    registration_body_digest(body) for body in bodies
+                )
+            # Missing routes must never become an implicit wildcard.  Retain
+            # both exact registration route keys so an empty body list means
+            # that route is closed during handoff.
+            for _method, path in _HANDOFF_REGISTRATION_ROUTES:
+                body_digests.setdefault(path, frozenset())
+        else:
+            actor = None
+        with self._admission_lock:
+            self.handoff_registration_actor = actor
+            self.handoff_registration_body_digests = body_digests
+            self.admission_mode = mode
+            self.accepting_authenticated_requests = mode != ADMISSION_CLOSED
+
+    def admission_snapshot(self) -> tuple[str, str | None, dict[str, frozenset[str]]]:
+        with self._admission_lock:
+            return (
+                self.admission_mode,
+                self.handoff_registration_actor,
+                dict(self.handoff_registration_body_digests),
+            )
 
 
 class RuntimeHandler(BaseHTTPRequestHandler):
@@ -46,15 +123,56 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def runtime(self):
         return self.server.runtime  # type: ignore[attr-defined]
 
+    def _admission_snapshot(self):
+        snapshot = getattr(self, "_runtime_admission_snapshot", None)
+        if snapshot is not None:
+            return snapshot
+        read_snapshot = getattr(self.server, "admission_snapshot", None)
+        if callable(read_snapshot):
+            snapshot = read_snapshot()
+        else:
+            mode = getattr(self.server, "admission_mode", ADMISSION_READY)
+            if not getattr(self.server, "accepting_authenticated_requests", True):
+                mode = ADMISSION_CLOSED
+            snapshot = (
+                mode,
+                getattr(self.server, "handoff_registration_actor", None),
+                dict(getattr(self.server, "handoff_registration_body_digests", {})),
+            )
+        self._runtime_admission_snapshot = snapshot
+        return snapshot
+
     def _identity(self, scope):
-        if self.path.split("?", 1)[0] == "/v1/health":
+        request_path = self.path.split("?", 1)[0]
+        if request_path == "/v1/health":
             return {"actor": "health", "scopes": ["health"]}
-        if not getattr(self.server, "accepting_authenticated_requests", True):
+        admission_mode, registration_actor, _registration_bodies = self._admission_snapshot()
+        if admission_mode == ADMISSION_CLOSED:
             raise AuthorizationError("runtime is not accepting authenticated requests")
+        if admission_mode == ADMISSION_HANDOFF_PENDING and (
+            (self.command, request_path) not in _HANDOFF_REGISTRATION_ROUTES
+            or scope != "worker:register"
+        ):
+            raise AuthorizationError("runtime handoff admission is pending")
         value = self.headers.get("Authorization", "")
         if not value.startswith("Bearer "):
             raise AuthorizationError("bearer credential required")
-        return self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        identity = self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
+        if (
+            admission_mode == ADMISSION_HANDOFF_PENDING
+            and identity.get("actor") != registration_actor
+        ):
+            raise AuthorizationError("runtime handoff registration actor is invalid")
+        return identity
+
+    def _registration_body(self, path: str):
+        body = self._body()
+        admission_mode, _registration_actor, configured = self._admission_snapshot()
+        if admission_mode == ADMISSION_HANDOFF_PENDING:
+            allowed = configured.get(path)
+            if allowed is None or registration_body_digest(body) not in allowed:
+                raise AuthorizationError("runtime handoff registration body is invalid")
+        return body
 
     def _content_length(self):
         """Return a strict, bounded request length before touching the body."""
@@ -125,12 +243,27 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
 
     def _error(self, exc):
+        request_id = self._request_id()
+        capture = capture_exception(request_id, exc)
+        capture_headers = {}
+        if capture.get("status") in {"captured", "uncertain"}:
+            # The body and status remain the established protocol response;
+            # this bounded header is the only opt-in capture status surface.
+            capture_headers["X-Exception-Capture"] = str(capture["status"])
         if isinstance(exc, RuntimeErrorBase):
             payload = exc.as_dict()
-            payload["request_id"] = self._request_id()
-            self._send(exc.status, error=payload)
+            payload["request_id"] = request_id
+            self._send(exc.status, error=payload, headers=capture_headers)
         else:
-            self._send(500, error={"code": "internal_error", "message": "internal runtime error", "request_id": self._request_id()})
+            self._send(
+                500,
+                error={
+                    "code": "internal_error",
+                    "message": "internal runtime error",
+                    "request_id": request_id,
+                },
+                headers=capture_headers,
+            )
 
     def _route(self):
         path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
@@ -656,13 +789,22 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.list_capabilities(cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
         if path == ["v1", "capabilities"] and method == "POST":
             self._identity("worker:register")
-            return self._send(201, self.runtime.register_capability(self._body()))
+            return self._send(
+                201, self.runtime.register_capability(self._registration_body("/v1/capabilities"))
+            )
         if path == ["v1", "executors"] and method == "POST":
             identity = self._identity("worker:register")
             key = self.headers.get("Idempotency-Key")
             if not key:
                 raise ProtocolError("Idempotency-Key header is required")
-            return self._send(201, self.runtime.register_executor(self._body(), idempotency_key=key, identity=identity))
+            return self._send(
+                201,
+                self.runtime.register_executor(
+                    self._registration_body("/v1/executors"),
+                    idempotency_key=key,
+                    identity=identity,
+                ),
+            )
         if len(path) == 3 and path[:2] == ["v1", "runs"] and method == "GET":
             self._identity("tasks:read")
             return self._send(200, self.runtime.run(path[2]))
@@ -670,6 +812,46 @@ class RuntimeHandler(BaseHTTPRequestHandler):
 
     def _is_local_worker_control(self):
         return getattr(self, "command", None) == "POST" and urlsplit(getattr(self, "path", "")).path == "/v1/control/local-worker/start"
+
+    def _uses_runtime_mutation_transaction(self):
+        if getattr(self, "command", None) not in {"POST", "PATCH", "PUT", "DELETE"}:
+            return False
+        # These routes mutate credentials, external backup destinations, the
+        # daemon process, or the local Worker rather than the live realm DB.
+        return urlsplit(getattr(self, "path", "")).path not in {
+            "/v1/credentials",
+            "/v1/backup",
+            "/v1/restore",
+            "/v1/replace",
+            "/v1/control/local-worker/start",
+        }
+
+    @contextmanager
+    def _runtime_mutation_admission_fence(self):
+        """Order the realm write fence before admission and hold both to commit."""
+        store = self.runtime.store
+        admission_fence = getattr(self.server, "_admission_lock", None)
+        with store._mutex:
+            transaction = store._transaction()
+            transaction.__enter__()
+            if admission_fence is not None:
+                admission_fence.acquire()
+            try:
+                yield
+            except BaseException as exc:
+                try:
+                    suppress = transaction.__exit__(type(exc), exc, exc.__traceback__)
+                finally:
+                    if admission_fence is not None:
+                        admission_fence.release()
+                if not suppress:
+                    raise
+            else:
+                try:
+                    transaction.__exit__(None, None, None)
+                finally:
+                    if admission_fence is not None:
+                        admission_fence.release()
 
     def _local_worker_control(self):
         identity = self._identity("admin")
@@ -697,17 +879,31 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         try:
             self._pending_response = None
             self._defer_response = True
+            self._runtime_admission_snapshot = None
             try:
+                admission_fence = getattr(self.server, "_admission_lock", None)
                 if self._is_local_worker_control():
                     # Process preparation and OS observation are deliberately
                     # outside the SQLite mutex. Credential authentication and
                     # publication use CredentialStore's short internal lock.
-                    self._local_worker_control()
+                    with admission_fence if admission_fence is not None else nullcontext():
+                        self._local_worker_control()
+                elif self._uses_runtime_mutation_transaction():
+                    # SQLite's write transaction is acquired before admission.
+                    # The orderly-handoff closer already owns that same write
+                    # fence, so a handler waiting behind it cannot retain an
+                    # older ready snapshot. Admission remains held through the
+                    # outer commit, which also drains mutations already past
+                    # the database fence before a mode transition can return.
+                    with self._runtime_mutation_admission_fence():
+                        self._route()
                 else:
                     with self.runtime.store._mutex:
-                        self._route()
+                        with admission_fence if admission_fence is not None else nullcontext():
+                            self._route()
             finally:
                 self._defer_response = False
+                self._runtime_admission_snapshot = None
             if self._pending_response is not None:
                 status, payload, kwargs = self._pending_response
                 self._pending_response = None

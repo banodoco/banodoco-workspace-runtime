@@ -23,6 +23,9 @@ import stat
 import subprocess
 import sys
 import threading
+import time
+import shutil
+import struct
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
@@ -39,7 +42,7 @@ from .local_worker import (
 )
 
 
-CONTROL_VERSION = "reigh.local-worker-control/v1"
+CONTROL_VERSION = "reigh.local-worker-control/v2"
 CONTROL_FRAME_LIMIT = 64 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 PROFILE_FIELDS = (
@@ -51,8 +54,67 @@ PROFILE_FIELDS = (
 )
 
 
+def _darwin_process_argv(pid: int) -> tuple[bytes, ...] | None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    sysctl = libc.sysctl
+    sysctl.argtypes = (
+        ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t,
+    )
+    sysctl.restype = ctypes.c_int
+    mib = (ctypes.c_int * 3)(1, 49, int(pid))
+    size = ctypes.c_size_t(0)
+    if sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+        return None
+    buffer = ctypes.create_string_buffer(size.value)
+    if sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        return None
+    raw = buffer.raw[: size.value]
+    argc = struct.unpack_from("=i", raw)[0]
+    if argc < 1 or argc > 1_000_000:
+        return None
+    offset = 4
+    executable_end = raw.find(b"\0", offset)
+    if executable_end < 0:
+        return None
+    offset = executable_end + 1
+    while offset < len(raw) and raw[offset] == 0:
+        offset += 1
+    argv: list[bytes] = []
+    while len(argv) < argc and offset < len(raw):
+        end = raw.find(b"\0", offset)
+        if end < 0:
+            return None
+        argv.append(raw[offset:end])
+        offset = end + 1
+    return tuple(argv) if len(argv) == argc else None
+
+
+def _process_argv(pid: int) -> tuple[bytes, ...] | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return _darwin_process_argv(pid) if sys.platform == "darwin" else None
+    return tuple(value for value in raw.split(b"\0") if value) or None
+
+
+def _argv_digest(argv: tuple[bytes, ...] | list[bytes]) -> str:
+    encoded = bytearray(b"astrid.argv.v1\0")
+    encoded.extend(len(argv).to_bytes(8, "big"))
+    for value in argv:
+        encoded.extend(len(value).to_bytes(8, "big"))
+        encoded.extend(value)
+    return "sha256:" + hashlib.sha256(bytes(encoded)).hexdigest()
+
+
 def _frame_send(channel: socket.socket, value: Mapping[str, Any]) -> None:
-    encoded = json.dumps(dict(value), sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    encoded = json.dumps(
+        dict(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
     if len(encoded) > CONTROL_FRAME_LIMIT:
         raise ConflictError("local Worker control frame is too large")
     channel.sendall(encoded + b"\n")
@@ -81,7 +143,7 @@ def _frame_receive(channel: socket.socket) -> dict[str, Any]:
 
 @dataclass
 class _PreparedWorker:
-    worker: subprocess.Popen[bytes]
+    worker: Any
     birth_id: str
     control: socket.socket
     report_value: dict[str, Any]
@@ -91,6 +153,33 @@ class _PreparedWorker:
     rpc_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_started: bool = False
+    adopted: bool = False
+    receipt: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _AdoptedWorkerProcess:
+    """Non-child process identity; deliberately has no waitpid interface."""
+
+    pid: int
+    birth_id: str
+
+    def poll(self) -> int | None:
+        observed = process_birth_identity(self.pid)
+        return None if observed == self.birth_id else 0
+
+
+def _ack_digest(value: Mapping[str, Any]) -> str:
+    payload = {key: item for key, item in value.items() if key != "ack_sha256"}
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 class CrossProcessWorkerPreparer(LocalWorkerPreparer):
@@ -108,6 +197,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         # publication. Cancellation waits for this tiny critical section so a
         # just-spawned child can never exist without an owner-visible handle.
         self._handoff_lock = threading.Lock()
+        self.cleanup_uncertain: str | None = None
 
     def set_prepare_cancel_event(self, event: threading.Event) -> None:
         self._prepare_cancel = event
@@ -166,6 +256,204 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
     def _rpc(self, handle: _PreparedWorker, payload: Mapping[str, Any]) -> dict[str, Any]:
         with handle.rpc_lock:
             return self._rpc_unlocked(handle, payload)
+
+    def _handoff_rpc(
+        self,
+        handle: _PreparedWorker,
+        payload: Mapping[str, Any],
+        *,
+        statuses: frozenset[str],
+        phases: frozenset[str],
+    ) -> dict[str, Any]:
+        with handle.rpc_lock:
+            if handle.closed or handle.worker.poll() is not None:
+                raise ConflictError("handoff Worker is not alive")
+            if self._birth(handle.worker.pid) != handle.birth_id:
+                raise ConflictError("handoff Worker identity changed")
+            _frame_send(handle.control, payload)
+            response = _frame_receive(handle.control)
+        command = str(payload.get("command") or "")
+        expected_keys = {
+            "version",
+            "command",
+            "handoff_id",
+            "status",
+            "nonce_digest",
+            "sealed_record_digest",
+            "host_ack",
+            "worker_phase",
+            "ack_sha256",
+        }
+        if set(response) != expected_keys:
+            # Worker error frames and malformed acknowledgements never carry
+            # enough authority to change custody.  Keep the error secret-free.
+            raise ConflictError("handoff Worker rejected the private operation")
+        if (
+            response.get("version") != CONTROL_VERSION
+            or response.get("command") != f"{command}_ack"
+            or response.get("handoff_id") != payload.get("handoff_id")
+            or response.get("nonce_digest") != payload.get("nonce_digest")
+            or response.get("sealed_record_digest")
+            != payload.get("sealed_record_digest")
+            or response.get("status") not in statuses
+            or response.get("worker_phase") not in phases
+            or not isinstance(response.get("host_ack"), Mapping)
+            or response.get("ack_sha256") != _ack_digest(response)
+        ):
+            raise ConflictError("handoff Worker acknowledgement is invalid")
+        return response
+
+    def handoff_command(
+        self, handle: _PreparedWorker, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Execute one strict v2 handoff command over the live private channel."""
+
+        command = str(payload.get("command") or "")
+        expected = {
+            "handoff_prepare": (frozenset({"prepared", "active_work"}), frozenset({"paused", "owned"})),
+            "handoff_seal": (frozenset({"sealed"}), frozenset({"export_sealed"})),
+            "handoff_adopt": (frozenset({"prepared"}), frozenset({"adopt_prepared"})),
+            "handoff_commit": (frozenset({"committed"}), frozenset({"rebind_committed"})),
+            "resume_prepare": (frozenset({"prepared"}), frozenset({"resume_armed"})),
+            "resume_commit": (frozenset({"committed"}), frozenset({"resumed"})),
+            "handoff_finalize": (frozenset({"finalized"}), frozenset({"finalized"})),
+            "handoff_abort": (frozenset({"cancelled", "aborted"}), frozenset({"owned", "aborted"})),
+        }.get(command)
+        if payload.get("version") != CONTROL_VERSION or expected is None:
+            raise ConflictError("handoff Worker request is invalid")
+        return self._handoff_rpc(
+            handle, payload, statuses=expected[0], phases=expected[1]
+        )
+
+    def export_control_descriptor(self, handle: _PreparedWorker) -> int:
+        """Duplicate the live control authority without releasing A's copy."""
+
+        with handle.rpc_lock:
+            if handle.closed or handle.worker.poll() is not None:
+                raise ConflictError("handoff Worker is not alive")
+            if self._birth(handle.worker.pid) != handle.birth_id:
+                raise ConflictError("handoff Worker identity changed")
+            descriptor = os.dup(handle.control.fileno())
+            try:
+                os.set_inheritable(descriptor, False)
+                if os.get_inheritable(descriptor):
+                    raise ConflictError("exported Worker control descriptor is inheritable")
+                return descriptor
+            except BaseException:
+                os.close(descriptor)
+                raise
+
+    def release_exported(self, handle: _PreparedWorker) -> None:
+        """Close owner A's copy after the coordinator acknowledges custody."""
+
+        with handle.rpc_lock:
+            if handle.closed:
+                return
+            handle.control.close()
+            handle.closed = True
+            if self._active is handle:
+                self._active = None
+
+    @staticmethod
+    def _report_from_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
+        processes: dict[str, dict[str, Any]] = {}
+        for name in ("worker", "host", "engine", "engine_listener"):
+            value = receipt.get(name)
+            if not isinstance(value, Mapping):
+                raise ConflictError("handoff receipt process identity is missing")
+            try:
+                processes[name] = {
+                    "pid": int(value["pid"]),
+                    "birth_id": str(value["birth_id"]),
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ConflictError("handoff receipt process identity is invalid") from exc
+        binding = receipt.get("engine_binding")
+        if not isinstance(binding, Mapping):
+            raise ConflictError("handoff receipt engine binding is missing")
+        return {
+            "processes": processes,
+            "engine_binding": {
+                key: binding[key]
+                for key in (
+                    "supervisor_pid",
+                    "listener_pid",
+                    "listener_parent_pid",
+                    "socket_owner_pid",
+                )
+            },
+            "session_config_digest": receipt.get("session_config_digest"),
+        }
+
+    def adopt_control_descriptor(
+        self, descriptor: int, receipt: Mapping[str, Any]
+    ) -> _PreparedWorker:
+        """Construct B custody from a transferred descriptor and receipt.
+
+        The resulting process is deliberately represented as a non-child;
+        cleanup must never call waitpid on it.
+        """
+
+        if self._active is not None:
+            raise ConflictError("a local Worker control authority is already active")
+        try:
+            os.set_inheritable(descriptor, False)
+            if os.get_inheritable(descriptor):
+                raise ConflictError("adopted Worker control descriptor is inheritable")
+            control = socket.socket(fileno=descriptor)
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        try:
+            worker_value = receipt.get("worker")
+            if not isinstance(worker_value, Mapping):
+                raise ConflictError("handoff receipt Worker identity is missing")
+            pid = int(worker_value["pid"])
+            birth_id = str(worker_value["birth_id"])
+            if self._birth(pid) != birth_id:
+                raise ConflictError("handoff Worker identity changed before adoption")
+            control.settimeout(self.timeout_seconds)
+            handle = _PreparedWorker(
+                _AdoptedWorkerProcess(pid, birth_id),
+                birth_id,
+                control,
+                self._report_from_receipt(receipt),
+                _session_config_path(self.environment),
+                activated=True,
+                adopted=True,
+                receipt=dict(receipt),
+            )
+            self._active = handle
+            return handle
+        except BaseException:
+            control.close()
+            raise
+
+    def abort_adopted_descriptor(
+        self, descriptor: int, receipt: Mapping[str, Any]
+    ) -> None:
+        """Clean a committed graph when adoption failed before handle return."""
+
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        provisional = type(
+            "_ProvisionalAdoptedCustody",
+            (),
+            {
+                "receipt": dict(receipt),
+                "owner_session_config_path": _session_config_path(self.environment),
+            },
+        )()
+        try:
+            self._force_cleanup_adopted_graph(provisional)
+        except BaseException as exc:
+            self.cleanup_uncertain = str(exc)
+            raise
 
     def prepare(self, profile: LocalWorkerProfile, *, operation_id: str, channel_id: str) -> _PreparedWorker:
         if self._active is not None:
@@ -289,7 +577,14 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                         handle.control.settimeout(previous_timeout)
                 finally:
                     handle.rpc_lock.release()
-            handle.worker.wait(timeout=self.cleanup_timeout_seconds)
+            if handle.adopted:
+                deadline = __import__("time").monotonic() + self.cleanup_timeout_seconds
+                while handle.worker.poll() is None and __import__("time").monotonic() < deadline:
+                    __import__("time").sleep(0.01)
+                if handle.worker.poll() is None:
+                    raise ConflictError("adopted Worker did not exit after bounded abort")
+            else:
+                handle.worker.wait(timeout=self.cleanup_timeout_seconds)
         except BaseException as exc:
             failure = exc
         finally:
@@ -298,7 +593,14 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             except OSError:
                 pass
             handle.control.close()
-            if owned and handle.worker.poll() is None:
+            if handle.adopted and self._adopted_graph_has_survivors(handle):
+                try:
+                    self._force_cleanup_adopted_graph(handle)
+                    failure = None
+                except BaseException as exc:
+                    self.cleanup_uncertain = str(exc)
+                    failure = exc
+            if owned and handle.worker.poll() is None and not handle.adopted:
                 try:
                     os.killpg(handle.worker.pid, signal.SIGTERM)
                 except ProcessLookupError:
@@ -319,6 +621,249 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 self._active = None
         if failure is not None:
             raise failure
+
+    @staticmethod
+    def _receipt_process(receipt: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+        value = receipt.get(name)
+        required = {
+            "pid", "birth_id", "uid", "parent_pid", "process_group",
+            "session_id", "executable", "artifact_digest", "command_line", "argv_digest",
+        }
+        if not isinstance(value, Mapping) or not required.issubset(value):
+            raise ConflictError(f"adopted {name} cleanup identity is incomplete")
+        return value
+
+    def _verify_cleanup_member(
+        self,
+        receipt: Mapping[str, Any],
+        name: str,
+        *,
+        expected_parent: int | None,
+        allow_reparented: bool = False,
+    ) -> bool:
+        expected = self._receipt_process(receipt, name)
+        pid = int(expected["pid"])
+        observed_birth = process_birth_identity(pid)
+        if observed_birth is None:
+            return False
+        if observed_birth != expected["birth_id"]:
+            raise ConflictError(f"adopted {name} cleanup birth identity changed")
+        try:
+            uid = int(_ps(pid, "uid"))
+            parent = int(_ps(pid, "ppid"))
+            command = _ps(pid, "command")
+            argv = _process_argv(pid)
+            group = os.getpgid(pid)
+            session = os.getsid(pid)
+        except (OSError, ValueError) as exc:
+            if process_birth_identity(pid) is None:
+                return False
+            try:
+                if _ps(pid, "state").startswith("Z"):
+                    return False
+            except ConflictError:
+                return False
+            raise ConflictError(f"adopted {name} cleanup identity is unobservable") from exc
+        if uid != int(expected["uid"]):
+            raise ConflictError(f"adopted {name} cleanup UID changed")
+        if allow_reparented:
+            # An adopted member may still have its receipt parent, or PID 1
+            # after that parent exits.  B itself can never become its parent.
+            if parent not in {int(expected["parent_pid"]), 1} or parent == os.getpid():
+                raise ConflictError(f"adopted {name} parent identity is invalid")
+        elif expected_parent is not None and parent != int(expected_parent):
+            raise ConflictError(f"adopted {name} cleanup parent identity changed")
+        if group != int(expected["process_group"]) or session != int(expected["session_id"]):
+            raise ConflictError(f"adopted {name} cleanup process group/session changed")
+        executable = Path(str(expected["executable"]))
+        if _actual_executable(pid) != executable or _file_digest(executable) != expected["artifact_digest"]:
+            raise ConflictError(f"adopted {name} cleanup executable identity changed")
+        if not expected["command_line"] or not command:
+            raise ConflictError(f"adopted {name} cleanup command line is unavailable")
+        if not argv or _argv_digest(argv) != expected["argv_digest"]:
+            raise ConflictError(f"adopted {name} cleanup argv identity changed")
+        return True
+
+    def _signal_verified_group(
+        self,
+        receipt: Mapping[str, Any],
+        names: tuple[str, ...],
+        *,
+        leader: str,
+        parents: Mapping[str, int | None],
+    ) -> None:
+        leader_value = self._receipt_process(receipt, leader)
+        group = int(leader_value["process_group"])
+        if group != int(leader_value["pid"]) or int(leader_value["session_id"]) != int(leader_value["pid"]):
+            raise ConflictError(f"adopted {leader} cleanup group is not independently owned")
+
+        def live_members() -> list[str]:
+            live = [
+                name for name in names
+                if self._verify_cleanup_member(
+                    receipt,
+                    name,
+                    expected_parent=parents.get(name),
+                    allow_reparented=True,
+                )
+            ]
+            if "engine_listener" in names:
+                listener = self._receipt_process(receipt, "engine_listener")
+                if "engine_listener" in live:
+                    owner, _endpoint = _listening_socket_owner(
+                        int(listener["pid"]), self.profile.engine_endpoint
+                    )
+                    if owner != int(listener["pid"]):
+                        raise ConflictError("adopted engine listener ownership changed")
+                else:
+                    parsed = urlsplit(self.profile.engine_endpoint)
+                    probe = socket.socket(
+                        socket.AF_INET6 if ":" in (parsed.hostname or "") else socket.AF_INET,
+                        socket.SOCK_STREAM,
+                    )
+                    try:
+                        probe.settimeout(self.cleanup_timeout_seconds)
+                        if probe.connect_ex((str(parsed.hostname), int(parsed.port))) == 0:
+                            raise ConflictError("adopted engine listener was replaced")
+                    finally:
+                        probe.close()
+            return live
+
+        current = live_members()
+        if not current:
+            return
+        # Every surviving named member is revalidated immediately before each
+        # group signal.  No PID-only signal is ever used.
+        os.killpg(group, signal.SIGTERM)
+        deadline = time.monotonic() + self.cleanup_timeout_seconds
+        while time.monotonic() < deadline:
+            if not any(process_birth_identity(int(self._receipt_process(receipt, name)["pid"])) == self._receipt_process(receipt, name)["birth_id"] for name in names):
+                return
+            time.sleep(0.01)
+        current = live_members()
+        if current:
+            os.killpg(group, signal.SIGKILL)
+            deadline = time.monotonic() + self.cleanup_timeout_seconds
+            while time.monotonic() < deadline:
+                if not any(process_birth_identity(int(self._receipt_process(receipt, name)["pid"])) == self._receipt_process(receipt, name)["birth_id"] for name in names):
+                    return
+                time.sleep(0.01)
+        if live_members():
+            raise ConflictError(f"adopted {leader} process group survived verified cleanup")
+
+    def _adopted_graph_has_survivors(self, handle: _PreparedWorker) -> bool:
+        receipt = handle.receipt
+        if not isinstance(receipt, Mapping):
+            return True
+        for name in ("worker", "host", "engine", "engine_listener"):
+            try:
+                expected = self._receipt_process(receipt, name)
+            except ConflictError:
+                return True
+            if process_birth_identity(int(expected["pid"])) == expected["birth_id"]:
+                return True
+        return False
+
+    @staticmethod
+    def _cleanup_partition(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
+        expected = [
+            {"role": "generic_pack_host", "leader": "host", "members": ["host"]},
+            {
+                "role": "engine",
+                "leader": "engine",
+                "members": ["engine", "engine_listener"],
+            },
+            {"role": "worker", "leader": "worker", "members": ["worker"]},
+        ]
+        if receipt.get("cleanup_groups") != expected:
+            raise ConflictError("adopted cleanup group partition is invalid")
+        return expected
+
+    def _force_cleanup_adopted_graph(self, handle: _PreparedWorker) -> None:
+        """Birth/executable/session checked fallback for an unresponsive Worker."""
+
+        receipt = handle.receipt
+        if not isinstance(receipt, Mapping):
+            raise ConflictError("adopted Worker cleanup receipt is unavailable")
+        cleanup_groups = self._cleanup_partition(receipt)
+        worker_pid = int(self._receipt_process(receipt, "worker")["pid"])
+        engine_pid = int(self._receipt_process(receipt, "engine")["pid"])
+        # Establish one complete immutable graph snapshot before the first
+        # signal.  Each group helper repeats these checks immediately before
+        # TERM and again before KILL.
+        live = {
+            "worker": self._verify_cleanup_member(
+                receipt, "worker", expected_parent=None, allow_reparented=True
+            ),
+            "host": self._verify_cleanup_member(
+                receipt, "host", expected_parent=worker_pid, allow_reparented=True
+            ),
+            "engine": self._verify_cleanup_member(
+                receipt, "engine", expected_parent=worker_pid, allow_reparented=True
+            ),
+            "engine_listener": self._verify_cleanup_member(
+                receipt, "engine_listener", expected_parent=engine_pid,
+                allow_reparented=True,
+            ),
+        }
+        if not any(live.values()):
+            return
+        # Prove the listener still belongs to the recorded listener before any
+        # signal; this also prevents cleaning an unrelated process graph after
+        # endpoint replacement.
+        listener = self._receipt_process(receipt, "engine_listener")
+        endpoint = self.profile.engine_endpoint
+        if live["engine_listener"]:
+            owner, endpoint = _listening_socket_owner(
+                int(listener["pid"]), self.profile.engine_endpoint
+            )
+            if owner != int(listener["pid"]):
+                raise ConflictError("adopted engine listener ownership changed")
+        else:
+            parsed_endpoint = urlsplit(endpoint)
+            replacement = socket.socket(
+                socket.AF_INET6 if ":" in (parsed_endpoint.hostname or "") else socket.AF_INET,
+                socket.SOCK_STREAM,
+            )
+            try:
+                replacement.settimeout(self.cleanup_timeout_seconds)
+                if replacement.connect_ex((str(parsed_endpoint.hostname), int(parsed_endpoint.port))) == 0:
+                    raise ConflictError("adopted engine listener was replaced")
+            finally:
+                replacement.close()
+        parents = {
+            "worker": None,
+            "host": worker_pid,
+            "engine": worker_pid,
+            "engine_listener": engine_pid,
+        }
+        for group in cleanup_groups:
+            self._signal_verified_group(
+                receipt,
+                tuple(group["members"]),
+                leader=str(group["leader"]),
+                parents=parents,
+            )
+        parsed = urlsplit(endpoint)
+        probe = socket.socket(socket.AF_INET6 if ":" in (parsed.hostname or "") else socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(self.cleanup_timeout_seconds)
+            if probe.connect_ex((str(parsed.hostname), int(parsed.port))) == 0:
+                raise ConflictError("adopted engine listener survived verified cleanup")
+        finally:
+            probe.close()
+        session_root = handle.owner_session_config_path.parent
+        support_root = Path(str(self.config["support_root"])).resolve()
+        try:
+            session_root.resolve().relative_to(support_root)
+            identity = session_root.lstat()
+        except (OSError, ValueError) as exc:
+            raise ConflictError("adopted engine registry root is unsafe") from exc
+        if session_root.is_symlink() or not stat.S_ISDIR(identity.st_mode) or identity.st_uid != os.getuid():
+            raise ConflictError("adopted engine registry root is unsafe")
+        shutil.rmtree(session_root)
+        if session_root.exists() or session_root.is_symlink():
+            raise ConflictError("adopted engine registry survived verified cleanup")
 
     def control_alive(self, handle: _PreparedWorker) -> bool:
         if not isinstance(handle, _PreparedWorker) or handle.closed or handle.worker.poll() is not None:
@@ -488,7 +1033,14 @@ class OSProcessInspector:
         observed_digest = _file_digest(executable)
         if observed_digest != digest:
             raise ConflictError("independent executable artifact digest disagrees with profile")
-        return ProcessIdentity(pid, observed_birth, uid, observed_parent, group, session, executable, observed_digest)
+        command_line = _ps(pid, "command")
+        argv = _process_argv(pid)
+        if not command_line or not argv:
+            raise ConflictError("independent process command line is unavailable")
+        return ProcessIdentity(
+            pid, observed_birth, uid, observed_parent, group, session,
+            executable, observed_digest, command_line, _argv_digest(argv),
+        )
 
     def observe(self, handle: _PreparedWorker) -> LocalWorkerObservation:
         report = getattr(handle, "report_value", None)
@@ -504,7 +1056,14 @@ class OSProcessInspector:
         listener_data = processes.get("engine_listener")
         if not all(isinstance(item, Mapping) for item in (worker_data, host_data, engine_data, listener_data)):
             raise ConflictError("Worker process report is incomplete")
-        worker = self._identity(int(worker_data["pid"]), str(worker_data["birth_id"]), self.profile.worker_executable, self.profile.worker_artifact_digest, parent_pid=os.getpid(), session_owner=True)
+        worker = self._identity(
+            int(worker_data["pid"]),
+            str(worker_data["birth_id"]),
+            self.profile.worker_executable,
+            self.profile.worker_artifact_digest,
+            parent_pid=None if getattr(handle, "adopted", False) else os.getpid(),
+            session_owner=True,
+        )
         host = self._identity(
             int(host_data["pid"]),
             str(host_data["birth_id"]),

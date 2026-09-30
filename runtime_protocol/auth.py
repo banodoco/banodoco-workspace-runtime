@@ -189,6 +189,44 @@ class CredentialStore:
             except ValidationError:
                 return None
 
+    def generation_snapshot(self, actor: str) -> dict[str, str]:
+        """Return a lock-protected, secret-free identity for one generation.
+
+        Handoff callers compare this value before and after custody transfer.
+        Reading and validating all three files under the credential lock keeps
+        the snapshot from combining bytes from two rotations.  The bearer is
+        deliberately omitted.
+        """
+
+        actor = self._actor(actor)
+        with self._lock:
+            # Validate file type, ownership, mode and the committed pair first.
+            self._read_actor(actor)
+            token_path, metadata_path, commit_path = self._paths(actor)
+            try:
+                token_bytes = token_path.read_bytes()
+                metadata_bytes = metadata_path.read_bytes()
+                commit_bytes = commit_path.read_bytes()
+                commit = json.loads(commit_bytes.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValidationError("credential generation is unreadable") from exc
+            generation = commit.get("generation") if isinstance(commit, dict) else None
+            if not isinstance(generation, str) or not generation:
+                raise ValidationError("credential generation marker is invalid")
+            token_sha256 = self._sha256(token_bytes)
+            metadata_sha256 = self._sha256(metadata_bytes)
+            if (
+                commit.get("token_sha256") != token_sha256
+                or commit.get("metadata_sha256") != metadata_sha256
+            ):
+                raise ValidationError("credential generation is inconsistent")
+            return {
+                "generation": generation,
+                "token_sha256": token_sha256,
+                "metadata_sha256": metadata_sha256,
+                "commit_sha256": self._sha256(commit_bytes),
+            }
+
     def disable_actor(self, actor: str) -> None:
         with self._lock:
             self._disabled_actors.add(self._actor(actor))
@@ -198,6 +236,13 @@ class CredentialStore:
         with self._lock:
             self._read_actor(actor)
             self._disabled_actors.discard(actor)
+
+    def actor_enabled(self, actor: str) -> bool:
+        """Return the in-process bearer gate without exposing credential bytes."""
+
+        actor = self._actor(actor)
+        with self._lock:
+            return actor not in self._disabled_actors
 
     def revoke(self, actor: str) -> None:
         actor = self._actor(actor)

@@ -62,7 +62,8 @@ def _interruption_report(connection: sqlite3.Connection) -> dict[str, object]:
     active_tasks = [
         {"task_id": str(row[0]), "status": str(row[1])}
         for row in connection.execute(
-            "SELECT id, status FROM tasks WHERE lower(status)='running' ORDER BY id"
+            "SELECT id, status FROM tasks "
+            "WHERE lower(status) IN ('running', 'cancel_requested') ORDER BY id"
         )
     ]
     unreconciled_attempts = []
