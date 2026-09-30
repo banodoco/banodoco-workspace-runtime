@@ -419,6 +419,11 @@ def child_exec_from_environment() -> int:
         raise CustodyError("custody target argv is invalid") from exc
     if not isinstance(argv, list) or not argv or any(not isinstance(v, str) or "\0" in v for v in argv):
         raise CustodyError("custody target argv is invalid")
+    # Session creation changes Darwin's audit-token pidversion.  Complete it
+    # before the broker samples the pre-exec token so the only pidversion
+    # transition after acknowledgement is the target exec itself.
+    if os.environ.get("ASTRID_RUNTIME_CUSTODY_START_SESSION") == "1":
+        os.setsid()
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.settimeout(5.0)
     connection.connect(os.environ.get("ASTRID_RUNTIME_CUSTODY_SOCKET", ""))
@@ -438,8 +443,6 @@ def child_exec_from_environment() -> int:
         or ack.get("registration_digest") != _digest_bytes(_canonical(frame))
     ):
         raise CustodyError("custody registration acknowledgement is invalid")
-    if os.environ.get("ASTRID_RUNTIME_CUSTODY_START_SESSION") == "1":
-        os.setsid()
     for name in tuple(os.environ):
         if name.startswith("ASTRID_RUNTIME_CUSTODY_"):
             os.environ.pop(name, None)

@@ -102,6 +102,148 @@ def _sealed_runtime_capability(tmp_path: Path, *, state: str = "sealed"):
     return sidecar, identity, registration
 
 
+def test_custody_child_creates_session_before_pre_exec_registration(monkeypatch):
+    events = []
+    frame = {}
+    target = ["/installed/runtime/bin/python", "-m", "runtime_protocol", "start"]
+    monkeypatch.setenv(
+        "ASTRID_RUNTIME_CUSTODY_TARGET_B64",
+        custody_broker_module.base64.b64encode(
+            custody_broker_module._canonical(target)
+        ).decode("ascii"),
+    )
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_SOCKET", "/private/custody.sock")
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_RUN_ID", "run-a")
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_ROLE", "runtime_owner")
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_START_SESSION", "1")
+    monkeypatch.setattr(custody_broker_module.os, "getpid", lambda: 4242)
+    monkeypatch.setattr(custody_broker_module.os, "getppid", lambda: 3131)
+    monkeypatch.setattr(custody_broker_module.os, "setsid", lambda: events.append("setsid"))
+    monkeypatch.setattr(
+        custody_broker_module.os,
+        "set_inheritable",
+        lambda descriptor, value: events.append(("inheritable", descriptor, value)),
+    )
+
+    class Connection:
+        def settimeout(self, value):
+            events.append(("timeout", value))
+
+        def connect(self, value):
+            events.append(("connect", value))
+
+        def fileno(self):
+            return 91
+
+        def detach(self):
+            events.append("detach")
+            return 91
+
+    monkeypatch.setattr(
+        custody_broker_module.socket, "socket",
+        lambda *_args: events.append("socket") or Connection(),
+    )
+
+    def send(_connection, value):
+        frame.update(value)
+        events.append("register")
+
+    def acknowledge(_connection):
+        events.append("ack")
+        return {
+            "status": "registered",
+            "run_id": frame["run_id"],
+            "role": frame["role"],
+            "pid": frame["pid"],
+            "registration_digest": custody_broker_module._digest_bytes(
+                custody_broker_module._canonical(frame)
+            ),
+        }
+
+    monkeypatch.setattr(custody_broker_module, "_send_frame", send)
+    monkeypatch.setattr(custody_broker_module, "_read_frame", acknowledge)
+
+    def execve(executable, argv, environment):
+        events.append("exec")
+        assert executable == target[0]
+        assert argv == target
+        assert not any(name.startswith("ASTRID_RUNTIME_CUSTODY_") for name in environment)
+        raise RuntimeError("exec reached")
+
+    monkeypatch.setattr(custody_broker_module.os, "execve", execve)
+
+    with pytest.raises(RuntimeError, match="exec reached"):
+        custody_broker_module.child_exec_from_environment()
+
+    assert events.index("setsid") < events.index(("connect", "/private/custody.sock"))
+    assert events.index("setsid") < events.index("register") < events.index("ack")
+    assert events.count("setsid") == 1
+    assert frame["pid"] == 4242
+    assert frame["ppid"] == 3131
+    assert frame["argv_digest"] == custody_broker_module._digest_bytes(
+        custody_broker_module._canonical(target)
+    )
+
+
+def test_custody_broker_seals_and_signals_only_actual_exec_token(tmp_path, monkeypatch):
+    if sys.platform != "darwin":
+        pytest.skip("Darwin audit-token custody is unavailable")
+    identity = {"pid": 4242, "birth_id": "birth-a", "uid": os.getuid()}
+    pre = {
+        "pid": 4242, "uid": os.getuid(), "pidversion": 17,
+        "sha256": "sha256:" + "1" * 64,
+        "words": [1, os.getuid(), 3, 4, 5, 4242, 7, 17],
+    }
+    same_pidversion_decoy = {
+        **pre,
+        "sha256": "sha256:" + "2" * 64,
+        "words": [11, os.getuid(), 13, 14, 15, 4242, 17, 17],
+    }
+    actual_exec = {
+        "pid": 4242, "uid": os.getuid(), "pidversion": 18,
+        "sha256": "sha256:" + "3" * 64,
+        "words": [21, os.getuid(), 23, 24, 25, 4242, 27, 18],
+    }
+    tokens = iter((pre, same_pidversion_decoy, actual_exec))
+    monkeypatch.setattr(custody_broker_module, "_peer_token", lambda _connection: next(tokens))
+    signalled = []
+    monkeypatch.setattr(
+        custody_broker_module,
+        "signal_audit_token",
+        lambda words, signum: signalled.append((list(words), signum)),
+    )
+    broker = custody_broker_module.RoleBoundCustodyBroker(
+        role="runtime_owner",
+        identity_provider=lambda _pid: identity,
+        ledger_root=tmp_path / "custody-ledger",
+    )
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.connect(str(broker.socket_path))
+        registration_frame = {
+            "version": custody_broker_module.PROTOCOL_VERSION,
+            "command": "register_pre_exec",
+            "run_id": broker.run_id,
+            "role": broker.role,
+            "pid": identity["pid"],
+            "ppid": os.getpid(),
+            "argv_digest": "sha256:" + "4" * 64,
+        }
+        custody_broker_module._send_frame(connection, registration_frame)
+        ack = custody_broker_module._read_frame(connection)
+        assert ack["status"] == "registered"
+        broker.wait_until_sealed()
+    finally:
+        connection.close()
+
+    assert broker.registration["pre_exec_pidversion"] == pre["pidversion"]
+    assert broker.registration["audit_token_pidversion"] == actual_exec["pidversion"]
+    assert broker.registration["audit_token_words"] == actual_exec["words"]
+    assert broker.registration["audit_token_words"] != same_pidversion_decoy["words"]
+    broker.signal(signal.SIGTERM, expected_pid=identity["pid"])
+    assert signalled == [(actual_exec["words"], signal.SIGTERM)]
+
+
 def test_sealed_runtime_capability_signals_only_registered_audit_token(tmp_path):
     sidecar, identity, registration = _sealed_runtime_capability(tmp_path)
     calls = []
