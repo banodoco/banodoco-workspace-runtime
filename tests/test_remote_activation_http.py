@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,6 +14,11 @@ from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.remote_worker_deployment import deployment_binding_from_task
 from runtime_protocol.store import RealmStore
 from tests.http_helpers import Api
+from tests.test_remote_worker_activation import (
+    CAPABILITY, CAPABILITY_DIGEST, OLD, OWNER, Inspector, Preparer, _observation, _reference,
+)
+from runtime_protocol.remote_worker_activation import QualifiedRemoteWorkerLauncher
+from runtime_protocol.errors import AuthorizationError, ConflictError
 
 
 def _qualification(service, task_id):
@@ -116,6 +122,80 @@ def test_remote_activation_rpc_uses_daemon_owner_and_resident_service(tmp_path):
                 "POST", revoke_route, {"activation_id": qualification["activation_id"]}
             )
         assert error.value.status == 409
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("lost_action", ["ack", "provision", "enable", "readiness"])
+def test_resident_acceptance_recovery_and_authenticated_enablement(tmp_path, lost_action):
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support", production_worker_credentials=True).start()
+    try:
+        service = daemon.service
+        service.register_capability({"capability_id": CAPABILITY, "definition_digest": CAPABILITY_DIGEST})
+        task_id = service.create_task({
+            "capability_id": CAPABILITY, "capability_digest": CAPABILITY_DIGEST,
+            "input_object_ids": [], "spec": {}, "idempotency_key": "resident-acceptance",
+            "execution_request": {"schema_version": 1, "target": OLD},
+        }, enforce_readiness=True)["task"]["id"]
+        ref = replace(_reference(tmp_path, service, task_id), executor_id="astrid-pack-host",
+                      runtime_endpoint=daemon.endpoint, runtime_instance_id=daemon.instance_id,
+                      credential_ref=str(daemon.worker_credential_path))
+        owner = WorkspaceClient(daemon.endpoint, daemon.token)
+        actions = []
+
+        def control(task, body):
+            result = owner.control_remote_credential(task, body)
+            actions.append(body["action"])
+            if body["action"] == lost_action:
+                raise EOFError("resident credential reply deliberately lost")
+            return result
+
+        preparer = Preparer()
+        deliveries = []
+
+        def accepted_but_reply_lost(handle, grant, *, accept):
+            deliveries.append(handle)
+            token = daemon.worker_credential_path.read_text().strip()
+            worker = Api(daemon.endpoint, token)
+            # Public health is positive for this explicitly disabled bearer.
+            assert worker.health()["status"] == "ok"
+            with pytest.raises(RuntimeError) as rejected:
+                worker.request("POST", "/v1/handshake", {"requested_scopes": ["worker:execute"]})
+            assert rejected.value.status == 401
+            accept(grant, {"pid": 12345, "birth_id": "birth-1"})
+            assert service._latest_remote_activation(task_id) is None
+            raise EOFError("private acceptance reply deliberately lost")
+
+        preparer.acknowledge = accepted_but_reply_lost
+        launcher = QualifiedRemoteWorkerLauncher(runtime=service, credentials=None, credential_control=control,
+                                                 preparer=preparer, inspector=Inspector(_observation(ref, service)))
+        if lost_action == "readiness":
+            preparer.await_ready = lambda handle: (_ for _ in ()).throw(ConflictError("capability readiness failed"))
+        parked = launcher.park(ref, target=OLD)
+        task = service._task_resource(service.store.get_task(task_id))
+        if lost_action == "ack":
+            result = launcher.activate(task, ref, parked)
+            assert launcher.activation_state == "active"
+            assert deliveries == [parked.handle]
+            token = daemon.worker_credential_path.read_text().strip()
+            assert Api(daemon.endpoint, token).request(
+                "POST", "/v1/handshake", {"requested_scopes": ["worker:execute"]},
+            )["actor_id"] == "astrid-pack-host"
+            assert service._latest_remote_activation(task_id) == result
+            assert actions == ["provision", "enable"]
+            assert service.doctor()["ok"]
+        else:
+            with pytest.raises((EOFError, ConflictError)):
+                launcher.activate(task, ref, parked)
+            assert launcher.activation_state == "inactive"
+            assert "revoke" in actions
+            assert service._latest_remote_activation(task_id) is None
+            assert daemon.credentials.actor_metadata("astrid-pack-host") is None
+            assert preparer.calls[-1] == "abort"
+            with pytest.raises(AuthorizationError):
+                daemon.credentials.load("never-enabled-or-already-revoked")
     finally:
         daemon.stop()
 

@@ -303,6 +303,9 @@ class RuntimeDaemon:
                 raise ConflictError("remote activation generation changed before revocation")
             if latest == qualification:
                 self.service.revoke_remote_activation(task_id, body["activation_id"], identity=identity)
+        # Fence in memory before filesystem cleanup, including cleanup whose
+        # reply or unlink fails after the credential was briefly enabled.
+        self.credentials.disable_actor(actor)
         self.credentials.revoke(actor)
         return {"revoked": True}
 

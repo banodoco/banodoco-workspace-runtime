@@ -133,8 +133,9 @@ class Preparer:
         self.calls.append("prepare")
         return object()
 
-    def acknowledge(self, handle, grant):
+    def acknowledge(self, handle, grant, *, accept):
         self.calls.append("private_ack")
+        accept(grant, {"pid": 12345, "birth_id": "birth-1"})
         return {"activation_id": "wrong" if self.bad_ack else grant["activation_id"],
                 "executor_incarnation": grant["executor_incarnation"],
                 "evidence_digest": grant["evidence_digest"]}

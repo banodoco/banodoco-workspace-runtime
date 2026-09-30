@@ -825,9 +825,7 @@ class RuntimeService:
             return False
         return recorded.get("binding_digest") == binding.digest()
 
-    @_durable_mutation
-    def record_remote_activation(self, task_id, qualification, *, identity=None):
-        """Commit a privately acknowledged, independently observed activation."""
+    def _validate_remote_activation_qualification(self, task_id, qualification, identity):
         actor = self._require_placement_recovery_owner(identity)
         if actor != "owner":
             raise AuthorizationError("remote activation requires the Runtime owner actor")
@@ -872,11 +870,120 @@ class RuntimeService:
         if not all(isinstance(qualification[field], str) and qualification[field] for field in
                    ("activation_id", "credential_actor", "executor_incarnation")):
             raise ValidationError("remote activation identity is incomplete")
+        return task
+
+    def _remote_grant_events(self, task_id=None):
+        with self.store._mutex:
+            return [
+                (row["kind"], json.loads(row["payload_json"]))
+                for row in self.store.conn.execute(
+                    "SELECT kind, payload_json FROM events WHERE (? IS NULL OR task_id=?) AND kind IN "
+                    "('task.remote_activation_granted', 'task.remote_activation_accepted', "
+                    "'task.remote_activation_revoked') ORDER BY id",
+                    (None if task_id is None else str(task_id), str(task_id)),
+                )
+            ]
+
+    @_durable_mutation
+    def _begin_remote_grant(self, task_id, record, *, identity):
+        """Reserve one private grant in the owner store, without enabling execution."""
+        if not isinstance(record, dict) or set(record) != {"qualification", "grant_digest", "launch_digest", "process"}:
+            raise ValidationError("private activation record is invalid")
+        qualification = record["qualification"]
+        task = self._validate_remote_activation_qualification(task_id, qualification, identity)
+        self._placement_evidence_digest(record["grant_digest"], "grant_digest")
+        self._placement_evidence_digest(record["launch_digest"], "launch_digest")
+        process = record["process"]
+        if (not isinstance(process, dict) or set(process) != {"pid", "birth_id"}
+                or type(process["pid"]) is not int or process["pid"] <= 0
+                or not isinstance(process["birth_id"], str) or not process["birth_id"]):
+            raise ValidationError("private activation process identity is invalid")
+        for kind, previous in self._remote_grant_events():
+            if kind == "task.remote_activation_granted" and (
+                    previous["qualification"]["activation_id"] == qualification["activation_id"]
+                    or previous["qualification"]["executor_incarnation"] == qualification["executor_incarnation"]
+                    or (previous["process"] == process
+                        and previous["qualification"]["effective_target"] == qualification["effective_target"])):
+                raise ConflictError("private activation grant or incarnation was already used")
+        events = self._remote_grant_events(task_id)
+        revoked = {payload["activation_id"] for kind, payload in events
+                   if kind == "task.remote_activation_revoked"}
+        for kind, previous in events:
+            if (kind == "task.remote_activation_granted"
+                    and previous["qualification"]["activation_id"] not in revoked):
+                raise ConflictError("another private activation grant is pending")
+        if (self._latest_remote_activation(task_id) is not None
+                or self._remote_activation_history(task_id, qualification["activation_id"])):
+            raise ConflictError("remote activation generation is already used or qualified")
+        self.store._append_event(task["run_id"], str(task_id), "task.remote_activation_granted", record)
+
+    def _assert_remote_grant(self, task_id, record, identity, *, accepted):
+        qualification = record["qualification"]
+        self._validate_remote_activation_qualification(task_id, qualification, identity)
+        activation_id = qualification["activation_id"]
+        events = self._remote_grant_events(task_id)
+        grants = [payload for kind, payload in events if kind == "task.remote_activation_granted"
+                  and payload["qualification"]["activation_id"] == activation_id]
+        receipts = [payload for kind, payload in events if kind == "task.remote_activation_accepted"
+                    and payload.get("activation_id") == activation_id]
+        if (grants != [record] or len(receipts) != int(accepted)
+                or any(kind == "task.remote_activation_revoked" and payload.get("activation_id") == activation_id
+                       for kind, payload in events)):
+            raise ConflictError("private activation acceptance is missing, mismatched, duplicate or revoked")
         latest = self._latest_remote_activation(task_id)
+        if latest is not None and latest != qualification:
+            raise ConflictError("private activation was superseded")
+
+    @_durable_mutation
+    def _accept_remote_grant(self, task_id, record, *, identity):
+        """Called by the private receiver after acceptance and BEFORE sending its ACK.
+
+        The bound owner callback is the only writer. A worker bearer, liveness
+        observation, ready file, or ACK exception cannot create this receipt.
+        """
+        self._assert_remote_grant(task_id, record, identity, accepted=False)
+        qualification = record["qualification"]
+        self.store._append_event(qualification["run_id"], str(task_id),
+                                 "task.remote_activation_accepted",
+                                 {"activation_id": qualification["activation_id"]})
+
+    @_verified_mutation
+    def _recover_remote_grant(self, task_id, record, *, identity):
+        self._assert_remote_grant(task_id, record, identity, accepted=True)
+
+    @_durable_mutation
+    def _revoke_remote_grant(self, task_id, activation_id, *, identity):
+        if self._require_placement_recovery_owner(identity) != "owner":
+            raise AuthorizationError("private activation revocation requires the Runtime owner actor")
+        events = self._remote_grant_events(task_id)
+        if not any(kind == "task.remote_activation_granted"
+                   and payload["qualification"]["activation_id"] == activation_id for kind, payload in events):
+            raise ConflictError("private activation grant is missing")
+        if any(kind == "task.remote_activation_revoked" and payload.get("activation_id") == activation_id
+               for kind, payload in events):
+            return
+        latest = self._latest_remote_activation(task_id)
+        if latest is not None and latest["activation_id"] != activation_id:
+            raise ConflictError("remote activation generation changed before revocation")
+        task = self.store.get_task(task_id)
+        self.store._append_event(task["run"]["id"], str(task_id), "task.remote_activation_revoked",
+                                 {"activation_id": activation_id, "revoked_at": now()})
+
+    @_durable_mutation
+    def record_remote_activation(self, task_id, qualification, *, identity=None):
+        """Commit a privately acknowledged, independently observed activation."""
+        task = self._validate_remote_activation_qualification(task_id, qualification, identity)
         history = self._remote_activation_history(task_id, qualification.get("activation_id"))
+        if any(kind == "task.remote_activation_revoked" for kind, _payload in history):
+            raise ConflictError("remote activation generation is permanently revoked")
+        for kind, record in self._remote_grant_events(task_id):
+            if (kind == "task.remote_activation_granted"
+                    and record["qualification"]["activation_id"] == qualification["activation_id"]):
+                if record["qualification"] != qualification:
+                    raise ConflictError("remote qualification differs from its private grant")
+                self._assert_remote_grant(task_id, record, identity, accepted=True)
+        latest = self._latest_remote_activation(task_id)
         if history:
-            if any(kind == "task.remote_activation_revoked" for kind, _payload in history):
-                raise ConflictError("remote activation generation is permanently revoked")
             if any(kind == "task.remote_activation_qualified" and payload == qualification for kind, payload in history):
                 return qualification
             raise ConflictError("remote activation generation was already used")
