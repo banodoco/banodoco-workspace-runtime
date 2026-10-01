@@ -48,6 +48,90 @@ def test_custody_socket_root_ignores_long_private_tmpdir_and_real_bind(monkeypat
         root.rmdir()
 
 
+def test_handoff_socket_root_ignores_long_private_tmpdir_and_real_bind(monkeypatch, tmp_path):
+    monkeypatch.setenv("TMPDIR", str(tmp_path / ("private-qualification-" * 12)))
+    root = runtime_boundary_module._create_compact_handoff_root()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    path = root / "coordinator.sock"
+    try:
+        sock.bind(str(path))
+        path.chmod(0o600)
+        sock.listen(1)
+        assert (
+            len(os.fsencode(path))
+            <= runtime_boundary_module.DARWIN_UNIX_SOCKET_PATH_MAX_BYTES
+        )
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert root.parent == runtime_boundary_module.DARWIN_HANDOFF_SOCKET_PARENT
+    finally:
+        sock.close()
+        path.unlink(missing_ok=True)
+        root.rmdir()
+
+
+def test_handoff_socket_root_rejects_unsafe_parent(monkeypatch, tmp_path):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    monkeypatch.setattr(runtime_boundary_module, "DARWIN_HANDOFF_SOCKET_PARENT", unsafe)
+    with pytest.raises(BootstrapError, match="parent is unsafe"):
+        runtime_boundary_module._create_compact_handoff_root()
+
+
+def test_handoff_socket_root_rejects_symlink_parent(monkeypatch, tmp_path):
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(runtime_boundary_module, "DARWIN_HANDOFF_SOCKET_PARENT", alias)
+    with pytest.raises(BootstrapError, match="parent is unsafe"):
+        runtime_boundary_module._create_compact_handoff_root()
+
+
+def test_handoff_socket_root_rejects_wrong_owner(monkeypatch, tmp_path):
+    safe = tmp_path / "safe"
+    safe.mkdir(mode=0o700)
+    root = safe / "root"
+    root.mkdir(mode=0o700)
+    real_lstat = runtime_boundary_module.os.lstat
+
+    def mismatched_owner(path):
+        observed = real_lstat(path)
+        if Path(path) == root:
+            values = list(observed)
+            values[4] = os.getuid() + 1
+            return os.stat_result(values)
+        return observed
+
+    monkeypatch.setattr(runtime_boundary_module, "DARWIN_HANDOFF_SOCKET_PARENT", safe)
+    monkeypatch.setattr(
+        runtime_boundary_module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(root),
+    )
+    monkeypatch.setattr(runtime_boundary_module.os, "lstat", mismatched_owner)
+    with pytest.raises(BootstrapError, match="root identity is unsafe"):
+        runtime_boundary_module._create_compact_handoff_root()
+    assert not root.exists()
+
+
+def test_handoff_socket_root_rejects_path_beyond_darwin_limit(monkeypatch, tmp_path):
+    safe = tmp_path / "safe"
+    safe.mkdir(mode=0o700)
+    root = safe / ("x" * 120)
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(runtime_boundary_module, "DARWIN_HANDOFF_SOCKET_PARENT", safe)
+    monkeypatch.setattr(
+        runtime_boundary_module.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(root),
+    )
+    with pytest.raises(BootstrapError, match="AF_UNIX limit"):
+        runtime_boundary_module._create_compact_handoff_root()
+    assert not root.exists()
+
+
 def test_custody_socket_root_rejects_path_beyond_darwin_limit(monkeypatch, tmp_path):
     root = tmp_path / ("x" * 120)
     root.mkdir()
@@ -936,7 +1020,8 @@ def test_actual_handoff_spawn_normalizes_fixed_fds_and_closes_capability_channel
         tracked_pairs.append(pair)
         return pair
 
-    def short_mkdtemp(*, prefix):
+    def short_mkdtemp(*, prefix, dir):
+        assert dir == runtime_boundary_module.DARWIN_HANDOFF_SOCKET_PARENT
         path = real_mkdtemp(prefix="rf4-", dir="/var/tmp")
         short_rendezvous.append(Path(path))
         return path
@@ -1094,9 +1179,7 @@ def test_actual_handoff_spawn_normalizes_fixed_fds_and_closes_capability_channel
         worker_runtime.close()
         worker_peer.close()
         runtime_listener.close()
-        for rendezvous in short_rendezvous:
-            (rendezvous / "coordinator.sock").unlink(missing_ok=True)
-            rendezvous.rmdir()
+        assert all(not rendezvous.exists() for rendezvous in short_rendezvous)
     assert owner_thread is not None and not owner_thread.is_alive()
     assert all(not thread.is_alive() for thread in child_threads)
     assert owner_errors == []

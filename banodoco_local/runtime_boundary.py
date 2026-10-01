@@ -46,6 +46,52 @@ WAIT_SECONDS = 10.0
 ADMISSION_TIMEOUT_ENV = "ASTRID_RUNTIME_ADMISSION_TIMEOUT_SECONDS"
 DEFAULT_ADMISSION_TIMEOUT_SECONDS = 120.0
 STARTUP_WAIT_MARGIN_SECONDS = 5.0
+DARWIN_UNIX_SOCKET_PATH_MAX_BYTES = 103
+DARWIN_HANDOFF_SOCKET_PARENT = Path("/private/tmp")
+
+
+def _create_compact_handoff_root() -> Path:
+    """Create an owner-only restart rendezvous below Darwin's short temp alias."""
+
+    parent = DARWIN_HANDOFF_SOCKET_PARENT
+    try:
+        parent_stat = os.lstat(parent)
+    except OSError as exc:
+        raise BootstrapError("Orderly handoff socket parent is unavailable.") from exc
+    if (
+        not parent.is_absolute()
+        or stat.S_ISLNK(parent_stat.st_mode)
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or (
+            parent_stat.st_mode & stat.S_IWOTH
+            and not parent_stat.st_mode & stat.S_ISVTX
+        )
+    ):
+        raise BootstrapError("Orderly handoff socket parent is unsafe.")
+    root = Path(
+        tempfile.mkdtemp(
+            prefix=f"astrid-handoff-{os.getuid()}-",
+            dir=parent,
+        )
+    )
+    os.chmod(root, 0o700)
+    root_stat = os.lstat(root)
+    if (
+        stat.S_ISLNK(root_stat.st_mode)
+        or not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != os.getuid()
+        or stat.S_IMODE(root_stat.st_mode) != 0o700
+    ):
+        try:
+            root.rmdir()
+        finally:
+            raise BootstrapError("Orderly handoff socket root identity is unsafe.")
+    if len(os.fsencode(str(root / "coordinator.sock"))) > DARWIN_UNIX_SOCKET_PATH_MAX_BYTES:
+        try:
+            root.rmdir()
+        finally:
+            raise BootstrapError("Orderly handoff socket path exceeds Darwin AF_UNIX limit.")
+    return root
 
 
 class RuntimeCustodyLaunchUncertain(BootstrapError):
@@ -1378,8 +1424,7 @@ class LocalRuntimeBoundary:
                 fcntl.flock(mutex_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise BootstrapError("Another orderly Runtime restart coordinator is active.") from exc
-            rendezvous = Path(tempfile.mkdtemp(prefix=f"astrid-handoff-{os.getuid()}-"))
-            rendezvous.chmod(0o700)
+            rendezvous = _create_compact_handoff_root()
             socket_path = rendezvous / "coordinator.sock"
             # Keep the exact authority record under the support root. The
             # rendezvous socket is temporary, but a coordinator crash or hard
@@ -1776,6 +1821,9 @@ class LocalRuntimeBoundary:
                 channel.close()
             if listener is not None:
                 listener.close()
+            if rendezvous is not None:
+                (rendezvous / "coordinator.sock").unlink(missing_ok=True)
+                rendezvous.rmdir()
             if token_file is not None and process is None:
                 token_file.unlink(missing_ok=True)
             try:
