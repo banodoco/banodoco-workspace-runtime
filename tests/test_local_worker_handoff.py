@@ -310,6 +310,39 @@ def test_runtime_handoff_stage_error_preserves_worker_bounded_tuple():
     assert error.details["handoff_stage"] == "handoff_prepare"
 
 
+def test_owner_handoff_stage_error_adds_only_bounded_phase_and_code():
+    error = runtime_cli._owner_handoff_stage_error(
+        ValidationError("private validation detail"),
+        "export_offer",
+    )
+
+    assert error.message == "private validation detail"
+    assert error.details == {
+        "handoff_error_code": "validation_error",
+        "handoff_stage": "export_offer",
+    }
+
+
+def test_owner_handoff_stage_error_preserves_inner_bounded_tuple():
+    error = runtime_cli._owner_handoff_stage_error(
+        ConflictError(
+            "private body",
+            details={
+                "handoff_error_code": "registered_state_invalid",
+                "handoff_stage": "handoff_prepare",
+                "raw_nonce": "never emitted",
+            },
+        ),
+        "export_offer",
+    )
+
+    assert error.details == {
+        "handoff_error_code": "registered_state_invalid",
+        "handoff_stage": "handoff_prepare",
+        "raw_nonce": "never emitted",
+    }
+
+
 def test_digest_valid_malformed_owned_record_is_nonfatal_and_nonmutating(tmp_path):
     support = tmp_path / "support"
     support.mkdir(mode=0o700)

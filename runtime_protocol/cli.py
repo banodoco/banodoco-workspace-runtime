@@ -243,6 +243,17 @@ def _close_inherited_handoff_descriptors(*values: object) -> None:
             pass
 
 
+def _owner_handoff_stage_error(
+    exc: RuntimeErrorBase, stage: str
+) -> RuntimeErrorBase:
+    """Add only a bounded owner-A phase and machine code to a refusal."""
+
+    details = dict(exc.details) if isinstance(exc.details, dict) else {}
+    details.setdefault("handoff_error_code", exc.code)
+    details.setdefault("handoff_stage", stage)
+    return type(exc)(exc.message, details=details)
+
+
 def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
     """Serve one authenticated A-side handoff after SIGUSR1.
 
@@ -251,6 +262,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
     in-memory frame.
     """
 
+    failure_stage = "pointer_validation"
     pointer_path = support_root / _HANDOFF_POINTER
     try:
         observed = pointer_path.lstat()
@@ -277,8 +289,10 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
     released_handoff = False
     exported_fds: list[int] = []
     try:
+        failure_stage = "coordinator_connect"
         channel.settimeout(max(0.1, float(record["deadline_monotonic"]) - time.monotonic()))
         channel.connect(str(socket_path))
+        failure_stage = "coordinator_identity"
         if (
             peer_uid(channel) != os.getuid()
             or peer_pid(channel) != int(pointer["coordinator_pid"])
@@ -293,6 +307,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             "owner_birth_id": process_birth_identity(),
             "record_digest": record["record_digest"],
         })
+        failure_stage = "seal_challenge"
         challenge = receive_frame(channel)
         if challenge != {
             "version": TRANSFER_VERSION,
@@ -303,12 +318,14 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             raise RuntimeErrorBase("orderly handoff seal challenge is invalid")
         raw_nonce = secrets.token_hex(32)
         capability_digest = nonce_digest(raw_nonce)
+        failure_stage = "seal_capability"
         send_frame(channel, {
             "version": TRANSFER_VERSION,
             "command": "seal_capability",
             "handoff_id": record["handoff_id"],
             "nonce_digest": capability_digest,
         })
+        failure_stage = "seal_record"
         sealed_ack = receive_frame(channel)
         sealed = HandoffRecord(Path(str(pointer["record_path"]))).read()
         if sealed_ack != {
@@ -332,6 +349,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             "deadline_monotonic": record["deadline_monotonic"],
             "deadline_unix_ms": record["deadline_unix_ms"],
         }
+        failure_stage = "handoff_prepare"
         prepared = daemon.begin_orderly_worker_handoff(common)
         if prepared.get("state") == "active_work":
             send_frame(channel, {
@@ -341,6 +359,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             })
             return False
         prepared_handoff = True
+        failure_stage = "export_offer"
         send_frame(channel, {
             "version": TRANSFER_VERSION,
             "command": "seal_export",
@@ -348,6 +367,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             "sealed_record_digest": sealed["sealed_record_digest"],
             "export": prepared["export"],
         })
+        failure_stage = "export_seal"
         export_sealed = receive_frame(channel)
         bound_record = HandoffRecord(Path(str(pointer["record_path"]))).read()
         if (
@@ -361,6 +381,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             or bound_record.get("export") != prepared["export"]
         ):
             raise RuntimeErrorBase("orderly handoff export seal is invalid")
+        failure_stage = "worker_seal"
         daemon.seal_orderly_worker_handoff(
             str(record["handoff_id"]),
             {
@@ -394,6 +415,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             int(prepared["worker_control_fd"]),
             int(prepared["listener_fd"]),
         ]
+        failure_stage = "authority_transfer"
         send_authority_transfer(
             channel,
             transfer,
@@ -403,6 +425,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
         for descriptor in exported_fds:
             os.close(descriptor)
         exported_fds = []
+        failure_stage = "custody_accept"
         accepted = receive_frame(channel)
         if accepted != {
             "version": TRANSFER_VERSION,
@@ -413,6 +436,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             raise RuntimeErrorBase("orderly handoff custody acknowledgement is invalid")
         daemon.release_orderly_worker_handoff(record["handoff_id"])
         released_handoff = True
+        failure_stage = "owner_release"
         send_frame(channel, {
             "version": TRANSFER_VERSION,
             "command": "owner_released",
@@ -420,7 +444,7 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
             "owner_pid": os.getpid(),
         })
         return True
-    except BaseException:
+    except BaseException as exc:
         if prepared_handoff and not released_handoff:
             try:
                 daemon.cancel_orderly_worker_handoff(
@@ -431,6 +455,8 @@ def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
                 # prove rollback.  Its ordinary stop path performs the
                 # verified owned cleanup rather than exporting ambiguity.
                 daemon.stop()
+        if isinstance(exc, RuntimeErrorBase):
+            raise _owner_handoff_stage_error(exc, failure_stage) from exc
         raise
     finally:
         for descriptor in exported_fds:
