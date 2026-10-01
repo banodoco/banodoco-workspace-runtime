@@ -277,10 +277,7 @@ class LocalRuntimeBoundary:
             process._runtime_boundary_owner = self  # type: ignore[attr-defined]
             process._runtime_boundary_sole_reaper = True  # type: ignore[attr-defined]
             process._runtime_custody_broker = broker  # type: ignore[attr-defined]
-            publish_active_capability(
-                support_root / ACTIVE_CAPABILITY_NAME,
-                broker,
-            )
+            broker.wait_until_sealed()
             return process, broker
         except (CustodyError, OSError) as exc:
             if process is not None:
@@ -536,6 +533,17 @@ class LocalRuntimeBoundary:
         try:
             endpoint = self._wait_endpoint(support_root, self._process)
             discovery = self._read_discovery(support_root)
+            ready_identity = self._custody_identity(self._process.pid)
+            if ready_identity is None:
+                raise BootstrapError("Runtime ready owner identity is unavailable.")
+            _broker.bind_ready_token(
+                expected_pid=self._process.pid,
+                expected_identity=ready_identity,
+            )
+            publish_active_capability(
+                support_root / ACTIVE_CAPABILITY_NAME,
+                _broker,
+            )
         except Exception:
             self._terminate(self._process)
             token_file.unlink(missing_ok=True)
@@ -935,6 +943,14 @@ class LocalRuntimeBoundary:
                 "Runtime adopter cleanup is uncertain: sealed audit-token custody is unavailable."
             )
         try:
+            identity = self._custody_identity(process.pid)
+            if identity is None:
+                raise CustodyError("failed Runtime adopter identity is unavailable")
+            if broker.state == "sealed":
+                broker.bind_ready_token(
+                    expected_pid=process.pid,
+                    expected_identity=identity,
+                )
             broker.signal(signal.SIGTERM, expected_pid=process.pid)
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -1642,6 +1658,17 @@ class LocalRuntimeBoundary:
                             str(discovery.get("endpoint") or ""), bootstrap_token
                         )
                     ):
+                        ready_identity = self._custody_identity(process.pid)
+                        if ready_identity is None:
+                            raise BootstrapError("Runtime ready owner identity is unavailable.")
+                        _broker.bind_ready_token(
+                            expected_pid=process.pid,
+                            expected_identity=ready_identity,
+                        )
+                        publish_active_capability(
+                            support / ACTIVE_CAPABILITY_NAME,
+                            _broker,
+                        )
                         self._publish_active_adopted_owner(
                             support=support,
                             record=record,

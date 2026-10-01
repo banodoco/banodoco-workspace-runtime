@@ -1,7 +1,7 @@
 """Darwin audit-token custody for the long-lived local Runtime owner.
 
 The launcher owns the broker only until admission is sealed.  The durable
-owner-only sidecar and hash-chained ledger retain the exact post-exec audit
+owner-only sidecar and hash-chained ledger retain the exact final-ready audit
 token so a later installed qualification controller can signal that process
 incarnation without using a numeric PID signal.
 """
@@ -28,11 +28,13 @@ from typing import Callable, Mapping, Sequence
 
 
 PROTOCOL_VERSION = 1
-CAPABILITY_VERSION = "runtime.role-bound-custody/v1"
+CAPABILITY_VERSION = "runtime.role-bound-custody/v2"
 ACTIVE_CAPABILITY_NAME = "runtime-custody-active.json"
 SOL_LOCAL = 0
 LOCAL_PEERTOKEN = 0x006
 TOKEN_BYTES = 32
+TASK_AUDIT_TOKEN = 15
+TASK_AUDIT_TOKEN_COUNT = 8
 FRAME_LIMIT = 16 * 1024
 DARWIN_UNIX_SOCKET_PATH_MAX_BYTES = 103
 DARWIN_CUSTODY_SOCKET_PARENT = Path("/private/tmp")
@@ -153,6 +155,60 @@ def _peer_token(connection: socket.socket) -> dict[str, object]:
     token = _AuditToken.from_buffer_copy(raw)
     details = audit_token_details([int(value) for value in token.value])
     return {**details, "words": [int(value) for value in token.value]}
+
+
+def current_process_audit_token(pid: int) -> dict[str, object]:
+    """Read one live process token through a retained Mach task-name port."""
+
+    if sys.platform != "darwin" or int(pid) <= 0:
+        raise CustodyError("Darwin audit-token custody is unavailable")
+    library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    library.task_name_for_pid.argtypes = [
+        ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_uint32),
+    ]
+    library.task_name_for_pid.restype = ctypes.c_int
+    library.task_info.argtypes = [
+        ctypes.c_uint32, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_uint32),
+    ]
+    library.task_info.restype = ctypes.c_int
+    library.pid_for_task.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)]
+    library.pid_for_task.restype = ctypes.c_int
+    library.mach_port_deallocate.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    library.mach_port_deallocate.restype = ctypes.c_int
+    task_self = ctypes.c_uint32.in_dll(library, "mach_task_self_").value
+    task_name = ctypes.c_uint32(0)
+    if int(library.task_name_for_pid(task_self, int(pid), ctypes.byref(task_name))) != 0:
+        raise CustodyError("final-ready Runtime task-name port is unavailable")
+
+    def read_token() -> list[int]:
+        token = _AuditToken()
+        count = ctypes.c_uint32(TASK_AUDIT_TOKEN_COUNT)
+        result = int(library.task_info(
+            task_name.value,
+            TASK_AUDIT_TOKEN,
+            ctypes.cast(ctypes.byref(token), ctypes.POINTER(ctypes.c_int32)),
+            ctypes.byref(count),
+        ))
+        if result != 0 or count.value != TASK_AUDIT_TOKEN_COUNT:
+            raise CustodyError("final-ready Runtime audit token is unavailable")
+        return [int(value) for value in token.value]
+
+    try:
+        first = read_token()
+        bound_pid = ctypes.c_int(0)
+        if (
+            int(library.pid_for_task(task_name.value, ctypes.byref(bound_pid))) != 0
+            or bound_pid.value != int(pid)
+        ):
+            raise CustodyError("final-ready Runtime task port changed process")
+        second = read_token()
+        if first != second:
+            raise CustodyError("final-ready Runtime audit token changed while binding")
+        return {**audit_token_details(first), "words": first}
+    finally:
+        if int(library.mach_port_deallocate(task_self, task_name.value)) != 0:
+            raise CustodyError("final-ready Runtime task-name port release failed")
 
 
 def signal_audit_token(words: Sequence[int], signum: int) -> None:
@@ -313,7 +369,11 @@ class RoleBoundCustodyBroker:
         self._thread.join(timeout=self.timeout)
         if self.error is not None:
             raise CustodyError(f"custody registration failed: {self.error}") from self.error
-        if self._thread.is_alive() or self.state != "sealed" or self.registration is None:
+        if (
+            self._thread.is_alive()
+            or self.state not in {"sealed", "ready-bound"}
+            or self.registration is None
+        ):
             raise CustodyError("custody admission did not seal")
 
     def signal(self, signum: int, *, expected_pid: int) -> None:
@@ -321,7 +381,7 @@ class RoleBoundCustodyBroker:
 
         if int(signum) not in _admitted_signals():
             raise CustodyError("custody signal is outside the admitted set")
-        if self.state != "sealed" or self.registration is None:
+        if self.state not in {"sealed", "ready-bound"} or self.registration is None:
             raise CustodyError("custody admission is not sealed")
         identity = self.registration.get("identity")
         if not isinstance(identity, dict) or identity.get("pid") != expected_pid:
@@ -333,6 +393,56 @@ class RoleBoundCustodyBroker:
         ):
             raise CustodyError("registered process incarnation is absent or changed")
         signal_audit_token(self.registration["audit_token_words"], signum)  # type: ignore[arg-type]
+
+    def bind_ready_token(
+        self,
+        *,
+        expected_pid: int,
+        expected_identity: Mapping[str, object],
+        token_provider: Callable[[int], Mapping[str, object]] = current_process_audit_token,
+    ) -> None:
+        """Replace the provisional post-exec token with the final ready owner."""
+
+        if self.state != "sealed" or self.registration is None:
+            raise CustodyError("custody admission is not provisionally sealed")
+        pinned = self.registration.get("identity")
+        expected = {key: expected_identity.get(key) for key in ("pid", "birth_id", "uid")}
+        if (
+            not isinstance(pinned, Mapping)
+            or expected_pid != expected.get("pid")
+            or {key: pinned.get(key) for key in expected} != expected
+        ):
+            raise CustodyError("final-ready Runtime identity differs from provisional custody")
+        before = self.identity_provider(expected_pid)
+        if before is None or {key: before.get(key) for key in expected} != expected:
+            raise CustodyError("final-ready Runtime incarnation is unavailable")
+        token = dict(token_provider(expected_pid))
+        after = self.identity_provider(expected_pid)
+        if after is None or {key: after.get(key) for key in expected} != expected:
+            raise CustodyError("final-ready Runtime incarnation changed while binding")
+        words = token.get("words")
+        if (
+            token.get("pid") != expected_pid
+            or token.get("uid") != expected.get("uid")
+            or not isinstance(token.get("pidversion"), int)
+            or not isinstance(token.get("sha256"), str)
+            or not isinstance(words, list)
+            or audit_token_details(words) != {
+                key: token[key] for key in ("pid", "pidversion", "uid", "sha256")
+            }
+        ):
+            raise CustodyError("final-ready Runtime audit token is invalid")
+        self.registration.update({
+            "post_exec_audit_token_sha256": self.registration.get("audit_token_sha256"),
+            "post_exec_pidversion": self.registration.get("audit_token_pidversion"),
+            "identity": dict(after),
+            "audit_token_words": list(words),
+            "audit_token_sha256": token["sha256"],
+            "audit_token_pidversion": token["pidversion"],
+        })
+        self.sequence = 3
+        self.state = "ready-bound"
+        self._persist("readiness_token_bound")
 
     def _persist(self, event_name: str) -> None:
         snapshot = {
@@ -458,8 +568,9 @@ def child_exec_from_environment() -> int:
     if not isinstance(argv, list) or not argv or any(not isinstance(v, str) or "\0" in v for v in argv):
         raise CustodyError("custody target argv is invalid")
     # Session creation changes Darwin's audit-token pidversion.  Complete it
-    # before the broker samples the pre-exec token so the only pidversion
-    # transition after acknowledgement is the target exec itself.
+    # before the broker samples the pre-exec token.  The target may perform
+    # further launcher execs, so this provisional token is rebound only after
+    # Runtime readiness by the parent that retains the direct-child handle.
     if os.environ.get("ASTRID_RUNTIME_CUSTODY_START_SESSION") == "1":
         os.setsid()
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -496,8 +607,8 @@ def publish_active_capability(sidecar_path: Path, broker: RoleBoundCustodyBroker
     ledger = json.loads(raw)
     registration = ledger.get("registration") if isinstance(ledger, dict) else None
     identity = registration.get("identity") if isinstance(registration, dict) else None
-    if ledger.get("state") != "sealed" or not isinstance(identity, dict):
-        raise CustodyError("custody admission is not sealed")
+    if ledger.get("state") != "ready-bound" or not isinstance(identity, dict):
+        raise CustodyError("custody admission is not bound to the ready owner")
     reference = {
         "version": CAPABILITY_VERSION, "role": broker.role,
         "ledger_path": str(broker.ledger_path.resolve()),
@@ -577,7 +688,7 @@ def load_sealed_capability(
     if (
         not isinstance(ledger, dict) or set(ledger) != required_ledger
         or ledger["version"] != PROTOCOL_VERSION or ledger["role"] != reference["role"]
-        or ledger["state"] != "sealed" or ledger["sequence"] != 2
+        or ledger["state"] != "ready-bound" or ledger["sequence"] != 3
         or not isinstance(registration, dict) or not isinstance(identity, dict)
         or not isinstance(ledger.get("chain_digest"), str)
     ):
@@ -604,7 +715,7 @@ def load_sealed_capability(
         events.append(event)
     terminal_snapshot = {key: ledger[key] for key in required_ledger if key != "chain_digest"}
     if (
-        not events or events[-1]["event"] != "admission_sealed"
+        not events or events[-1]["event"] != "readiness_token_bound"
         or predecessor != ledger["chain_digest"]
         or events[-1]["snapshot"] != terminal_snapshot
     ):

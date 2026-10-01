@@ -114,7 +114,7 @@ class _Response:
         return json.dumps({"status": "ok", "protocol": "workspace.v1"}).encode()
 
 
-def _sealed_runtime_capability(tmp_path: Path, *, state: str = "sealed"):
+def _sealed_runtime_capability(tmp_path: Path, *, state: str = "ready-bound"):
     support = tmp_path / "support"
     ledger_root = support / "runtime-custody" / "run-a"
     ledger_root.mkdir(parents=True, mode=0o700)
@@ -125,6 +125,8 @@ def _sealed_runtime_capability(tmp_path: Path, *, state: str = "sealed"):
         "argv_digest": "sha256:" + "1" * 64,
         "pre_exec_audit_token_sha256": "sha256:" + "2" * 64,
         "pre_exec_pidversion": 6,
+        "post_exec_audit_token_sha256": "sha256:" + "5" * 64,
+        "post_exec_pidversion": 7,
         "audit_token_words": [1, os.getuid(), 3, 4, 5, 4242, 7, 8],
         "audit_token_sha256": "sha256:" + "3" * 64,
         "audit_token_pidversion": 8,
@@ -134,14 +136,14 @@ def _sealed_runtime_capability(tmp_path: Path, *, state: str = "sealed"):
         "run_id": "sha256:" + "4" * 64,
         "role": "runtime_owner",
         "state": state,
-        "sequence": 2,
+        "sequence": 3,
         "registration": registration,
         "ack": {"status": "registered"},
     }
     event = {
         "version": 1,
-        "event": "admission_sealed",
-        "sequence": 2,
+        "event": "readiness_token_bound",
+        "sequence": 3,
         "predecessor_digest": None,
         "snapshot_digest": custody_broker_module._digest_bytes(
             custody_broker_module._canonical(snapshot)
@@ -256,7 +258,7 @@ def test_custody_child_creates_session_before_pre_exec_registration(monkeypatch)
     )
 
 
-def test_custody_broker_seals_and_signals_only_actual_exec_token(tmp_path, monkeypatch):
+def test_custody_broker_rebinds_and_signals_only_final_ready_token(tmp_path, monkeypatch):
     if sys.platform != "darwin":
         pytest.skip("Darwin audit-token custody is unavailable")
     identity = {"pid": 4242, "birth_id": "birth-a", "uid": os.getuid()}
@@ -275,6 +277,13 @@ def test_custody_broker_seals_and_signals_only_actual_exec_token(tmp_path, monke
         "sha256": "sha256:" + "3" * 64,
         "words": [21, os.getuid(), 23, 24, 25, 4242, 27, 18],
     }
+    final_ready = {
+        "pid": 4242, "uid": os.getuid(), "pidversion": 19,
+        "words": [31, os.getuid(), 33, 34, 35, 4242, 37, 19],
+    }
+    final_ready["sha256"] = custody_broker_module.audit_token_details(
+        final_ready["words"]
+    )["sha256"]
     tokens = iter((pre, same_pidversion_decoy, actual_exec))
     monkeypatch.setattr(custody_broker_module, "_peer_token", lambda _connection: next(tokens))
     signalled = []
@@ -304,15 +313,21 @@ def test_custody_broker_seals_and_signals_only_actual_exec_token(tmp_path, monke
         ack = custody_broker_module._read_frame(connection)
         assert ack["status"] == "registered"
         broker.wait_until_sealed()
+        broker.bind_ready_token(
+            expected_pid=identity["pid"],
+            expected_identity=identity,
+            token_provider=lambda _pid: final_ready,
+        )
     finally:
         connection.close()
 
     assert broker.registration["pre_exec_pidversion"] == pre["pidversion"]
-    assert broker.registration["audit_token_pidversion"] == actual_exec["pidversion"]
-    assert broker.registration["audit_token_words"] == actual_exec["words"]
+    assert broker.registration["post_exec_pidversion"] == actual_exec["pidversion"]
+    assert broker.registration["audit_token_pidversion"] == final_ready["pidversion"]
+    assert broker.registration["audit_token_words"] == final_ready["words"]
     assert broker.registration["audit_token_words"] != same_pidversion_decoy["words"]
     broker.signal(signal.SIGTERM, expected_pid=identity["pid"])
-    assert signalled == [(actual_exec["words"], signal.SIGTERM)]
+    assert signalled == [(final_ready["words"], signal.SIGTERM)]
 
 
 def test_sealed_runtime_capability_signals_only_registered_audit_token(tmp_path):
@@ -411,7 +426,7 @@ def test_runtime_capability_rejects_symlink_stale_and_replaced_inputs(tmp_path):
         )
 
 
-def test_post_popen_custody_publish_failure_retains_handle_and_sealed_cleanup(
+def test_post_popen_provisional_custody_failure_retains_handle_and_cleanup(
     tmp_path, monkeypatch,
 ):
     calls = []
@@ -426,8 +441,16 @@ def test_post_popen_custody_publish_failure_retains_handle_and_sealed_cleanup(
             assert start_new_session is True
             return {}
 
+        def wait_until_sealed(self):
+            raise custody_broker_module.CustodyError("fsync failed")
+
         def signal(self, signum, *, expected_pid):
             calls.append((signum, expected_pid))
+
+        def bind_ready_token(self, *, expected_pid, expected_identity):
+            assert expected_pid == process.pid
+            assert expected_identity["pid"] == process.pid
+            self.state = "ready-bound"
 
     class Process:
         pid = 313
@@ -446,12 +469,12 @@ def test_post_popen_custody_publish_failure_retains_handle_and_sealed_cleanup(
         runtime_boundary_module, "custody_wrapper_argv", lambda _executable: ["wrapper"],
     )
     monkeypatch.setattr(runtime_boundary_module.subprocess, "Popen", lambda *_a, **_k: process)
-    monkeypatch.setattr(
-        runtime_boundary_module,
-        "publish_active_capability",
-        lambda *_args: (_ for _ in ()).throw(custody_broker_module.CustodyError("fsync failed")),
-    )
     boundary = LocalRuntimeBoundary()
+    monkeypatch.setattr(
+        boundary,
+        "_custody_identity",
+        lambda pid: {"pid": pid, "birth_id": "birth-313", "uid": os.getuid()},
+    )
     support = tmp_path / "support"
     support.mkdir()
     with pytest.raises(runtime_boundary_module.RuntimeCustodyLaunchUncertain) as raised:
