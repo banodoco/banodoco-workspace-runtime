@@ -66,6 +66,43 @@ def test_custody_socket_root_rejects_unsafe_parent(monkeypatch, tmp_path):
         custody_broker_module._create_compact_socket_root()
 
 
+@pytest.mark.parametrize("failure", ["bind", "listen"])
+def test_custody_constructor_failure_cleans_socket_resources(monkeypatch, tmp_path, failure):
+    socket_root = tmp_path / "socket-root"
+    socket_root.mkdir(mode=0o700)
+    monkeypatch.setattr(custody_broker_module.sys, "platform", "darwin")
+    monkeypatch.setattr(custody_broker_module, "_create_compact_socket_root", lambda: socket_root)
+
+    class Listener:
+        closed = False
+
+        def bind(self, path):
+            if failure == "bind":
+                raise OSError("injected bind failure")
+            Path(path).touch(mode=0o600)
+
+        def listen(self, _backlog):
+            if failure == "listen":
+                raise OSError("injected listen failure")
+
+        def settimeout(self, _timeout):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    listener = Listener()
+    monkeypatch.setattr(custody_broker_module.socket, "socket", lambda *_args: listener)
+    with pytest.raises(OSError, match=failure):
+        custody_broker_module.RoleBoundCustodyBroker(
+            role="runtime_owner", identity_provider=lambda _pid: None,
+            ledger_root=tmp_path / "ledger", timeout=1.0,
+        )
+    assert listener.closed is True
+    assert not (socket_root / "s").exists()
+    assert not socket_root.exists()
+
+
 class _Response:
     def __enter__(self):
         return self

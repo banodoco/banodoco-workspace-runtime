@@ -256,11 +256,23 @@ class RoleBoundCustodyBroker:
         self.ledger_path = ledger_root / "custody.ledger.json"
         self.socket_root = _create_compact_socket_root()
         self.socket_path = self.socket_root / "s"
-        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.listener.bind(str(self.socket_path))
-        os.chmod(self.socket_path, 0o600)
-        self.listener.listen(1)
-        self.listener.settimeout(timeout)
+        listener: socket.socket | None = None
+        try:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(self.socket_path))
+            os.chmod(self.socket_path, 0o600)
+            listener.listen(1)
+            listener.settimeout(timeout)
+        except BaseException:
+            if listener is not None:
+                listener.close()
+            self.socket_path.unlink(missing_ok=True)
+            try:
+                self.socket_root.rmdir()
+            except OSError:
+                pass
+            raise
+        self.listener = listener
         self.sequence = 0
         self.chain_head: str | None = None
         self.state = "accepting"
