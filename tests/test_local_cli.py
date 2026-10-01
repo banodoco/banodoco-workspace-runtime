@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
+import urllib.error
 
 from banodoco_local import cli
 from banodoco_local.paths import RuntimePaths
@@ -67,3 +69,51 @@ def test_reboot_is_safe_disabled_and_resume_is_typed(monkeypatch, tmp_path, caps
     resume_args = ["resume", "--home", str(tmp_path), "--checkpoint-id", "c", "--nonce", "n", "--authorization", "n", "--runtime-epoch", "7", "--json"]
     assert cli.main(resume_args) == 0
     assert fake.calls[-1][0] == "resume"
+
+
+def test_start_worker_preserves_only_bounded_worker_rejection_diagnostic(monkeypatch, tmp_path, capsys):
+    paths = RuntimePaths.sandbox(tmp_path)
+    monkeypatch.setattr(cli, "_validate_support_paths", lambda _paths: None)
+    monkeypatch.setattr(cli, "_read_support_json", lambda _path: {"endpoint": "http://127.0.0.1:4123"})
+    monkeypatch.setattr(cli, "_credential", lambda _paths: "not-retained")
+    detail = {
+        "code": "conflict",
+        "message": "prepared Worker rejected the operation",
+        "details": {
+            "handoff_error_code": "worker_configuration",
+            "handoff_stage": "prepare",
+            "secret": "must-not-cross-the-cli-boundary",
+        },
+    }
+    error = urllib.error.HTTPError(
+        "http://127.0.0.1:4123/v1/control/local-worker/start",
+        409,
+        "Conflict",
+        {},
+        io.BytesIO(json.dumps(detail).encode()),
+    )
+    monkeypatch.setattr(cli.urllib.request, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(cli, "_paths", lambda _args: paths)
+
+    assert cli.main([
+        "start-worker", "--data-root", str(tmp_path), "--profile", "astrid",
+        "--expected-workspace-uuid", "workspace", "--json",
+    ]) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "ok": False,
+        "error": "prepared Worker rejected the operation",
+        "error_code": "worker_configuration",
+        "error_stage": "prepare",
+        "operation": "start-worker",
+    }
+
+
+def test_start_worker_rejection_diagnostic_fails_closed_on_unbounded_values():
+    error = cli._LocalWorkerStartError(
+        "prepared Worker rejected the operation",
+        error_code="secret: value",
+        error_stage="prepare\nsecret",
+    )
+    assert error.error_code == "worker_rejected"
+    assert error.error_stage == "worker_control"

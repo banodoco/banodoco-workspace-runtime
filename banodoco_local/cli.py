@@ -7,6 +7,7 @@ from dataclasses import asdict, is_dataclass
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any, Mapping
 import urllib.error
 import urllib.request
@@ -51,6 +52,23 @@ class UnconfiguredBoundary:
 
     def is_pid_alive(self, pid):
         return False
+
+
+class _LocalWorkerStartError(BootstrapError):
+    """Credential-safe structured failure from the owner Worker-start route."""
+
+    def __init__(self, message: str, *, error_code: object, error_stage: object) -> None:
+        super().__init__(message)
+        self.error_code = (
+            error_code
+            if isinstance(error_code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code)
+            else "worker_rejected"
+        )
+        self.error_stage = (
+            error_stage
+            if isinstance(error_stage, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_stage)
+            else "worker_control"
+        )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -266,7 +284,12 @@ def _start_local_worker(paths: RuntimePaths, *, profile_id: str, expected_worksp
             detail = json.loads(exc.read().decode("utf-8"))
         except Exception:
             detail = {"message": str(exc)}
-        raise BootstrapError(str(detail.get("message") or detail)) from exc
+        bounded = detail.get("details") if isinstance(detail.get("details"), Mapping) else {}
+        raise _LocalWorkerStartError(
+            str(detail.get("message") or "Runtime rejected local Worker launch"),
+            error_code=bounded.get("handoff_error_code"),
+            error_stage=bounded.get("handoff_stage"),
+        ) from exc
     if not isinstance(value, Mapping):
         raise BootstrapError("Runtime returned invalid local Worker launch metadata.")
     return value
@@ -437,6 +460,15 @@ def main(argv: list[str] | None = None) -> int:
             value = _client(paths).recover_realm(expected_realm_id=args.expected_realm_id, expected_version=args.expected_version, confirmation=args.confirmation, noninteractive=args.non_interactive)
             _emit(value, json_mode=args.json)
             return 0
+    except _LocalWorkerStartError as exc:
+        _emit({
+            "ok": False,
+            "error": str(exc),
+            "error_code": exc.error_code,
+            "error_stage": exc.error_stage,
+            "operation": "start-worker",
+        }, json_mode=True)
+        return 1
     except (BootstrapError, ValueError, OSError) as exc:
         _emit({"ok": False, "error": str(exc)}, json_mode=True)
         return 1
