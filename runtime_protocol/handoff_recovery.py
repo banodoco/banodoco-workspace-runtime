@@ -456,6 +456,7 @@ def validate_pending_adopter_request(
     record_digest: str,
     predecessor_active_ref_digest: str | None,
     old_owner: Mapping[str, Any],
+    old_runtime: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Authenticate B's already-framed request without taking recovery locks."""
 
@@ -476,7 +477,13 @@ def validate_pending_adopter_request(
             )
         )
         or not isinstance(old_owner, Mapping)
-        or not {"pid", "birth_id"}.issubset(old_owner)
+        or set(old_owner) != {"pid", "birth_id"}
+        or isinstance(old_owner.get("pid"), bool)
+        or not isinstance(old_owner.get("pid"), int)
+        or old_owner["pid"] <= 0
+        or not isinstance(old_owner.get("birth_id"), str)
+        or not old_owner["birth_id"]
+        or not isinstance(old_runtime, Mapping)
     ):
         raise ConflictError("pending adopter request binding is invalid")
     pointer = _pointer_snapshot(support_root)
@@ -489,13 +496,29 @@ def validate_pending_adopter_request(
         record = HandoffRecord(record_path).read()
     except Exception as exc:
         raise ConflictError("pending adopter handoff record is invalid") from exc
+    record_owner = record.get("old_owner")
+    record_runtime = (
+        record_owner.get("runtime") if isinstance(record_owner, Mapping) else None
+    )
     if (
         record.get("state") != "COMMITTED_ORPHAN"
         or record.get("handoff_id") != handoff_id
         or record.get("record_digest") != record_digest
         or record.get("predecessor_active_ref_digest")
         != predecessor_active_ref_digest
-        or record.get("old_owner") != dict(old_owner)
+        or not isinstance(record_owner, Mapping)
+        or set(record_owner) != {
+            "pid", "birth_id", "runtime_instance_id", "runtime"
+        }
+        or {
+            "pid": record_owner.get("pid"),
+            "birth_id": record_owner.get("birth_id"),
+        }
+        != dict(old_owner)
+        or not isinstance(record_runtime, Mapping)
+        or dict(record_runtime) != dict(old_runtime)
+        or record_owner.get("runtime_instance_id")
+        != old_runtime.get("runtime_instance_id")
         or record.get("adopter") is not None
     ):
         raise ConflictError("pending adopter handoff record binding is invalid")

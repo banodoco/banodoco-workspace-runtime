@@ -200,6 +200,26 @@ def _write_committed_record(
     return value
 
 
+def _runtime_identity(instance="runtime-a"):
+    return {
+        "endpoint": "http://127.0.0.1:8188",
+        "protocol": "workspace.v1",
+        "schema_digest": "sha256:" + "9" * 64,
+        "runtime_epoch": 1,
+        "runtime_instance_id": instance,
+        "runtime_session_id": "session-a",
+    }
+
+
+def _record_owner(pid, birth, runtime):
+    return {
+        "pid": pid,
+        "birth_id": birth,
+        "runtime_instance_id": runtime["runtime_instance_id"],
+        "runtime": runtime,
+    }
+
+
 def _resolution_fixture(tmp_path):
     root = tmp_path / "realm"
     support = tmp_path / "support"
@@ -1079,12 +1099,13 @@ def test_first_handoff_pending_adopter_accepts_absent_predecessor_reference(tmp_
     birth = process_birth_identity()
     handoff_id = "first"
     record_path = support / f"orderly-handoff-record-{handoff_id}.json"
+    old_runtime = _runtime_identity()
     record = _write_committed_record(
         record_path,
         support,
         handoff_id=handoff_id,
         predecessor_digest=None,
-        old_owner={"pid": os.getpid(), "birth_id": birth},
+        old_owner=_record_owner(os.getpid(), birth, old_runtime),
     )
     _write_handoff_pointer(
         support, handoff_id=handoff_id, record_path=record_path
@@ -1099,6 +1120,7 @@ def test_first_handoff_pending_adopter_accepts_absent_predecessor_reference(tmp_
         inherited_listener_fd=inherited_fd,
         handoff_predecessor_active_ref_digest=None,
         handoff_predecessor_old_owner={"pid": os.getpid(), "birth_id": birth},
+        handoff_predecessor_old_runtime=old_runtime,
         handoff_id=handoff_id,
         handoff_record_path=record_path,
         handoff_record_path_raw=str(record_path),
@@ -1150,12 +1172,13 @@ def test_authenticated_adopter_start_does_not_reacquire_held_recovery_locks(tmp_
     active.chmod(0o600)
     handoff_id = "new"
     record_path = support / f"orderly-handoff-record-{handoff_id}.json"
+    old_runtime = _runtime_identity()
     committed = _write_committed_record(
         record_path,
         support,
         handoff_id=handoff_id,
         predecessor_digest=reference["reference_digest"],
-        old_owner={"pid": os.getpid(), "birth_id": birth},
+        old_owner=_record_owner(os.getpid(), birth, old_runtime),
     )
     _write_handoff_pointer(
         support, handoff_id=handoff_id, record_path=record_path
@@ -1189,6 +1212,7 @@ daemon = RuntimeDaemon(
     root, support_root=support, inherited_listener_fd=listener_fd,
     handoff_predecessor_active_ref_digest=config.get("predecessor"),
     handoff_predecessor_old_owner=config.get("old_owner"),
+    handoff_predecessor_old_runtime=config.get("old_runtime"),
     handoff_id=config.get("handoff_id"),
     handoff_record_path=record_path,
     handoff_record_path_raw=config.get("record_path_raw"),
@@ -1207,6 +1231,7 @@ finally:
             "record_digest": committed["record_digest"],
             "predecessor": reference["reference_digest"],
             "old_owner": {"pid": os.getpid(), "birth_id": birth},
+            "old_runtime": old_runtime,
             "expected_listener": list(listener.getsockname()),
         }
         pipe_read, pipe_write = os.pipe()
@@ -1234,6 +1259,9 @@ finally:
             ("wrong-predecessor", {**exact, "predecessor": "sha256:" + "0" * 64}),
             ("wrong-owner-pid", {**exact, "old_owner": {"pid": os.getpid() + 1, "birth_id": birth}}),
             ("wrong-owner-birth", {**exact, "old_owner": {"pid": os.getpid(), "birth_id": "wrong"}}),
+            ("wrong-runtime", {**exact, "old_runtime": {**old_runtime, "runtime_instance_id": "wrong"}}),
+            ("wrong-runtime-type", {**exact, "old_runtime": ["wrong"]}),
+            ("extra-old-owner-field", {**exact, "old_owner": {"pid": os.getpid(), "birth_id": birth, "runtime": old_runtime}}),
             ("empty-id", {**exact, "handoff_id": ""}),
             ("empty-digest", {**exact, "record_digest": ""}),
             ("whitespace-id", {**exact, "handoff_id": "   "}),

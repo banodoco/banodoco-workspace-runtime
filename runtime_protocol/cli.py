@@ -1058,6 +1058,9 @@ def main(argv=None):
             handoff_predecessor_old_owner=(
                 handoff_frame.get("old_owner") if handoff_supplied else None
             ),
+            handoff_predecessor_old_runtime=(
+                handoff_frame.get("old_runtime") if handoff_supplied else None
+            ),
             handoff_id=(
                 handoff_record_value.get("handoff_id") if handoff_supplied else None
             ),

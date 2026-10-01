@@ -114,7 +114,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, production_worker_credentials=False, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, inherited_listener_fd=None, handoff_registration_actor=None, handoff_registration_bodies=None, handoff_predecessor_active_ref_digest=None, handoff_predecessor_old_owner=None, handoff_id=None, handoff_record_path=None, handoff_record_path_raw=None, handoff_record_digest=None, handoff_expected_listener=None):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, production_worker_credentials=False, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None, inherited_listener_fd=None, handoff_registration_actor=None, handoff_registration_bodies=None, handoff_predecessor_active_ref_digest=None, handoff_predecessor_old_owner=None, handoff_predecessor_old_runtime=None, handoff_id=None, handoff_record_path=None, handoff_record_path_raw=None, handoff_record_digest=None, handoff_expected_listener=None):
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("runtime daemon only binds to loopback")
         self.root = _authority_path(root, "realm root").resolve()
@@ -164,6 +164,7 @@ class RuntimeDaemon:
         self.handoff_pending = self.inherited_listener_fd is not None
         self.handoff_predecessor_active_ref_digest = handoff_predecessor_active_ref_digest
         self.handoff_predecessor_old_owner = handoff_predecessor_old_owner
+        self.handoff_predecessor_old_runtime = handoff_predecessor_old_runtime
         self.handoff_id = handoff_id
         self.handoff_record_path = handoff_record_path
         self.handoff_record_path_raw = handoff_record_path_raw
@@ -340,6 +341,7 @@ class RuntimeDaemon:
             self.handoff_record_path_raw,
             self.handoff_record_digest,
             self.handoff_predecessor_old_owner,
+            self.handoff_predecessor_old_runtime,
             self.handoff_expected_listener,
         )
         required_present = tuple(value is not None for value in required_pending_binding)
@@ -353,7 +355,7 @@ class RuntimeDaemon:
         if all(required_present):
             (
                 fd, handoff_id, record_path, record_path_raw, record_digest,
-                old_owner, expected_listener,
+                old_owner, old_runtime, expected_listener,
             ) = required_pending_binding
             expected_record_path = (
                 self.support_root / f"orderly-handoff-record-{handoff_id}.json"
@@ -385,12 +387,14 @@ class RuntimeDaemon:
                     )
                 )
                 or type(old_owner) is not dict
+                or set(old_owner) != {"pid", "birth_id"}
                 or isinstance(old_owner.get("pid"), bool)
                 or not isinstance(old_owner.get("pid"), int)
                 or old_owner["pid"] <= 0
                 or not isinstance(old_owner.get("birth_id"), str)
                 or not old_owner["birth_id"]
                 or old_owner["birth_id"] != old_owner["birth_id"].strip()
+                or type(old_runtime) is not dict
                 or type(expected_listener) is not tuple
                 or len(expected_listener) != 2
                 or expected_listener[0] not in {"127.0.0.1", "::1"}
@@ -462,6 +466,7 @@ class RuntimeDaemon:
                     self.handoff_predecessor_active_ref_digest
                 ),
                 old_owner=self.handoff_predecessor_old_owner,
+                old_runtime=self.handoff_predecessor_old_runtime,
             )
             self._assert_active_adoption_start_allowed()
         else:
