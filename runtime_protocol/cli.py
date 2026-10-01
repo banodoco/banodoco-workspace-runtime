@@ -512,7 +512,7 @@ def _adopter_handoff_frame(args) -> tuple[socket.socket, dict, tuple[str, int]]:
                 and frame.get("export_sealed_digest") == record.get("export_sealed_digest")
                 and frame.get("committed_record_digest") == record.get("record_digest")
                 and frame.get("export") == record.get("export")
-                and frame.get("old_owner") == record.get("old_owner")
+                and _adopter_owner_binding_matches(record, frame)
                 and contender_digest == record.get("nonce_digest")
             )
             if valid:
@@ -542,6 +542,40 @@ def _adopter_handoff_frame(args) -> tuple[socket.socket, dict, tuple[str, int]]:
         )
         raise
     return capability, frame, expected
+
+
+def _adopter_owner_binding_matches(record: object, frame: object) -> bool:
+    """Bind A's compact transfer identity to the full signed owner record.
+
+    The wire frame intentionally carries only A's PID and birth marker while
+    the durable record also binds A's Runtime identity.  Compare the compact
+    projection exactly and independently bind the full Runtime object rather
+    than requiring the differently shaped objects to be byte-equal.
+    """
+
+    if not isinstance(record, dict) or not isinstance(frame, dict):
+        return False
+    recorded_owner = record.get("old_owner")
+    transferred_owner = frame.get("old_owner")
+    transferred_runtime = frame.get("old_runtime")
+    if (
+        not isinstance(recorded_owner, dict)
+        or set(recorded_owner) != {"pid", "birth_id", "runtime_instance_id", "runtime"}
+        or not isinstance(transferred_owner, dict)
+        or set(transferred_owner) != {"pid", "birth_id"}
+        or not isinstance(transferred_runtime, dict)
+        or recorded_owner.get("runtime") != transferred_runtime
+    ):
+        return False
+    return (
+        transferred_owner
+        == {
+            "pid": recorded_owner.get("pid"),
+            "birth_id": recorded_owner.get("birth_id"),
+        }
+        and recorded_owner.get("runtime_instance_id")
+        == transferred_runtime.get("runtime_instance_id")
+    )
 
 
 def _retry_same_adopter_step(deadline_monotonic: float, operation):

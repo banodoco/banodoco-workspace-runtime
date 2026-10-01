@@ -670,6 +670,18 @@ def test_wrong_committed_orphan_contender_is_nonmutating_then_valid_b_adopts(tmp
     directory.chmod(0o700)
     record = HandoffRecord(directory / "record.json")
     raw_nonce = "n" * 32
+    worker_runtime, worker_peer, listener = _authorities()
+    endpoint = listener.getsockname()
+    old_runtime = {
+        "endpoint": f"http://{endpoint[0]}:{endpoint[1]}",
+        "runtime_instance_id": "runtime-a",
+    }
+    recorded_old_owner = {
+        "pid": os.getpid(),
+        "birth_id": "owner-a-birth",
+        "runtime_instance_id": "runtime-a",
+        "runtime": old_runtime,
+    }
     old_owner = {"pid": os.getpid(), "birth_id": "owner-a-birth"}
     deadline_monotonic = time.monotonic() + 30
     deadline_unix_ms = int(time.time() * 1000) + 30_000
@@ -684,7 +696,7 @@ def test_wrong_committed_orphan_contender_is_nonmutating_then_valid_b_adopts(tmp
         "deadline_unix_ms": deadline_unix_ms,
         "nonce_digest": None,
         "sealed_record_digest": None,
-        "old_owner": old_owner,
+        "old_owner": recorded_old_owner,
         "export": None,
         "export_sealed_digest": None,
         "adopter": None,
@@ -714,9 +726,7 @@ def test_wrong_committed_orphan_contender_is_nonmutating_then_valid_b_adopts(tmp
         expected_record_digest=prepared["record_digest"],
         updates={"owner_a_released": True},
     )
-    worker_runtime, worker_peer, listener = _authorities()
     coordinator, adopter_channel = socket.socketpair()
-    endpoint = listener.getsockname()
     valid = {
         "version": TRANSFER_VERSION,
         "command": "adopt",
@@ -729,7 +739,7 @@ def test_wrong_committed_orphan_contender_is_nonmutating_then_valid_b_adopts(tmp
         "committed_record_digest": committed["record_digest"],
         "export": export,
         "old_owner": old_owner,
-        "old_runtime": {"endpoint": f"http://{endpoint[0]}:{endpoint[1]}"},
+        "old_runtime": old_runtime,
     }
     observed = {}
 
@@ -777,7 +787,14 @@ def test_wrong_committed_orphan_contender_is_nonmutating_then_valid_b_adopts(tmp
         worker_fd = worker_runtime.detach()
         listener_fd = listener.detach()
         bad = {**valid, "old_runtime": {"endpoint": "https://not-loopback.invalid"}}
-        sender2 = threading.Thread(target=lambda: handoff.send_frame(coordinator2, bad))
+        rejected = []
+
+        def send_bad_runtime():
+            handoff.send_frame(coordinator2, bad)
+            rejected.append(handoff.receive_frame(coordinator2))
+            coordinator2.close()
+
+        sender2 = threading.Thread(target=send_bad_runtime)
         sender2.start()
         args2 = SimpleNamespace(
             handoff_record=str(record.path),
@@ -785,10 +802,15 @@ def test_wrong_committed_orphan_contender_is_nonmutating_then_valid_b_adopts(tmp
             handoff_listener_fd=listener_fd,
             handoff_capability_fd=capability_fd,
         )
-        with pytest.raises(RuntimeErrorBase, match="endpoint"):
+        with pytest.raises(RuntimeErrorBase, match="channel closed|could not be read"):
             runtime_cli._adopter_handoff_frame(args2)
         sender2.join(timeout=2)
-        coordinator2.close()
+        assert rejected == [{
+            "version": TRANSFER_VERSION,
+            "command": "adopt_rejected",
+            "handoff_id": "handoff-contender",
+            "record_digest": committed["record_digest"],
+        }]
         for descriptor in (worker_fd, listener_fd, capability_fd):
             with pytest.raises(OSError):
                 os.fstat(descriptor)
@@ -798,3 +820,43 @@ def test_wrong_committed_orphan_contender_is_nonmutating_then_valid_b_adopts(tmp
         worker_runtime.close()
         worker_peer.close()
         listener.close()
+
+
+def test_adopter_owner_binding_compares_projection_and_full_runtime():
+    runtime = {
+        "endpoint": "http://127.0.0.1:61234",
+        "runtime_instance_id": "runtime-a",
+        "protocol": "workspace.v1",
+    }
+    record = {
+        "old_owner": {
+            "pid": 1234,
+            "birth_id": "birth-a",
+            "runtime_instance_id": "runtime-a",
+            "runtime": runtime,
+        },
+    }
+    frame = {
+        "old_owner": {"pid": 1234, "birth_id": "birth-a"},
+        "old_runtime": runtime,
+    }
+
+    assert runtime_cli._adopter_owner_binding_matches(record, frame)
+    assert not runtime_cli._adopter_owner_binding_matches(
+        record, {**frame, "old_owner": {"pid": 1235, "birth_id": "birth-a"}},
+    )
+    assert not runtime_cli._adopter_owner_binding_matches(
+        record, {**frame, "old_owner": {"pid": 1234, "birth_id": "birth-b"}},
+    )
+    assert not runtime_cli._adopter_owner_binding_matches(
+        record, {**frame, "old_runtime": {**runtime, "protocol": "changed"}},
+    )
+    assert not runtime_cli._adopter_owner_binding_matches(
+        {
+            "old_owner": {
+                **record["old_owner"],
+                "runtime_instance_id": "runtime-b",
+            },
+        },
+        frame,
+    )
