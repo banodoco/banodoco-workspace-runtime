@@ -207,6 +207,57 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         self._handoff_lock = threading.Lock()
         self.cleanup_uncertain: str | None = None
 
+    @staticmethod
+    def _record_async_control_failure(
+        handle: _PreparedWorker,
+        *,
+        fallback_code: str,
+        fallback_stage: str,
+    ) -> None:
+        """Retain only the Worker's bounded refusal code and stage.
+
+        The private peer can fail between the liveness watcher's probes and
+        owner-A's first handoff request.  Consuming its already-buffered error
+        frame here avoids collapsing that failure into an unactionable EOF,
+        while never retaining its free-form body.
+        """
+
+        error_code = fallback_code
+        error_stage = fallback_stage
+        try:
+            readable, _, exceptional = select.select(
+                [handle.control], [], [handle.control], 0
+            )
+            if readable and not exceptional:
+                response = _frame_receive(handle.control)
+                candidate_code = response.get("error_code")
+                candidate_stage = response.get("error_stage")
+                if (
+                    response.get("version") == CONTROL_VERSION
+                    and response.get("status") == "error"
+                    and isinstance(candidate_code, str)
+                    and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate_code)
+                    and isinstance(candidate_stage, str)
+                    and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", candidate_stage)
+                ):
+                    error_code = candidate_code
+                    error_stage = candidate_stage
+        except (ConflictError, OSError, ValueError):
+            pass
+        print(
+            json.dumps(
+                {
+                    "error_code": error_code,
+                    "event": "prepared_worker_async_refusal",
+                    "stage": error_stage,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
     def set_prepare_cancel_event(self, event: threading.Event) -> None:
         self._prepare_cancel = event
 
@@ -249,7 +300,21 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         }
 
     def _rpc_unlocked(self, handle: _PreparedWorker, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if handle.closed or handle.worker.poll() is not None:
+        if handle.closed:
+            raise ConflictError("prepared Worker is not alive")
+        returncode = handle.worker.poll()
+        if returncode is not None:
+            self._record_async_control_failure(
+                handle,
+                fallback_code=(
+                    "prepared_worker_exit_0"
+                    if returncode == 0
+                    else "prepared_worker_exit_78"
+                    if returncode == 78
+                    else "prepared_worker_exit_other"
+                ),
+                fallback_stage=str(payload.get("command") or "worker_control"),
+            )
             raise ConflictError("prepared Worker is not alive")
         if self._birth(handle.worker.pid) != handle.birth_id:
             raise ConflictError("prepared Worker identity changed")
@@ -907,6 +972,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 # With no RPC in flight, either EOF or unsolicited bytes are
                 # a protocol/control-channel failure. Do not leave bytes
                 # perpetually buffered and mistake a closed peer for liveness.
+                self._record_async_control_failure(
+                    handle,
+                    fallback_code="worker_control_unavailable",
+                    fallback_stage="liveness",
+                )
                 return False
             return True
         except (OSError, ValueError):

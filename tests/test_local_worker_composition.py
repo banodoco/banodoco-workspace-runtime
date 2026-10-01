@@ -878,6 +878,47 @@ def test_control_probe_rejects_buffered_data_from_closed_peer(tmp_path, monkeypa
         parent.close()
 
 
+def test_control_probe_retains_only_bounded_async_worker_failure(
+    tmp_path, monkeypatch, capsys
+):
+    profile, _unused = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    parent, peer = socket.socketpair()
+    handle = _PreparedWorker(Worker(), "birth", parent, {}, tmp_path / "config.json")
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+    _frame_send(
+        peer,
+        {
+            "version": CONTROL_VERSION,
+            "status": "error",
+            "error": "secret nonce must never be retained",
+            "error_code": "host_control_closed",
+            "error_stage": "control",
+        },
+    )
+    try:
+        assert preparer.control_alive(handle) is False
+        retained = capsys.readouterr().err
+        assert json.loads(retained) == {
+            "error_code": "host_control_closed",
+            "event": "prepared_worker_async_refusal",
+            "stage": "control",
+        }
+        assert "secret" not in retained
+        assert "nonce" not in retained
+    finally:
+        peer.close()
+        parent.close()
+
+
 def _worker_ack(request, *, status="prepared", phase="paused", bad_hash=False):
     value = {
         "version": CONTROL_VERSION,
