@@ -17,7 +17,8 @@ import pytest
 
 import runtime_protocol.local_worker_handoff as handoff
 from runtime_protocol import cli as runtime_cli
-from runtime_protocol.errors import ConflictError, RuntimeErrorBase
+from runtime_protocol import daemon as runtime_daemon
+from runtime_protocol.errors import ConflictError, RuntimeErrorBase, ValidationError
 from runtime_protocol.local_worker_handoff import (
     TRANSFER_VERSION,
     peer_uid,
@@ -277,6 +278,36 @@ def test_owner_handoff_emits_only_bounded_worker_stage_and_code(
         "event": "orderly_handoff_owner_a_refused",
         "stage": "handoff_prepare",
     }
+
+
+def test_runtime_handoff_stage_error_maps_validation_without_private_details():
+    error = runtime_daemon._handoff_stage_error(
+        ValidationError("credential generation is inconsistent"),
+        "handoff_fence",
+    )
+
+    assert error.message == "credential generation is inconsistent"
+    assert error.details == {
+        "handoff_error_code": "credential_generation_inconsistent",
+        "handoff_stage": "handoff_fence",
+    }
+
+
+def test_runtime_handoff_stage_error_preserves_worker_bounded_tuple():
+    error = runtime_daemon._handoff_stage_error(
+        ConflictError(
+            "private body",
+            details={
+                "handoff_error_code": "host_ack_binding",
+                "handoff_stage": "handoff_prepare",
+                "private": "not emitted by the caller",
+            },
+        ),
+        "handoff_fence",
+    )
+
+    assert error.details["handoff_error_code"] == "host_ack_binding"
+    assert error.details["handoff_stage"] == "handoff_prepare"
 
 
 def test_digest_valid_malformed_owned_record_is_nonfatal_and_nonmutating(tmp_path):

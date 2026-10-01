@@ -16,7 +16,7 @@ from .auth import CredentialStore
 from .catalog import LiveDiscovery, RealmCatalog, process_birth_identity
 from .backup import restore_backup, verify_backup, verify_restore_candidate
 from .dirfd import capture_parent, close_pinned, validate_parent
-from .errors import ConflictError
+from .errors import ConflictError, RuntimeErrorBase
 from .handoff_recovery import (
     recover_aborted_predecessor_resolution,
     validate_pending_adopter_request,
@@ -43,6 +43,27 @@ WORKER_SCOPES = (
     "objects:write",
 )
 _HANDOFF_REGISTRATION_PATHS = ("/v1/capabilities", "/v1/executors")
+
+_BOUNDED_RUNTIME_HANDOFF_ERRORS = {
+    "cannot establish runtime interruption safety: task/attempt tables are missing":
+        "interruption_schema_missing",
+    "credential generation is unreadable": "credential_generation_unreadable",
+    "credential generation marker is invalid": "credential_generation_marker_invalid",
+    "credential generation is inconsistent": "credential_generation_inconsistent",
+    "handoff_id is required": "handoff_id_missing",
+}
+
+
+def _handoff_stage_error(exc: RuntimeErrorBase, stage: str) -> RuntimeErrorBase:
+    """Add one credential-safe phase/code without exposing refusal details."""
+
+    details = dict(exc.details) if isinstance(exc.details, Mapping) else {}
+    details.setdefault(
+        "handoff_error_code",
+        _BOUNDED_RUNTIME_HANDOFF_ERRORS.get(str(exc), exc.code),
+    )
+    details.setdefault("handoff_stage", stage)
+    return type(exc)(exc.message, details=details)
 
 
 def handoff_registration_admission(registered_state: Mapping[str, object]):
@@ -599,13 +620,19 @@ class RuntimeDaemon:
 
         if self.local_worker_launcher is None or self.httpd is None or self.service is None:
             raise ConflictError("orderly Worker handoff requires an active local Worker Runtime")
-        first_audit = inspect_interruption_state(self.root)
+        try:
+            first_audit = inspect_interruption_state(self.root)
+        except RuntimeErrorBase as exc:
+            raise _handoff_stage_error(exc, "interruption_audit") from exc
         if not first_audit["safe"]:
             raise ConflictError(
                 "runtime lifecycle refused while work is active or unreconciled",
                 details=first_audit,
             )
-        facts = self.local_worker_launcher.orderly_handoff_source_facts()
+        try:
+            facts = self.local_worker_launcher.orderly_handoff_source_facts()
+        except RuntimeErrorBase as exc:
+            raise _handoff_stage_error(exc, "handoff_source_facts") from exc
         request = {
             **dict(common),
             "command": "handoff_prepare",
@@ -613,14 +640,19 @@ class RuntimeDaemon:
             "receipt_evidence_digest": facts["receipt"]["evidence_digest"],
             "credential_generation": facts["credential_generation"],
         }
-        prepared = self.local_worker_launcher.prepare_orderly_handoff(request)
+        try:
+            prepared = self.local_worker_launcher.prepare_orderly_handoff(request)
+        except RuntimeErrorBase as exc:
+            raise _handoff_stage_error(exc, "handoff_prepare") from exc
         if prepared["state"] == "active_work":
             return {"state": "active_work", "audit": first_audit, **prepared}
         handoff_id = str(common["handoff_id"])
+        failure_stage = "handoff_fence"
         try:
             with interruption_fence(self.root) as fenced_audit:
                 fenced = self.local_worker_launcher.fence_orderly_handoff(handoff_id)
                 self.httpd.set_admission_mode("closed")
+            failure_stage = "handoff_export"
             worker_fd, export = self.local_worker_launcher.export_orderly_handoff(handoff_id)
             listener_fd = os.dup(self.httpd.socket.fileno())
             os.set_inheritable(listener_fd, False)
@@ -639,6 +671,13 @@ class RuntimeDaemon:
                 "listener_fd": listener_fd,
                 "old_runtime": request["old_runtime"],
             }
+        except RuntimeErrorBase as exc:
+            self.local_worker_launcher.cancel_orderly_handoff(
+                handoff_id, reason_code="runtime_prepare_failed"
+            )
+            if self.httpd is not None:
+                self.httpd.set_admission_mode("ready")
+            raise _handoff_stage_error(exc, failure_stage) from exc
         except BaseException:
             self.local_worker_launcher.cancel_orderly_handoff(
                 handoff_id, reason_code="runtime_prepare_failed"
