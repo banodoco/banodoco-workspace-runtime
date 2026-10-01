@@ -233,7 +233,7 @@ def test_peer_uid_requires_a_unix_channel():
         tcp.close()
 
 
-def test_wrong_owned_pointer_is_rejected_without_owner_mutation(tmp_path):
+def test_wrong_owned_pointer_is_rejected_without_owner_mutation(tmp_path, capsys):
     support = tmp_path / "support"
     support.mkdir(mode=0o700)
     pointer = support / "orderly-handoff-request.json"
@@ -245,6 +245,11 @@ def test_wrong_owned_pointer_is_rejected_without_owner_mutation(tmp_path):
     assert runtime_cli._attempt_owner_handoff(daemon, support) is False
     assert pointer.read_bytes() == before
     assert daemon.local_worker_launcher is launcher
+    assert json.loads(capsys.readouterr().err) == {
+        "error_code": "runtime_error",
+        "event": "orderly_handoff_owner_a_refused",
+        "stage": "owner_a_request",
+    }
 
 
 def test_digest_valid_malformed_owned_record_is_nonfatal_and_nonmutating(tmp_path):

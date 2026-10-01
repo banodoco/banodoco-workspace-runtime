@@ -742,9 +742,29 @@ def _attempt_owner_handoff(daemon: RuntimeDaemon, support_root: Path) -> bool:
 
     try:
         return _owner_handoff_request(daemon, support_root)
-    except (RuntimeErrorBase, OSError, TimeoutError, KeyError, TypeError, ValueError):
+    except (RuntimeErrorBase, OSError, TimeoutError, KeyError, TypeError, ValueError) as exc:
         if daemon.local_worker_launcher is None:
             raise
+        # The coordinator sees only a closed authenticated channel when A
+        # rejects after rendezvous.  Preserve one credential-safe diagnostic in
+        # A's existing stderr/runtime log so an installed failure can be
+        # distinguished without weakening the fail-closed handoff boundary.
+        if isinstance(exc, RuntimeErrorBase):
+            diagnostic = {
+                "event": "orderly_handoff_owner_a_refused",
+                "error_code": exc.code,
+                "stage": "owner_a_request",
+            }
+        else:
+            diagnostic = {
+                "event": "orderly_handoff_owner_a_refused",
+                "error_code": "owner_handoff_error",
+                "stage": "owner_a_request",
+            }
+        try:
+            print(json.dumps(diagnostic, sort_keys=True), file=sys.stderr, flush=True)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
         return False
 
 
