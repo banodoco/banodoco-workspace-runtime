@@ -364,6 +364,22 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             _frame_send(handle.control, payload)
             response = _frame_receive(handle.control)
         command = str(payload.get("command") or "")
+        if response.get("version") == CONTROL_VERSION and response.get("status") == "error":
+            error_code = response.get("error_code")
+            error_stage = response.get("error_stage")
+            if (
+                isinstance(error_code, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code)
+                and isinstance(error_stage, str)
+                and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_stage)
+            ):
+                raise ConflictError(
+                    "handoff Worker rejected the private operation",
+                    details={
+                        "handoff_error_code": error_code,
+                        "handoff_stage": error_stage,
+                    },
+                )
         expected_keys = {
             "version",
             "command",

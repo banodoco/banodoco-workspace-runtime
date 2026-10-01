@@ -937,6 +937,109 @@ def _worker_ack(request, *, status="prepared", phase="paused", bad_hash=False):
     return value
 
 
+def test_handoff_command_preserves_only_bounded_worker_refusal(tmp_path, monkeypatch):
+    profile, _ = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    parent, peer = socket.socketpair()
+    handle = _PreparedWorker(Worker(), "birth", parent, {}, tmp_path / "config.json")
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+    payload = {
+        "version": CONTROL_VERSION,
+        "command": "handoff_prepare",
+        "handoff_id": "handoff-1",
+        "nonce_digest": _digest("a"),
+        "sealed_record_digest": _digest("b"),
+    }
+
+    def worker_reply():
+        request = _frame_receive(peer)
+        assert request == payload
+        _frame_send(
+            peer,
+            {
+                "version": CONTROL_VERSION,
+                "status": "error",
+                "error": "credential material must not cross the boundary",
+                "error_code": "sealed_owner_mismatch",
+                "error_stage": "handoff_prepare",
+            },
+        )
+
+    thread = threading.Thread(target=worker_reply)
+    thread.start()
+    try:
+        with pytest.raises(ConflictError) as raised:
+            preparer.handoff_command(handle, payload)
+        assert "credential material" not in raised.value.message
+        assert raised.value.details == {
+            "handoff_error_code": "sealed_owner_mismatch",
+            "handoff_stage": "handoff_prepare",
+        }
+    finally:
+        thread.join(1)
+        parent.close()
+        peer.close()
+
+
+def test_handoff_command_keeps_malformed_worker_refusal_generic(tmp_path, monkeypatch):
+    profile, _ = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    parent, peer = socket.socketpair()
+    handle = _PreparedWorker(Worker(), "birth", parent, {}, tmp_path / "config.json")
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+    payload = {
+        "version": CONTROL_VERSION,
+        "command": "handoff_prepare",
+        "handoff_id": "handoff-1",
+        "nonce_digest": _digest("a"),
+        "sealed_record_digest": _digest("b"),
+    }
+
+    def worker_reply():
+        _frame_receive(peer)
+        _frame_send(
+            peer,
+            {
+                "version": CONTROL_VERSION,
+                "status": "error",
+                "error": "secret nonce must never be retained",
+                "error_code": "credential=secret",
+                "error_stage": "handoff_prepare",
+            },
+        )
+
+    thread = threading.Thread(target=worker_reply)
+    thread.start()
+    try:
+        with pytest.raises(
+            ConflictError, match="handoff Worker rejected the private operation"
+        ) as raised:
+            preparer.handoff_command(handle, payload)
+        assert raised.value.details is None
+        assert "secret" not in raised.value.message
+        assert "nonce" not in raised.value.message
+    finally:
+        thread.join(1)
+        parent.close()
+        peer.close()
+
+
 def test_handoff_command_requires_exact_binders_phase_and_ack_hash(tmp_path, monkeypatch):
     profile, _ = _inspector_fixture(tmp_path)
 
