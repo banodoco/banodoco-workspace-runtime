@@ -641,7 +641,7 @@ def test_forged_session_digest_cannot_create_observed_fact(tmp_path, monkeypatch
         inspector.observe(handle)
 
 
-def test_cross_process_abort_is_bounded_and_reaps_after_kill(tmp_path, monkeypatch):
+def test_cross_process_abort_timeout_is_bounded_and_retains_custody_owner(tmp_path, monkeypatch):
     profile, _handle = _inspector_fixture(tmp_path)
 
     class Worker:
@@ -668,14 +668,10 @@ def test_cross_process_abort_is_bounded_and_reaps_after_kill(tmp_path, monkeypat
     )
     preparer._active = handle
     monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
-    signals = []
-
-    def killpg(_pid, sent_signal):
-        signals.append(sent_signal)
-        if sent_signal == signal.SIGKILL:
-            worker.returncode = -signal.SIGKILL
-
-    monkeypatch.setattr("runtime_protocol.local_worker_composition.os.killpg", killpg)
+    monkeypatch.setattr(
+        "runtime_protocol.local_worker_composition.os.killpg",
+        lambda *_args: pytest.fail("a missing ACK must not discard the live custody owner"),
+    )
     started = __import__("time").monotonic()
     try:
         with pytest.raises((TimeoutError, OSError)):
@@ -685,10 +681,57 @@ def test_cross_process_abort_is_bounded_and_reaps_after_kill(tmp_path, monkeypat
     elapsed = __import__("time").monotonic() - started
 
     assert elapsed < 0.5
-    assert signals == [signal.SIGTERM, signal.SIGKILL]
-    assert worker.poll() == -signal.SIGKILL
-    assert handle.closed is True
-    assert preparer._active is None
+    assert worker.poll() is None
+    assert handle.closed is False
+    assert handle.cleanup_started is False
+    assert preparer._active is handle
+    assert preparer.cleanup_uncertain
+
+
+def test_cross_process_abort_rejects_malformed_ack_and_retains_custody_owner(
+    tmp_path, monkeypatch
+):
+    profile, _handle = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+        @staticmethod
+        def wait(timeout=None):
+            raise subprocess.TimeoutExpired("worker", timeout)
+
+    parent, peer = socket.socketpair()
+    handle = _PreparedWorker(Worker(), "birth", parent, {}, tmp_path / "config.json")
+    preparer = CrossProcessWorkerPreparer(
+        profile=profile,
+        config={},
+        environment={},
+        cleanup_timeout_seconds=0.25,
+    )
+    preparer._active = handle
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+
+    def malformed_ack() -> None:
+        assert _frame_receive(peer) == {"version": CONTROL_VERSION, "command": "abort"}
+        _frame_send(peer, {"version": "wrong", "status": "ok"})
+
+    responder = threading.Thread(target=malformed_ack)
+    responder.start()
+    try:
+        with pytest.raises(ConflictError, match="control version is invalid"):
+            preparer.abort(handle)
+        responder.join(timeout=1)
+    finally:
+        peer.close()
+
+    assert not responder.is_alive()
+    assert handle.closed is False
+    assert preparer._active is handle
+    assert preparer.cleanup_uncertain
 
 
 def test_installed_cleanup_budget_keeps_worker_control_alive_for_delayed_ack(

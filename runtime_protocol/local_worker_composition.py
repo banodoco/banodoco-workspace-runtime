@@ -571,9 +571,9 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 return
             handle.cleanup_started = True
         failure: BaseException | None = None
-        owned = False
         try:
-            owned = self._birth(handle.worker.pid) == handle.birth_id
+            if self._birth(handle.worker.pid) != handle.birth_id:
+                raise ConflictError("prepared Worker identity changed before cleanup")
             acquired = handle.rpc_lock.acquire(timeout=self.cleanup_timeout_seconds)
             if acquired:
                 try:
@@ -596,37 +596,38 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         except BaseException as exc:
             failure = exc
         finally:
-            try:
-                handle.control.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            handle.control.close()
-            if handle.adopted and self._adopted_graph_has_survivors(handle):
+            if handle.adopted:
                 try:
-                    self._force_cleanup_adopted_graph(handle)
-                    failure = None
-                except BaseException as exc:
-                    self.cleanup_uncertain = str(exc)
-                    failure = exc
-            if owned and handle.worker.poll() is None and not handle.adopted:
-                try:
-                    os.killpg(handle.worker.pid, signal.SIGTERM)
-                except ProcessLookupError:
+                    handle.control.shutdown(socket.SHUT_RDWR)
+                except OSError:
                     pass
+                handle.control.close()
+                if self._adopted_graph_has_survivors(handle):
+                    try:
+                        self._force_cleanup_adopted_graph(handle)
+                        failure = None
+                    except BaseException as exc:
+                        self.cleanup_uncertain = str(exc)
+                        failure = exc
+                handle.closed = True
+                if self._active is handle:
+                    self._active = None
+            elif failure is None:
                 try:
-                    handle.worker.wait(timeout=self.cleanup_timeout_seconds)
-                except (subprocess.TimeoutExpired, TimeoutError):
-                    try:
-                        os.killpg(handle.worker.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        handle.worker.wait(timeout=self.cleanup_timeout_seconds)
-                    except (subprocess.TimeoutExpired, TimeoutError):
-                        pass
-            handle.closed = True
-            if self._active is handle:
-                self._active = None
+                    handle.control.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                handle.control.close()
+                handle.closed = True
+                if self._active is handle:
+                    self._active = None
+            else:
+                # The private Worker still owns the only live engine broker.
+                # A missing/malformed ACK or control failure cannot justify
+                # terminating that owner and discarding its cleanup authority.
+                self.cleanup_uncertain = str(failure)
+                with handle.cleanup_lock:
+                    handle.cleanup_started = False
         if failure is not None:
             raise failure
 
