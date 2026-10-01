@@ -1136,7 +1136,11 @@ class LocalWorkerLauncher:
             thread.start()
             timeout = max(
                 1.0,
-                float(getattr(self.preparer, "cleanup_timeout_seconds", 0.1)) * 8.0,
+                float(getattr(
+                    self.preparer,
+                    "shutdown_timeout_seconds",
+                    getattr(self.preparer, "cleanup_timeout_seconds", 0.1),
+                )),
             )
             thread.join(timeout)
             if not completed.is_set():

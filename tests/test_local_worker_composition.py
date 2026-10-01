@@ -20,6 +20,8 @@ from runtime_protocol.errors import ConflictError
 from runtime_protocol.local_worker import LocalWorkerProfile, ProcessIdentity
 from runtime_protocol.local_worker_composition import (
     CONTROL_VERSION,
+    DEFAULT_WORKER_CLEANUP_TIMEOUT_SECONDS,
+    DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
     CrossProcessWorkerPreparer,
     OSProcessInspector,
     _PreparedWorker,
@@ -29,6 +31,8 @@ from runtime_protocol.local_worker_composition import (
     _process_argv,
     _ps,
     _listening_socket_owner,
+    _frame_receive,
+    _frame_send,
     load_local_worker_composition,
 )
 from runtime_protocol.catalog import process_birth_identity
@@ -111,6 +115,8 @@ def test_factory_derives_runtime_identity_and_roots(tmp_path: Path) -> None:
     composition.bind_runtime(endpoint="http://127.0.0.1:1234", runtime_instance_id="instance-2", credential_file=support / "worker.token")
     assert composition.preparer.config["runtime_endpoint"] == "http://127.0.0.1:1234"
     assert composition.preparer.config["runtime_instance_id"] == "instance-2"
+    assert composition.preparer.cleanup_timeout_seconds == DEFAULT_WORKER_CLEANUP_TIMEOUT_SECONDS
+    assert composition.preparer.shutdown_timeout_seconds == DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECONDS
 
 
 def test_factory_installed_mode_uses_verified_package_without_checkout(
@@ -681,6 +687,56 @@ def test_cross_process_abort_is_bounded_and_reaps_after_kill(tmp_path, monkeypat
     assert elapsed < 0.5
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert worker.poll() == -signal.SIGKILL
+    assert handle.closed is True
+    assert preparer._active is None
+
+
+def test_installed_cleanup_budget_keeps_worker_control_alive_for_delayed_ack(
+    tmp_path, monkeypatch
+):
+    profile, _handle = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("worker", timeout)
+            return self.returncode
+
+    parent, peer = socket.socketpair()
+    worker = Worker()
+    handle = _PreparedWorker(worker, "birth", parent, {}, tmp_path / "config.json")
+    preparer = CrossProcessWorkerPreparer(
+        profile=profile,
+        config={},
+        environment={},
+        cleanup_timeout_seconds=0.5,
+        shutdown_timeout_seconds=0.75,
+    )
+    preparer._active = handle
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+
+    def acknowledge_after_real_cleanup_delay() -> None:
+        assert _frame_receive(peer) == {"version": CONTROL_VERSION, "command": "abort"}
+        time.sleep(0.2)  # Demonstrably longer than the historical 100ms budget.
+        worker.returncode = 0
+        _frame_send(peer, {"version": CONTROL_VERSION, "status": "ok"})
+
+    responder = threading.Thread(target=acknowledge_after_real_cleanup_delay)
+    responder.start()
+    try:
+        preparer.abort(handle)
+        responder.join(timeout=1)
+    finally:
+        peer.close()
+
+    assert not responder.is_alive()
+    assert worker.returncode == 0
     assert handle.closed is True
     assert preparer._active is None
 

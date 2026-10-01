@@ -45,6 +45,8 @@ from .local_worker import (
 CONTROL_VERSION = "reigh.local-worker-control/v2"
 CONTROL_FRAME_LIMIT = 64 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+DEFAULT_WORKER_CLEANUP_TIMEOUT_SECONDS = 45.0
+DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECONDS = 50.0
 PROFILE_FIELDS = (
     "profile_id", "workspace_uuid", "realm_root", "support_root", "machine_id",
     "worker_executable", "host_executable", "engine_executable",
@@ -185,12 +187,18 @@ def _ack_digest(value: Mapping[str, Any]) -> str:
 class CrossProcessWorkerPreparer(LocalWorkerPreparer):
     """Runtime-side transport for the installed Worker private ABI."""
 
-    def __init__(self, *, profile: LocalWorkerProfile, config: Mapping[str, Any], environment: Mapping[str, str], timeout_seconds: float = 900.0, cleanup_timeout_seconds: float = 0.1):
+    def __init__(self, *, profile: LocalWorkerProfile, config: Mapping[str, Any], environment: Mapping[str, str], timeout_seconds: float = 900.0, cleanup_timeout_seconds: float = 0.1, shutdown_timeout_seconds: float | None = None):
         self.profile = profile
         self.config = dict(config)
         self.environment = dict(environment)
         self.timeout_seconds = float(timeout_seconds)
         self.cleanup_timeout_seconds = max(0.05, float(cleanup_timeout_seconds))
+        self.shutdown_timeout_seconds = max(
+            self.cleanup_timeout_seconds,
+            float(shutdown_timeout_seconds)
+            if shutdown_timeout_seconds is not None
+            else self.cleanup_timeout_seconds,
+        )
         self._active: _PreparedWorker | None = None
         self._prepare_cancel = threading.Event()
         # The only uninterruptible handoff is spawn -> handle construction ->
@@ -1334,6 +1342,12 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         config=config,
         environment={**{str(k): str(v) for k, v in environment.items()}, "ASTRID_WORKER_ENVIRONMENT": str(worker_environment)},
         timeout_seconds=float(raw.get("worker_timeout_seconds") or 900.0),
+        # Worker abort acknowledges only after its GenericPackHost and
+        # separately sessioned engine/listener are verified, stopped, and
+        # reaped.  The transport's historical 100ms default could terminate
+        # the Worker while that cleanup was still in progress.
+        cleanup_timeout_seconds=DEFAULT_WORKER_CLEANUP_TIMEOUT_SECONDS,
+        shutdown_timeout_seconds=DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
     )
     inspector = OSProcessInspector(profile)
     return LocalWorkerComposition({profile.profile_id: profile}, preparer, inspector)
