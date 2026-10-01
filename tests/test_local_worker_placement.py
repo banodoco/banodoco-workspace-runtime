@@ -1124,6 +1124,33 @@ def test_shutdown_cleans_steady_active_handle_once_without_cancel_race(tmp_path)
     assert preparer.handle is None
 
 
+def test_shutdown_preserves_bounded_cleanup_failure_detail(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class FailedAcknowledgement(FakePreparer):
+        cleanup_uncertain = None
+
+        def abort(self, _handle):
+            self.cleanup_uncertain = "abort acknowledgement was malformed\nsecond line"
+            raise ConflictError("abort acknowledgement was rejected")
+
+    preparer = FailedAcknowledgement(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    launcher.start("astrid", workspace_uuid)
+
+    handles = launcher.begin_shutdown()
+    with pytest.raises(ConflictError) as raised:
+        launcher.finish_shutdown(handles)
+
+    message = str(raised.value)
+    assert "ConflictError:abort acknowledgement was rejected" in message
+    assert "preparer:abort acknowledgement was malformed second line" in message
+    assert "\n" not in message
+
+
 def test_shutdown_captures_worker_blocked_inside_prepare(tmp_path):
     profile = _profile(tmp_path, str(uuid.uuid4()))
     store = CredentialStore(tmp_path / "credentials")

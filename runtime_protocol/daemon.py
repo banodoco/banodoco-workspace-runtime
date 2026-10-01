@@ -1216,7 +1216,7 @@ class RuntimeDaemon:
                         "version": 1,
                         "state": "cleanup_uncertain",
                         "runtime_instance_id": self.instance_id,
-                        "reason": type(exc).__name__,
+                        "reason": " ".join(str(exc).split())[:768],
                     },
                 )
             self.local_worker_launcher = None
@@ -1224,7 +1224,7 @@ class RuntimeDaemon:
             self.service.close()
             self.service = None
         if cleanup_failure is not None:
-            raise ConflictError("local Worker graph cleanup is uncertain") from cleanup_failure
+            raise ConflictError(str(cleanup_failure)) from cleanup_failure
         catalog_neutral = True
         if realm_id is not None:
             try:

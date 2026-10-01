@@ -1157,7 +1157,25 @@ class LocalWorkerLauncher:
             failures.extend(failure)
         uncertain = getattr(self.preparer, "cleanup_uncertain", None)
         if failures or uncertain:
-            raise ConflictError("local Worker graph cleanup is uncertain")
+            # Preserve a bounded, credential-free operational reason.  The
+            # caller persists this after the private control channel is gone;
+            # replacing it with a generic ConflictError made a failed ACK,
+            # timeout, and malformed response indistinguishable in retained
+            # product-down evidence.
+            details: list[str] = []
+            for failure in failures:
+                value = " ".join(str(failure).split())[:384]
+                details.append(f"{type(failure).__name__}:{value or 'no_detail'}")
+            if uncertain:
+                value = " ".join(str(uncertain).split())[:384]
+                entry = f"preparer:{value or 'no_detail'}"
+                if entry not in details:
+                    details.append(entry)
+            detail = ";".join(details)[:768]
+            raise ConflictError(
+                "local Worker graph cleanup is uncertain"
+                + (f" [{detail}]" if detail else "")
+            )
 
     def _try_reconnect(self, profile: LocalWorkerProfile, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         receipt = metadata.get("local_launch_receipt")
