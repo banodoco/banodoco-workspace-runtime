@@ -639,10 +639,13 @@ class RuntimeDaemon:
         except RuntimeErrorBase as exc:
             raise _handoff_stage_error(exc, "interruption_audit") from exc
         if not first_audit["safe"]:
-            raise ConflictError(
-                "runtime lifecycle refused while work is active or unreconciled",
-                details=first_audit,
-            )
+            # This is the expected, non-mutating refusal path.  Return the
+            # typed result before reading Worker source facts or preparing,
+            # fencing, and exporting the live graph so the owner-side CLI can
+            # send its authenticated ``refused_active_work`` frame.  Raising
+            # here closes that private channel and makes the coordinator see
+            # only a misleading transfer EOF.
+            return {"state": "active_work", "audit": first_audit}
         try:
             facts = self.local_worker_launcher.orderly_handoff_source_facts()
         except RuntimeErrorBase as exc:

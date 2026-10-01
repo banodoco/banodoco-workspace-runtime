@@ -457,6 +457,39 @@ def test_runtime_handoff_stage_error_preserves_worker_bounded_tuple():
     assert error.details["handoff_stage"] == "handoff_prepare"
 
 
+def test_unsafe_interruption_audit_returns_typed_refusal_before_worker_mutation(
+    tmp_path, monkeypatch,
+):
+    class MustNotBeObserved:
+        def __getattr__(self, name):
+            raise AssertionError(f"active-work refusal crossed into {name}")
+
+    audit = {
+        "safe": False,
+        "active_tasks": 1,
+        "unsettled_attempts": 1,
+        "unreleased_reservations": 1,
+    }
+    monkeypatch.setattr(
+        runtime_daemon,
+        "inspect_interruption_state",
+        lambda _root: audit,
+    )
+    daemon = SimpleNamespace(
+        root=tmp_path / "realm",
+        local_worker_launcher=MustNotBeObserved(),
+        httpd=MustNotBeObserved(),
+        service=MustNotBeObserved(),
+    )
+
+    assert runtime_daemon.RuntimeDaemon.begin_orderly_worker_handoff(
+        daemon, {"handoff_id": "must-not-be-consumed"}
+    ) == {
+        "state": "active_work",
+        "audit": audit,
+    }
+
+
 def test_owner_handoff_stage_error_adds_only_bounded_phase_and_code():
     error = runtime_cli._owner_handoff_stage_error(
         ValidationError("private validation detail"),
@@ -544,7 +577,7 @@ def test_digest_valid_malformed_owned_record_is_nonfatal_and_nonmutating(tmp_pat
 
 
 def test_owner_a_active_work_refusal_emits_exact_frame_without_authority_mutation(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     support = tmp_path / "support"
     support.mkdir(mode=0o700)
@@ -634,16 +667,32 @@ def test_owner_a_active_work_refusal_emits_exact_frame_without_authority_mutatio
 
     thread = threading.Thread(target=coordinator)
     thread.start()
+    class MustNotCrossActiveWorkBoundary:
+        def __getattr__(self, name):
+            raise AssertionError(f"active-work refusal crossed into {name}")
+
+    audit = {
+        "safe": False,
+        "active_tasks": 1,
+        "unsettled_attempts": 1,
+        "unreleased_reservations": 1,
+    }
+    monkeypatch.setattr(
+        runtime_daemon,
+        "inspect_interruption_state",
+        lambda _root: audit,
+    )
     daemon = SimpleNamespace(
         local_worker_launcher=object(),
+        httpd=MustNotCrossActiveWorkBoundary(),
         instance_id="runtime-a",
         root=tmp_path / "realm",
         service=SimpleNamespace(realm={"id": "realm-1"}),
         runtime_identity=lambda: runtime_identity,
-        begin_orderly_worker_handoff=lambda _common: {
-            "state": "active_work",
-            "audit": {"safe": False},
-        },
+    )
+    daemon.local_worker_launcher = MustNotCrossActiveWorkBoundary()
+    daemon.begin_orderly_worker_handoff = lambda common: (
+        runtime_daemon.RuntimeDaemon.begin_orderly_worker_handoff(daemon, common)
     )
     try:
         assert runtime_cli._attempt_owner_handoff(daemon, support) is False
@@ -653,6 +702,10 @@ def test_owner_a_active_work_refusal_emits_exact_frame_without_authority_mutatio
             "version": TRANSFER_VERSION,
             "command": "refused_active_work",
             "handoff_id": handoff_id,
+        }
+        assert daemon.begin_orderly_worker_handoff({}) == {
+            "state": "active_work",
+            "audit": audit,
         }
         assert (
             authority.read_bytes(), authority.lstat().st_dev,
