@@ -32,6 +32,40 @@ from runtime_protocol import cli as runtime_cli
 from runtime_protocol.orderly_handoff import digest
 
 
+def test_custody_socket_root_ignores_long_private_tmpdir_and_real_bind(monkeypatch, tmp_path):
+    monkeypatch.setenv("TMPDIR", str(tmp_path / ("private-qualification-" * 12)))
+    root = custody_broker_module._create_compact_socket_root()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    path = root / "s"
+    try:
+        sock.bind(str(path))
+        sock.listen(1)
+        assert len(os.fsencode(path)) <= custody_broker_module.DARWIN_UNIX_SOCKET_PATH_MAX_BYTES
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    finally:
+        sock.close()
+        path.unlink(missing_ok=True)
+        root.rmdir()
+
+
+def test_custody_socket_root_rejects_path_beyond_darwin_limit(monkeypatch, tmp_path):
+    root = tmp_path / ("x" * 120)
+    root.mkdir()
+    monkeypatch.setattr(custody_broker_module.tempfile, "mkdtemp", lambda **_kwargs: str(root))
+    with pytest.raises(custody_broker_module.CustodyError, match="AF_UNIX limit"):
+        custody_broker_module._create_compact_socket_root()
+    assert not root.exists()
+
+
+def test_custody_socket_root_rejects_unsafe_parent(monkeypatch, tmp_path):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir(mode=0o777)
+    unsafe.chmod(0o777)
+    monkeypatch.setattr(custody_broker_module, "DARWIN_CUSTODY_SOCKET_PARENT", unsafe)
+    with pytest.raises(custody_broker_module.CustodyError, match="parent is unsafe"):
+        custody_broker_module._create_compact_socket_root()
+
+
 class _Response:
     def __enter__(self):
         return self

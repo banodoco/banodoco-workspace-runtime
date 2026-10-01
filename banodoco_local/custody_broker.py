@@ -34,10 +34,37 @@ SOL_LOCAL = 0
 LOCAL_PEERTOKEN = 0x006
 TOKEN_BYTES = 32
 FRAME_LIMIT = 16 * 1024
+DARWIN_UNIX_SOCKET_PATH_MAX_BYTES = 103
+DARWIN_CUSTODY_SOCKET_PARENT = Path("/private/tmp")
 
 
 class CustodyError(RuntimeError):
     """The exact registered Runtime incarnation cannot be proved or signalled."""
+
+
+def _create_compact_socket_root() -> Path:
+    """Create an owner-only socket directory below Darwin's short temp alias."""
+
+    parent = DARWIN_CUSTODY_SOCKET_PARENT
+    try:
+        parent_stat = os.lstat(parent)
+    except OSError as exc:
+        raise CustodyError("custody socket parent is unavailable") from exc
+    if (
+        not parent.is_absolute()
+        or stat.S_ISLNK(parent_stat.st_mode)
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or (parent_stat.st_mode & stat.S_IWOTH and not parent_stat.st_mode & stat.S_ISVTX)
+    ):
+        raise CustodyError("custody socket parent is unsafe")
+    root = Path(tempfile.mkdtemp(prefix="runtime-cb-", dir=parent))
+    os.chmod(root, 0o700)
+    if len(os.fsencode(str(root / "s"))) > DARWIN_UNIX_SOCKET_PATH_MAX_BYTES:
+        try:
+            root.rmdir()
+        finally:
+            raise CustodyError("custody socket path exceeds Darwin AF_UNIX limit")
+    return root
 
 
 class _AuditToken(ctypes.Structure):
@@ -227,8 +254,7 @@ class RoleBoundCustodyBroker:
         self.root = ledger_root
         self.journal_path = ledger_root / "custody.journal.jsonl"
         self.ledger_path = ledger_root / "custody.ledger.json"
-        self.socket_root = Path(tempfile.mkdtemp(prefix="runtime-cb-"))
-        os.chmod(self.socket_root, 0o700)
+        self.socket_root = _create_compact_socket_root()
         self.socket_path = self.socket_root / "s"
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(self.socket_path))
