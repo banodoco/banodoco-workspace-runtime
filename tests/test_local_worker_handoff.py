@@ -48,6 +48,153 @@ def _frame():
     }
 
 
+def test_large_export_control_and_authority_frames_round_trip_within_bound():
+    payload = "x" * (256 * 1024)
+    control_sender, control_receiver = socket.socketpair()
+    control_result = {}
+
+    def receive_control():
+        control_result["frame"] = handoff.receive_frame(control_receiver)
+
+    control_thread = threading.Thread(target=receive_control)
+    control_thread.start()
+    try:
+        frame = {
+            "version": TRANSFER_VERSION,
+            "command": "seal_export",
+            "export": {"registered_state": payload},
+        }
+        handoff.send_frame(control_sender, frame)
+        control_thread.join(timeout=5)
+        assert not control_thread.is_alive()
+        assert control_result["frame"] == frame
+    finally:
+        control_sender.close()
+        control_receiver.close()
+
+    sender, receiver = socket.socketpair()
+    worker_runtime, worker_peer, listener = _authorities()
+    authority_result = {}
+
+    def receive_authority():
+        authority_result["transfer"] = receive_authority_transfer(
+            receiver,
+            expected_uid=os.getuid(),
+            expected_listener=listener.getsockname(),
+        )
+
+    authority_thread = threading.Thread(target=receive_authority)
+    authority_thread.start()
+    try:
+        authority_frame = {**_frame(), "export": {"registered_state": payload}}
+        send_authority_transfer(
+            sender,
+            authority_frame,
+            worker_control_fd=worker_runtime.fileno(),
+            listener_fd=listener.fileno(),
+        )
+        authority_thread.join(timeout=5)
+        assert not authority_thread.is_alive()
+        transfer = authority_result["transfer"]
+        try:
+            assert transfer.frame == authority_frame
+        finally:
+            transfer.close()
+    finally:
+        sender.close()
+        receiver.close()
+        worker_runtime.close()
+        worker_peer.close()
+        listener.close()
+
+
+def test_frame_larger_than_bound_is_rejected_with_bounded_details():
+    with pytest.raises(ValidationError) as observed:
+        handoff._canonical_frame({"payload": "x" * handoff.TRANSFER_FRAME_LIMIT})
+    assert observed.value.details == {
+        "handoff_error_code": "transfer_frame_too_large",
+        "frame_bytes": handoff.TRANSFER_FRAME_LIMIT + len('{"payload":""}'),
+        "frame_limit": handoff.TRANSFER_FRAME_LIMIT,
+    }
+
+
+def test_export_frame_crosses_legacy_ceiling_but_remains_bounded():
+    legacy_limit = 64 * 1024
+    empty_size = len(handoff._canonical_frame({"payload": ""}))
+    at_legacy_limit = handoff._canonical_frame({
+        "payload": "x" * (legacy_limit - empty_size),
+    })
+    above_legacy_limit = handoff._canonical_frame({
+        "payload": "x" * (legacy_limit - empty_size + 1),
+    })
+    assert len(at_legacy_limit) == legacy_limit
+    assert len(above_legacy_limit) == legacy_limit + 1
+    assert len(above_legacy_limit) < handoff.TRANSFER_FRAME_LIMIT
+
+
+def test_oversized_export_refusal_preserves_sealed_owned_record(tmp_path):
+    directory = tmp_path / "handoff"
+    directory.mkdir(mode=0o700)
+    record = HandoffRecord(directory / "record.json")
+    created = record.create({
+        "version": RECORD_VERSION,
+        "state": "OWNED",
+        "handoff_id": "oversized-export",
+        "realm_id": "realm-1",
+        "realm_root": str(tmp_path / "realm"),
+        "support_root": str(tmp_path / "support"),
+        "deadline_monotonic": time.monotonic() + 30,
+        "deadline_unix_ms": int(time.time() * 1000) + 30_000,
+        "nonce_digest": None,
+        "sealed_record_digest": None,
+        "old_owner": {"pid": os.getpid(), "birth_id": "owner-a-birth"},
+        "export": None,
+        "export_sealed_digest": None,
+        "adopter": None,
+        "predecessor_active_ref_digest": None,
+    })
+    sealed = record.seal(
+        expected_record_digest=created["record_digest"],
+        nonce_sha256=nonce_digest("n" * 32),
+    )
+    before = record.path.read_bytes()
+    with pytest.raises(ValidationError) as observed:
+        handoff._canonical_frame({
+            "version": TRANSFER_VERSION,
+            "command": "seal_export",
+            "export": {"registered_state": "x" * handoff.TRANSFER_FRAME_LIMIT},
+        })
+    assert observed.value.details["handoff_error_code"] == "transfer_frame_too_large"
+    assert record.path.read_bytes() == before
+    assert record.read() == sealed
+    assert sealed["state"] == "OWNED"
+    assert sealed["export"] is None
+
+
+def test_authority_transfer_completes_after_partial_descriptor_send():
+    class PartialChannel:
+        def __init__(self):
+            self.tail = b""
+
+        def sendmsg(self, values, ancillary):
+            assert ancillary
+            return 17
+
+        def sendall(self, value):
+            self.tail = value
+
+    channel = PartialChannel()
+    frame = _frame()
+    encoded = handoff._canonical_frame(frame)
+    handoff.send_authority_transfer(
+        channel,
+        frame,
+        worker_control_fd=0,
+        listener_fd=1,
+    )
+    assert channel.tail == encoded[17:]
+
+
 def test_authority_transfer_receives_exact_sockets_and_sets_cloexec():
     sender, receiver = socket.socketpair()
     worker_runtime, worker_peer, listener = _authorities()

@@ -19,7 +19,12 @@ from .errors import ConflictError, ValidationError
 
 
 TRANSFER_VERSION = "runtime.local-worker-handoff-transfer/v1"
-TRANSFER_FRAME_LIMIT = 64 * 1024
+# The sealed export contains the complete registered Worker state and process
+# identity evidence.  A real installed graph with the full capability census
+# is larger than the former 64 KiB control-frame ceiling.  Keep the channel
+# bounded, while allowing that already-validated export to cross both the
+# seal and authority-transfer phases.
+TRANSFER_FRAME_LIMIT = 1024 * 1024
 AUTHORITY_FD_COUNT = 2
 
 
@@ -33,9 +38,19 @@ def _canonical_frame(value: Mapping[str, Any]) -> bytes:
             allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
-        raise ValidationError("handoff transfer frame must be JSON-compatible") from exc
+        raise ValidationError(
+            "handoff transfer frame must be JSON-compatible",
+            details={"handoff_error_code": "transfer_frame_not_json"},
+        ) from exc
     if len(encoded) > TRANSFER_FRAME_LIMIT:
-        raise ValidationError("handoff transfer frame is too large")
+        raise ValidationError(
+            "handoff transfer frame is too large",
+            details={
+                "handoff_error_code": "transfer_frame_too_large",
+                "frame_bytes": len(encoded),
+                "frame_limit": TRANSFER_FRAME_LIMIT,
+            },
+        )
     return encoded + b"\n"
 
 
@@ -137,10 +152,12 @@ def send_authority_transfer(
             [encoded],
             [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors.tobytes())],
         )
+        if sent <= 0:
+            raise ConflictError("handoff authority transfer was incomplete")
+        if sent < len(encoded):
+            channel.sendall(encoded[sent:])
     except OSError as exc:
         raise ConflictError("handoff authority transfer failed") from exc
-    if sent != len(encoded):
-        raise ConflictError("handoff authority transfer was incomplete")
 
 
 def send_frame(channel: socket.socket, frame: Mapping[str, Any]) -> None:
