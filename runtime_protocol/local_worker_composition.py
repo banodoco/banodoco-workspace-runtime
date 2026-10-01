@@ -58,6 +58,140 @@ PROFILE_FIELDS = (
     "profile_revision", "profile_digest", "release_digest",
 )
 
+_HOST_CONTROL_OPERATION_PHASES = {
+    "pause_prepare": frozenset({"owned"}),
+    "pause_cancel": frozenset({"paused", "export_sealed"}),
+    "rebind_prepare": frozenset({"export_sealed"}),
+    "rebind_commit": frozenset({"adopt_prepared"}),
+    "resume_prepare": frozenset({"rebind_committed"}),
+    "resume_commit": frozenset({"resume_armed"}),
+    "handoff_finalize": frozenset({"resumed"}),
+    "handoff_abort": frozenset(
+        {"adopt_prepared", "rebind_committed", "resume_armed", "resumed"}
+    ),
+    "idle_peek": frozenset(
+        {
+            "owned", "paused", "export_sealed", "adopt_prepared",
+            "rebind_committed", "resume_armed", "resumed",
+        }
+    ),
+}
+_HOST_CONTROL_STAGE_CATEGORIES = {
+    "send": frozenset(
+        {
+            "timeout", "broken_pipe", "connection_reset", "connection_error",
+            "framing", "configuration", "os_error",
+        }
+    ),
+    "receive": frozenset(
+        {
+            "timeout", "broken_pipe", "connection_reset", "connection_error",
+            "eof", "framing", "configuration", "os_error",
+        }
+    ),
+    "validation": frozenset({"ack_validation"}),
+    "peek": frozenset(
+        {
+            "broken_pipe", "connection_reset", "connection_error", "eof",
+            "os_error", "unsolicited_frame",
+        }
+    ),
+}
+_HOST_CONTROL_OPERATION_STAGES = {
+    operation: (
+        frozenset({"peek"})
+        if operation == "idle_peek"
+        else frozenset({"send", "receive", "validation"})
+    )
+    for operation in _HOST_CONTROL_OPERATION_PHASES
+}
+_PS_LSTART_BIRTH_ID = re.compile(
+    r"ps-lstart:(Mon|Tue|Wed|Thu|Fri|Sat|Sun) +"
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +"
+    r"([1-9]|[12][0-9]|3[01]) +"
+    r"([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9]) +([0-9]{4})\Z"
+)
+_PROC_START_TICKS_BIRTH_ID = re.compile(r"proc-start-ticks:[1-9][0-9]*\Z")
+
+
+def _validated_host_control_diagnostic(
+    value: object,
+    *,
+    expected_handoff_id: object,
+    expected_host: object,
+) -> dict[str, Any] | None:
+    """Accept only the Worker's fixed, credential-free host diagnostic schema."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    required = {
+        "operation", "handoff_phase", "stage", "exception_category", "host",
+    }
+    if not required.issubset(value) or set(value) - (required | {"handoff_id", "errno"}):
+        return None
+    operation = value.get("operation")
+    phase = value.get("handoff_phase")
+    stage = value.get("stage")
+    category = value.get("exception_category")
+    if not isinstance(operation, str) or operation not in _HOST_CONTROL_OPERATION_PHASES:
+        return None
+    if not isinstance(phase, str) or phase not in _HOST_CONTROL_OPERATION_PHASES[operation]:
+        return None
+    if not isinstance(stage, str) or stage not in _HOST_CONTROL_STAGE_CATEGORIES:
+        return None
+    if stage not in _HOST_CONTROL_OPERATION_STAGES[operation]:
+        return None
+    if not isinstance(category, str) or category not in _HOST_CONTROL_STAGE_CATEGORIES[stage]:
+        return None
+    host = value.get("host")
+    if not isinstance(host, Mapping) or set(host) != {"pid", "birth_id"}:
+        return None
+    pid = host.get("pid")
+    birth_id = host.get("birth_id")
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid < 1
+        or not isinstance(birth_id, str)
+        or (
+            _PS_LSTART_BIRTH_ID.fullmatch(birth_id) is None
+            and _PROC_START_TICKS_BIRTH_ID.fullmatch(birth_id) is None
+        )
+    ):
+        return None
+    if (
+        not isinstance(expected_host, Mapping)
+        or set(expected_host) != {"pid", "birth_id"}
+        or pid != expected_host.get("pid")
+        or birth_id != expected_host.get("birth_id")
+    ):
+        return None
+    handoff_id = value.get("handoff_id")
+    if "handoff_id" in value and (
+        not isinstance(handoff_id, str)
+        or not handoff_id
+        or len(handoff_id) > 256
+        or handoff_id != expected_handoff_id
+    ):
+        return None
+    error_number = value.get("errno")
+    if "errno" in value and (
+        isinstance(error_number, bool)
+        or not isinstance(error_number, int)
+        or not -(2**31) <= error_number < 2**31
+    ):
+        return None
+    return {
+        key: (
+            {"pid": int(pid), "birth_id": str(birth_id)}
+            if key == "host"
+            else item
+        )
+        for key, item in value.items()
+    }
+
 
 def _darwin_process_argv(pid: int) -> tuple[bytes, ...] | None:
     libc = ctypes.CDLL(None, use_errno=True)
@@ -483,12 +617,25 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 and isinstance(error_stage, str)
                 and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_stage)
             ):
+                details: dict[str, Any] = {
+                    "handoff_error_code": error_code,
+                    "handoff_stage": error_stage,
+                }
+                diagnostic = _validated_host_control_diagnostic(
+                    response.get("host_control_diagnostic"),
+                    expected_handoff_id=payload.get("handoff_id"),
+                    expected_host=(
+                        handle.report_value.get("processes", {}).get("host")
+                        if isinstance(handle.report_value, Mapping)
+                        and isinstance(handle.report_value.get("processes"), Mapping)
+                        else None
+                    ),
+                )
+                if diagnostic is not None:
+                    details["host_control_diagnostic"] = diagnostic
                 raise ConflictError(
                     "handoff Worker rejected the private operation",
-                    details={
-                        "handoff_error_code": error_code,
-                        "handoff_stage": error_stage,
-                    },
+                    details=details,
                 )
         expected_keys = {
             "version",
