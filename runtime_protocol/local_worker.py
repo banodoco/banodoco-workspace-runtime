@@ -1074,9 +1074,11 @@ class LocalWorkerLauncher:
         self._watch_stop.set()
         self._prepare_cancel.set()
         with self._state_lock:
+            active_before_fence = self._active_handle
+            preparing_before_fence = self._preparing_handle
             owned_before_fence = (
-                self._active_handle,
-                self._preparing_handle,
+                active_before_fence,
+                preparing_before_fence,
                 self.preparer.current_handle(),
             )
             self._revoke_actor()
@@ -1086,7 +1088,14 @@ class LocalWorkerLauncher:
             self._active_receipt = None
             self._preparing_handle = None
         cancel_current = getattr(self.preparer, "cancel_current", None)
-        if callable(cancel_current):
+        # A steady active graph is cleaned exactly once by finish_shutdown(),
+        # where the acknowledgement and custody result remain observable.  The
+        # cancellation hook exists for the narrower prepare-in-flight window;
+        # using it for an already-active graph raced the watcher/cleanup path,
+        # swallowed the concrete failure, and could leave only a generic
+        # cleanup-uncertain latch even after every child had exited.
+        cancel_prepare = active_before_fence is None
+        if cancel_prepare and callable(cancel_current):
             try:
                 cancel_current()
             except BaseException:

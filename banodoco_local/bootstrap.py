@@ -1294,6 +1294,11 @@ def _interrupt_owner_locked(
         process_birth_id=process_birth_id, realm_id=realm_id, realm_root=realm_root,
     ):
         raise BootstrapError("Runtime owner changed during stop; refusing owner-lock cleanup.")
+    cleanup_gate = paths.runtime_support / _HANDOFF_CLEANUP_GATE
+    if cleanup_gate.exists() or cleanup_gate.is_symlink():
+        raise BootstrapError(
+            "Runtime stop left uncertain local Worker graph cleanup; operator audit is required."
+        )
     if current_discovery is not None:
         remove_file(paths.discovery_path)
     if current_marker is not None:
@@ -1306,11 +1311,6 @@ def _interrupt_owner_locked(
         ):
             raise BootstrapError(
                 "The adopted Runtime owner reference changed during stop."
-            )
-        cleanup_gate = paths.runtime_support / _HANDOFF_CLEANUP_GATE
-        if cleanup_gate.exists() or cleanup_gate.is_symlink():
-            raise BootstrapError(
-                "Normal stop left uncertain handoff cleanup; operator audit is required."
             )
         stop_receipt = {
             "version": 1,

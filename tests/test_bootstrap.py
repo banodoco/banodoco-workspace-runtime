@@ -2516,6 +2516,25 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result["status"], "stopped")
         self.assertFalse(self.paths.discovery_path.exists())
 
+    def test_down_refuses_stopped_status_when_worker_cleanup_gate_exists(self):
+        self._configure()
+        bootstrap(self.paths, self.boundary, self.config)
+
+        def uncertain_stop(**kwargs):
+            self.boundary.alive.discard(kwargs["pid"])
+            marker = self.paths.runtime_support / "orderly-handoff-cleanup-uncertain.json"
+            marker.write_text(json.dumps({
+                "version": 1,
+                "state": "cleanup_uncertain",
+                "reason": "ConflictError",
+            }))
+
+        self.boundary.stop_owner = uncertain_stop
+        with self.assertRaisesRegex(BootstrapError, "uncertain local Worker graph cleanup"):
+            down(self.paths, self.boundary)
+        self.assertTrue(self.paths.discovery_path.exists())
+        self.assertTrue(self.paths.instance_lock_path.exists())
+
     def test_down_refuses_wrong_discovery_root_without_signal(self):
         self._configure()
         bootstrap(self.paths, self.boundary, self.config)

@@ -1097,6 +1097,33 @@ def test_shutdown_race_cannot_reenable_revoked_bearer(tmp_path):
     assert store.actor_metadata(WORKER_ACTOR) is None
 
 
+def test_shutdown_cleans_steady_active_handle_once_without_cancel_race(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+
+    class CancelAwarePreparer(FakePreparer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.cancel_calls = 0
+
+        def cancel_current(self):
+            self.cancel_calls += 1
+            self.abort(self.handle)
+
+    preparer = CancelAwarePreparer(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    launcher.start("astrid", workspace_uuid)
+
+    handles = launcher.begin_shutdown()
+    launcher.finish_shutdown(handles)
+
+    assert preparer.cancel_calls == 0
+    assert preparer.events.count("abort") == 1
+    assert preparer.handle is None
+
+
 def test_shutdown_captures_worker_blocked_inside_prepare(tmp_path):
     profile = _profile(tmp_path, str(uuid.uuid4()))
     store = CredentialStore(tmp_path / "credentials")
