@@ -19,6 +19,7 @@ import pytest
 from runtime_protocol.errors import ConflictError
 from runtime_protocol.local_worker import LocalWorkerProfile, ProcessIdentity
 from runtime_protocol.local_worker_composition import (
+    CONTROL_FRAME_LIMIT,
     CONTROL_VERSION,
     DEFAULT_WORKER_CLEANUP_TIMEOUT_SECONDS,
     DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECONDS,
@@ -44,6 +45,46 @@ def _digest(char: str) -> str:
 
 def test_argv_digest_preserves_argument_boundaries() -> None:
     assert _argv_digest([b"a b", b"c"]) != _argv_digest([b"a", b"b c"])
+
+
+def test_private_worker_control_accepts_large_bounded_handoff_seal() -> None:
+    sender, receiver = socket.socketpair()
+    observed = {}
+
+    def receive() -> None:
+        observed["frame"] = _frame_receive(receiver)
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    frame = {
+        "version": CONTROL_VERSION,
+        "command": "handoff_seal",
+        "export": {"registered_state": "x" * (256 * 1024)},
+    }
+    try:
+        _frame_send(sender, frame)
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert observed["frame"] == frame
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_private_worker_control_rejects_above_bound_with_safe_details() -> None:
+    sender, receiver = socket.socketpair()
+    try:
+        with pytest.raises(ConflictError) as observed:
+            _frame_send(sender, {"payload": "x" * CONTROL_FRAME_LIMIT})
+        assert observed.value.details == {
+            "handoff_error_code": "worker_control_frame_too_large",
+            "handoff_stage": "worker_control",
+            "frame_bytes": CONTROL_FRAME_LIMIT + len('{"payload":""}'),
+            "frame_limit": CONTROL_FRAME_LIMIT,
+        }
+    finally:
+        sender.close()
+        receiver.close()
 
 
 def _content_digest(value: bytes) -> str:

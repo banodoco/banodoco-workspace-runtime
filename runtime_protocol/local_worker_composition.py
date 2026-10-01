@@ -43,7 +43,10 @@ from .local_worker import (
 
 
 CONTROL_VERSION = "reigh.local-worker-control/v2"
-CONTROL_FRAME_LIMIT = 64 * 1024
+# Handoff seal requests carry the same complete registered-state export that
+# crossed the owner rendezvous.  Keep the private Worker channel bounded at
+# the same ceiling as that owner-only transport.
+CONTROL_FRAME_LIMIT = 1024 * 1024
 _SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 DEFAULT_WORKER_CLEANUP_TIMEOUT_SECONDS = 45.0
 DEFAULT_WORKER_SHUTDOWN_TIMEOUT_SECONDS = 50.0
@@ -118,7 +121,15 @@ def _frame_send(channel: socket.socket, value: Mapping[str, Any]) -> None:
         allow_nan=False,
     ).encode("utf-8")
     if len(encoded) > CONTROL_FRAME_LIMIT:
-        raise ConflictError("local Worker control frame is too large")
+        raise ConflictError(
+            "local Worker control frame is too large",
+            details={
+                "handoff_error_code": "worker_control_frame_too_large",
+                "handoff_stage": "worker_control",
+                "frame_bytes": len(encoded),
+                "frame_limit": CONTROL_FRAME_LIMIT,
+            },
+        )
     channel.sendall(encoded + b"\n")
 
 
