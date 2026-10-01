@@ -333,24 +333,28 @@ class RuntimeDaemon:
     def _start(self, *, rotate_credentials=False):
         # Direct starts use the same bootstrap -> coordinator recovery order as
         # the installed launcher, before active-owner or request-pointer checks.
-        pending_binding = (
+        required_pending_binding = (
             self.inherited_listener_fd,
             self.handoff_id,
             self.handoff_record_path,
             self.handoff_record_path_raw,
             self.handoff_record_digest,
-            self.handoff_predecessor_active_ref_digest,
             self.handoff_predecessor_old_owner,
             self.handoff_expected_listener,
         )
-        present = tuple(value is not None for value in pending_binding)
-        if any(present) and not all(present):
+        required_present = tuple(value is not None for value in required_pending_binding)
+        predecessor = self.handoff_predecessor_active_ref_digest
+        if (
+            any(required_present) and not all(required_present)
+        ) or (
+            predecessor is not None and not all(required_present)
+        ):
             raise ConflictError("pending adopter binding tuple is incomplete")
-        if all(present):
+        if all(required_present):
             (
                 fd, handoff_id, record_path, record_path_raw, record_digest,
-                predecessor, old_owner, expected_listener,
-            ) = pending_binding
+                old_owner, expected_listener,
+            ) = required_pending_binding
             expected_record_path = (
                 self.support_root / f"orderly-handoff-record-{handoff_id}.json"
                 if isinstance(handoff_id, str) else None
@@ -373,8 +377,13 @@ class RuntimeDaemon:
                 or any(part in {".", ".."} for part in record_path.parts)
                 or not isinstance(record_digest, str)
                 or re.fullmatch(r"sha256:[0-9a-f]{64}", record_digest) is None
-                or not isinstance(predecessor, str)
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", predecessor) is None
+                or (
+                    predecessor is not None
+                    and (
+                        not isinstance(predecessor, str)
+                        or re.fullmatch(r"sha256:[0-9a-f]{64}", predecessor) is None
+                    )
+                )
                 or type(old_owner) is not dict
                 or isinstance(old_owner.get("pid"), bool)
                 or not isinstance(old_owner.get("pid"), int)

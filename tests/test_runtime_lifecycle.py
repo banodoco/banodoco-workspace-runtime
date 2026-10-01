@@ -1071,6 +1071,53 @@ def test_direct_runtime_handoff_start_requires_exact_predecessor_chain(tmp_path)
         right.close()
 
 
+def test_first_handoff_pending_adopter_accepts_absent_predecessor_reference(tmp_path):
+    root = tmp_path / "realm"
+    support = tmp_path / "support"
+    support.mkdir(mode=0o700)
+    RealmStore.initialize(root, realm_id="realm-1").close()
+    birth = process_birth_identity()
+    handoff_id = "first"
+    record_path = support / f"orderly-handoff-record-{handoff_id}.json"
+    record = _write_committed_record(
+        record_path,
+        support,
+        handoff_id=handoff_id,
+        predecessor_digest=None,
+        old_owner={"pid": os.getpid(), "birth_id": birth},
+    )
+    _write_handoff_pointer(
+        support, handoff_id=handoff_id, record_path=record_path
+    )
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    inherited_fd = os.dup(listener.fileno())
+    daemon = RuntimeDaemon(
+        root,
+        support_root=support,
+        inherited_listener_fd=inherited_fd,
+        handoff_predecessor_active_ref_digest=None,
+        handoff_predecessor_old_owner={"pid": os.getpid(), "birth_id": birth},
+        handoff_id=handoff_id,
+        handoff_record_path=record_path,
+        handoff_record_path_raw=str(record_path),
+        handoff_record_digest=record["record_digest"],
+        handoff_expected_listener=listener.getsockname(),
+    )
+    try:
+        daemon.start()
+        assert daemon.handoff_pending
+        assert daemon.handoff_predecessor_active_ref_digest is None
+    finally:
+        daemon.stop()
+        try:
+            os.close(inherited_fd)
+        except OSError:
+            pass
+        listener.close()
+
+
 @pytest.mark.skipif(fcntl is None, reason="POSIX owner-lock regression")
 def test_authenticated_adopter_start_does_not_reacquire_held_recovery_locks(tmp_path):
     root = tmp_path / "realm"

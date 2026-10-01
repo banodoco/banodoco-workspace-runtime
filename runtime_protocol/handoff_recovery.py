@@ -454,7 +454,7 @@ def validate_pending_adopter_request(
     handoff_id: str,
     record_path: Path,
     record_digest: str,
-    predecessor_active_ref_digest: str,
+    predecessor_active_ref_digest: str | None,
     old_owner: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Authenticate B's already-framed request without taking recovery locks."""
@@ -467,9 +467,14 @@ def validate_pending_adopter_request(
         or not isinstance(record_digest, str)
         or not record_digest.startswith("sha256:")
         or _SHA256_RE.fullmatch(record_digest[7:]) is None
-        or not isinstance(predecessor_active_ref_digest, str)
-        or not predecessor_active_ref_digest.startswith("sha256:")
-        or _SHA256_RE.fullmatch(predecessor_active_ref_digest[7:]) is None
+        or (
+            predecessor_active_ref_digest is not None
+            and (
+                not isinstance(predecessor_active_ref_digest, str)
+                or not predecessor_active_ref_digest.startswith("sha256:")
+                or _SHA256_RE.fullmatch(predecessor_active_ref_digest[7:]) is None
+            )
+        )
         or not isinstance(old_owner, Mapping)
         or not {"pid", "birth_id"}.issubset(old_owner)
     ):
