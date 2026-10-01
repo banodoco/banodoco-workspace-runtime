@@ -182,6 +182,105 @@ class _AdoptedWorkerProcess:
         return None if observed == self.birth_id else 0
 
 
+@dataclass(frozen=True)
+class _ProcessBirthObservation:
+    """A PID birth observation that keeps absence separate from uncertainty."""
+
+    state: str
+    birth_id: str | None
+    stage: str
+    returncode: int | None = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class _ProcessFieldObservation:
+    state: str
+    value: str | None
+    stage: str
+    returncode: int | None = None
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+
+
+def _observe_ps_field(pid: int, field: str) -> _ProcessFieldObservation:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(int(pid)), "-o", f"{field}="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _ProcessFieldObservation("unknown", None, f"ps_{field}")
+    rendered = result.stdout.strip()
+    stdout_bytes = len(result.stdout.encode("utf-8"))
+    stderr_bytes = len(result.stderr.encode("utf-8"))
+    values = {
+        "stage": f"ps_{field}",
+        "returncode": result.returncode,
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+    }
+    if result.returncode == 0 and rendered:
+        return _ProcessFieldObservation("present", rendered, **values)
+    if result.returncode == 1 and not rendered and not result.stderr.strip():
+        return _ProcessFieldObservation("absent", None, **values)
+    return _ProcessFieldObservation("unknown", None, **values)
+
+
+def _observe_process_birth(pid: int) -> _ProcessBirthObservation:
+    value = int(pid)
+    if value <= 0:
+        return _ProcessBirthObservation("unknown", None, "invalid_pid")
+    stat_path = Path(f"/proc/{value}/stat")
+    if Path("/proc").is_dir():
+        try:
+            raw = stat_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return _ProcessBirthObservation("absent", None, "proc_stat")
+        except OSError:
+            return _ProcessBirthObservation("unknown", None, "proc_stat")
+        try:
+            fields = raw.rsplit(")", 1)[-1].split()
+            if len(fields) < 20:
+                raise ValueError("short proc stat")
+            return _ProcessBirthObservation(
+                "present", f"proc-start-ticks:{fields[19]}", "proc_stat"
+            )
+        except (IndexError, ValueError):
+            return _ProcessBirthObservation("unknown", None, "proc_stat")
+    observed = _observe_ps_field(value, "lstart")
+    if observed.state == "present":
+        return _ProcessBirthObservation(
+            "present",
+            f"ps-lstart:{observed.value}",
+            observed.stage,
+            returncode=observed.returncode,
+            stdout_bytes=observed.stdout_bytes,
+            stderr_bytes=observed.stderr_bytes,
+        )
+    if observed.state == "absent":
+        return _ProcessBirthObservation(
+            "absent",
+            None,
+            observed.stage,
+            returncode=observed.returncode,
+            stdout_bytes=observed.stdout_bytes,
+            stderr_bytes=observed.stderr_bytes,
+        )
+    return _ProcessBirthObservation(
+        "unknown",
+        None,
+        observed.stage,
+        returncode=observed.returncode,
+        stdout_bytes=observed.stdout_bytes,
+        stderr_bytes=observed.stderr_bytes,
+    )
+
+
 def _ack_digest(value: Mapping[str, Any]) -> str:
     payload = {key: item for key, item in value.items() if key != "ack_sha256"}
     return "sha256:" + hashlib.sha256(
@@ -762,10 +861,20 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
     ) -> bool:
         expected = self._receipt_process(receipt, name)
         pid = int(expected["pid"])
-        observed_birth = process_birth_identity(pid)
-        if observed_birth is None:
+        observed = _observe_process_birth(pid)
+        if observed.state == "absent":
             return False
-        if observed_birth != expected["birth_id"]:
+        if observed.state != "present":
+            raise ConflictError(
+                f"adopted {name} cleanup identity is unobservable",
+                details={
+                    "observation_stage": observed.stage,
+                    "observation_returncode": observed.returncode,
+                    "observation_stdout_bytes": observed.stdout_bytes,
+                    "observation_stderr_bytes": observed.stderr_bytes,
+                },
+            )
+        if observed.birth_id != expected["birth_id"]:
             raise ConflictError(f"adopted {name} cleanup birth identity changed")
         try:
             uid = int(_ps(pid, "uid"))
@@ -774,15 +883,40 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             argv = _process_argv(pid)
             group = os.getpgid(pid)
             session = os.getsid(pid)
-        except (OSError, ValueError) as exc:
-            if process_birth_identity(pid) is None:
+        except (ConflictError, OSError, ValueError) as exc:
+            refreshed = _observe_process_birth(pid)
+            if refreshed.state == "absent":
                 return False
-            try:
-                if _ps(pid, "state").startswith("Z"):
+            if refreshed.state == "present" and refreshed.birth_id != expected["birth_id"]:
+                raise ConflictError(
+                    f"adopted {name} cleanup birth identity changed"
+                ) from exc
+            if refreshed.state == "present":
+                state = _observe_ps_field(pid, "state")
+                if state.state == "absent":
                     return False
-            except ConflictError:
-                return False
-            raise ConflictError(f"adopted {name} cleanup identity is unobservable") from exc
+                if state.state == "present" and str(state.value).startswith("Z"):
+                    # A zombie retains the same creation identity but cannot
+                    # own authority.  The caller still checks every recorded
+                    # descendant and listener before declaring the graph gone.
+                    return False
+                refreshed = _ProcessBirthObservation(
+                    "unknown",
+                    None,
+                    state.stage,
+                    state.returncode,
+                    state.stdout_bytes,
+                    state.stderr_bytes,
+                )
+            raise ConflictError(
+                f"adopted {name} cleanup identity is unobservable",
+                details={
+                    "observation_stage": refreshed.stage,
+                    "observation_returncode": refreshed.returncode,
+                    "observation_stdout_bytes": refreshed.stdout_bytes,
+                    "observation_stderr_bytes": refreshed.stderr_bytes,
+                },
+            ) from exc
         if uid != int(expected["uid"]):
             raise ConflictError(f"adopted {name} cleanup UID changed")
         if allow_reparented:

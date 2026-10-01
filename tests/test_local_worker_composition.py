@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import runtime_protocol.local_worker_composition as composition
 from runtime_protocol.errors import ConflictError
 from runtime_protocol.local_worker import LocalWorkerProfile, ProcessIdentity
 from runtime_protocol.local_worker_composition import (
@@ -27,6 +28,7 @@ from runtime_protocol.local_worker_composition import (
     OSProcessInspector,
     _PreparedWorker,
     _AdoptedWorkerProcess,
+    _ProcessBirthObservation,
     _actual_executable,
     _argv_digest,
     _process_argv,
@@ -41,6 +43,163 @@ from runtime_protocol.catalog import process_birth_identity
 
 def _digest(char: str) -> str:
     return "sha256:" + char * 64
+
+
+def _cleanup_identity(pid: int = 4321, birth_id: str = "birth") -> dict[str, object]:
+    return {
+        "pid": pid,
+        "birth_id": birth_id,
+        "uid": os.getuid(),
+        "parent_pid": 1,
+        "process_group": pid,
+        "session_id": pid,
+        "executable": sys.executable,
+        "artifact_digest": _digest("a"),
+        "command_line": "worker",
+        "argv_digest": _digest("b"),
+    }
+
+
+def test_cleanup_member_accepts_only_positive_race_to_absence(tmp_path, monkeypatch):
+    profile, _handle = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    observations = iter(
+        [
+            _ProcessBirthObservation("present", "birth", "ps_lstart", 0, 30, 0),
+            _ProcessBirthObservation("absent", None, "ps_lstart", 1, 0, 0),
+        ]
+    )
+    monkeypatch.setattr(composition, "_observe_process_birth", lambda _pid: next(observations))
+    monkeypatch.setattr(
+        composition,
+        "_ps",
+        lambda *_args: (_ for _ in ()).throw(ConflictError("cannot independently observe process 4321")),
+    )
+    monkeypatch.setattr(
+        composition.os,
+        "killpg",
+        lambda *_args: pytest.fail("classification must not signal"),
+    )
+
+    assert preparer._verify_cleanup_member(
+        {"worker": _cleanup_identity()},
+        "worker",
+        expected_parent=None,
+        allow_reparented=True,
+    ) is False
+
+
+@pytest.mark.parametrize(
+    ("observations", "message"),
+    [
+        (
+            [_ProcessBirthObservation("unknown", None, "ps_lstart", None, 0, 0)],
+            "identity is unobservable",
+        ),
+        (
+            [_ProcessBirthObservation("present", "replacement", "ps_lstart", 0, 30, 0)],
+            "birth identity changed",
+        ),
+        (
+            [
+                _ProcessBirthObservation("present", "birth", "ps_lstart", 0, 30, 0),
+                _ProcessBirthObservation("present", "birth", "ps_lstart", 0, 30, 0),
+            ],
+            "identity is unobservable",
+        ),
+        (
+            [
+                _ProcessBirthObservation("present", "birth", "ps_lstart", 0, 30, 0),
+                _ProcessBirthObservation("unknown", None, "ps_lstart", None, 0, 0),
+            ],
+            "identity is unobservable",
+        ),
+        (
+            [
+                _ProcessBirthObservation("present", "birth", "ps_lstart", 0, 30, 0),
+                _ProcessBirthObservation("present", "replacement", "ps_lstart", 0, 30, 0),
+            ],
+            "birth identity changed",
+        ),
+    ],
+)
+def test_cleanup_member_unknown_live_or_reused_pid_fails_closed(
+    tmp_path, monkeypatch, observations, message
+):
+    profile, _handle = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    observed = iter(observations)
+    monkeypatch.setattr(composition, "_observe_process_birth", lambda _pid: next(observed))
+    monkeypatch.setattr(
+        composition,
+        "_observe_ps_field",
+        lambda _pid, field: SimpleNamespace(
+            state="present",
+            value="S",
+            stage=f"ps_{field}",
+            returncode=0,
+            stdout_bytes=2,
+            stderr_bytes=0,
+        ),
+    )
+    monkeypatch.setattr(
+        composition,
+        "_ps",
+        lambda *_args: (_ for _ in ()).throw(ConflictError("cannot independently observe process 4321")),
+    )
+    monkeypatch.setattr(
+        composition.os,
+        "killpg",
+        lambda *_args: pytest.fail("classification must not signal"),
+    )
+
+    with pytest.raises(ConflictError, match=message):
+        preparer._verify_cleanup_member(
+            {"worker": _cleanup_identity()},
+            "worker",
+            expected_parent=None,
+            allow_reparented=True,
+        )
+
+
+def test_cleanup_member_matching_zombie_defers_to_remaining_graph_checks(
+    tmp_path, monkeypatch
+):
+    profile, _handle = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    monkeypatch.setattr(
+        composition,
+        "_observe_process_birth",
+        lambda _pid: _ProcessBirthObservation(
+            "present", "birth", "ps_lstart", 0, 30, 0
+        ),
+    )
+    monkeypatch.setattr(
+        composition,
+        "_ps",
+        lambda *_args: (_ for _ in ()).throw(
+            ConflictError("cannot independently observe process 4321")
+        ),
+    )
+    monkeypatch.setattr(
+        composition,
+        "_observe_ps_field",
+        lambda _pid, field: SimpleNamespace(
+            state="present",
+            value="Z+",
+            stage=f"ps_{field}",
+            returncode=0,
+            stdout_bytes=3,
+            stderr_bytes=0,
+        ),
+    )
+
+    assert preparer._verify_cleanup_member(
+        {"worker": _cleanup_identity()},
+        "worker",
+        expected_parent=None,
+        allow_reparented=True,
+    ) is False
 
 
 def test_argv_digest_preserves_argument_boundaries() -> None:
