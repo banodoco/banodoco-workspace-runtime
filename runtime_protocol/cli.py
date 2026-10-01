@@ -750,10 +750,21 @@ def _attempt_owner_handoff(daemon: RuntimeDaemon, support_root: Path) -> bool:
         # A's existing stderr/runtime log so an installed failure can be
         # distinguished without weakening the fail-closed handoff boundary.
         if isinstance(exc, RuntimeErrorBase):
+            details = exc.details if isinstance(exc.details, dict) else {}
+            handoff_error_code = details.get("handoff_error_code")
+            handoff_stage = details.get("handoff_stage")
             diagnostic = {
                 "event": "orderly_handoff_owner_a_refused",
-                "error_code": exc.code,
-                "stage": "owner_a_request",
+                "error_code": (
+                    handoff_error_code
+                    if isinstance(handoff_error_code, str)
+                    else exc.code
+                ),
+                "stage": (
+                    handoff_stage
+                    if isinstance(handoff_stage, str)
+                    else "owner_a_request"
+                ),
             }
         else:
             diagnostic = {

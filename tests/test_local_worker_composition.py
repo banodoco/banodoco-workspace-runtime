@@ -688,6 +688,61 @@ def test_cross_process_abort_timeout_is_bounded_and_retains_custody_owner(tmp_pa
     assert preparer.cleanup_uncertain
 
 
+def test_private_worker_refusal_preserves_only_bounded_stage_and_code(
+    tmp_path, monkeypatch
+):
+    profile, _handle = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    parent, peer = socket.socketpair()
+    handle = _PreparedWorker(Worker(), "birth", parent, {}, tmp_path / "config.json")
+    preparer = CrossProcessWorkerPreparer(
+        profile=profile,
+        config={},
+        environment={},
+    )
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+
+    def refuse() -> None:
+        request = _frame_receive(peer)
+        assert request["command"] == "handoff_prepare"
+        _frame_send(
+            peer,
+            {
+                "version": CONTROL_VERSION,
+                "status": "error",
+                "error": "private detail must not cross the boundary",
+                "error_code": "sealed_owner_mismatch",
+                "error_stage": "handoff_prepare",
+            },
+        )
+
+    responder = threading.Thread(target=refuse)
+    responder.start()
+    try:
+        with pytest.raises(ConflictError) as raised:
+            preparer._rpc_unlocked(
+                handle,
+                {"version": CONTROL_VERSION, "command": "handoff_prepare"},
+            )
+        responder.join(timeout=1)
+    finally:
+        peer.close()
+        parent.close()
+
+    assert "private detail" not in raised.value.message
+    assert raised.value.details == {
+        "handoff_error_code": "sealed_owner_mismatch",
+        "handoff_stage": "handoff_prepare",
+    }
+
+
 def test_cross_process_abort_rejects_malformed_ack_and_retains_custody_owner(
     tmp_path, monkeypatch
 ):

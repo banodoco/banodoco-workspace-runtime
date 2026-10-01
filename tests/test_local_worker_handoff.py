@@ -252,6 +252,33 @@ def test_wrong_owned_pointer_is_rejected_without_owner_mutation(tmp_path, capsys
     }
 
 
+def test_owner_handoff_emits_only_bounded_worker_stage_and_code(
+    tmp_path, capsys, monkeypatch
+):
+    daemon = SimpleNamespace(local_worker_launcher=object())
+
+    def reject(_daemon, _support):
+        raise ConflictError(
+            "private detail must not be emitted",
+            details={
+                "handoff_error_code": "sealed_owner_mismatch",
+                "handoff_stage": "handoff_prepare",
+                "raw_nonce": "must-not-be-emitted",
+            },
+        )
+
+    monkeypatch.setattr(runtime_cli, "_owner_handoff_request", reject)
+    assert runtime_cli._attempt_owner_handoff(daemon, tmp_path) is False
+    output = capsys.readouterr().err
+    assert "private detail" not in output
+    assert "must-not-be-emitted" not in output
+    assert json.loads(output) == {
+        "error_code": "sealed_owner_mismatch",
+        "event": "orderly_handoff_owner_a_refused",
+        "stage": "handoff_prepare",
+    }
+
+
 def test_digest_valid_malformed_owned_record_is_nonfatal_and_nonmutating(tmp_path):
     support = tmp_path / "support"
     support.mkdir(mode=0o700)

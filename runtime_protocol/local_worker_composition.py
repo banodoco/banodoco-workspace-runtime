@@ -258,7 +258,25 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         if response.get("version") != CONTROL_VERSION:
             raise ConflictError("prepared Worker control version is invalid")
         if response.get("status") != "ok":
-            raise ConflictError(str(response.get("error") or "prepared Worker rejected the operation"))
+            error_code = response.get("error_code")
+            error_stage = response.get("error_stage")
+            if (
+                not isinstance(error_code, str)
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_code) is None
+            ):
+                error_code = "worker_rejected"
+            if (
+                not isinstance(error_stage, str)
+                or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", error_stage) is None
+            ):
+                error_stage = "worker_control"
+            raise ConflictError(
+                "prepared Worker rejected the operation",
+                details={
+                    "handoff_error_code": error_code,
+                    "handoff_stage": error_stage,
+                },
+            )
         return response
 
     def _rpc(self, handle: _PreparedWorker, payload: Mapping[str, Any]) -> dict[str, Any]:
