@@ -13,6 +13,7 @@ import base64
 import ctypes
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -358,6 +359,7 @@ class RoleBoundCustodyBroker:
             "ASTRID_RUNTIME_CUSTODY_RUN_ID": self.run_id,
             "ASTRID_RUNTIME_CUSTODY_ROLE": self.role,
             "ASTRID_RUNTIME_CUSTODY_START_SESSION": "1" if start_new_session else "0",
+            "ASTRID_RUNTIME_CUSTODY_TIMEOUT_SECONDS": repr(self.timeout),
             "ASTRID_RUNTIME_CUSTODY_TARGET_B64": base64.b64encode(
                 _canonical(normalized)
             ).decode("ascii"),
@@ -573,8 +575,17 @@ def child_exec_from_environment() -> int:
     # Runtime readiness by the parent that retains the direct-child handle.
     if os.environ.get("ASTRID_RUNTIME_CUSTODY_START_SESSION") == "1":
         os.setsid()
+    try:
+        timeout = float(os.environ.get("ASTRID_RUNTIME_CUSTODY_TIMEOUT_SECONDS", "5"))
+    except ValueError as exc:
+        raise CustodyError("custody registration timeout is invalid") from exc
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 60:
+        raise CustodyError("custody registration timeout is invalid")
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(5.0)
+    # The broker durably checkpoints the pre-exec registration before its ACK.
+    # Use the broker's own bounded timeout so a slow fsync cannot make the child
+    # abandon a registration the broker is still entitled to complete.
+    connection.settimeout(timeout)
     connection.connect(os.environ.get("ASTRID_RUNTIME_CUSTODY_SOCKET", ""))
     os.set_inheritable(connection.fileno(), True)
     frame = {

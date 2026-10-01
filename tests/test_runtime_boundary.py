@@ -273,6 +273,7 @@ def test_custody_child_creates_session_before_pre_exec_registration(monkeypatch)
     monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_RUN_ID", "run-a")
     monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_ROLE", "runtime_owner")
     monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_START_SESSION", "1")
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_TIMEOUT_SECONDS", "9.5")
     monkeypatch.setattr(custody_broker_module.os, "getpid", lambda: 4242)
     monkeypatch.setattr(custody_broker_module.os, "getppid", lambda: 3131)
     monkeypatch.setattr(custody_broker_module.os, "setsid", lambda: events.append("setsid"))
@@ -334,12 +335,38 @@ def test_custody_child_creates_session_before_pre_exec_registration(monkeypatch)
 
     assert events.index("setsid") < events.index(("connect", "/private/custody.sock"))
     assert events.index("setsid") < events.index("register") < events.index("ack")
+    assert ("timeout", 9.5) in events
     assert events.count("setsid") == 1
     assert frame["pid"] == 4242
     assert frame["ppid"] == 3131
     assert frame["argv_digest"] == custody_broker_module._digest_bytes(
         custody_broker_module._canonical(target)
     )
+
+
+@pytest.mark.parametrize("value", ["invalid", "nan", "0", "61"])
+def test_custody_child_rejects_invalid_broker_timeout_before_socket_use(
+    monkeypatch, value
+):
+    target = ["/installed/runtime/bin/python", "-m", "runtime_protocol", "start"]
+    monkeypatch.setenv(
+        "ASTRID_RUNTIME_CUSTODY_TARGET_B64",
+        custody_broker_module.base64.b64encode(
+            custody_broker_module._canonical(target)
+        ).decode("ascii"),
+    )
+    monkeypatch.setenv("ASTRID_RUNTIME_CUSTODY_TIMEOUT_SECONDS", value)
+    monkeypatch.setattr(
+        custody_broker_module.socket,
+        "socket",
+        lambda *_args: pytest.fail("invalid timeout reached socket creation"),
+    )
+
+    with pytest.raises(
+        custody_broker_module.CustodyError,
+        match="custody registration timeout is invalid",
+    ):
+        custody_broker_module.child_exec_from_environment()
 
 
 def test_custody_broker_rebinds_and_signals_only_final_ready_token(tmp_path, monkeypatch):
@@ -381,6 +408,10 @@ def test_custody_broker_rebinds_and_signals_only_final_ready_token(tmp_path, mon
         identity_provider=lambda _pid: identity,
         ledger_root=tmp_path / "custody-ledger",
     )
+    assert broker.child_environment(
+        [sys.executable, "-m", "runtime_protocol", "start"],
+        start_new_session=True,
+    )["ASTRID_RUNTIME_CUSTODY_TIMEOUT_SECONDS"] == "5.0"
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         connection.connect(str(broker.socket_path))
