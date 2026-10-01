@@ -254,6 +254,76 @@ def _owner_handoff_stage_error(
     return type(exc)(exc.message, details=details)
 
 
+def _bounded_adopter_failure(exc: BaseException, stage: str) -> dict[str, object]:
+    """Retain the initiating B-side phase without private frame contents."""
+
+    result: dict[str, object] = {
+        "code": exc.code if isinstance(exc, RuntimeErrorBase) else "startup_error",
+        "adopter_stage": stage,
+    }
+    if not isinstance(exc, RuntimeErrorBase) or not isinstance(exc.details, dict):
+        return result
+    for key in (
+        "handoff_error_code",
+        "handoff_stage",
+        "observation_stage",
+        "observation_returncode",
+        "observation_stdout_bytes",
+        "observation_stderr_bytes",
+        "frame_bytes",
+        "frame_limit",
+    ):
+        value = exc.details.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            result[key] = value
+    diagnostic = exc.details.get("host_control_diagnostic")
+    if isinstance(diagnostic, dict):
+        bounded = {
+            key: diagnostic[key]
+            for key in (
+                "operation", "handoff_phase", "stage", "exception_category",
+                "errno", "handoff_id",
+            )
+            if isinstance(diagnostic.get(key), (str, int))
+            and not isinstance(diagnostic.get(key), bool)
+        }
+        host = diagnostic.get("host")
+        if (
+            isinstance(host, dict)
+            and isinstance(host.get("pid"), int)
+            and not isinstance(host.get("pid"), bool)
+            and isinstance(host.get("birth_id"), str)
+        ):
+            bounded["host"] = {
+                "pid": host["pid"],
+                "birth_id": host["birth_id"],
+            }
+        if bounded:
+            result["host_control_diagnostic"] = bounded
+    return result
+
+
+def _failed_adopter_error_payload(
+    initiating_error: BaseException,
+    cleanup_error: BaseException | None,
+    stage: str,
+) -> dict[str, object]:
+    """Keep cleanup primary while retaining a bounded initiating failure."""
+
+    effective = cleanup_error or initiating_error
+    if isinstance(effective, RuntimeErrorBase):
+        error: dict[str, object] = effective.as_dict()
+    else:
+        error = {"code": "startup_error", "message": str(effective)}
+    if cleanup_error is not None:
+        details = dict(error.get("details")) if isinstance(error.get("details"), dict) else {}
+        details["initiating_failure"] = _bounded_adopter_failure(
+            initiating_error, stage
+        )
+        error["details"] = details
+    return error
+
+
 def _owner_handoff_request(daemon: RuntimeDaemon, support_root: Path) -> bool:
     """Serve one authenticated A-side handoff after SIGUSR1.
 
@@ -997,6 +1067,7 @@ def main(argv=None):
     capability_channel = None
     handoff_frame = None
     handoff_record = None
+    adopter_failure_stage = "runtime_setup"
     try:
         composition = None
         if getattr(args, "worker_profile", None):
@@ -1019,6 +1090,7 @@ def main(argv=None):
         if handoff_supplied:
             if composition is None:
                 raise RuntimeErrorBase("orderly handoff requires the installed Worker profile")
+            adopter_failure_stage = "handoff_input"
             capability_channel, handoff_frame, _expected_listener = _adopter_handoff_frame(args)
             handoff_record = HandoffRecord(Path(args.handoff_record))
             handoff_record_value = handoff_record.read()
@@ -1033,6 +1105,7 @@ def main(argv=None):
             }
         else:
             actor, registration_bodies = None, None
+        adopter_failure_stage = "daemon_start"
         daemon = RuntimeDaemon(
             args.root,
             support_root=args.support_root,
@@ -1080,6 +1153,7 @@ def main(argv=None):
         ).start()
         handoff_result = None
         if handoff_supplied:
+            adopter_failure_stage = "adopter_binding"
             handoff_frame = dict(handoff_frame)
             handoff_frame["worker_control_fd"] = int(args.handoff_worker_fd)
             send_frame(capability_channel, {
@@ -1116,7 +1190,9 @@ def main(argv=None):
             }
             capability_channel.close()
             capability_channel = None
+            adopter_failure_stage = "worker_adopt"
             handoff_result = daemon.adopt_orderly_worker_handoff(handoff_frame)
+            adopter_failure_stage = "adopter_publication"
             _retry_same_adopter_step(
                 float(handoff_frame["deadline_monotonic"]),
                 lambda: _complete_adopter_publication(
@@ -1137,8 +1213,9 @@ def main(argv=None):
             )
         # Installed operator entrypoints must fail as a stable JSON boundary;
         # never leak a traceback for an unsupported format or bad root.
-        effective_error = cleanup_error or exc
-        error = effective_error.as_dict() if isinstance(effective_error, RuntimeErrorBase) else {"code": "startup_error", "message": str(effective_error)}
+        error = _failed_adopter_error_payload(
+            exc, cleanup_error, adopter_failure_stage
+        )
         print(json.dumps({"ok": False, "error": error}, sort_keys=True))
         return 1
     _emit_post_admission_report({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path), "worker_credential_file": str(daemon.worker_credential_path), "worker_actor": "astrid-pack-host", "worker_scopes": list(WORKER_SCOPES), "worker_profile_configured": bool(daemon.local_worker_profiles), "orderly_handoff": handoff_result})

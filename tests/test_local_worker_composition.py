@@ -202,6 +202,142 @@ def test_cleanup_member_matching_zombie_defers_to_remaining_graph_checks(
     ) is False
 
 
+def _adopted_cleanup_handle(tmp_path: Path) -> tuple[_PreparedWorker, socket.socket]:
+    class AdoptedWorker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return 0
+
+    parent, peer = socket.socketpair()
+    receipt = {
+        "worker": _cleanup_identity(4321, "worker-birth"),
+        "host": _cleanup_identity(4322, "host-birth"),
+        "engine": _cleanup_identity(4323, "engine-birth"),
+        "engine_listener": _cleanup_identity(4324, "listener-birth"),
+    }
+    return (
+        _PreparedWorker(
+            AdoptedWorker(),
+            "worker-birth",
+            parent,
+            {},
+            tmp_path / "config.json",
+            adopted=True,
+            receipt=receipt,
+        ),
+        peer,
+    )
+
+
+def test_adopted_abort_accepts_positive_graph_absence_without_signaling(
+    tmp_path, monkeypatch
+):
+    profile, _unused = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    handle, peer = _adopted_cleanup_handle(tmp_path)
+    preparer._active = handle
+    monkeypatch.setattr(
+        composition,
+        "_observe_process_birth",
+        lambda _pid: _ProcessBirthObservation(
+            "absent", None, "ps_lstart", 1, 0, 0
+        ),
+    )
+    monkeypatch.setattr(
+        composition.os,
+        "killpg",
+        lambda *_args: pytest.fail("positive absence must not signal"),
+    )
+    try:
+        preparer.abort(handle)
+    finally:
+        peer.close()
+
+    assert handle.closed is True
+    assert preparer._active is None
+    assert preparer.cleanup_uncertain is None
+
+
+def test_adopted_abort_same_birth_uses_verified_graph_cleanup(
+    tmp_path, monkeypatch
+):
+    profile, _unused = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    handle, peer = _adopted_cleanup_handle(tmp_path)
+    preparer._active = handle
+    forced = []
+    monkeypatch.setattr(
+        composition,
+        "_observe_process_birth",
+        lambda _pid: _ProcessBirthObservation(
+            "present", "worker-birth", "ps_lstart", 0, 30, 0
+        ),
+    )
+    monkeypatch.setattr(
+        preparer,
+        "_rpc_unlocked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ConflictError("control channel closed")
+        ),
+    )
+    monkeypatch.setattr(preparer, "_adopted_graph_has_survivors", lambda _handle: True)
+    monkeypatch.setattr(
+        preparer,
+        "_force_cleanup_adopted_graph",
+        lambda _handle: forced.append("verified_cleanup"),
+    )
+    try:
+        preparer.abort(handle)
+    finally:
+        peer.close()
+
+    assert forced == ["verified_cleanup"]
+    assert handle.closed is True
+    assert preparer._active is None
+    assert preparer.cleanup_uncertain is None
+
+
+@pytest.mark.parametrize(
+    ("observation", "message"),
+    [
+        (
+            _ProcessBirthObservation("unknown", None, "ps_lstart", None, 0, 0),
+            "cleanup identity is unobservable",
+        ),
+        (
+            _ProcessBirthObservation(
+                "present", "replacement-birth", "ps_lstart", 0, 30, 0
+            ),
+            "cleanup birth identity changed",
+        ),
+    ],
+)
+def test_adopted_abort_unknown_or_reused_worker_fails_closed_without_signaling(
+    tmp_path, monkeypatch, observation, message
+):
+    profile, _unused = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    handle, peer = _adopted_cleanup_handle(tmp_path)
+    preparer._active = handle
+    monkeypatch.setattr(composition, "_observe_process_birth", lambda _pid: observation)
+    monkeypatch.setattr(
+        composition.os,
+        "killpg",
+        lambda *_args: pytest.fail("uncertain or reused identity must not signal"),
+    )
+    try:
+        with pytest.raises(ConflictError, match=message):
+            preparer.abort(handle)
+    finally:
+        peer.close()
+
+    assert handle.closed is True
+    assert preparer._active is None
+    assert preparer.cleanup_uncertain
+
+
 def test_argv_digest_preserves_argument_boundaries() -> None:
     assert _argv_digest([b"a b", b"c"]) != _argv_digest([b"a", b"b c"])
 

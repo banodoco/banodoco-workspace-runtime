@@ -928,19 +928,39 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             handle.cleanup_started = True
         failure: BaseException | None = None
         try:
-            if self._birth(handle.worker.pid) != handle.birth_id:
+            worker_present = True
+            if handle.adopted:
+                observed = _observe_process_birth(handle.worker.pid)
+                if observed.state == "absent":
+                    worker_present = False
+                elif observed.state != "present":
+                    raise ConflictError(
+                        "prepared Worker birth identity is unobservable",
+                        details={
+                            "observation_stage": observed.stage,
+                            "observation_returncode": observed.returncode,
+                            "observation_stdout_bytes": observed.stdout_bytes,
+                            "observation_stderr_bytes": observed.stderr_bytes,
+                        },
+                    )
+                elif observed.birth_id != handle.birth_id:
+                    raise ConflictError(
+                        "prepared Worker identity changed before cleanup"
+                    )
+            elif self._birth(handle.worker.pid) != handle.birth_id:
                 raise ConflictError("prepared Worker identity changed before cleanup")
-            acquired = handle.rpc_lock.acquire(timeout=self.cleanup_timeout_seconds)
-            if acquired:
-                try:
-                    previous_timeout = handle.control.gettimeout()
-                    handle.control.settimeout(self.cleanup_timeout_seconds)
+            if worker_present:
+                acquired = handle.rpc_lock.acquire(timeout=self.cleanup_timeout_seconds)
+                if acquired:
                     try:
-                        self._rpc_unlocked(handle, {"version": CONTROL_VERSION, "command": "abort"})
+                        previous_timeout = handle.control.gettimeout()
+                        handle.control.settimeout(self.cleanup_timeout_seconds)
+                        try:
+                            self._rpc_unlocked(handle, {"version": CONTROL_VERSION, "command": "abort"})
+                        finally:
+                            handle.control.settimeout(previous_timeout)
                     finally:
-                        handle.control.settimeout(previous_timeout)
-                finally:
-                    handle.rpc_lock.release()
+                        handle.rpc_lock.release()
             if handle.adopted:
                 deadline = __import__("time").monotonic() + self.cleanup_timeout_seconds
                 while handle.worker.poll() is None and __import__("time").monotonic() < deadline:
@@ -958,13 +978,21 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 except OSError:
                     pass
                 handle.control.close()
-                if self._adopted_graph_has_survivors(handle):
-                    try:
-                        self._force_cleanup_adopted_graph(handle)
-                        failure = None
-                    except BaseException as exc:
-                        self.cleanup_uncertain = str(exc)
-                        failure = exc
+                try:
+                    graph_has_survivors = self._adopted_graph_has_survivors(handle)
+                except BaseException as exc:
+                    self.cleanup_uncertain = str(exc)
+                    failure = exc
+                else:
+                    if graph_has_survivors:
+                        try:
+                            self._force_cleanup_adopted_graph(handle)
+                            failure = None
+                        except BaseException as exc:
+                            self.cleanup_uncertain = str(exc)
+                            failure = exc
+                if failure is None:
+                    self.cleanup_uncertain = None
                 handle.closed = True
                 if self._active is handle:
                     self._active = None
@@ -1155,12 +1183,19 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         receipt = handle.receipt
         if not isinstance(receipt, Mapping):
             return True
+        parents = {
+            "worker": None,
+            "host": int(self._receipt_process(receipt, "worker")["pid"]),
+            "engine": int(self._receipt_process(receipt, "worker")["pid"]),
+            "engine_listener": int(self._receipt_process(receipt, "engine")["pid"]),
+        }
         for name in ("worker", "host", "engine", "engine_listener"):
-            try:
-                expected = self._receipt_process(receipt, name)
-            except ConflictError:
-                return True
-            if process_birth_identity(int(expected["pid"])) == expected["birth_id"]:
+            if self._verify_cleanup_member(
+                receipt,
+                name,
+                expected_parent=parents[name],
+                allow_reparented=True,
+            ):
                 return True
         return False
 

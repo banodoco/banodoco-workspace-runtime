@@ -26,6 +26,7 @@ from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.catalog import process_birth_identity
 from runtime_protocol.cli import (
     _abort_failed_adopter_after_cleanup,
+    _failed_adopter_error_payload,
     _complete_adopter_publication,
     _owned_handoff_request,
     _resolve_aborted_predecessor,
@@ -925,6 +926,60 @@ def test_failed_b_cleanup_uncertainty_preserves_custody_state_and_blocks_aborted
     )
     assert isinstance(error, ConflictError)
     assert events == ["read", "cleanup"]
+
+
+def test_failed_b_cleanup_preserves_only_bounded_initiating_phase():
+    initiating = ConflictError(
+        "private initiating detail",
+        details={
+            "handoff_error_code": "host_control_failed",
+            "handoff_stage": "control",
+            "secret": "must-not-cross",
+            "host_control_diagnostic": {
+                "operation": "rebind_prepare",
+                "handoff_phase": "handoff_adopt",
+                "stage": "receive",
+                "exception_category": "eof",
+                "errno": 54,
+                "handoff_id": "handoff-1",
+                "host": {
+                    "pid": 4322,
+                    "birth_id": "ps-lstart:Thu Oct  1 15:36:52 2026",
+                },
+                "raw_frame": "must-not-cross",
+            },
+        },
+    )
+    cleanup = ConflictError("local Worker graph cleanup is uncertain")
+
+    payload = _failed_adopter_error_payload(
+        initiating, cleanup, "worker_adopt"
+    )
+
+    assert payload["code"] == "conflict"
+    assert payload["message"] == "local Worker graph cleanup is uncertain"
+    bounded = payload["details"]["initiating_failure"]
+    assert bounded == {
+        "code": "conflict",
+        "adopter_stage": "worker_adopt",
+        "handoff_stage": "control",
+        "handoff_error_code": "host_control_failed",
+        "host_control_diagnostic": {
+            "operation": "rebind_prepare",
+            "handoff_phase": "handoff_adopt",
+            "stage": "receive",
+            "exception_category": "eof",
+            "errno": 54,
+            "handoff_id": "handoff-1",
+            "host": {
+                "pid": 4322,
+                "birth_id": "ps-lstart:Thu Oct  1 15:36:52 2026",
+            },
+        },
+    }
+    assert "private" not in json.dumps(payload)
+    assert "secret" not in json.dumps(payload)
+    assert "raw_frame" not in json.dumps(payload)
 
 
 def test_post_adopted_gate_invariant_latches_operator_audit_and_retains_record(tmp_path):
