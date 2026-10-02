@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import json
 import threading
@@ -22,6 +23,7 @@ from runtime_protocol.local_worker import (
     LocalWorkerProfile,
     ProcessIdentity,
 )
+import runtime_protocol.local_worker as local_worker_module
 from runtime_protocol.store import RealmStore
 
 
@@ -254,7 +256,7 @@ class FakeInspector:
         self.calls += 1
         if self.assert_unissued and self.calls <= 2:
             assert self.store.actor_metadata(WORKER_ACTOR) is None
-        elif self.calls >= 3:
+        elif self.assert_unissued and self.calls >= 3:
             token = self.store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
             with pytest.raises(AuthorizationError):
                 self.store.load(token)
@@ -307,6 +309,168 @@ def test_owner_transaction_issues_only_after_two_observations_then_activates(tmp
     assert observed.engine_listener.session_id == observed.engine.pid
     token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
     assert store.load(token)["execution_binding"]["executor_incarnation"] == result["executor_incarnation"]
+
+
+def test_repeated_start_revalidates_the_owned_graph_without_prepare_or_signal(tmp_path):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    inspector = FakeInspector(store, observed, assert_unissued=False)
+    launcher = _launcher(store, profile, preparer, inspector, 77)
+    first = launcher.start("astrid", workspace_uuid)
+    events = list(preparer.events)
+
+    repeated = launcher.start("astrid", workspace_uuid)
+
+    assert repeated["state"] == "reconnected"
+    assert repeated["executor_incarnation"] == first["executor_incarnation"]
+    assert preparer.events == events
+    assert preparer.aborted is False
+    assert not (profile.support_root / "orderly-handoff-cleanup-uncertain.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(lambda value: value["local_launch_receipt"].__setitem__(
+            "version", "runtime.local-worker-receipt/v2"
+        ), id="receipt-version"),
+        pytest.param(lambda value: value["local_launch_receipt"]["engine_listener"].__setitem__(
+            "parent_pid", 999999
+        ), id="listener-parent"),
+        pytest.param(lambda value: value["local_launch_receipt"]["engine_binding"].__setitem__(
+            "socket_owner_pid", 999999
+        ), id="listener-socket-owner"),
+        pytest.param(lambda value: value["local_launch_receipt"]["engine_binding"].__setitem__(
+            "endpoint", "http://127.0.0.1:9"
+        ), id="engine-endpoint"),
+        pytest.param(lambda value: value["local_launch_receipt"].__setitem__(
+            "machine_id", "wrong-machine"
+        ), id="machine"),
+    ],
+)
+def test_active_generation_rejects_mutated_durable_receipt_before_prepare_or_cleanup(
+    tmp_path, mutation,
+):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    inspector = FakeInspector(store, observed)
+    launcher = _launcher(store, profile, preparer, inspector, 77)
+    launcher.start("astrid", workspace_uuid)
+    events = list(preparer.events)
+    metadata = copy.deepcopy(store.actor_metadata(WORKER_ACTOR))
+    mutation(metadata)
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+    store._publish(WORKER_ACTOR, token, metadata)
+
+    with pytest.raises(ConflictError, match="durable receipt differs"):
+        launcher.start("astrid", workspace_uuid)
+
+    assert preparer.events == events
+    assert preparer.aborted is False
+    assert preparer.current_handle() is not None
+    assert not (profile.support_root / "orderly-handoff-cleanup-uncertain.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(lambda receipt: receipt.__setitem__("machine_id", "wrong-machine"), id="machine"),
+        pytest.param(lambda receipt: receipt["engine_binding"].__setitem__(
+            "endpoint", "http://127.0.0.1:9"
+        ), id="engine-endpoint"),
+        pytest.param(lambda receipt: receipt["engine_binding"].__setitem__(
+            "socket_owner_pid", 999999
+        ), id="socket-owner"),
+    ],
+)
+@pytest.mark.parametrize("recompute_digest", [False, True], ids=["old-digest", "recomputed-digest"])
+def test_restarted_owner_rejects_receipt_identity_contradictions_before_authority_enablement(
+    tmp_path, mutation, recompute_digest,
+):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    first_preparer = FakePreparer(store, observed)
+    _launcher(
+        store, profile, first_preparer,
+        FakeInspector(store, observed, assert_unissued=False), 77,
+    ).start("astrid", workspace_uuid)
+    metadata = copy.deepcopy(store.actor_metadata(WORKER_ACTOR))
+    receipt = metadata["local_launch_receipt"]
+    mutation(receipt)
+    if recompute_digest:
+        projection = {
+            key: copy.deepcopy(value)
+            for key, value in receipt.items()
+            if key not in {"version", "evidence_digest", "executor_incarnation"}
+        }
+        projection["worker"].pop("parent_pid", None)
+        receipt["evidence_digest"] = local_worker_module._digest(projection)
+        metadata["execution_binding"]["verification"]["evidence_digest"] = receipt[
+            "evidence_digest"
+        ]
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+    store._publish(WORKER_ACTOR, token, metadata)
+    restarted_preparer = FakePreparer(store, observed)
+    restarted = _launcher(
+        store, profile, restarted_preparer,
+        FakeInspector(store, observed, assert_unissued=False), 88,
+    )
+
+    with pytest.raises(
+        ConflictError,
+        match="contradicts current profile authority|surviving local [Ww]orker identity changed",
+    ):
+        restarted.start("astrid", workspace_uuid)
+
+    assert store.actor_enabled(WORKER_ACTOR) is False
+    assert not (profile.support_root / "orderly-handoff-cleanup-uncertain.json").exists()
+
+
+def test_restarted_owner_rejects_wrong_receipt_version_without_prepare_or_replacement(
+    tmp_path,
+):
+    workspace_uuid = str(uuid.uuid4())
+    profile = _profile(tmp_path, workspace_uuid)
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    first_preparer = FakePreparer(store, observed)
+    first = _launcher(
+        store, profile, first_preparer,
+        FakeInspector(store, observed, assert_unissued=False), 77,
+    ).start("astrid", workspace_uuid)
+    survivor_handle = first_preparer.current_handle()
+    metadata = copy.deepcopy(store.actor_metadata(WORKER_ACTOR))
+    metadata["local_launch_receipt"]["version"] = "runtime.local-worker-receipt/v2"
+    token = store.path_for(WORKER_ACTOR).read_text(encoding="utf-8")
+    store._publish(WORKER_ACTOR, token, metadata)
+
+    restarted_preparer = FakePreparer(store, observed)
+    restarted = _launcher(
+        store, profile, restarted_preparer,
+        FakeInspector(store, observed, assert_unissued=False), 88,
+    )
+
+    with pytest.raises(
+        ConflictError,
+        match="existing local Worker receipt contradicts current profile authority",
+    ):
+        restarted.start("astrid", workspace_uuid)
+
+    assert first["state"] == "active"
+    assert first_preparer.current_handle() is survivor_handle
+    assert restarted_preparer.events == []
+    assert restarted_preparer.current_handle() is None
+    assert store.actor_enabled(WORKER_ACTOR) is False
+    assert store.actor_metadata(WORKER_ACTOR) is None
+    assert not (profile.support_root / "orderly-handoff-cleanup-uncertain.json").exists()
 
 
 def test_orderly_handoff_preserves_generation_and_incarnation_across_two_launchers(tmp_path):
@@ -1272,7 +1436,10 @@ def test_private_owner_route_does_not_take_sqlite_mutex(tmp_path):
             return getattr(store_probe["store"], name)
 
     proxy = StoreProxy()
-    observed = _observation(profile, os.getpid())
+    # Use a PID range outside Darwin's live-process space. Low fake PIDs can
+    # collide with unrelated host processes and make the teardown census
+    # report a false live graph.
+    observed = _observation(profile, os.getpid(), base=2_000_000)
     preparer = DeferredPreparer(proxy, observed)
     inspector = FakeInspector(proxy, observed)
     daemon = RuntimeDaemon(

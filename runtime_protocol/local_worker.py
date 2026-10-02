@@ -227,6 +227,7 @@ class LocalWorkerLauncher:
         self._prepare_cancel = threading.Event()
         self._orderly_handoff: _OrderlyHandoff | None = None
         self._cleanup_uncertain: str | None = None
+        self._startup_receipt_rejection: str | None = None
         for method in ("control_alive", "current_handle"):
             if not callable(getattr(preparer, method, None)):
                 raise ValueError(f"local worker preparer must implement {method}")
@@ -240,6 +241,22 @@ class LocalWorkerLauncher:
             # pre-I-06 generation has no receipt and can never be revalidated.
             credentials.disable_actor(actor)
             if not self._receipt_shape_valid(existing):
+                receipt = existing.get("local_launch_receipt")
+                profile = (
+                    self.profiles.get(receipt.get("profile_id"))
+                    if isinstance(receipt, Mapping) else None
+                )
+                if (
+                    isinstance(receipt, Mapping)
+                    and profile is not None
+                    and receipt.get("workspace_uuid") == self.workspace_uuid
+                    and receipt.get("profile_revision") == profile.profile_revision
+                    and receipt.get("profile_digest") == profile.profile_digest
+                    and receipt.get("release_digest") == profile.release_digest
+                ):
+                    self._startup_receipt_rejection = (
+                        "existing local Worker receipt contradicts current profile authority"
+                    )
                 self._revoke_actor()
 
     def _revoke_actor(self) -> None:
@@ -316,7 +333,54 @@ class LocalWorkerLauncher:
             and actual.get("profile_revision") == profile.profile_revision
             and actual.get("profile_digest") == profile.profile_digest
             and actual.get("release_digest") == profile.release_digest
+            and self._receipt_identity_digest_valid(profile, receipt)
         )
+
+    def _receipt_identity_digest_valid(
+        self, profile: LocalWorkerProfile, receipt: Mapping[str, Any],
+    ) -> bool:
+        """Bind every serialized stable receipt field to its evidence digest.
+
+        Only the surviving Worker's parent may change after a Runtime owner
+        exits. All other process lineage, machine, endpoint, socket custody,
+        profile, and artifact fields are committed exactly as they were at
+        issuance.
+        """
+
+        identity_keys = {
+            "profile_id", "workspace_uuid", "realm_root", "support_root",
+            "machine_id", "uid", "worker", "host", "engine",
+            "engine_listener", "cleanup_groups", "engine_binding",
+            "session_config_digest", "profile_revision", "profile_digest",
+            "release_digest",
+        }
+        if set(receipt) != identity_keys | {
+            "version", "evidence_digest", "executor_incarnation",
+        }:
+            return False
+        if (
+            receipt.get("version") != RECEIPT_VERSION
+            or receipt.get("profile_id") != profile.profile_id
+            or receipt.get("workspace_uuid") != self.workspace_uuid
+            or receipt.get("realm_root") != str(self.realm_root)
+            or receipt.get("support_root") != str(self.support_root)
+            or receipt.get("machine_id") != profile.machine_id
+            or receipt.get("session_config_digest") != profile.session_config_digest
+            or receipt.get("profile_revision") != profile.profile_revision
+            or receipt.get("profile_digest") != profile.profile_digest
+            or receipt.get("release_digest") != profile.release_digest
+        ):
+            return False
+        projection = {key: receipt.get(key) for key in identity_keys}
+        worker = projection.get("worker")
+        if not isinstance(worker, Mapping):
+            return False
+        projection["worker"] = dict(worker)
+        projection["worker"].pop("parent_pid", None)
+        try:
+            return receipt.get("evidence_digest") == _digest(projection)
+        except (TypeError, ValueError):
+            return False
 
     def _profile(self, profile_id: str, expected_workspace_uuid: str) -> LocalWorkerProfile:
         if not isinstance(profile_id, str) or not profile_id:
@@ -1180,9 +1244,11 @@ class LocalWorkerLauncher:
     def _try_reconnect(self, profile: LocalWorkerProfile, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         receipt = metadata.get("local_launch_receipt")
         if not isinstance(receipt, Mapping) or receipt.get("version") != RECEIPT_VERSION:
-            return None
+            raise ConflictError("surviving local Worker receipt shape or version is invalid")
         if receipt.get("profile_id") != profile.profile_id or receipt.get("workspace_uuid") != self.workspace_uuid:
-            return None
+            raise ConflictError("surviving local Worker receipt authority differs")
+        if not self._receipt_identity_digest_valid(profile, receipt):
+            raise ConflictError("surviving local Worker receipt identity digest is invalid")
         handle = self.preparer.reconnect(receipt)
         if handle is None:
             return None
@@ -1219,6 +1285,68 @@ class LocalWorkerLauncher:
                 self._abort(handle)
             raise
 
+    def _current_active_result(
+        self, profile: LocalWorkerProfile, metadata: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return the already-owned generation without reconnect side effects.
+
+        A repeated start request can arrive while this Runtime still owns the
+        active handle.  The durable credential is public-to-the-owner input,
+        not cleanup custody: if its receipt or binding was replaced, reject it
+        before disabling authority, reconnecting, preparing, or signaling the
+        verified graph.  This also gives installed negative controls a real
+        consumer boundary without corrupting cleanup authority.
+        """
+
+        with self._state_lock:
+            handle = self._active_handle
+            active_profile = self._active_profile
+            active_identity = (
+                dict(self._active_identity)
+                if self._active_identity is not None else None
+            )
+            active_receipt = (
+                dict(self._active_receipt)
+                if self._active_receipt is not None else None
+            )
+        if handle is None:
+            return None
+        if active_profile != profile or active_identity is None or active_receipt is None:
+            raise ConflictError("active local Worker custody is incomplete")
+        receipt = metadata.get("local_launch_receipt")
+        binding = metadata.get("execution_binding")
+        verification = binding.get("verification") if isinstance(binding, Mapping) else None
+        actual = binding.get("actual") if isinstance(binding, Mapping) else None
+        if (
+            not isinstance(receipt, Mapping)
+            or dict(receipt) != active_receipt
+            or not isinstance(binding, Mapping)
+            or binding.get("executor_incarnation")
+            != active_receipt.get("executor_incarnation")
+            or not isinstance(verification, Mapping)
+            or verification.get("verified") is not True
+            or verification.get("evidence_digest")
+            != active_receipt.get("evidence_digest")
+            or not isinstance(actual, Mapping)
+            or actual.get("kind") != "machine"
+            or actual.get("id") != active_identity.get("machine_id")
+            or actual.get("profile_revision") != profile.profile_revision
+            or actual.get("profile_digest") != profile.profile_digest
+            or actual.get("release_digest") != profile.release_digest
+        ):
+            raise ConflictError(
+                "active local Worker durable receipt differs from Runtime custody"
+            )
+        observed = self.inspector.observe(handle)
+        current = self._validate_observation(
+            profile, observed, report=None, reconnect=True,
+        )
+        if current != active_identity:
+            raise ConflictError("active local Worker identity changed")
+        result = dict(active_receipt)
+        result["state"] = "reconnected"
+        return result
+
     def start(self, profile_id: str, expected_workspace_uuid: str) -> dict[str, Any]:
         if not self._operation_lock.acquire(blocking=False):
             raise ConflictError("a local worker launch operation is already in progress")
@@ -1227,6 +1355,8 @@ class LocalWorkerLauncher:
         try:
             if self._shutdown.is_set():
                 raise ConflictError("Runtime owner is shutting down")
+            if self._startup_receipt_rejection is not None:
+                raise ConflictError(self._startup_receipt_rejection)
             if self._cleanup_uncertain is not None or getattr(self.preparer, "cleanup_uncertain", None):
                 raise ConflictError("local Worker graph cleanup is uncertain")
             profile = self._profile(profile_id, expected_workspace_uuid)
@@ -1235,6 +1365,10 @@ class LocalWorkerLauncher:
                     raise ConflictError("Runtime owner is shutting down")
                 self._prepare_cancel.clear()
             existing = self.credentials.actor_metadata(self.actor)
+            if existing:
+                active = self._current_active_result(profile, existing)
+                if active is not None:
+                    return active
             if existing:
                 self.credentials.disable_actor(self.actor)
                 try:
