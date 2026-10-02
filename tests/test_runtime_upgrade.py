@@ -95,12 +95,13 @@ def _legacy_realm(root, *, register_indexes=True):
     return realm_id
 
 
-def test_upgrade_archives_legacy_state_and_preserves_canonical_rows(tmp_path):
+def test_upgrade_retains_archive_only_when_explicitly_requested(tmp_path):
     root = tmp_path / "realm"
     realm_id = _legacy_realm(root)
 
-    result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    result = upgrade_realm(root, retain_backup=True, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     assert result["ok"] is True
+    assert result["backup_retained"] is True
     archive = tmp_path / "realm" / "realm-upgrade-backups" / result["archive"].split("/")[-1]
     manifest = json.loads((archive / "manifest.json").read_text())
     assert manifest["source_schema_version"] == 23
@@ -409,6 +410,34 @@ def test_upgrade_repairs_missing_historical_object_indexes(tmp_path):
         reopened.close()
 
 
+def test_upgrade_does_not_leave_a_persistent_backup_by_default(tmp_path):
+    root = tmp_path / "realm"
+    realm_id = _legacy_realm(root)
+
+    result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+
+    assert result["ok"] is True
+    assert result["archive"] is None
+    assert result["backup_retained"] is False
+    assert not (root / "realm-upgrade-backups").exists()
+    assert not list(tmp_path.glob(".realm-upgrade-transaction-*"))
+
+
+def test_upgrade_rejects_archive_destination_without_explicit_retention(tmp_path):
+    root = tmp_path / "realm"
+    realm_id = _legacy_realm(root)
+
+    with pytest.raises(ValidationError, match="retain_backup=True"):
+        upgrade_realm(
+            root,
+            archive_root=tmp_path / "manual-backups",
+            timeout_seconds=30,
+            confirmation=f"UPGRADE {realm_id}",
+        )
+
+    assert not (tmp_path / "manual-backups").exists()
+
+
 def test_repair_generic_media_types_updates_object_association_and_variant(tmp_path):
     root = tmp_path / "realm"
     store = RealmStore.initialize(root, realm_id="realm-repair")
@@ -539,7 +568,7 @@ os._exit(0)
     )
     assert (root / "realm.sqlite3-wal").is_file()
 
-    result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    result = upgrade_realm(root, retain_backup=True, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     archive = root / "realm-upgrade-backups" / result["archive"].split("/")[-1]
     manifest = json.loads((archive / "manifest.json").read_text())
     assert "realm.sqlite3-wal" in manifest["components"]

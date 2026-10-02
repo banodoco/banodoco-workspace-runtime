@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+from pathlib import Path
 
 import pytest
 
+import runtime_protocol.daemon as daemon_module
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.server import RuntimeHandler, RuntimeHTTPServer
 from runtime_protocol.store import RealmStore
@@ -16,7 +18,8 @@ def _fresh(root):
     RealmStore.initialize(root).close()
 
 
-def test_verified_candidate_replaces_owner_with_fresh_epoch_credentials_and_quarantine(tmp_path):
+@pytest.mark.parametrize("retain_superseded", [False, True])
+def test_verified_candidate_replaces_owner_and_retention_is_opt_in(tmp_path, retain_superseded):
     active_root = tmp_path / "active"
     support_root = tmp_path / "support"
     _fresh(active_root)
@@ -29,17 +32,22 @@ def test_verified_candidate_replaces_owner_with_fresh_epoch_credentials_and_quar
     try:
         old_service.backup(backup)
         old_service.restore(backup, candidate)
-        result = daemon.activate_candidate(candidate)
+        result = daemon.activate_candidate(candidate, retain_superseded=retain_superseded)
         assert result["state"] == "complete"
         assert result["runtime_epoch"] > old_epoch
-        assert result["runtime_instance_id"] != result["superseded_root"]
         assert daemon.token != old_token
         assert daemon.service is not old_service
         assert old_service.store.conn is None
         assert active_root.is_dir()
         assert not candidate.exists()
-        assert (tmp_path / result["superseded_root"].split("/")[-1]).is_dir()
-        assert json.loads((support_root / "replacement-state.json").read_text())["state"] == "complete"
+        if retain_superseded:
+            assert (tmp_path / result["superseded_root"].split("/")[-1]).is_dir()
+        else:
+            assert result["superseded_root"] is None
+            assert not any(path.name.startswith(".active.superseded-") for path in tmp_path.iterdir())
+        state = json.loads((support_root / "replacement-state.json").read_text())
+        assert state["state"] == "complete"
+        assert state["retain_superseded"] is retain_superseded
         catalog = daemon.catalog.read()
         row = next(item for item in catalog["realms"] if item["realm_id"] == daemon.service.realm["id"])
         assert row["data_root"] == str(active_root)
@@ -84,6 +92,79 @@ def test_failed_replacement_rolls_back_and_leaves_recoverable_state(tmp_path, mo
         assert daemon.service is not None
         assert daemon.service.health()["status"] == "ok"
         assert any(path.name.startswith(".active.superseded-") for path in tmp_path.iterdir()) is False
+    finally:
+        daemon.stop()
+
+
+def test_cleanup_failure_after_commit_never_rolls_back_published_candidate(tmp_path, monkeypatch):
+    active_root = tmp_path / "active"
+    support_root = tmp_path / "support"
+    _fresh(active_root)
+    daemon = RuntimeDaemon(active_root, support_root=support_root, production_worker_credentials=True).start()
+    backup = tmp_path / "backup"
+    candidate = tmp_path / "candidate"
+    original_rmtree = daemon_module.shutil.rmtree
+    original_atomic_write = daemon_module.atomic_json_write
+
+    def partial_cleanup(path, *args, **kwargs):
+        path = Path(path)
+        if path.name.startswith(".active.superseded-"):
+            (path / "owner.lock").unlink(missing_ok=True)
+            raise OSError("injected cleanup ENOSPC")
+        return original_rmtree(path, *args, **kwargs)
+
+    def fail_cleanup_receipt(path, value, **kwargs):
+        if Path(path).name == "replacement-state.json" and value.get("state") == "cleanup_pending":
+            raise OSError("injected journal ENOSPC")
+        return original_atomic_write(path, value, **kwargs)
+
+    monkeypatch.setattr(daemon_module.shutil, "rmtree", partial_cleanup)
+    monkeypatch.setattr(daemon_module, "atomic_json_write", fail_cleanup_receipt)
+    try:
+        daemon.service.backup(backup)
+        daemon.service.restore(backup, candidate)
+        result = daemon.activate_candidate(candidate)
+        assert result["state"] == "complete"
+        assert result["cleanup_pending"] is True
+        assert "ENOSPC" in result["cleanup_error"]
+        assert active_root.is_dir()
+        assert daemon.service is not None
+        assert daemon.service.health()["status"] == "ok"
+        assert len(list(tmp_path.glob(".active.superseded-*"))) == 1
+        state = json.loads((support_root / "replacement-state.json").read_text())
+        assert state["state"] == "complete"
+        assert state["retain_superseded"] is False
+    finally:
+        daemon.stop()
+
+
+def test_completion_receipt_failure_after_start_never_rolls_back_live_candidate(tmp_path, monkeypatch):
+    active_root = tmp_path / "active"
+    support_root = tmp_path / "support"
+    _fresh(active_root)
+    daemon = RuntimeDaemon(active_root, support_root=support_root, production_worker_credentials=True).start()
+    backup = tmp_path / "backup"
+    candidate = tmp_path / "candidate"
+    original_atomic_write = daemon_module.atomic_json_write
+
+    def fail_complete_receipt(path, value, **kwargs):
+        if Path(path).name == "replacement-state.json" and value.get("state") == "complete":
+            raise OSError("injected journal ENOSPC")
+        return original_atomic_write(path, value, **kwargs)
+
+    monkeypatch.setattr(daemon_module, "atomic_json_write", fail_complete_receipt)
+    try:
+        daemon.service.backup(backup)
+        daemon.service.restore(backup, candidate)
+        result = daemon.activate_candidate(candidate)
+        assert result["state"] == "complete"
+        assert result["completion_receipt_pending"] is True
+        assert daemon.service.health()["status"] == "ok"
+        assert active_root.is_dir()
+        assert len(list(tmp_path.glob(".active.superseded-*"))) == 0
+        state = json.loads((support_root / "replacement-state.json").read_text())
+        assert state["state"] == "candidate_published"
+        assert state["retain_superseded"] is False
     finally:
         daemon.stop()
 

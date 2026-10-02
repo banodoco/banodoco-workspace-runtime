@@ -10,7 +10,19 @@
       "properties": {
         "object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
         "source_object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-        "recipe_version": { "type": "integer", "const": 1 }
+        "recipe_version": { "type": "integer", "const": 1 },
+        "selection": {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "type": "string", "enum": ["variant", "source_frame"] },
+            "source_time_seconds": { "type": "number", "minimum": 0, "maximum": 4000000000, "multipleOf": 0.000001 }
+          },
+          "allOf": [
+            { "if": { "properties": { "kind": { "const": "source_frame" } }, "required": ["kind"] }, "then": { "required": ["source_time_seconds"] } },
+            { "if": { "properties": { "kind": { "const": "variant" } }, "required": ["kind"] }, "then": { "not": { "required": ["source_time_seconds"] } } }
+          ]
+        }
       }
     }
   },

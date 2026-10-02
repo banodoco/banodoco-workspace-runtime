@@ -1072,6 +1072,99 @@ class RuntimeService:
             if not isinstance(item, dict) or not isinstance(item.get("item_id", item.get("id")), str) or not item.get("media_id"):
                 raise ValidationError("shot revision items cannot be projected losslessly")
 
+    def _validate_published_text_bindings(self, project_id, shot_id, payload, *, require_current):
+        """Verify immutable shot text pins against the registered text authority."""
+        bindings = payload.get("text_bindings", [])
+        if not isinstance(bindings, list):
+            raise ValidationError("shot text_bindings must be a list")
+        scripts = []
+        seen_binding_ids = set()
+        seen_slots = set()
+        for descriptor in bindings:
+            if not isinstance(descriptor, dict):
+                raise ValidationError("shot text binding must be an object")
+            binding_id = descriptor.get("binding_id")
+            if not isinstance(binding_id, str) or not binding_id:
+                raise ValidationError(
+                    "embedded shot text is not authoritative; register it with the shot text binding service, then publish its binding_id and head",
+                    details={"shot_id": shot_id, "action": "register_text_binding"},
+                )
+            if binding_id in seen_binding_ids:
+                raise ValidationError("shot text_bindings contain a duplicate binding_id", details={"binding_id": binding_id})
+            seen_binding_ids.add(binding_id)
+            row = self.store.conn.execute(
+                "SELECT * FROM shot_text_bindings WHERE id=? AND project_id=?",
+                (binding_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise ConflictError(
+                    "shot text binding is not registered in this project; register it before publishing",
+                    details={"shot_id": shot_id, "binding_id": binding_id, "action": "register_text_binding"},
+                )
+            if str(row["shot_id"]) != shot_id:
+                raise ConflictError("shot text binding belongs to a different shot", details={"binding_id": binding_id})
+            head = descriptor.get("head")
+            if isinstance(head, bool) or not isinstance(head, int) or head < 1:
+                raise ValidationError("shot text binding descriptor requires its positive pinned head", details={"binding_id": binding_id})
+            if require_current and head != int(row["head_seq"]):
+                raise ConflictError(
+                    "shot text binding head is stale; read the current binding and republish the shot",
+                    details={"binding_id": binding_id, "expected_head": head, "actual_head": int(row["head_seq"]), "action": "refresh_text_binding_pin"},
+                )
+            # Verify the complete registered event chain and current authority
+            # object before accepting any historical pin from that stream.
+            resource = self._text_binding_resource(row)
+            for field in ("project_id", "shot_id", "kind", "slot", "event_stream_id"):
+                if field in descriptor and descriptor[field] != resource[field]:
+                    raise ConflictError("shot text binding descriptor identity does not match its registered binding", details={"binding_id": binding_id, "field": field})
+            slot_key = (resource["kind"], resource["slot"])
+            if slot_key in seen_slots:
+                raise ValidationError("shot text_bindings contain duplicate kind/slot descriptors", details={"kind": resource["kind"], "slot": resource["slot"]})
+            seen_slots.add(slot_key)
+            event = self.store.conn.execute(
+                "SELECT kind, payload_json, created_at FROM shot_text_binding_events WHERE binding_id=? AND seq=?",
+                (binding_id, head),
+            ).fetchone()
+            if event is None:
+                raise ConflictError("pinned shot text binding event is missing", details={"binding_id": binding_id, "head": head})
+            event_payload = json.loads(event["payload_json"])
+            media_id = event_payload.get("media_id")
+            content_hash = event_payload.get("content_hash")
+            if not isinstance(media_id, str) or not media_id.startswith("sha256:") or content_hash != media_id:
+                raise ConflictError("pinned shot text binding event has invalid content provenance", details={"binding_id": binding_id, "head": head})
+            for field, expected in (("media_id", media_id), ("content_hash", content_hash)):
+                if descriptor.get(field) != expected:
+                    raise ConflictError("shot text binding descriptor does not match its pinned event", details={"binding_id": binding_id, "head": head, "field": field})
+            media = self._verify_text_object(project_id, media_id)
+            if descriptor.get("byte_size") != int(media["size"]):
+                raise ConflictError("shot text binding byte_size does not match its pinned media", details={"binding_id": binding_id, "head": head})
+            if descriptor.get("mime_type") != str(media["media_type"]):
+                raise ConflictError("shot text binding mime_type does not match its pinned media", details={"binding_id": binding_id, "head": head})
+            if "created_at" in descriptor and descriptor["created_at"] != resource["created_at"]:
+                raise ConflictError("shot text binding created_at does not match its registered identity", details={"binding_id": binding_id})
+            if "updated_at" in descriptor and descriptor["updated_at"] != event["created_at"]:
+                raise ConflictError("shot text binding updated_at does not match its pinned event", details={"binding_id": binding_id, "head": head})
+            text_path = self.cas.path_for(media["digest"])
+            text_bytes = text_path.read_bytes()
+            try:
+                text = text_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ConflictError("pinned shot text binding bytes are not valid UTF-8", details={"binding_id": binding_id, "head": head}) from exc
+            if "text" in descriptor and descriptor["text"] != text:
+                raise ConflictError("embedded text does not match its registered shot text binding", details={"binding_id": binding_id, "head": head, "field": "text"})
+            if resource["kind"] == "voiceover_script":
+                scripts.append((binding_id, text))
+        metadata = payload.get("metadata", {})
+        if isinstance(metadata, dict) and "voiceover_script" in metadata:
+            script = metadata["voiceover_script"]
+            if not scripts:
+                raise ValidationError(
+                    "metadata.voiceover_script has no registered voiceover_script binding; register the script and publish its text binding descriptor",
+                    details={"shot_id": shot_id, "action": "register_text_binding"},
+                )
+            if not isinstance(script, str) or all(script != value for _, value in scripts):
+                raise ConflictError("metadata.voiceover_script does not match the registered voiceover_script binding", details={"shot_id": shot_id})
+
     def _apply_published_shot_projection(self, project_id, value, timestamp):
         """Keep the mutable shot projection semantically equal to a new child revision."""
         self._validate_published_shot_payload(value)
@@ -2498,6 +2591,26 @@ class RuntimeService:
             if match is None:
                 raise NotFoundError("shot revision internal timeline dependency is missing", details={"revision_id": value["internal_timeline_revision_id"]})
             resolved_internal[(match["timeline_id"], match["revision_id"])] = match
+        # A caller may include an already-committed child in `shot_revisions`
+        # instead of linking it only from an occurrence. Preserve that exact
+        # immutable pin without requiring the mutable text binding head to
+        # remain current. New child revisions must pin the binding head seen
+        # by this same publication transaction.
+        for value in resolved_shots.values():
+            existing = self.store.conn.execute(
+                "SELECT * FROM shot_revisions WHERE id=?", (value["revision_id"],)
+            ).fetchone()
+            if existing is not None:
+                if (existing["project_id"] != project["id"] or existing["shot_id"] != value["shot_id"]
+                        or existing["internal_timeline_revision_id"] != value["internal_timeline_revision_id"]
+                        or existing["content_digest"] != value["content_digest"]
+                        or existing["payload_json"] != canonical_json(value["payload"])):
+                    raise ConflictError("shot revision identity was reused with different bytes", details={"revision_id": value["revision_id"]})
+                value["existing"] = True
+            if not value.get("existing", False):
+                self._validate_published_text_bindings(
+                    project["id"], value["shot_id"], value["payload"], require_current=True,
+                )
         # Recompute closure only after every occurrence has been resolved to
         # immutable child bytes.  This is the source of truth for both the
         # manifest check and the rows stored below.
@@ -4371,6 +4484,115 @@ class RuntimeService:
         created_at = self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=? AND ordinal=?", (project_id, source, target, kind, ordinal)).fetchone()[0]
         result = {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "ordinal": ordinal, "metadata": metadata, "created_at": created_at}
         return self._command_record("media_relation.create", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
+
+    @staticmethod
+    def _source_frame_thumbnail_descriptor(body):
+        if not isinstance(body, dict) or set(body) != {"object_id", "source_object_id", "recipe_version", "selection"}:
+            raise ValidationError("source-frame thumbnail requires object_id, source_object_id, recipe_version, and selection")
+        descriptor = copy.deepcopy(body)
+        for field in ("object_id", "source_object_id"):
+            value = descriptor[field]
+            if not isinstance(value, str) or not OBJECT_ID_RE.fullmatch(value) or not value.startswith("sha256:"):
+                raise ValidationError(f"thumbnail {field} must be a canonical sha256 object id")
+        if isinstance(descriptor["recipe_version"], bool) or not isinstance(descriptor["recipe_version"], int) or descriptor["recipe_version"] != 1:
+            raise ValidationError("thumbnail recipe_version is unsupported")
+        selection = descriptor["selection"]
+        if not isinstance(selection, dict) or set(selection) != {"kind", "source_time_seconds"} or selection.get("kind") != "source_frame":
+            raise ValidationError("thumbnail selection must identify a source_frame and source_time_seconds")
+        source_time = selection.get("source_time_seconds")
+        if isinstance(source_time, bool) or not isinstance(source_time, (int, float)) or not math.isfinite(float(source_time)) or not 0 <= float(source_time) <= 4_000_000_000:
+            raise ValidationError("thumbnail source_time_seconds must be finite and in [0, 4000000000]")
+        normalized_time = round(float(source_time), 6)
+        if normalized_time != float(source_time):
+            raise ValidationError("thumbnail source_time_seconds must be normalized to six decimal places")
+        descriptor["selection"]["source_time_seconds"] = normalized_time
+        return descriptor
+
+    @staticmethod
+    def _source_frame_thumbnail_identity(descriptor):
+        time_micros = int(round(float(descriptor["selection"]["source_time_seconds"]) * 1_000_000))
+        return (1 << 62) + time_micros * 1_000 + int(descriptor["recipe_version"])
+
+    def get_source_frame_thumbnail(self, project, *, source_object_id, source_time_seconds, recipe_version=1):
+        project_id = self.store.get_project(project)["id"]
+        if not isinstance(source_object_id, str) or not OBJECT_ID_RE.fullmatch(source_object_id) or not source_object_id.startswith("sha256:"):
+            raise ValidationError("thumbnail source_object_id must be a canonical sha256 object id")
+        source_digest = source_object_id.removeprefix("sha256:")
+        owned = self.store.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, source_digest),
+        ).fetchone()
+        if not owned:
+            raise NotFoundError("thumbnail source object is outside the project")
+        descriptor = self._source_frame_thumbnail_descriptor({
+            "object_id": "sha256:" + "0" * 64,
+            "source_object_id": source_object_id,
+            "recipe_version": recipe_version,
+            "selection": {"kind": "source_frame", "source_time_seconds": source_time_seconds},
+        })
+        source = descriptor["source_object_id"].removeprefix("sha256:")
+        rows = self.store.conn.execute(
+            "SELECT from_digest, metadata_json FROM media_relations "
+            "WHERE project_id=? AND to_digest=? AND kind='derived_from' AND ordinal=? "
+            "ORDER BY created_at, from_digest",
+            (project_id, source, self._source_frame_thumbnail_identity(descriptor)),
+        ).fetchall()
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            if metadata.get("thumbnail") == descriptor | {"object_id": "sha256:" + row["from_digest"]}:
+                return {"thumbnail": descriptor | {"object_id": "sha256:" + row["from_digest"]}}
+        return {"thumbnail": None}
+
+    @_durable_mutation
+    def ensure_source_frame_thumbnail(self, project, body, *, idempotency_key=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        project_id = self.store.get_project(project)["id"]
+        descriptor = self._source_frame_thumbnail_descriptor(body)
+        source = descriptor["source_object_id"].removeprefix("sha256:")
+        thumbnail = descriptor["object_id"].removeprefix("sha256:")
+        if source == thumbnail:
+            raise ValidationError("thumbnail source and image objects must be distinct")
+        ordinal = self._source_frame_thumbnail_identity(descriptor)
+        for digest in (source, thumbnail):
+            if not self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone():
+                raise NotFoundError("thumbnail source or image object not found")
+            if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
+                raise NotFoundError("thumbnail source or image object is outside the project")
+        source_row = self.store.conn.execute("SELECT media_type FROM objects WHERE digest=?", (source,)).fetchone()
+        if not str(source_row["media_type"]).lower().startswith("video/"):
+            raise ConflictError("source-frame thumbnail source object must be video")
+        image = self.store.conn.execute("SELECT media_type FROM objects WHERE digest=?", (thumbnail,)).fetchone()
+        if not image or str(image["media_type"]).lower() != "image/jpeg":
+            raise ConflictError("source-frame thumbnail object must be image/jpeg")
+        aggregate_id = f"{source}:{ordinal}:{descriptor['recipe_version']}"
+        request_hash = hashlib.sha256(canonical_json({"project_id": project_id, "thumbnail": descriptor}).encode()).hexdigest()
+        replay = self._command_replay("thumbnail.source_frame.ensure", aggregate_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        candidates = self.store.conn.execute(
+            "SELECT from_digest, metadata_json, created_at FROM media_relations "
+            "WHERE project_id=? AND to_digest=? AND kind='derived_from' AND ordinal=? "
+            "ORDER BY created_at, from_digest",
+            (project_id, source, ordinal),
+        ).fetchall()
+        existing = None
+        for candidate in candidates:
+            candidate_thumbnail = json.loads(candidate["metadata_json"]).get("thumbnail")
+            if isinstance(candidate_thumbnail, dict) and all(
+                candidate_thumbnail.get(key) == descriptor.get(key)
+                for key in ("source_object_id", "recipe_version", "selection")
+            ):
+                existing = {"thumbnail": candidate_thumbnail}
+                break
+        if existing:
+            result = existing["thumbnail"]
+        else:
+            metadata = {"thumbnail": descriptor}
+            self.store.conn.execute(
+                "INSERT INTO media_relations VALUES (?, ?, ?, 'derived_from', ?, ?, ?)",
+                (project_id, thumbnail, source, ordinal, canonical_json(metadata), now()),
+            )
+            result = descriptor
+        return self._command_record("thumbnail.source_frame.ensure", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
 
     def list_media_relations(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project_id = self.store.get_project(project)["id"]

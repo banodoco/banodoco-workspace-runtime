@@ -89,6 +89,98 @@ def test_parent_revision_and_head_reads_and_linked_reuse_do_not_regress_child_he
         service.close()
 
 
+def _script_revision(project_id, binding, *, parent_revision_id="parent-2", shot_revision_id="shot-rev-2"):
+    body = _publication(project_id, expected_head="parent-1", parent_revision_id=parent_revision_id, shot_revision_id=shot_revision_id)
+    body["internal_timeline_revisions"][0]["revision_id"] = "timeline-rev-2"
+    body["shot_revisions"][0]["internal_timeline_revision_id"] = "timeline-rev-2"
+    body["shot_revisions"][0]["payload"]["text_bindings"] = [copy.deepcopy(binding)]
+    body["parent_composition"]["occurrences"][0]["shot_revision_id"] = shot_revision_id
+    return body
+
+
+def test_new_shot_revision_requires_current_registered_text_pin_and_historical_read_stays_pinned(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
+        binding = service.set_project_shot_text_binding(
+            project_id, {"shot_id": "shot-1", "kind": "voiceover_script", "text": "A first line.", "expected_head": 0},
+            idempotency_key="script-1",
+        )["data"]
+        published = service.publish_parent_composition(
+            project_id, "main", _script_revision(project_id, binding), idempotency_key="publish-2",
+        )
+        pinned = published["data"]["payload"]["occurrences"][0]["shot_revision_id"]
+        assert pinned == "shot-rev-2"
+
+        service.set_project_shot_text_binding(
+            project_id, {"binding_id": binding["binding_id"], "text": "A changed line.", "expected_head": 1},
+            idempotency_key="script-2",
+        )
+        historical = service.inspect_timeline(project_id, "main", {"revision_id": "parent-2"})
+        descriptor = historical["selected"][0]["occurrence"]["text_bindings"][0]
+        assert descriptor["head"] == 1
+        assert descriptor["media_id"] == binding["media_id"]
+        assert descriptor["authority"] == "shot_text_binding"
+
+        stale = _script_revision(project_id, binding, parent_revision_id="parent-3", shot_revision_id="shot-rev-3")
+        stale["expected_head"] = "parent-2"
+        with pytest.raises(ConflictError, match="text binding head is stale"):
+            service.publish_parent_composition(project_id, "main", stale, idempotency_key="publish-stale-pin")
+    finally:
+        service.close()
+
+
+def test_publication_rejects_embedded_or_mismatched_narration(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
+        body = _publication(project_id, expected_head="parent-1", parent_revision_id="parent-2", shot_revision_id="shot-rev-2")
+        body["internal_timeline_revisions"][0]["revision_id"] = "timeline-rev-2"
+        body["shot_revisions"][0]["internal_timeline_revision_id"] = "timeline-rev-2"
+        body["shot_revisions"][0]["payload"]["text_bindings"] = [{"kind": "voiceover_script", "text": "inline only"}]
+        body["parent_composition"]["occurrences"][0]["shot_revision_id"] = "shot-rev-2"
+        with pytest.raises(ValidationError, match="register it with the shot text binding service"):
+            service.publish_parent_composition(project_id, "main", body, idempotency_key="publish-inline")
+
+        binding = service.set_project_shot_text_binding(
+            project_id, {"shot_id": "shot-1", "kind": "voiceover_script", "text": "canonical", "expected_head": 0},
+            idempotency_key="script-1",
+        )["data"]
+        body = _script_revision(project_id, binding)
+        body["shot_revisions"][0]["payload"]["text_bindings"][0]["text"] = "mismatch"
+        with pytest.raises(ConflictError, match="does not match its registered"):
+            service.publish_parent_composition(project_id, "main", body, idempotency_key="publish-mismatch")
+
+        body = _script_revision(project_id, binding)
+        body["shot_revisions"][0]["payload"]["text_bindings"].append(copy.deepcopy(binding))
+        with pytest.raises(ValidationError, match="duplicate binding_id"):
+            service.publish_parent_composition(project_id, "main", body, idempotency_key="publish-duplicate")
+    finally:
+        service.close()
+
+
+def test_new_text_pin_rejects_tampered_authority_event_chain(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-1")
+        binding = service.set_project_shot_text_binding(
+            project_id, {"shot_id": "shot-1", "kind": "voiceover_script", "text": "canonical", "expected_head": 0},
+            idempotency_key="script-1",
+        )["data"]
+        service.store.conn.execute(
+            "UPDATE shot_text_binding_events SET event_hash=? WHERE binding_id=? AND seq=1",
+            ("0" * 64, binding["binding_id"]),
+        )
+        before = service.store.conn.execute("SELECT COUNT(*) FROM shot_revisions").fetchone()[0]
+        with pytest.raises(ConflictError, match="event hash"):
+            service.publish_parent_composition(
+                project_id, "main", _script_revision(project_id, binding), idempotency_key="publish-tampered",
+            )
+        assert service.store.conn.execute("SELECT COUNT(*) FROM shot_revisions").fetchone()[0] == before
+    finally:
+        service.close()
+
+
 def test_occurrence_only_linked_reuse_resolves_committed_child_closure(tmp_path):
     service, project_id = _service(tmp_path)
     try:
