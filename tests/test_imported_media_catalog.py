@@ -15,6 +15,13 @@ from runtime_protocol.service import OBJECT_MAX_BYTES, RuntimeService
 from runtime_protocol.store import RealmStore
 
 
+@pytest.fixture(autouse=True)
+def catalog_synthetic_payloads(monkeypatch):
+    # These unit tests isolate catalog/receipt semantics with labeled byte strings.
+    # Real local decoder and HTTP transfer coverage lives in test_streaming_media_io.
+    monkeypatch.setattr(RuntimeService, "_validate_media_file", staticmethod(lambda *args: None))
+
+
 @pytest.fixture()
 def service(tmp_path: Path):
     root = tmp_path / "realm"
@@ -225,7 +232,7 @@ def test_project_media_permission_and_size_rejections_have_no_catalog_side_effec
         def __len__(self):
             return OBJECT_MAX_BYTES + 1
 
-    with pytest.raises(ValidationError, match="64 MiB"):
+    with pytest.raises(ValidationError, match="byte limit"):
         service.import_media(
             owner["id"], Oversized(b"small"), media_type="video/mp4",
             actor_id="owner", idempotency_key="too-large",
@@ -319,4 +326,4 @@ def test_http_generated_client_imports_image_video_and_enforces_scopes(service: 
         b"",
     )
     assert status == 400
-    assert "64 MiB" in json.loads(body)["message"]
+    assert "byte limit" in json.loads(body)["message"]

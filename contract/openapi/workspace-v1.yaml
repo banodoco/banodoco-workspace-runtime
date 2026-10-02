@@ -153,10 +153,10 @@ paths:
       requestBody:
         required: true
         content:
-          application/octet-stream: { schema: { type: string, format: binary, maxLength: 67108864 } }
-          image/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
-          video/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
-          audio/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
+          application/octet-stream: { schema: { type: string, format: binary, maxLength: 5368709120 } }
+          image/*: { schema: { type: string, format: binary, maxLength: 5368709120 } }
+          video/*: { schema: { type: string, format: binary, maxLength: 5368709120 } }
+          audio/*: { schema: { type: string, format: binary, maxLength: 5368709120 } }
       responses:
         '201': { description: Completed Runtime media import with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
         '409': { $ref: '#/components/responses/Conflict' }
@@ -856,13 +856,13 @@ components:
           properties:
             object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
             media_type: { type: string }
-            size: { type: integer, minimum: 0, maximum: 67108864 }
+            size: { type: integer, minimum: 0, maximum: 5368709120 }
             filename: { type: [string, 'null'] }
         provenance: { type: object, additionalProperties: true }
         actor_id: { type: string }
         filename: { type: [string, 'null'] }
         mime_type: { type: string }
-        size: { type: integer, minimum: 0, maximum: 67108864 }
+        size: { type: integer, minimum: 0, maximum: 5368709120 }
         width: { type: [integer, 'null'], minimum: 1 }
         height: { type: [integer, 'null'], minimum: 1 }
         duration_seconds: { type: [number, 'null'], exclusiveMinimum: 0 }

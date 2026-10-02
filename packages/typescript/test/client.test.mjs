@@ -86,3 +86,34 @@ test("generated TypeScript recovery routes preserve path identity and 201 checkp
   assert.equal(calls[0].body.attempt_id, undefined);
   assert.equal(calls[1].path, "/v1/attempts/a%2F1/checkpoint");
 });
+
+test("binary client imports forward Blob without materializing its bytes", async () => {
+  const blob = new Blob(["media"], { type: "video/mp4" });
+  blob.arrayBuffer = async () => { throw new Error("whole file was buffered"); };
+  const calls = [];
+  const transport = async (method, path, headers, body) => {
+    assert.equal(body, blob);
+    calls.push(path);
+    return { status: 201, headers: {}, body: json({ data: { object_id: "sha256:media" }, receipt: { receipt_id: "receipt" } }) };
+  };
+  const client = new WorkspaceClient("http://runtime", undefined, transport);
+  await client.ingestObject(blob, "video/mp4", "object");
+  await client.ingestProjectObject("project", blob, "video/mp4", "project-object");
+  await client.importProjectMedia("project", blob, "video/mp4", "media");
+  assert.deepEqual(calls, ["/v1/objects", "/v1/projects/project/objects", "/v1/projects/project/media-imports"]);
+});
+
+test("default fetch receives Blob directly", async () => {
+  const previousFetch = globalThis.fetch;
+  const blob = new Blob(["media"], { type: "image/png" });
+  blob.arrayBuffer = async () => { throw new Error("whole file was buffered"); };
+  globalThis.fetch = async (url, options) => {
+    assert.equal(options.body, blob);
+    return new Response(json({ data: { object_id: "sha256:media" }, receipt: { receipt_id: "receipt" } }), { status: 201 });
+  };
+  try {
+    await new WorkspaceClient("http://runtime").importProjectMedia("project", blob, "image/png", "media");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
