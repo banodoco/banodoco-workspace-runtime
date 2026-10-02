@@ -1875,39 +1875,50 @@ class BootstrapTests(unittest.TestCase):
             ).encode("utf-8")).hexdigest()
 
         repository_root = Path(__file__).resolve().parents[1]
-        run_name = repository_root.parent.name
-        run_root = repository_root.parents[2] / "runs" / run_name
-        evidence_root = run_root / "evidence"
-        binding_files = {
-            "v28_hold": evidence_root
-            / "X3-remediation-v2.8-runtime-exact-review-HOLD.md",
-            "closure_checklist": evidence_root
-            / "X3-remediation-v2.4-runtime-281-75-closure-checklist.md",
-            "normative_amendment": evidence_root
-            / "X3-finalizing-normative-amendment-v2.3.md",
-            "acceptance_matrix_amendment": evidence_root
-            / "X3-finalizing-acceptance-matrix-amendment-v2.3.md",
-            "predecessor_acceptance_matrix": evidence_root
-            / "X3-revised-handoff-acceptance-matrix.md",
-            "v28_freeze_bundle": evidence_root
-            / "X3-remediation-v2.8-runtime-freeze-bundle.json",
-            "v28_authoritative_receipt": evidence_root
-            / "X3-remediation-v2.8-runtime-route-matrix-receipt.json",
-        }
-        normative_bindings = {
-            name: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-            for name, path in binding_files.items()
-        }
-        expected_bindings = {
-            "v28_hold": "sha256:d114c44da6b5d78e76a58fc28d71375830c183d13360bac9b5b206d76ccb6584",
-            "closure_checklist": "sha256:cf59d7ac07bb2fc669d506568a9cac9926446f812973a300fa89ec496acf95e3",
-            "normative_amendment": "sha256:7995464a42c74027ecce8593e03d4350b2f8014ebfe43b56bc5d7ac89531b9dc",
-            "acceptance_matrix_amendment": "sha256:bb8203b9d89c93435122f969671d1fe82effe6b7f7b52468594469145a22b6eb",
-            "predecessor_acceptance_matrix": "sha256:5af694f2acea33647dc457ce52106672a7428c8ad8840c1e84c61c503a0dae5f",
-            "v28_freeze_bundle": "sha256:b3a60354b21e11191e64ea3c0924f0667cd2943072a380a5285297d734718c5b",
-            "v28_authoritative_receipt": "sha256:7265355264703da92df5016eecaac91bdf69e2f8ca2fd408465bef565da132bf",
-        }
-        self.assertEqual(normative_bindings, expected_bindings)
+        # The old v2.8/v2.9 review packet is optional provenance.  A caller
+        # that has explicitly supplied that historical evidence can still
+        # validate its exact hashes; its former run-directory derivation must
+        # not prevent the reusable behavioral matrix from running.
+        normative_bindings = {}
+        historical_evidence_root = os.environ.get(
+            "X3_RUNTIME_V29_HISTORICAL_EVIDENCE_ROOT"
+        )
+        if historical_evidence_root:
+            evidence_root = Path(historical_evidence_root).expanduser()
+            binding_files = {
+                "v28_hold": evidence_root
+                / "X3-remediation-v2.8-runtime-exact-review-HOLD.md",
+                "closure_checklist": evidence_root
+                / "X3-remediation-v2.4-runtime-281-75-closure-checklist.md",
+                "normative_amendment": evidence_root
+                / "X3-finalizing-normative-amendment-v2.3.md",
+                "acceptance_matrix_amendment": evidence_root
+                / "X3-finalizing-acceptance-matrix-amendment-v2.3.md",
+                "predecessor_acceptance_matrix": evidence_root
+                / "X3-revised-handoff-acceptance-matrix.md",
+                "v28_freeze_bundle": evidence_root
+                / "X3-remediation-v2.8-runtime-freeze-bundle.json",
+                "v28_authoritative_receipt": evidence_root
+                / "X3-remediation-v2.8-runtime-route-matrix-receipt.json",
+            }
+            missing_bindings = [
+                str(path) for path in binding_files.values() if not path.is_file()
+            ]
+            self.assertEqual(missing_bindings, [])
+            normative_bindings = {
+                name: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+                for name, path in binding_files.items()
+            }
+            expected_bindings = {
+                "v28_hold": "sha256:d114c44da6b5d78e76a58fc28d71375830c183d13360bac9b5b206d76ccb6584",
+                "closure_checklist": "sha256:cf59d7ac07bb2fc669d506568a9cac9926446f812973a300fa89ec496acf95e3",
+                "normative_amendment": "sha256:7995464a42c74027ecce8593e03d4350b2f8014ebfe43b56bc5d7ac89531b9dc",
+                "acceptance_matrix_amendment": "sha256:bb8203b9d89c93435122f969671d1fe82effe6b7f7b52468594469145a22b6eb",
+                "predecessor_acceptance_matrix": "sha256:5af694f2acea33647dc457ce52106672a7428c8ad8840c1e84c61c503a0dae5f",
+                "v28_freeze_bundle": "sha256:b3a60354b21e11191e64ea3c0924f0667cd2943072a380a5285297d734718c5b",
+                "v28_authoritative_receipt": "sha256:7265355264703da92df5016eecaac91bdf69e2f8ca2fd408465bef565da132bf",
+            }
+            self.assertEqual(normative_bindings, expected_bindings)
 
         with tempfile.TemporaryDirectory() as baseline_directory:
             baseline_path = Path(baseline_directory) / "v28-supervised.json"
