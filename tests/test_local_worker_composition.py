@@ -581,6 +581,25 @@ def test_initial_control_failure_uses_independently_sealed_graph_cleanup(
     assert preparer.cleanup_uncertain is None
 
 
+def test_initial_sealed_cleanup_allows_only_verified_init_reparenting(
+    tmp_path, monkeypatch
+):
+    profile, handle = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    observed = []
+    monkeypatch.setattr(
+        preparer,
+        "_force_cleanup_verified_graph",
+        lambda received, *, allow_reparented: observed.append(
+            (received, allow_reparented)
+        ),
+    )
+
+    preparer._force_cleanup_initial_graph(handle)
+
+    assert observed == [(handle, True)]
+
+
 def test_argv_digest_preserves_argument_boundaries() -> None:
     assert _argv_digest([b"a b", b"c"]) != _argv_digest([b"a", b"b c"])
 

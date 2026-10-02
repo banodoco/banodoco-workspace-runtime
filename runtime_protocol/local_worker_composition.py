@@ -1513,7 +1513,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         self._force_cleanup_verified_graph(handle, allow_reparented=True)
 
     def _force_cleanup_initial_graph(self, handle: _PreparedWorker) -> None:
-        self._force_cleanup_verified_graph(handle, allow_reparented=False)
+        # A failed/closed Worker control path may let a still-authenticated
+        # child reparent to init before the sealed fallback runs.  Accept only
+        # that kernel lineage transition; every birth, UID, executable, argv,
+        # group, session, listener, and receipt check remains mandatory.
+        self._force_cleanup_verified_graph(handle, allow_reparented=True)
 
     def control_alive(self, handle: _PreparedWorker) -> bool:
         if not isinstance(handle, _PreparedWorker) or handle.closed or handle.worker.poll() is not None:
