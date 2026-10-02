@@ -124,6 +124,11 @@ CREATE TABLE project_documents (
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     UNIQUE(project_id, id)
 );
+CREATE TABLE user_preferences (
+    actor_id TEXT PRIMARY KEY NOT NULL, id TEXT NOT NULL UNIQUE,
+    content TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 CREATE TABLE generations (
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
     source_task_id TEXT REFERENCES tasks(id), type TEXT NOT NULL DEFAULT 'generation',

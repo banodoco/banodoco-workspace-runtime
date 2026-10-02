@@ -3393,6 +3393,95 @@ class RuntimeService:
         result.update({"revision_id": timeline["revision_id"], "content_digest": timeline["content_digest"]})
         return self._command_record("timeline.reference.create", aggregate_id, idempotency_key, request_hash, result)
 
+    PREFERENCE_DOCUMENT_KIND = "astrid.preferences"
+    PROJECT_PREFERENCE_PREFIX = "preferences:project:"
+
+    @classmethod
+    def _validate_preference_document(cls, project_id, document_id, kind, content):
+        reserved = document_id.startswith(cls.PROJECT_PREFERENCE_PREFIX)
+        if reserved or kind == cls.PREFERENCE_DOCUMENT_KIND:
+            if document_id != cls.PROJECT_PREFERENCE_PREFIX + project_id:
+                raise ValidationError("project preference document identity is reserved for its owning project")
+            if kind != cls.PREFERENCE_DOCUMENT_KIND:
+                raise ValidationError("project preference document kind is reserved")
+            if not isinstance(content, str):
+                raise ValidationError("preference content must be a Markdown string")
+
+    def _preference_target(self, scope, project_id, identity):
+        if scope not in ("user", "project"):
+            raise ValidationError("preference scope must be user or project")
+        actor = identity.get("actor") if isinstance(identity, dict) else None
+        if not isinstance(actor, str) or not actor:
+            raise AuthorizationError("authenticated actor is required")
+        if scope == "user":
+            if project_id is not None:
+                raise ValidationError("user preferences do not accept a project selector")
+            return actor, None, "preferences:user:" + actor
+        if project_id is None:
+            project = self.store.current_project(actor)["project"]
+        else:
+            project = self.store.get_project(project_id)
+        return actor, project["id"], self.PROJECT_PREFERENCE_PREFIX + project["id"]
+
+    @staticmethod
+    def _preference_resource(scope, actor, project_id, document_id, row):
+        return {
+            "scope": scope, "actor_id": actor if scope == "user" else None,
+            "project_id": project_id, "document_id": document_id,
+            "content": (row["content"] if scope == "user" else json.loads(row["content_json"])) if row else "",
+            "version": int(row["version"]) if row else 0,
+            "created_at": row["created_at"] if row else None,
+            "updated_at": row["updated_at"] if row else None,
+        }
+
+    def get_preferences(self, scope, project_id=None, *, identity):
+        # Serialize the shared connection read so no caller observes another
+        # handler's uncommitted write; absent reads have no side effects.
+        with self.store._mutex:
+            actor, project_id, document_id = self._preference_target(scope, project_id, identity)
+            if scope == "user":
+                row = self.store.conn.execute("SELECT * FROM user_preferences WHERE actor_id=?", (actor,)).fetchone()
+            else:
+                row = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project_id, document_id)).fetchone()
+                if row:
+                    self._validate_preference_document(project_id, document_id, row["kind"], json.loads(row["content_json"]))
+            return self._preference_resource(scope, actor, project_id, document_id, row)
+
+    @_durable_mutation
+    def update_preferences(self, scope, content, expected_version, idempotency_key, project_id=None, *, identity):
+        actor, project_id, document_id = self._preference_target(scope, project_id, identity)
+        require_idempotency_key(idempotency_key)
+        if not isinstance(content, str):
+            raise ValidationError("preference content must be a Markdown string")
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int) or expected_version < 0:
+            raise ValidationError("expected_version must be a non-negative integer")
+        request = {"scope": scope, "owner": actor if scope == "user" else project_id,
+                   "content": content, "expected_version": expected_version}
+        request_hash = hashlib.sha256(canonical_json(request).encode()).hexdigest()
+        # The actor is part of the aggregate, not a caller-controlled field.
+        aggregate_id = document_id
+        replay = self._command_replay("preferences.update", aggregate_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        current = self.get_preferences(scope, project_id, identity=identity)
+        if current["version"] != expected_version:
+            raise ConflictError("preference version conflict", details={"expected": expected_version, "actual": current["version"]})
+        timestamp = now()
+        if scope == "user":
+            if expected_version == 0:
+                self.store.conn.execute("INSERT INTO user_preferences(actor_id, id, content, version, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)", (actor, document_id, content, timestamp, timestamp))
+            else:
+                self.store.conn.execute("UPDATE user_preferences SET content=?, version=?, updated_at=? WHERE actor_id=?", (content, expected_version + 1, timestamp, actor))
+        elif expected_version == 0:
+            self.store.conn.execute("INSERT INTO project_documents VALUES (?, ?, ?, ?, 1, ?, ?)", (document_id, project_id, self.PREFERENCE_DOCUMENT_KIND, canonical_json(content), timestamp, timestamp))
+        else:
+            self.store.conn.execute("UPDATE project_documents SET content_json=?, version=?, updated_at=? WHERE project_id=? AND id=?", (canonical_json(content), expected_version + 1, timestamp, project_id, document_id))
+        result = self.get_preferences(scope, project_id, identity=identity)
+        if scope == "user":
+            # A user command has neither a project sequence nor project receipt.
+            return self._command_record("preferences.update", aggregate_id, idempotency_key, request_hash, {"data": result, "receipt": None})
+        return self._command_record("preferences.update", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
+
     def _document_resource(self, row):
         value = dict(row)
         value["document_id"] = value.pop("id")
@@ -3408,6 +3497,7 @@ class RuntimeService:
         if not document_id or not kind or "content" not in body:
             raise ValidationError("document_id, kind, and content are required")
         content = body["content"]
+        self._validate_preference_document(project["id"], document_id, kind, content)
         request_hash = hashlib.sha256(canonical_json({"project_id": project["id"], "document_id": document_id, "kind": kind, "content": content}).encode()).hexdigest()
         replay = self._command_replay("document.create", document_id, idempotency_key, request_hash, project_id=project["id"])
         if replay is not None:
@@ -3415,23 +3505,23 @@ class RuntimeService:
         existing = self.store.conn.execute("SELECT * FROM project_documents WHERE project_id=? AND id=?", (project["id"], document_id)).fetchone()
         if existing:
             if existing["kind"] == kind and json.loads(existing["content_json"]) == content:
-                return self._document_resource(existing)
+                return self._command_record("document.create", document_id, idempotency_key, request_hash, self._document_resource(existing), project_id=project["id"])
             raise ConflictError("document already exists", details={"document_id": document_id})
         timestamp = now()
         self.store.conn.execute("INSERT INTO project_documents VALUES (?, ?, ?, ?, 1, ?, ?)", (document_id, project["id"], kind, canonical_json(content), timestamp, timestamp))
         result = self._document_resource(self.store.conn.execute("SELECT * FROM project_documents WHERE id=?", (document_id,)).fetchone())
         return self._command_record("document.create", document_id, idempotency_key, request_hash, result, project_id=project["id"])
 
-    def list_documents(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+    def list_documents(self, project_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT, kind=None):
         project = self.store.get_project(project_id)
         # Timeline composition documents are immutable recovery material, not
         # a public document authority. Keep ordinary project documents
         # listable while forcing timeline callers through inspectTimeline.
         rows = self.store.conn.execute(
-            "SELECT * FROM project_documents WHERE project_id=? AND id NOT LIKE 'timeline:%' ORDER BY created_at, id",
-            (project["id"],),
+            "SELECT * FROM project_documents WHERE project_id=? AND id NOT LIKE 'timeline:%' AND (? IS NULL OR kind=?) ORDER BY created_at, id",
+            (project["id"], kind, kind),
         ).fetchall()
-        return _page_rows(rows, scope=f"documents:{project['id']}", cursor=cursor, limit=limit,
+        return _page_rows(rows, scope=f"documents:{project['id']}" if kind is None else canonical_json({"documents": project["id"], "kind": kind}), cursor=cursor, limit=limit,
                           key_fn=lambda row: (str(row["created_at"]), str(row["id"])),
                           resource_fn=self._document_resource)
 
@@ -3460,6 +3550,9 @@ class RuntimeService:
         content = body.get("content", json.loads(row["content_json"]))
         if not kind:
             raise ValidationError("document kind is required")
+        self._validate_preference_document(project["id"], document_id, kind, content)
+        if document_id.startswith(self.PROJECT_PREFERENCE_PREFIX) and body.get("document_id", document_id) != document_id:
+            raise ValidationError("project preference document identity is reserved")
         timeline_id = document_id.removeprefix("timeline:") if document_id.startswith("timeline:") else None
         if timeline_id is not None and not isinstance(content, dict):
             raise ValidationError("timeline document content must be an object for lossless canonical revision")

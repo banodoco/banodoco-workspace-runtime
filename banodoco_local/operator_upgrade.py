@@ -82,7 +82,7 @@ def _schema_kind(root: Path, *, expected_realm_id: str) -> str:
                     raise OperatorUpgradeError("legacy realm identity does not match the selected workspace")
                 return "v23"
             raise OperatorUpgradeError(f"realm has unsupported legacy schema version {version}")
-        raise OperatorUpgradeError("realm is neither canonical v24/v25/v26 nor the supported v23 format")
+        raise OperatorUpgradeError("realm is neither canonical v24/v25/v26/v27 nor the supported v23 format")
     finally:
         connection.close()
 

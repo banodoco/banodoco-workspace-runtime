@@ -41,7 +41,7 @@ LEGACY_TABLES = frozenset(
     }
 )
 NEW_TABLES = frozenset({
-    "runtime_schema", "managed_output_associations", "managed_output_lifecycle",
+    "runtime_schema", "managed_output_associations", "managed_output_lifecycle", "user_preferences",
     "internal_timeline_revisions", "shot_revisions", "parent_composition_revisions",
     "shot_revision_heads", "parent_composition_heads", "composition_revision_occurrences",
     "composition_revision_dependencies",
@@ -56,6 +56,8 @@ CANONICAL_PREVIOUS_SCHEMA_VERSION = 24
 VARIANT_STATE_TARGET_SCHEMA_VERSION = 25
 EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION = 25
 EXECUTION_BINDING_TARGET_SCHEMA_VERSION = 26
+USER_PREFERENCES_PREVIOUS_SCHEMA_VERSION = 26
+USER_PREFERENCES_TARGET_SCHEMA_VERSION = 27
 HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION = "MIGRATE MANAGED OUTPUTS"
 GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION = "REPAIR GENERIC MEDIA TYPES"
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv"})
@@ -168,7 +170,7 @@ def _canonical_shape_for(version: int) -> tuple[set[str], dict[str, set[str]]]:
     """Return the exact supported canonical layout for one historical version.
 
     Historical targets are deliberately pinned.  A future current schema must
-    not silently change what v24 or v25 means, and a database carrying a known
+    not silently change what v24, v25 or v26 means, and a database carrying a known
     version number with an alternate (for example distributed-binding) layout
     is not accepted as that version.
     """
@@ -176,10 +178,14 @@ def _canonical_shape_for(version: int) -> tuple[set[str], dict[str, set[str]]]:
         CANONICAL_PREVIOUS_SCHEMA_VERSION,
         VARIANT_STATE_TARGET_SCHEMA_VERSION,
         EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
+        USER_PREFERENCES_TARGET_SCHEMA_VERSION,
     }:
         raise ValidationError(f"canonical schema version {version} is not supported")
     tables = set(REQUIRED_SCHEMA_TABLES)
     columns = {table: set(values) for table, values in REQUIRED_SCHEMA_COLUMNS.items()}
+    if version < USER_PREFERENCES_TARGET_SCHEMA_VERSION:
+        tables.remove("user_preferences")
+        columns.pop("user_preferences")
     if version < EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
         tables.remove("execution_bindings")
         columns.pop("execution_bindings")
@@ -199,7 +205,7 @@ def _canonical_schema_identity(
     *,
     expected_realm_id: str | None = None,
 ) -> dict[str, object]:
-    """Classify a supported v24/v25/current database by version *and* shape."""
+    """Classify a supported v24/v25/v26/current database by version *and* shape."""
     tables = _tables(connection)
     if "runtime_schema" not in tables:
         raise ValidationError("canonical runtime_schema table is missing")
@@ -211,9 +217,9 @@ def _canonical_schema_identity(
     format_id, version = str(rows[0][1]), int(rows[0][2])
     if format_id != CANONICAL_FORMAT_ID:
         raise ValidationError(f"unsupported canonical format {format_id!r}")
-    if version > EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+    if version > USER_PREFERENCES_TARGET_SCHEMA_VERSION:
         raise ValidationError(
-            f"canonical schema v{version} is newer than supported v{EXECUTION_BINDING_TARGET_SCHEMA_VERSION}"
+            f"canonical schema v{version} is newer than supported v{USER_PREFERENCES_TARGET_SCHEMA_VERSION}"
         )
     if version < CANONICAL_PREVIOUS_SCHEMA_VERSION:
         raise ValidationError(f"canonical schema v{version} is not a supported migration source")
@@ -416,6 +422,29 @@ def _apply_v25_to_v26(connection: sqlite3.Connection) -> dict[str, object]:
     }
 
 
+def _apply_v26_to_v27(connection: sqlite3.Connection) -> dict[str, object]:
+    if "user_preferences" in _tables(connection):
+        raise ValidationError("v26 user preferences table is already present")
+    connection.execute(
+        """
+        CREATE TABLE user_preferences (
+            actor_id TEXT PRIMARY KEY NOT NULL, id TEXT NOT NULL UNIQUE,
+            content TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "UPDATE runtime_schema SET version=? WHERE id=1",
+        (USER_PREFERENCES_TARGET_SCHEMA_VERSION,),
+    )
+    return {
+        "source_schema_version": USER_PREFERENCES_PREVIOUS_SCHEMA_VERSION,
+        "target_schema_version": USER_PREFERENCES_TARGET_SCHEMA_VERSION,
+        "added_tables": ["user_preferences"],
+    }
+
+
 def migrate_canonical_v24_to_v25(
     root: str | Path,
     *,
@@ -520,9 +549,9 @@ def migrate_canonical_to_current(
     confirmation: str | None = None,
     expected_realm_id: str | None = None,
 ) -> dict:
-    """Atomically run every supported canonical step through pinned v26.
+    """Atomically run every supported canonical step through pinned v27.
 
-    Current v26 is a read-only idempotent result.  Unknown, alternate, and
+    Current v27 is a read-only idempotent result.  Unknown, alternate, and
     newer layouts are rejected by the read-only preflight before an owner-lock
     marker, SQLite sidecar, journal, process signal, or schema mutation occurs.
     """
@@ -535,12 +564,12 @@ def migrate_canonical_to_current(
     if confirmation != expected_confirmation:
         raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
     source_version = int(identity["version"])
-    if source_version == EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+    if source_version == USER_PREFERENCES_TARGET_SCHEMA_VERSION:
         return {
             "ok": True,
             "realm_id": realm_id,
             "source_schema_version": source_version,
-            "target_schema_version": EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
+            "target_schema_version": USER_PREFERENCES_TARGET_SCHEMA_VERSION,
             "steps": [],
             "changed": False,
         }
@@ -562,9 +591,14 @@ def migrate_canonical_to_current(
                     raise ValidationError("v24 to v25 migration did not produce the pinned v25 layout")
             if int(current["version"]) == EXECUTION_BINDING_PREVIOUS_SCHEMA_VERSION:
                 steps.append(_apply_v25_to_v26(connection))
+                current = _canonical_schema_identity(connection, expected_realm_id=realm_id)
+                if int(current["version"]) != EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
+                    raise ValidationError("v25 to v26 migration did not produce the pinned v26 layout")
+            if int(current["version"]) == USER_PREFERENCES_PREVIOUS_SCHEMA_VERSION:
+                steps.append(_apply_v26_to_v27(connection))
             final = _canonical_schema_identity(connection, expected_realm_id=realm_id)
-            if int(final["version"]) != EXECUTION_BINDING_TARGET_SCHEMA_VERSION:
-                raise ValidationError("canonical migration did not produce the pinned v26 layout")
+            if int(final["version"]) != USER_PREFERENCES_TARGET_SCHEMA_VERSION:
+                raise ValidationError("canonical migration did not produce the pinned v27 layout")
             if _quick_check(connection, float(timeout_seconds)) != "ok":
                 raise ValidationError("migrated database failed SQLite integrity check")
             foreign_keys = _foreign_key_errors(connection, float(timeout_seconds))
@@ -575,7 +609,7 @@ def migrate_canonical_to_current(
                 "ok": True,
                 "realm_id": realm_id,
                 "source_schema_version": source_version,
-                "target_schema_version": EXECUTION_BINDING_TARGET_SCHEMA_VERSION,
+                "target_schema_version": USER_PREFERENCES_TARGET_SCHEMA_VERSION,
                 "steps": steps,
                 "changed": True,
                 "elapsed_seconds": time.monotonic() - started,
@@ -625,7 +659,8 @@ def _source_shape(connection: sqlite3.Connection) -> tuple[set[str], dict[str, l
     if missing:
         raise ValidationError("upgrade source is missing shared canonical tables: " + ", ".join(sorted(missing)))
     columns: dict[str, list[str]] = {}
-    for table in sorted(REQUIRED_SCHEMA_TABLES - NEW_TABLES):
+    shared_tables = (REQUIRED_SCHEMA_TABLES - NEW_TABLES) | (tables & {"user_preferences"})
+    for table in sorted(shared_tables):
         actual = _table_columns(connection, table)
         expected = list(REQUIRED_SCHEMA_COLUMNS[table])
         if set(actual) != set(expected) or len(actual) != len(expected):

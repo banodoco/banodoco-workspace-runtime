@@ -201,6 +201,18 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if daemon is None:
                 raise ProtocolError("replacement is unavailable outside the owning daemon")
             return self._send(200, daemon.activate_candidate(body["candidate"]))
+        if len(path) == 3 and path[:2] == ["v1", "preferences"] and method in ("GET", "PUT"):
+            identity = self._identity("projects:read" if method == "GET" else "projects:write")
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if set(query) - {"project_id"} or len(query.get("project_id", [])) > 1:
+                raise ProtocolError("preferences accept only one optional project_id selector")
+            project_id = query.get("project_id", [None])[0]
+            if method == "GET":
+                return self._send(200, self.runtime.get_preferences(path[2], project_id, identity=identity))
+            body = self._project_mutation_body()
+            if set(body) != {"content", "expected_version"}:
+                raise ProtocolError("preferences require only content and expected_version")
+            return self._send(200, self.runtime.update_preferences(path[2], body["content"], body["expected_version"], self._idempotency_key(), project_id, identity=identity))
         if path == ["v1", "projects", "selection"] and method in ("GET", "PUT"):
             identity = self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
@@ -334,7 +346,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 self._identity("projects:read" if method == "GET" else "projects:write")
                 if method == "GET":
                     query = parse_qs(urlsplit(self.path).query)
-                    return self._send(200, self.runtime.list_documents(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
+                    return self._send(200, self.runtime.list_documents(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0], kind=query.get("kind", [None])[0]))
                 if method == "POST":
                     body = self._body()
                     if isinstance(body, dict) and (
