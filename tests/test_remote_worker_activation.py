@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from runtime_protocol.auth import CredentialStore
-from runtime_protocol.errors import AuthorizationError, ConflictError
+from runtime_protocol.errors import AuthorizationError, ConflictError, ValidationError
 from runtime_protocol.remote_worker_activation import QualifiedRemoteWorkerLauncher, _digest
 from runtime_protocol.remote_worker_deployment import ArtifactReference, DeploymentReference, deployment_binding_from_task
 from runtime_protocol.service import RuntimeService
@@ -163,6 +163,64 @@ def _fixture(tmp_path):
         runtime=service, credentials=credentials, preparer=preparer, inspector=inspector,
     )
     return service, task_id, reference, credentials, preparer, inspector, launcher
+
+
+def test_resident_credential_control_lifecycle_uses_callback_without_local_store(tmp_path):
+    service, task_id, ref, credentials, preparer, inspector, _launcher = _fixture(tmp_path)
+    calls = []
+
+    def control(control_task, value):
+        assert control_task == task_id
+        action = value["action"]
+        calls.append(action)
+        if action == "provision":
+            _token, path = credentials.provision(
+                "host", ["worker:execute"], rotate=True, enabled=False,
+                metadata={"execution_binding": value["placement"],
+                          "qualified_activation": value["qualification"]},
+            )
+            return {"credential_actor": "host", "credential_file": str(path)}
+        if action == "enable":
+            credentials.enable_actor("host")
+            return {"enabled": True}
+        if action == "verify":
+            return {"fresh": credentials.actor_metadata("host") is not None}
+        if action == "revoke":
+            credentials.revoke("host")
+            return {"revoked": True}
+        pytest.fail(f"unexpected resident control: {action}")
+
+    launcher = QualifiedRemoteWorkerLauncher(
+        runtime=service, credentials=None, credential_control=control,
+        preparer=preparer, inspector=inspector,
+    )
+    try:
+        parked = launcher.park(ref, target=OLD)
+        task = service._task_resource(service.store.get_task(task_id))
+        qualification = launcher.activate(task, ref, parked)
+        assert launcher.activation_state == "active"
+        assert calls == ["provision", "enable"]
+        launcher.assert_fresh(service._task_resource(service.store.get_task(task_id)), ref, parked, qualification)
+        assert calls[-1] == "verify"
+        credentials.revoke("host")
+        with pytest.raises(ConflictError, match="revoked or expired"):
+            launcher.assert_fresh(service._task_resource(service.store.get_task(task_id)), ref, parked, qualification)
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("both", [False, True])
+def test_resident_credential_control_requires_exactly_one_authority(tmp_path, both):
+    service, _task_id, _ref, credentials, preparer, inspector, _launcher = _fixture(tmp_path)
+    try:
+        with pytest.raises(ValidationError, match="exactly one"):
+            QualifiedRemoteWorkerLauncher(
+                runtime=service, credentials=credentials if both else None,
+                credential_control=(lambda *_args: {}) if both else None,
+                preparer=preparer, inspector=inspector,
+            )
+    finally:
+        service.close()
 
 
 def _claim(service, target, identity, key):

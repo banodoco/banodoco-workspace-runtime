@@ -3899,11 +3899,9 @@ class RuntimeService:
         project_row = self.store.get_project(project)
         if not isinstance(media_type, str) or not media_type or len(media_type) > 255:
             raise ValidationError("media import Content-Type is invalid")
-        content_type = "image" if media_type.lower().startswith("image/") else (
-            "video" if media_type.lower().startswith("video/") else None
-        )
-        if content_type is None:
-            raise ValidationError("media import Content-Type must be image/* or video/*")
+        content_type = media_type.lower().split("/", 1)[0]
+        if content_type not in {"image", "video", "audio"} or "/" not in media_type:
+            raise ValidationError("media import Content-Type must be image/*, video/* or audio/*")
         if original_name is not None:
             original_name = _canonical_managed_output_filename(original_name)
         if not isinstance(actor_id, str) or not actor_id:
@@ -3911,6 +3909,8 @@ class RuntimeService:
         width = self._media_import_optional_integer(width, "width")
         height = self._media_import_optional_integer(height, "height")
         duration_seconds = self._media_import_optional_duration(duration_seconds)
+        if content_type == "audio" and (width is not None or height is not None):
+            raise ValidationError("audio imports must not declare visual dimensions")
         if content_type == "image" and duration_seconds is not None:
             raise ValidationError("image imports must not declare duration_seconds")
         expected = (expected_digest or "").removeprefix("sha256:") or None
@@ -4097,7 +4097,7 @@ class RuntimeService:
     def import_media(self, project, data: bytes, *, media_type, original_name=None,
                      expected_digest=None, actor_id, width=None, height=None,
                      duration_seconds=None, idempotency_key=None):
-        """Ingest and settle one authenticated image/video import operation."""
+        """Ingest and settle one authenticated image/video/audio import operation."""
         prepared = self._media_import_request(
             project, data, media_type=media_type, original_name=original_name,
             expected_digest=expected_digest, actor_id=actor_id, width=width,
