@@ -37,6 +37,7 @@ def _project(service: RuntimeService, slug: str = "imports") -> dict:
     [
         (b"image-bytes", "image/png", "still.png", (1280, 720), None),
         (b"video-bytes", "video/mp4", "clip.mp4", (1920, 1080), 2.5),
+        (b"audio-bytes", "audio/wav", "voice.wav", (None, None), 1.0),
     ],
 )
 def test_service_import_settles_one_generation_and_primary_variant(
@@ -74,6 +75,7 @@ def test_service_import_settles_one_generation_and_primary_variant(
     assert generation["project_id"] == project["id"]
     assert generation["source_task_id"] == imported["task_id"]
     assert generation["status"] == "completed"
+    assert generation["type"] == media_type.split("/")[0]
     assert generation["metadata"]["provenance"] == imported["provenance"]
     assert len(variants) == 1
     assert variants[0]["variant_id"] == imported["variant_id"]
@@ -195,10 +197,15 @@ def test_project_media_permission_and_size_rejections_have_no_catalog_side_effec
             "input_object_ids": [imported["asset_id"]],
             "idempotency_key": "browser-import-task",
         })
-    with pytest.raises(ValidationError, match=r"image/\* or video/\*"):
+    with pytest.raises(ValidationError, match=r"image/\*, video/\* or audio/\*"):
         service.import_media(
             owner["id"], b"text", media_type="text/plain",
             actor_id="owner", idempotency_key="bad-type",
+        )
+    with pytest.raises(ValidationError, match="visual dimensions"):
+        service.import_media(
+            owner["id"], b"audio", media_type="audio/wav", width=1280,
+            actor_id="owner", idempotency_key="bad-audio-dimensions",
         )
     with pytest.raises(ConflictError, match="digest"):
         service.import_media(
@@ -282,9 +289,14 @@ def test_http_generated_client_imports_image_video_and_enforces_scopes(service: 
         filename="http.mp4", width=1920, height=1080,
         duration_seconds=3.0, idempotency_key="http-video",
     )
+    audio = owner.import_project_media(
+        project.project_id, b"http-audio", media_type="audio/wav",
+        filename="http.wav", duration_seconds=1.0, idempotency_key="http-audio",
+    )
     assert owner.get_project_media_import(project.project_id, "http-image")["generation_id"] == image["generation_id"]
     assert owner.get_project_media_import(project.project_id, "http-video")["variant_id"] == video["variant_id"]
-    assert len(owner.list_generations(project.project_id)[0]) == 2
+    assert owner.get_project_media_import(project.project_id, "http-audio")["asset_id"] == audio["asset_id"]
+    assert len(owner.list_generations(project.project_id)[0]) == 3
 
     reader = WorkspaceClient("http://runtime.test", "reader-token", transport=transport)
     assert reader.get_project_media_import(project.project_id, "http-image")["asset_id"] == image["asset_id"]

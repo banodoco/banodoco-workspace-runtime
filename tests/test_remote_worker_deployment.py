@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -13,8 +14,11 @@ from runtime_protocol.remote_worker_deployment import (
     CapabilityIdentity,
     DeploymentReference,
     DeploymentReferenceError,
+    deployment_binding_from_task,
     project_launch,
 )
+from runtime_protocol.service import RuntimeService
+from runtime_protocol.store import RealmStore
 
 
 def _digest(char: str) -> str:
@@ -234,6 +238,19 @@ def test_runtime_binding_preserves_initial_and_authorized_replacement_placement(
     assert replacement.admission_identity.admission_digest == initial.admission_identity.admission_digest
 
 
+def test_explicit_request_inputs_reject_duplicate_object_ids() -> None:
+    task = _task_projection()
+    duplicate = _digest("1")
+    task["input_object_ids"] = [duplicate, duplicate]
+    task["spec"]["input_object_ids"] = [duplicate, duplicate]
+    task["execution_request"]["inputs"] = [
+        {"name": "first", "object_id": duplicate},
+        {"name": "second", "object_id": duplicate},
+    ]
+    with pytest.raises(DeploymentReferenceError, match="duplicate object IDs"):
+        deployment_binding_from_task(task)
+
+
 def _missing_capability_digest(task: dict) -> None:
     task.pop("capability_digest")
 
@@ -271,3 +288,121 @@ def test_runtime_binding_rejects_missing_foreign_stale_and_drifted_contract(muta
     mutation(task)
     with pytest.raises(DeploymentReferenceError, match=message):
         deployment_binding_from_task(task)
+
+
+@pytest.fixture
+def admitted_omitted_input_task(tmp_path: Path):
+    """Use the public admission path and its actual task readback envelope."""
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        project = service.create_project({"slug": "binding-test", "name": "Binding test"})
+        bundle = service.ingest(
+            project["id"], b"bundle", original_name="bundle.zip", idempotency_key="bundle-input",
+        )["data"]["digest"]
+        request = service.ingest(
+            project["id"], b"request", original_name="request.json", idempotency_key="request-input",
+        )["data"]["digest"]
+        ids = {"input_bundle": bundle, "request": request}
+        admitted = service.create_task({
+            "capability_id": "h3_av.transform",
+            "capability_digest": _digest("2"),
+            "project": project["id"],
+            "input_object_ids": [bundle, request],
+            "spec": {
+                "inputs": {
+                    "request": {"object_id": request, "digest": request, "filename": "request.json"},
+                    "input_bundle": {"object_id": bundle, "digest": bundle, "filename": "bundle.zip"},
+                },
+                "input_digests": [
+                    {"name": "input_bundle", "digest": bundle},
+                    {"name": "request", "digest": request},
+                ],
+            },
+            "execution_request": {"schema_version": 1, "target": {
+                "kind": "runpod", "pod_id": "pod-old", "provider_account_ref": "account-a",
+            }},
+            "idempotency_key": "omitted-request-inputs",
+        })
+        task = service._task_resource(service.store.get_task(admitted["task"]["id"]))
+        yield service, task, ids
+    finally:
+        service.close()
+
+
+def test_omitted_request_inputs_resolve_from_public_admitted_spec(admitted_omitted_input_task) -> None:
+    _, task, ids = admitted_omitted_input_task
+    before = deepcopy(task)
+    assert "inputs" not in task["execution_request"]
+    assert task["spec"]["spec"]["inputs"]["input_bundle"]["object_id"] == ids["input_bundle"]
+
+    binding = deployment_binding_from_task(task)
+
+    assert [(row.name, row.object_id, row.digest) for row in binding.input_bindings] == [
+        (name, ids[name], ids[name]) for name in ("input_bundle", "request")
+    ]
+    assert task == before
+
+
+def test_explicit_empty_request_inputs_still_reject_two_admitted_ids(admitted_omitted_input_task) -> None:
+    _, task, _ = admitted_omitted_input_task
+    task["execution_request"]["inputs"] = []
+    with pytest.raises(DeploymentReferenceError, match="does not mirror"):
+        deployment_binding_from_task(task)
+
+
+@pytest.mark.parametrize("mutation, message", [
+    (lambda task, ids: task["spec"]["spec"]["inputs"]["request"].update(digest=ids["input_bundle"]), "conflicting digest"),
+    (lambda task, ids: task["spec"]["spec"]["input_digests"][0].update(digest=ids["request"]), "input_digests conflicts"),
+    (lambda task, ids: (
+        task["spec"]["spec"]["inputs"].pop("request"),
+        task["spec"]["spec"]["input_digests"].pop(),
+    ), "do not match input_object_ids"),
+    (lambda task, ids: task["spec"]["spec"]["inputs"].update(
+        second_bundle={"object_id": ids["input_bundle"], "digest": ids["input_bundle"]}
+    ), "ambiguous input descriptors"),
+])
+def test_omitted_request_inputs_reject_conflicting_missing_or_ambiguous_descriptors(
+    admitted_omitted_input_task, mutation, message,
+) -> None:
+    _, task, ids = admitted_omitted_input_task
+    mutation(task, ids)
+    with pytest.raises(DeploymentReferenceError, match=message):
+        deployment_binding_from_task(task)
+
+
+def test_omitted_request_inputs_accept_unambiguous_direct_spec_projection(admitted_omitted_input_task) -> None:
+    _, task, ids = admitted_omitted_input_task
+    task["spec"]["inputs"] = task["spec"]["spec"].pop("inputs")
+    task["spec"]["input_digests"] = task["spec"]["spec"].pop("input_digests")
+    binding = deployment_binding_from_task(task)
+    assert [(row.name, row.object_id) for row in binding.input_bindings] == [
+        (name, ids[name]) for name in ("input_bundle", "request")
+    ]
+
+
+def test_omitted_request_inputs_reject_conflicting_direct_and_enveloped_descriptors(admitted_omitted_input_task) -> None:
+    _, task, ids = admitted_omitted_input_task
+    task["spec"]["inputs"] = {"input_bundle": ids["request"], "request": ids["input_bundle"]}
+    with pytest.raises(DeploymentReferenceError, match="ambiguous input descriptors"):
+        deployment_binding_from_task(task)
+
+
+def test_omitted_request_inputs_accept_public_zero_input_task(tmp_path: Path) -> None:
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    service = RuntimeService(root)
+    try:
+        admitted = service.create_task({
+            "capability_id": "h3_av.transform", "capability_digest": _digest("2"),
+            "input_object_ids": [], "spec": {"inputs": {"prompt": "hello"}},
+            "execution_request": {"schema_version": 1, "target": {
+                "kind": "runpod", "pod_id": "pod-old", "provider_account_ref": "account-a",
+            }},
+            "idempotency_key": "zero-inputs",
+        })
+        task = service._task_resource(service.store.get_task(admitted["task"]["id"]))
+        assert deployment_binding_from_task(task).input_bindings == ()
+    finally:
+        service.close()

@@ -141,7 +141,7 @@ paths:
   /v1/projects/{project_id}/media-imports:
     post:
       operationId: importProjectMedia
-      description: Authenticated Runtime-host image/video ingest and atomic Generation plus original primary Variant settlement. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
+      description: Authenticated Runtime-host image/video/audio ingest and atomic Generation plus original primary Variant settlement. Audio imports accept duration but must omit visual dimensions. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
       parameters:
         - { $ref: '#/components/parameters/ProjectId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -156,6 +156,7 @@ paths:
           application/octet-stream: { schema: { type: string, format: binary, maxLength: 67108864 } }
           image/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
           video/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
+          audio/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
       responses:
         '201': { description: Completed Runtime media import with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
         '409': { $ref: '#/components/responses/Conflict' }
