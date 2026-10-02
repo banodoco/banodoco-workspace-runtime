@@ -39,6 +39,7 @@ from runtime_protocol.store import RealmStore
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.errors import ConflictError
 from runtime_protocol.handoff_recovery import recover_aborted_predecessor_resolution
+from runtime_protocol.lifecycle import interruption_fence
 from runtime_protocol.orderly_handoff import RECORD_VERSION, digest
 
 
@@ -297,9 +298,10 @@ class FakeBoundary:
         return self.start(realm_id=kwargs.get("realm_id", "ignored"), realm_root=Path(tempfile.mkdtemp()) / "realm", owner_lock=Path("/tmp/lock"), source_profile=PROFILE)
 
     def stop_owner(self, **kwargs):
-        self.restart_calls += 1
-        self.alive.discard(kwargs["pid"])
-        return {"status": "stopped"}
+        with interruption_fence(self.starts[-1]["realm_root"]) as idle:
+            self.restart_calls += 1
+            self.alive.discard(kwargs["pid"])
+        return {"status": "stopped", "interruption_audit": idle}
 
 
 class BootstrapTests(unittest.TestCase):
@@ -2528,6 +2530,7 @@ class BootstrapTests(unittest.TestCase):
                 "state": "cleanup_uncertain",
                 "reason": "ConflictError",
             }))
+            return {"status": "stopped", "interruption_audit": {"safe": True}}
 
         self.boundary.stop_owner = uncertain_stop
         with self.assertRaisesRegex(BootstrapError, "uncertain local Worker graph cleanup"):
@@ -2567,6 +2570,7 @@ class BootstrapTests(unittest.TestCase):
             )
             observed.append(probe.returncode)
             self.boundary.alive.discard(kwargs["pid"])
+            return {"status": "stopped", "interruption_audit": {"safe": True}}
 
         self.boundary.stop_owner = fenced_stop
         result = down(self.paths, self.boundary)
@@ -2591,6 +2595,7 @@ class BootstrapTests(unittest.TestCase):
             self.paths.instance_lock_path.write_text(json.dumps({
                 **replacement, "realm_id": "configured-realm",
             }))
+            return {"status": "stopped", "interruption_audit": {"safe": True}}
 
         self.boundary.stop_owner = replace_owner
         with self.assertRaisesRegex(BootstrapError, "changed during stop"):

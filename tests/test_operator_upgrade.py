@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import hashlib
 import json
+import shutil
 from types import SimpleNamespace
 import sqlite3
 
@@ -29,6 +30,7 @@ class _Boundary:
 
     def stop_owner(self, **kwargs):
         self.calls.append(("stop", kwargs))
+        return {"status": "stopped", "interruption_audit": {"safe": True}}
 
     def validate_owner(self, **_kwargs):
         return True
@@ -48,7 +50,9 @@ class _Boundary:
         return SimpleNamespace(doctor=lambda: {"ok": True, "state": "healthy"})
 
 
-def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
+def _fixture(
+    tmp_path, *, live=True, runtime_checkout=None, runtime_environment=None, version=25
+):
     support = tmp_path / "support"
     paths = RuntimePaths.current_mac(data_root=support)
     paths.ensure_support_dirs()
@@ -64,7 +68,12 @@ def _fixture(tmp_path, *, live=True, runtime_checkout=None, version=25):
         finally:
             connection.close()
     checkout = runtime_checkout or tmp_path
-    profile = SourceProfile(profile="astrid", runtime_checkout=str(checkout), source_checkout=str(checkout))
+    profile = SourceProfile(
+        profile="astrid",
+        runtime_checkout=str(checkout),
+        source_checkout=str(checkout),
+        runtime_environment=(str(runtime_environment) if runtime_environment else None),
+    )
     catalog = {
         "version": 1,
         "selected_realm_id": "realm-1",
@@ -121,7 +130,8 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
         ((realm_root,), {"timeout_seconds": 120.0, "confirmation": "MIGRATE CANONICAL realm-1", "expected_realm_id": "realm-1"})
     ]
     assert boundary.calls[1][0] == "stop"
-    assert boundary.calls[1][1]["require_health"] is False
+    assert "require_health" not in boundary.calls[1][1]
+    assert boundary.calls[1][1]["interruption_timeout_seconds"] == 120.0
     assert started == [paths.app_support]
     journal = json.loads((paths.runtime_support / "upgrade-journal.json").read_text())
     assert journal["state"] == "complete"
@@ -154,6 +164,37 @@ def test_operator_upgrade_refuses_running_task_before_signaling_owner(tmp_path):
     assert not any(call[0] == "stop" for call in boundary.calls)
 
 
+def test_operator_upgrade_final_fence_refusal_prevents_migration_and_activation(
+    tmp_path, monkeypatch
+):
+    paths, profile, _realm_root = _fixture(tmp_path)
+    boundary = _Boundary(paths)
+    migration_calls = []
+
+    def refuse_stop(**kwargs):
+        boundary.calls.append(("stop", kwargs))
+        raise BootstrapError("runtime lifecycle refused while work became active or unreconciled")
+
+    boundary.stop_owner = refuse_stop
+    monkeypatch.setattr(
+        "banodoco_local.operator_upgrade.migrate_canonical_to_current",
+        lambda *args, **kwargs: migration_calls.append((args, kwargs)),
+    )
+    with pytest.raises(OperatorUpgradeError, match="work became active"):
+        upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
+    assert migration_calls == []
+    assert [call[0] for call in boundary.calls] == ["prepare", "stop"]
+    journal = json.loads((paths.runtime_support / "upgrade-journal.json").read_text())
+    assert journal["state"] == "failed"
+    assert [entry["state"] for entry in journal["history"]] == [
+        "planned", "stopping", "failed"
+    ]
+    assert not any(
+        entry["state"] in {"stopped", "activated", "restarted"}
+        for entry in journal["history"]
+    )
+
+
 def test_operator_upgrade_failure_before_activation_restarts_original_and_journals(tmp_path, monkeypatch):
     paths, profile, realm_root = _fixture(tmp_path)
     boundary = _Boundary(paths)
@@ -177,9 +218,32 @@ def test_operator_upgrade_failure_before_activation_restarts_original_and_journa
     assert journal["activated"] is False
 
 
-def test_operator_upgrade_restarts_a_real_current_runtime(tmp_path):
+def test_operator_upgrade_restarts_a_real_current_runtime(
+    tmp_path, stage1_runtime_environment, monkeypatch
+):
     repo = Path(__file__).resolve().parents[1]
-    paths, profile, _realm_root = _fixture(tmp_path, live=False, runtime_checkout=repo)
+    paths, profile, _realm_root = _fixture(
+        tmp_path,
+        live=False,
+        runtime_checkout=repo,
+        runtime_environment=stage1_runtime_environment,
+    )
+    site_packages = list(
+        (stage1_runtime_environment / "lib").glob("python*/site-packages")
+    )
+    assert len(site_packages) == 1
+    installed_client = site_packages[0] / "banodoco_workspace_client"
+    assert installed_client.is_dir() and not installed_client.is_symlink()
+    parent_dependencies = tmp_path / "parent-client-dependencies"
+    parent_dependencies.mkdir()
+    shutil.copytree(installed_client, parent_dependencies / installed_client.name)
+    monkeypatch.syspath_prepend(str(parent_dependencies))
+    client_module = __import__("banodoco_workspace_client")
+    loaded_origin = Path(client_module.__file__).resolve()
+    assert loaded_origin.is_relative_to(parent_dependencies.resolve())
+    assert hashlib.sha256(loaded_origin.read_bytes()).digest() == hashlib.sha256(
+        (installed_client / loaded_origin.name).read_bytes()
+    ).digest()
     boundary = LocalRuntimeBoundary(wait_seconds=8)
     try:
         result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))

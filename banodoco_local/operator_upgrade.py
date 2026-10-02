@@ -31,7 +31,7 @@ from runtime_protocol.upgrade import (
     migrate_canonical_to_current,
     upgrade_realm,
 )
-from runtime_protocol.lifecycle import inspect_interruption_state, interruption_fence
+from runtime_protocol.lifecycle import inspect_interruption_state
 
 
 class OperatorUpgradeError(BootstrapError):
@@ -240,19 +240,21 @@ def upgrade_workspace(
                     support_root=paths.runtime_support, pid=int(owner["pid"]),
                 )
                 _journal(paths, operation_id=operation_id, state="stopping", realm_id=realm_id, schema_before=kind, idle=idle)
-                # BEGIN IMMEDIATE serializes with admission/claim/settlement.
-                # Hold it across the final identity-checked signal so a claim
-                # cannot land between the idle decision and owner shutdown.
                 try:
-                    with interruption_fence(realm_root, timeout_seconds=timeout_seconds) as fenced_idle:
-                        stop_owner(
-                            endpoint=str(owner["endpoint"]), pid=int(owner["pid"]),
-                            instance_id=str(owner["runtime_instance_id"]), process_birth_id=str(owner["process_birth_id"]),
-                            realm_id=realm_id, owner_lock=paths.instance_lock_path,
-                            discovery_path=paths.discovery_path, require_health=False,
+                    stop_result = stop_owner(
+                        endpoint=str(owner["endpoint"]), pid=int(owner["pid"]),
+                        instance_id=str(owner["runtime_instance_id"]), process_birth_id=str(owner["process_birth_id"]),
+                        realm_id=realm_id, owner_lock=paths.instance_lock_path,
+                        discovery_path=paths.discovery_path,
+                        interruption_timeout_seconds=timeout_seconds,
+                    )
+                    fenced_idle = dict(stop_result.get("interruption_audit", {}))
+                    if not fenced_idle or fenced_idle.get("safe") is not True:
+                        raise OperatorUpgradeError(
+                            "runtime stop did not return a safe fenced interruption audit"
                         )
-                        stopped = True
-                        idle = fenced_idle
+                    stopped = True
+                    idle = fenced_idle
                 except Exception as exc:
                     raise OperatorUpgradeError(str(exc)) from exc
                 remove_file(paths.discovery_path)

@@ -1,3 +1,4 @@
+import contextlib
 import json
 import fcntl
 import inspect
@@ -9,6 +10,8 @@ import stat
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -29,7 +32,10 @@ from runtime_protocol.local_worker_handoff import (
     send_frame,
 )
 from runtime_protocol import cli as runtime_cli
+from runtime_protocol.daemon import RuntimeDaemon
+from runtime_protocol.lifecycle import interruption_fence as real_interruption_fence
 from runtime_protocol.orderly_handoff import digest
+from runtime_protocol.store import RealmStore
 
 
 def test_custody_socket_root_ignores_long_private_tmpdir_and_real_bind(monkeypatch, tmp_path):
@@ -769,6 +775,55 @@ def test_direct_child_cleanup_requires_sole_reaper_and_rechecks_before_kill(monk
     assert parents == [os.getpid(), os.getpid()]
 
 
+def test_sealed_direct_child_cleanup_signals_through_custody_and_reaps(monkeypatch, tmp_path):
+    boundary = LocalRuntimeBoundary()
+    calls = []
+
+    class Process:
+        pid = 4321
+        returncode = None
+        _runtime_boundary_owner = boundary
+        _runtime_boundary_sole_reaper = True
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            self.returncode = -15
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("raw direct-child signal must not be used")
+
+        def kill(self):
+            raise AssertionError("raw direct-child signal must not be used")
+
+    process = Process()
+    monkeypatch.setattr(boundary, "_process_parent_pid", lambda _pid: os.getpid())
+    monkeypatch.setattr(
+        boundary,
+        "_signal_registered_owner",
+        lambda **kwargs: calls.append(("sealed", kwargs)) or {"ok": True},
+    )
+
+    assert boundary._terminate_direct_child_owner_with_sealed_custody(
+        process,
+        support=tmp_path,
+        expected_pid=process.pid,
+        expected_birth="birth-a",
+    ) is True
+    assert calls == [
+        ("sealed", {
+            "support": tmp_path,
+            "expected_pid": process.pid,
+            "expected_birth": "birth-a",
+            "signum": signal.SIGTERM,
+        }),
+        ("wait", 5),
+    ]
+
+
 def test_detached_owner_cleanup_uses_only_sealed_capability_for_term_and_kill(monkeypatch, tmp_path):
     boundary = LocalRuntimeBoundary()
     calls = []
@@ -1285,3 +1340,768 @@ def test_slow_healthy_runtime_and_degraded_owner(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+
+def _normal_down_phase_fixture(tmp_path, monkeypatch, *, preflight=None, mutate_under_fence=None):
+    root = tmp_path / "realm"
+    support = tmp_path / "support"
+    credentials = support / "credentials"
+    root.mkdir()
+    credentials.mkdir(parents=True)
+    (credentials / "owner.token").write_text("private-test-token", encoding="utf-8")
+    discovery_path = support / "discovery.json"
+    owner_lock = support / "instance.lock"
+    pid = 43210
+    endpoint = "http://127.0.0.1:43123"
+    instance_id = "instance-1"
+    birth_id = "birth-1"
+    realm_id = "realm-1"
+    record = {
+        "pid": pid,
+        "endpoint": endpoint,
+        "runtime_instance_id": instance_id,
+        "process_birth_id": birth_id,
+        "active_realm": realm_id,
+        "realm_id": realm_id,
+        "realm_root": str(root.resolve()),
+    }
+    discovery_path.write_text(json.dumps(record), encoding="utf-8")
+    owner_lock.write_text(json.dumps(record), encoding="utf-8")
+    boundary = LocalRuntimeBoundary()
+    boundary.prepare_restart(
+        source_profile=SourceProfile(
+            profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path)
+        ),
+        realm_id=realm_id,
+        realm_root=root,
+        support_root=support,
+        pid=pid,
+    )
+    state = {"inside_fence": False, "events": [], "signals": 0}
+    health = {
+        "protocol": "workspace.v1",
+        "status": "ok",
+        "runtime_instance_id": instance_id,
+    }
+    endpoint_identity = {
+        "runtime_instance_id": instance_id,
+        "realm_id": realm_id,
+        "status": "ok",
+    }
+    if preflight == "health-unavailable":
+        health = None
+    elif preflight == "health-instance":
+        health = {**health, "runtime_instance_id": "other"}
+    elif preflight == "auth-unavailable":
+        endpoint_identity = {}
+    elif preflight == "auth-realm":
+        endpoint_identity = {**endpoint_identity, "realm_id": "other"}
+
+    def http_health(_endpoint):
+        assert state["inside_fence"] is False
+        state["events"].append("http-health")
+        return health
+
+    def endpoint_metadata(**_kwargs):
+        assert state["inside_fence"] is False
+        state["events"].append("http-auth")
+        return endpoint_identity
+
+    monkeypatch.setattr(boundary, "_http_health_payload", http_health)
+    monkeypatch.setattr(boundary, "endpoint_metadata", endpoint_metadata)
+    monkeypatch.setattr(boundary, "is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(boundary, "process_birth_identity", lambda _pid: birth_id)
+    monkeypatch.setattr(runtime_boundary_module.os, "getpgid", lambda _pid: pid)
+
+    @contextlib.contextmanager
+    def fence(_root, *, timeout_seconds):
+        assert timeout_seconds == 7.0
+        state["events"].append("fence-enter")
+        state["inside_fence"] = True
+        if mutate_under_fence is not None:
+            mutate_under_fence(record, discovery_path, owner_lock, boundary, state)
+        try:
+            yield {"safe": True, "active_tasks": [], "unreconciled_attempts": []}
+        finally:
+            state["inside_fence"] = False
+            state["events"].append("fence-exit")
+
+    monkeypatch.setattr("runtime_protocol.lifecycle.interruption_fence", fence)
+
+    def terminate(**kwargs):
+        assert state["inside_fence"] is True
+        callback = kwargs.pop("event_callback")
+        assert kwargs == {"support": support.resolve(), "expected_pid": pid, "expected_birth": birth_id}
+        callback("sealed_term_requested")
+        state["events"].append("sealed-signal")
+        state["signals"] += 1
+        callback("sealed_term_completed")
+        return True
+
+    monkeypatch.setattr(boundary, "_terminate_detached_owner", terminate)
+    kwargs = {
+        "endpoint": endpoint,
+        "pid": pid,
+        "instance_id": instance_id,
+        "process_birth_id": birth_id,
+        "realm_id": realm_id,
+        "owner_lock": owner_lock,
+        "discovery_path": discovery_path,
+        "interruption_timeout_seconds": 7.0,
+    }
+    return boundary, kwargs, state, support, discovery_path, owner_lock
+
+
+def test_normal_down_authenticates_before_fence_and_revalidates_locally(tmp_path, monkeypatch):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+    stopped = boundary.stop_owner(**kwargs)
+    assert stopped["interruption_audit"]["safe"] is True
+    assert stopped["identity_validation"] == {
+        "authenticated_before_fence": True,
+        "local_fences_revalidated_under_fence": True,
+        "http_probe_under_fence": False,
+        "sealed_custody_signal": True,
+        "receipt_path": str(support.resolve() / "runtime-stop-validation.json"),
+    }
+    assert state["events"] == [
+        "http-health", "http-auth", "fence-enter", "sealed-signal", "fence-exit"
+    ]
+    assert state["signals"] == 1
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "completed"
+    assert receipt["phases"]["authenticated_preflight"]["passed"] is True
+    assert receipt["phases"]["local_identity_revalidation"]["passed"] is True
+    assert receipt["effects"] == {
+        "signal_attempted": True,
+        "signal_completed": True,
+        "sealed_term_requested": True,
+        "sealed_term_completed": True,
+        "sealed_kill_requested": False,
+        "sealed_kill_completed": False,
+        "reaped_without_signal": False,
+    }
+    assert "private-test-token" not in json.dumps(receipt)
+
+
+def test_normal_down_direct_child_uses_sealed_custody_before_reaping(tmp_path, monkeypatch):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    class Process:
+        pid = kwargs["pid"]
+        returncode = None
+        _runtime_boundary_owner = boundary
+        _runtime_boundary_sole_reaper = True
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            state["events"].append(("reap", timeout))
+            self.returncode = -15
+            return self.returncode
+
+        def terminate(self):
+            raise AssertionError("normal down must not use raw direct-child terminate")
+
+        def kill(self):
+            raise AssertionError("normal down must not use raw direct-child kill")
+
+    process = Process()
+    boundary._detached_pid = None
+    boundary._process = process
+    monkeypatch.setattr(boundary, "_process_parent_pid", lambda _pid: os.getpid())
+    sealed_calls = []
+
+    def sealed_signal(**call):
+        assert state["inside_fence"] is True
+        sealed_calls.append(call)
+        return {"ok": True}
+
+    monkeypatch.setattr(boundary, "_signal_registered_owner", sealed_signal)
+    result = boundary.stop_owner(**kwargs)
+    assert result["identity_validation"]["sealed_custody_signal"] is True
+    assert sealed_calls == [{
+        "support": support.resolve(),
+        "expected_pid": kwargs["pid"],
+        "expected_birth": kwargs["process_birth_id"],
+        "signum": signal.SIGTERM,
+    }]
+    assert ("reap", 5) in state["events"]
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["effects"] == {
+        "signal_attempted": True,
+        "signal_completed": True,
+        "sealed_term_requested": True,
+        "sealed_term_completed": True,
+        "sealed_kill_requested": False,
+        "sealed_kill_completed": False,
+        "reaped_without_signal": False,
+    }
+
+
+def test_normal_down_direct_child_custody_refusal_has_no_raw_signal_fallback(
+    tmp_path, monkeypatch
+):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    class Process:
+        pid = kwargs["pid"]
+        _runtime_boundary_owner = boundary
+        _runtime_boundary_sole_reaper = True
+
+        def poll(self):
+            return None
+
+        def wait(self, _timeout):
+            raise AssertionError("custody refusal must not reap a live unsignaled child")
+
+        def terminate(self):
+            raise AssertionError("raw direct-child terminate must not be used")
+
+        def kill(self):
+            raise AssertionError("raw direct-child kill must not be used")
+
+    boundary._detached_pid = None
+    boundary._process = Process()
+    monkeypatch.setattr(boundary, "_process_parent_pid", lambda _pid: os.getpid())
+    monkeypatch.setattr(
+        boundary,
+        "_signal_registered_owner",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            BootstrapError("Runtime sealed custody is unavailable for the selected owner.")
+        ),
+    )
+    with pytest.raises(BootstrapError, match="sealed custody is unavailable"):
+        boundary.stop_owner(**kwargs)
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "stop_failed"
+    assert receipt["effects"] == {
+        "signal_attempted": True,
+        "signal_completed": False,
+        "sealed_term_requested": True,
+        "sealed_term_completed": False,
+        "sealed_kill_requested": False,
+        "sealed_kill_completed": False,
+        "reaped_without_signal": False,
+    }
+
+
+def test_normal_down_direct_child_term_timeout_uses_sealed_kill_and_reaps(
+    tmp_path, monkeypatch
+):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    class Process:
+        pid = kwargs["pid"]
+        _runtime_boundary_owner = boundary
+        _runtime_boundary_sole_reaper = True
+
+        def __init__(self):
+            self.waits = []
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            if timeout == 5:
+                raise subprocess.TimeoutExpired("runtime", timeout)
+            return -9
+
+        def terminate(self):
+            raise AssertionError("raw direct-child terminate must not be used")
+
+        def kill(self):
+            raise AssertionError("raw direct-child kill must not be used")
+
+    process = Process()
+    boundary._detached_pid = None
+    boundary._process = process
+    monkeypatch.setattr(boundary, "_process_parent_pid", lambda _pid: os.getpid())
+    sealed_signals = []
+    monkeypatch.setattr(
+        boundary,
+        "_signal_registered_owner",
+        lambda **call: sealed_signals.append(call["signum"]) or {"ok": True},
+    )
+    result = boundary.stop_owner(**kwargs)
+    assert result["identity_validation"]["sealed_custody_signal"] is True
+    assert sealed_signals == [signal.SIGTERM, signal.SIGKILL]
+    assert process.waits == [5, 2]
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["effects"]["sealed_term_completed"] is True
+    assert receipt["effects"]["sealed_kill_completed"] is True
+    assert receipt["effects"]["signal_completed"] is True
+
+
+def test_normal_down_direct_child_custody_change_before_escalation_has_no_fallback(
+    tmp_path, monkeypatch
+):
+    boundary, kwargs, _state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    class Process:
+        pid = kwargs["pid"]
+        _runtime_boundary_owner = boundary
+        _runtime_boundary_sole_reaper = True
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            if timeout == 5:
+                raise subprocess.TimeoutExpired("runtime", timeout)
+            raise AssertionError("failed sealed escalation must not enter reap wait")
+
+        def terminate(self):
+            raise AssertionError("raw direct-child terminate must not be used")
+
+        def kill(self):
+            raise AssertionError("raw direct-child kill must not be used")
+
+    boundary._detached_pid = None
+    boundary._process = Process()
+    monkeypatch.setattr(boundary, "_process_parent_pid", lambda _pid: os.getpid())
+    calls = []
+
+    def sealed_signal(**call):
+        calls.append(call["signum"])
+        if call["signum"] == signal.SIGKILL:
+            raise BootstrapError("Runtime sealed custody refused: selected owner identity changed.")
+        return {"ok": True}
+
+    monkeypatch.setattr(boundary, "_signal_registered_owner", sealed_signal)
+    with pytest.raises(BootstrapError, match="sealed custody refused"):
+        boundary.stop_owner(**kwargs)
+    assert calls == [signal.SIGTERM, signal.SIGKILL]
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "stop_failed"
+    assert receipt["effects"]["sealed_term_completed"] is True
+    assert receipt["effects"]["sealed_kill_requested"] is True
+    assert receipt["effects"]["sealed_kill_completed"] is False
+
+
+def test_normal_down_already_exited_direct_child_reaps_without_signal_claim(
+    tmp_path, monkeypatch
+):
+    boundary, kwargs, _state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    class Process:
+        pid = kwargs["pid"]
+        _runtime_boundary_owner = boundary
+        _runtime_boundary_sole_reaper = True
+
+        def poll(self):
+            return -15
+
+        def wait(self, timeout):
+            assert timeout == 2
+            return -15
+
+        def terminate(self):
+            raise AssertionError("already-exited child must not be signaled")
+
+        def kill(self):
+            raise AssertionError("already-exited child must not be signaled")
+
+    boundary._detached_pid = None
+    boundary._process = Process()
+    sealed_signals = []
+    monkeypatch.setattr(
+        boundary,
+        "_signal_registered_owner",
+        lambda **call: sealed_signals.append(call) or {"ok": True},
+    )
+    result = boundary.stop_owner(**kwargs)
+    assert sealed_signals == []
+    assert result["identity_validation"]["sealed_custody_signal"] is False
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "completed"
+    assert receipt["effects"]["signal_attempted"] is False
+    assert receipt["effects"]["signal_completed"] is False
+    assert receipt["effects"]["reaped_without_signal"] is True
+    assert receipt["events"][-1]["phase"] == "reaped_without_signal"
+
+
+@pytest.mark.parametrize("failure", ["birth-changed", "pid-gone", "group-changed"])
+def test_restart_direct_child_requires_final_identity_validation_before_signal(
+    tmp_path, monkeypatch, failure
+):
+    boundary, kwargs, _state, _support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    class Process:
+        pid = kwargs["pid"]
+
+    process = Process()
+    boundary._detached_pid = None
+    boundary._process = process
+    if failure == "birth-changed":
+        births = iter((kwargs["process_birth_id"], "replacement-birth"))
+        monkeypatch.setattr(boundary, "process_birth_identity", lambda _pid: next(births))
+    elif failure == "pid-gone":
+        alive = iter((True, False))
+        monkeypatch.setattr(boundary, "is_pid_alive", lambda _pid: next(alive))
+    elif failure == "group-changed":
+        groups = iter((kwargs["pid"], kwargs["pid"] + 1))
+        monkeypatch.setattr(runtime_boundary_module.os, "getpgid", lambda _pid: next(groups))
+    signals = []
+    monkeypatch.setattr(boundary, "_terminate", lambda value: signals.append(value))
+    with pytest.raises(BootstrapError, match="owner identity changed or is stale"):
+        boundary.restart(**kwargs, start_after_stop=False)
+    assert signals == []
+    assert boundary._process is process
+
+
+def test_restart_direct_child_signals_only_after_two_identity_validations(
+    tmp_path, monkeypatch
+):
+    boundary, kwargs, _state, _support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    class Process:
+        pid = kwargs["pid"]
+
+    process = Process()
+    boundary._detached_pid = None
+    boundary._process = process
+    birth_calls = []
+
+    def birth(_pid):
+        birth_calls.append(kwargs["process_birth_id"])
+        return kwargs["process_birth_id"]
+
+    monkeypatch.setattr(boundary, "process_birth_identity", birth)
+    signals = []
+    monkeypatch.setattr(boundary, "_terminate", lambda value: signals.append(value))
+    result = boundary.restart(**kwargs, start_after_stop=False)
+    assert result["status"] == "stopped"
+    assert birth_calls == [kwargs["process_birth_id"], kwargs["process_birth_id"]]
+    assert signals == [process]
+    assert boundary._process is None
+
+
+@pytest.mark.parametrize(
+    "failure,failed_check",
+    [
+        ("health-unavailable", "health_instance"),
+        ("health-instance", "health_instance"),
+        ("auth-unavailable", "authenticated_instance"),
+        ("auth-realm", "authenticated_realm"),
+    ],
+)
+def test_normal_down_authentication_failure_is_receipt_first_without_signal(
+    tmp_path, monkeypatch, failure, failed_check
+):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch, preflight=failure
+    )
+    with pytest.raises(BootstrapError, match="Runtime restart refused"):
+        boundary.stop_owner(**kwargs)
+    assert state["signals"] == 0
+    assert "fence-enter" not in state["events"]
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "refused_before_fence"
+    assert receipt["phases"]["authenticated_preflight"]["checks"][failed_check] is False
+    assert receipt["effects"] == {
+        "signal_attempted": False,
+        "signal_completed": False,
+        "sealed_term_requested": False,
+        "sealed_term_completed": False,
+        "sealed_kill_requested": False,
+        "sealed_kill_completed": False,
+        "reaped_without_signal": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation,failed_check",
+    [
+        ("discovery-pid", "discovery_pid"),
+        ("discovery-birth", "discovery_birth"),
+        ("owner-lock-instance", "owner_lock_instance"),
+        ("owner-lock-root", "owner_lock_root"),
+        ("owner-lock-missing", "identity_observation_completed"),
+        ("pid-gone", "pid_alive"),
+        ("birth-changed", "process_birth"),
+        ("group-changed", "process_group_leader"),
+        ("group-unavailable", "process_group_leader"),
+    ],
+)
+def test_normal_down_final_local_fence_change_refuses_without_signal(
+    tmp_path, monkeypatch, mutation, failed_check
+):
+    def mutate(record, discovery_path, owner_lock, boundary, _state):
+        if mutation.startswith("discovery-"):
+            changed = dict(record)
+            changed[{"discovery-pid": "pid", "discovery-birth": "process_birth_id"}[mutation]] = (
+                99999 if mutation == "discovery-pid" else "other"
+            )
+            discovery_path.write_text(json.dumps(changed), encoding="utf-8")
+        elif mutation == "owner-lock-instance":
+            changed = dict(record)
+            changed["runtime_instance_id"] = "other"
+            owner_lock.write_text(json.dumps(changed), encoding="utf-8")
+        elif mutation == "owner-lock-root":
+            changed = dict(record)
+            changed["realm_root"] = str((owner_lock.parent / "other-realm").resolve())
+            owner_lock.write_text(json.dumps(changed), encoding="utf-8")
+        elif mutation == "owner-lock-missing":
+            owner_lock.unlink()
+        elif mutation == "pid-gone":
+            monkeypatch.setattr(boundary, "is_pid_alive", lambda _pid: False)
+        elif mutation == "birth-changed":
+            monkeypatch.setattr(boundary, "process_birth_identity", lambda _pid: "replacement")
+        elif mutation == "group-changed":
+            monkeypatch.setattr(runtime_boundary_module.os, "getpgid", lambda _pid: 99999)
+        elif mutation == "group-unavailable":
+            def missing_group(_pid):
+                raise ProcessLookupError("gone")
+            monkeypatch.setattr(runtime_boundary_module.os, "getpgid", missing_group)
+
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch, mutate_under_fence=mutate
+    )
+    with pytest.raises(BootstrapError, match="Runtime restart refused"):
+        boundary.stop_owner(**kwargs)
+    assert state["signals"] == 0
+    assert state["events"][-1] == "fence-exit"
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "refused_under_fence"
+    assert receipt["phases"]["local_identity_revalidation"]["checks"][failed_check] is False
+    assert receipt["effects"] == {
+        "signal_attempted": False,
+        "signal_completed": False,
+        "sealed_term_requested": False,
+        "sealed_term_completed": False,
+        "sealed_kill_requested": False,
+        "sealed_kill_completed": False,
+        "reaped_without_signal": False,
+    }
+
+
+def test_normal_down_active_work_between_auth_and_fence_refuses_without_signal(tmp_path, monkeypatch):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+
+    @contextlib.contextmanager
+    def refused_fence(_root, *, timeout_seconds):
+        assert timeout_seconds == 7.0
+        raise BootstrapError("runtime lifecycle refused while work became active")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("runtime_protocol.lifecycle.interruption_fence", refused_fence)
+    with pytest.raises(BootstrapError, match="work became active"):
+        boundary.stop_owner(**kwargs)
+    assert state["signals"] == 0
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "stop_failed"
+    assert receipt["failure"]["class"] == "BootstrapError"
+
+
+def test_normal_down_has_no_reusable_identity_context_after_stop(tmp_path, monkeypatch):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+    boundary.stop_owner(**kwargs)
+    with pytest.raises(BootstrapError, match="owned process handle changed"):
+        boundary.stop_owner(**kwargs)
+    assert state["signals"] == 1
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "stop_failed"
+
+
+@pytest.mark.parametrize("custody_failure", ["identity-changed", "capability-unavailable"])
+def test_normal_down_sealed_custody_change_has_no_raw_signal_fallback(
+    tmp_path, monkeypatch, custody_failure
+):
+    boundary, kwargs, state, support, _discovery, _lock = _normal_down_phase_fixture(
+        tmp_path, monkeypatch
+    )
+    sealed_calls = []
+    observed_birth = "replacement" if custody_failure == "identity-changed" else kwargs["process_birth_id"]
+    monkeypatch.setattr(
+        boundary,
+        "_custody_identity",
+        lambda _pid: {"pid": kwargs["pid"], "birth_id": observed_birth, "uid": os.getuid()},
+    )
+
+    def sealed_signal(*_args, **_kwargs):
+        sealed_calls.append("validator")
+        raise custody_broker_module.CustodyError("missing sealed capability")
+
+    monkeypatch.setattr(runtime_boundary_module, "signal_sealed_capability", sealed_signal)
+    monkeypatch.setattr(boundary, "_terminate_detached_owner", LocalRuntimeBoundary._terminate_detached_owner.__get__(boundary))
+    expected = "sealed custody refused" if custody_failure == "identity-changed" else "sealed custody is unavailable"
+    with pytest.raises(BootstrapError, match=expected):
+        boundary.stop_owner(**kwargs)
+    assert sealed_calls == ([] if custody_failure == "identity-changed" else ["validator"])
+    assert state["signals"] == 0
+    receipt = json.loads((support / "runtime-stop-validation.json").read_text())
+    assert receipt["state"] == "stop_failed"
+    assert receipt["failure"]["class"] == "BootstrapError"
+    assert "os.kill(" not in inspect.getsource(runtime_boundary_module)
+    assert "os.killpg" not in inspect.getsource(runtime_boundary_module)
+
+
+def test_normal_down_real_fence_allows_contention_without_http_under_fence(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "realm"
+    support = tmp_path / "support"
+    RealmStore.initialize(root, realm_id="realm-1").close()
+    daemon = RuntimeDaemon(root, support_root=support).start()
+    mutation_result = {}
+    attempted = threading.Event()
+    acquired = threading.Event()
+    mutation_thread = None
+    original_transaction = daemon.service.store._transaction
+    original_http = LocalRuntimeBoundary._http_health_payload
+    inside_fence = {"value": False}
+    http_phases = []
+    simulated_signals = []
+    try:
+        baseline = original_http(daemon.endpoint)
+        assert baseline and baseline["status"] == "ok"
+        instance_id = str(baseline["runtime_instance_id"])
+        credentials = support / "credentials"
+        credentials.mkdir(parents=True, exist_ok=True)
+        (credentials / "owner.token").write_text(daemon.token, encoding="utf-8")
+        endpoint_identity = LocalRuntimeBoundary().endpoint_metadata(
+            endpoint=daemon.endpoint, credential_file=credentials / "owner.token"
+        )
+        assert endpoint_identity["realm_id"] == "realm-1"
+        pid = 43211
+        birth_id = "birth-contention"
+        record = {
+            "pid": pid,
+            "endpoint": daemon.endpoint,
+            "runtime_instance_id": instance_id,
+            "process_birth_id": birth_id,
+            "active_realm": "realm-1",
+            "realm_id": "realm-1",
+            "realm_root": str(root.resolve()),
+        }
+        (support / "discovery.json").write_text(json.dumps(record), encoding="utf-8")
+        (support / "instance.lock").write_text(json.dumps(record), encoding="utf-8")
+        boundary = LocalRuntimeBoundary()
+        boundary.prepare_restart(
+            source_profile=SourceProfile(
+                profile="astrid", runtime_checkout=str(tmp_path), source_checkout=str(tmp_path)
+            ),
+            realm_id="realm-1",
+            realm_root=root,
+            support_root=support,
+            pid=pid,
+        )
+        monkeypatch.setattr(boundary, "is_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(boundary, "process_birth_identity", lambda _pid: birth_id)
+        monkeypatch.setattr(runtime_boundary_module.os, "getpgid", lambda _pid: pid)
+
+        def observed_http(endpoint):
+            assert inside_fence["value"] is False
+            http_phases.append("health")
+            return original_http(endpoint)
+
+        original_metadata = boundary.endpoint_metadata
+
+        def observed_metadata(**kwargs):
+            assert inside_fence["value"] is False
+            http_phases.append("realm")
+            return original_metadata(**kwargs)
+
+        monkeypatch.setattr(boundary, "_http_health_payload", observed_http)
+        monkeypatch.setattr(boundary, "endpoint_metadata", observed_metadata)
+
+        @contextlib.contextmanager
+        def observed_transaction():
+            attempted.set()
+            with original_transaction():
+                acquired.set()
+                yield
+
+        daemon.service.store._transaction = observed_transaction
+
+        def mutate():
+            request = urllib.request.Request(
+                daemon.endpoint + "/v1/projects",
+                data=json.dumps({"slug": "phase-order", "name": "Phase order", "metadata": {}}).encode(),
+                method="POST",
+                headers={
+                    "Authorization": "Bearer " + daemon.token,
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": "phase-order",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    mutation_result["status"] = response.status
+            except urllib.error.HTTPError as exc:
+                mutation_result["status"] = exc.code
+
+        @contextlib.contextmanager
+        def wrapped_fence(path, *, timeout_seconds):
+            nonlocal mutation_thread
+            with real_interruption_fence(path, timeout_seconds=timeout_seconds) as audit:
+                inside_fence["value"] = True
+                mutation_thread = threading.Thread(target=mutate, name="phase-order-mutation")
+                mutation_thread.start()
+                assert attempted.wait(2)
+                assert acquired.is_set() is False
+                try:
+                    yield audit
+                finally:
+                    daemon.httpd.set_admission_mode("closed")
+                    inside_fence["value"] = False
+
+        monkeypatch.setattr("runtime_protocol.lifecycle.interruption_fence", wrapped_fence)
+
+        def simulate_signal(**_kwargs):
+            assert inside_fence["value"] is True
+            simulated_signals.append("sealed-signal")
+
+        monkeypatch.setattr(boundary, "_terminate_detached_owner", simulate_signal)
+        result = boundary.stop_owner(
+            endpoint=daemon.endpoint,
+            pid=pid,
+            instance_id=instance_id,
+            process_birth_id=birth_id,
+            realm_id="realm-1",
+            owner_lock=support / "instance.lock",
+            discovery_path=support / "discovery.json",
+        )
+        assert result["status"] == "stopped"
+        # endpoint_metadata performs its own authenticated health fetch before
+        # the realm request; every one of these calls must precede the fence.
+        assert http_phases == ["health", "realm", "health"]
+        assert simulated_signals == ["sealed-signal"]
+        assert mutation_thread is not None
+        mutation_thread.join(12)
+        assert not mutation_thread.is_alive()
+        assert acquired.is_set() is True
+        assert mutation_result == {"status": 401}
+        with daemon.service.store._mutex:
+            rows = daemon.service.store.conn.execute(
+                "SELECT COUNT(*) FROM projects WHERE slug='phase-order'"
+            ).fetchone()[0]
+        assert rows == 0
+    finally:
+        daemon.service.store._transaction = original_transaction
+        daemon.stop()
+        if mutation_thread is not None and mutation_thread.is_alive():
+            mutation_thread.join(1)

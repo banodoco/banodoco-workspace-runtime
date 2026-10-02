@@ -24,11 +24,12 @@ import time
 import uuid
 import urllib.error
 import urllib.request
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 
 from .bootstrap import BootstrapError, SourceProfile
 from .compatibility import canonical_value
+from .io import atomic_write_json
 from .custody_broker import (
     ACTIVE_CAPABILITY_NAME,
     CustodyError,
@@ -950,15 +951,20 @@ class LocalRuntimeBoundary:
         support: Path,
         expected_pid: int,
         expected_birth: str,
-    ) -> None:
+        event_callback: Callable[[str], None] | None = None,
+    ) -> bool:
         """Stop an adopted owner without any PID or process-group signal."""
 
+        if event_callback is not None:
+            event_callback("sealed_term_requested")
         self._signal_registered_owner(
             support=support,
             expected_pid=expected_pid,
             expected_birth=expected_birth,
             signum=signal.SIGTERM,
         )
+        if event_callback is not None:
+            event_callback("sealed_term_completed")
         deadline = time.monotonic() + 5
         while (
             time.monotonic() < deadline
@@ -966,12 +972,70 @@ class LocalRuntimeBoundary:
         ):
             time.sleep(0.05)
         if self.process_birth_identity(expected_pid) == expected_birth:
+            if event_callback is not None:
+                event_callback("sealed_kill_requested")
             self._signal_registered_owner(
                 support=support,
                 expected_pid=expected_pid,
                 expected_birth=expected_birth,
                 signum=signal.SIGKILL,
             )
+            if event_callback is not None:
+                event_callback("sealed_kill_completed")
+        return True
+
+    def _terminate_direct_child_owner_with_sealed_custody(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        support: Path,
+        expected_pid: int,
+        expected_birth: str,
+        event_callback: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Signal an owned child through sealed custody, then reap its handle."""
+
+        if process.pid != expected_pid:
+            raise BootstrapError("Runtime restart refused: owned process handle changed.")
+        if process.poll() is not None:
+            process.wait(timeout=2)
+            if event_callback is not None:
+                event_callback("reaped_without_signal")
+            return False
+        self._assert_direct_child_termination_authority(process)
+        if event_callback is not None:
+            event_callback("sealed_term_requested")
+        self._signal_registered_owner(
+            support=support,
+            expected_pid=expected_pid,
+            expected_birth=expected_birth,
+            signum=signal.SIGTERM,
+        )
+        if event_callback is not None:
+            event_callback("sealed_term_completed")
+        try:
+            process.wait(timeout=5)
+        except ProcessLookupError:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self._assert_direct_child_termination_authority(process)
+            if event_callback is not None:
+                event_callback("sealed_kill_requested")
+            self._signal_registered_owner(
+                support=support,
+                expected_pid=expected_pid,
+                expected_birth=expected_birth,
+                signum=signal.SIGKILL,
+            )
+            if event_callback is not None:
+                event_callback("sealed_kill_completed")
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired as exc:
+                raise BootstrapError(
+                    "Runtime sealed direct-child cleanup is uncertain after kill."
+                ) from exc
+        return True
 
     def _cleanup_failed_handoff_process(
         self,
@@ -1152,8 +1216,8 @@ class LocalRuntimeBoundary:
         self._bootstrap_credential = None
 
     def stop_owner(self, **kwargs) -> Mapping[str, Any]:
-        """Stop an adopted owner using the same birth/lock fences as restart."""
-        return self.restart(**kwargs, start_after_stop=False)
+        """Authenticate, fence, revalidate, and stop one adopted owner."""
+        return self._restart_impl(kwargs, stop_with_fence=True)
 
     def prepare_restart(self, *, source_profile: SourceProfile, realm_id: str, realm_root: Path, support_root: Path, pid: int) -> None:
         """Adopt a detached daemon for an operator restart.
@@ -1171,10 +1235,18 @@ class LocalRuntimeBoundary:
         self._detached_pid = int(pid)
 
     def restart(self, **kwargs) -> Mapping[str, Any]:
+        return self._restart_impl(kwargs, stop_with_fence=False)
+
+    def _restart_impl(
+        self,
+        kwargs: Mapping[str, Any],
+        *,
+        stop_with_fence: bool,
+    ) -> Mapping[str, Any]:
         if not self._source or not self._realm_root or not self._support_root or not self._realm_id:
             raise BootstrapError("No runtime process is available to restart.")
         source, root, support, realm_id = self._source, self._realm_root, self._support_root, self._realm_id
-        start_after_stop = bool(kwargs.get("start_after_stop", True))
+        start_after_stop = False if stop_with_fence else bool(kwargs.get("start_after_stop", True))
         require_health = bool(kwargs.get("require_health", True))
         endpoint = str(kwargs.get("endpoint", ""))
         expected_pid = int(kwargs.get("pid", 0))
@@ -1185,7 +1257,11 @@ class LocalRuntimeBoundary:
         owner_lock = self._validate_path(Path(kwargs.get("owner_lock", support / "instance.lock")), "owner lock").resolve()
         discovery_path = self._validate_path(Path(kwargs.get("discovery_path", support / "discovery.json")), "runtime discovery").resolve()
 
-        def validate_before_signal(*, require_health: bool = True) -> None:
+        def validate_before_signal(
+            *,
+            require_health: bool = True,
+            authenticate_endpoint: bool = True,
+        ) -> dict[str, Any]:
             """Re-read every fence immediately before the first signal."""
             if expected_pid <= 0 or not endpoint or not expected_instance or not expected_birth:
                 raise BootstrapError("Runtime restart refused: discovery identity is incomplete.")
@@ -1212,44 +1288,243 @@ class LocalRuntimeBoundary:
                 ).resolve()
             except (BootstrapError, OSError) as exc:
                 raise BootstrapError("Runtime restart refused: realm-root identity is invalid.") from exc
-            health = self._http_health_payload(endpoint)
-            endpoint_identity = self.endpoint_metadata(
-                endpoint=endpoint,
-                credential_file=support / "credentials" / "owner.token",
-            )
-            checks = (
-                str(discovery.get("pid")) == str(expected_pid),
-                str(discovery.get("endpoint")) == endpoint,
-                str(discovery.get("runtime_instance_id")) == expected_instance,
-                str(discovery.get("process_birth_id")) == expected_birth,
-                str(discovery.get("active_realm")) == expected_realm,
-                discovery_root == expected_root,
-                str(marker.get("pid")) == str(expected_pid),
-                str(marker.get("runtime_instance_id")) == expected_instance,
-                str(marker.get("process_birth_id")) == expected_birth,
-                str(marker.get("realm_id")) == expected_realm,
-                marker_root == expected_root,
-                self.is_pid_alive(expected_pid),
-                self.process_birth_identity(expected_pid) == expected_birth,
-                bool(health and health.get("runtime_instance_id") == expected_instance),
-                bool(endpoint_identity and endpoint_identity.get("runtime_instance_id") == expected_instance),
-                bool(endpoint_identity and endpoint_identity.get("realm_id") == expected_realm),
-                (bool(health and health.get("status") == "ok") if require_health else True),
-            )
-            if not all(checks):
-                raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")
-            # A group kill is only safe for the daemon's own session leader.
+            observed_birth = self.process_birth_identity(expected_pid)
+            checks = {
+                "discovery_pid": str(discovery.get("pid")) == str(expected_pid),
+                "discovery_endpoint": str(discovery.get("endpoint")) == endpoint,
+                "discovery_instance": str(discovery.get("runtime_instance_id")) == expected_instance,
+                "discovery_birth": str(discovery.get("process_birth_id")) == expected_birth,
+                "discovery_realm": str(discovery.get("active_realm")) == expected_realm,
+                "discovery_root": discovery_root == expected_root,
+                "owner_lock_pid": str(marker.get("pid")) == str(expected_pid),
+                "owner_lock_instance": str(marker.get("runtime_instance_id")) == expected_instance,
+                "owner_lock_birth": str(marker.get("process_birth_id")) == expected_birth,
+                "owner_lock_realm": str(marker.get("realm_id")) == expected_realm,
+                "owner_lock_root": marker_root == expected_root,
+                "pid_alive": self.is_pid_alive(expected_pid),
+                "process_birth": observed_birth == expected_birth,
+            }
+            observed = {
+                "discovery_pid": discovery.get("pid"),
+                "discovery_endpoint": discovery.get("endpoint"),
+                "discovery_instance": discovery.get("runtime_instance_id"),
+                "discovery_birth": discovery.get("process_birth_id"),
+                "discovery_realm": discovery.get("active_realm"),
+                "discovery_root": str(discovery_root),
+                "owner_lock_pid": marker.get("pid"),
+                "owner_lock_instance": marker.get("runtime_instance_id"),
+                "owner_lock_birth": marker.get("process_birth_id"),
+                "owner_lock_realm": marker.get("realm_id"),
+                "owner_lock_root": str(marker_root),
+                "process_birth": observed_birth,
+            }
+            if authenticate_endpoint:
+                health = self._http_health_payload(endpoint)
+                endpoint_identity = self.endpoint_metadata(
+                    endpoint=endpoint,
+                    credential_file=support / "credentials" / "owner.token",
+                )
+                checks.update({
+                    "health_instance": bool(health and health.get("runtime_instance_id") == expected_instance),
+                    "authenticated_instance": bool(endpoint_identity and endpoint_identity.get("runtime_instance_id") == expected_instance),
+                    "authenticated_realm": bool(endpoint_identity and endpoint_identity.get("realm_id") == expected_realm),
+                    "required_health": (bool(health and health.get("status") == "ok") if require_health else True),
+                })
+                observed.update({
+                    "health_status": health.get("status") if health else None,
+                    "health_instance": health.get("runtime_instance_id") if health else None,
+                    "authenticated_instance": endpoint_identity.get("runtime_instance_id") if endpoint_identity else None,
+                    "authenticated_realm": endpoint_identity.get("realm_id") if endpoint_identity else None,
+                })
             try:
-                if os.getpgid(expected_pid) != expected_pid:
-                    raise BootstrapError("Runtime restart refused: owner is not its own process-group leader.")
+                observed_group = os.getpgid(expected_pid)
             except OSError as exc:
-                raise BootstrapError("Runtime restart refused: owner process disappeared.") from exc
+                observed_group = None
+                checks["process_group_leader"] = False
+                observed["process_group"] = None
+                observed["process_group_error"] = type(exc).__name__
+            else:
+                checks["process_group_leader"] = observed_group == expected_pid
+                observed["process_group"] = observed_group
+            result = {"checks": checks, "observed": observed, "passed": all(checks.values())}
+            return result
 
-        # A stopped owner must still pass the birth/lock identity fence.  The
-        # operator upgrade path may explicitly disable only the health check
-        # here so an unhealthy daemon can be stopped without signaling a
-        # reused PID or unrelated process group.
-        validate_before_signal(require_health=require_health)
+        def require_validation(**options: Any) -> dict[str, Any]:
+            result = validate_before_signal(**options)
+            if not result["passed"]:
+                raise BootstrapError("Runtime restart refused: owner identity changed or is stale.")
+            return result
+
+        if stop_with_fence:
+            if preserve_worker:
+                raise BootstrapError("Worker preservation uses the separate restart handoff path.")
+            # Authenticate the live endpoint before taking the realm write
+            # fence. HTTP handlers need the Runtime store mutex and cannot
+            # respond while a mutation is queued behind that fence holding
+            # the mutex. The same stop invocation then holds the fence while
+            # it repeats every local identity check and uses sealed custody.
+            validation_path = support / "runtime-stop-validation.json"
+            phase_events: list[dict[str, Any]] = []
+            receipt: dict[str, Any] = {
+                "version": 1,
+                "operation": "normal-down",
+                "state": "validating",
+                "expected": {
+                    "pid": expected_pid,
+                    "process_birth_id": expected_birth,
+                    "runtime_instance_id": expected_instance,
+                    "realm_id": expected_realm,
+                    "realm_root": str(root),
+                    "endpoint": endpoint,
+                    "owner_lock": str(owner_lock),
+                    "discovery_path": str(discovery_path),
+                },
+                "phases": {},
+                "events": phase_events,
+                "effects": {
+                    "signal_attempted": False,
+                    "signal_completed": False,
+                    "sealed_term_requested": False,
+                    "sealed_term_completed": False,
+                    "sealed_kill_requested": False,
+                    "sealed_kill_completed": False,
+                    "reaped_without_signal": False,
+                },
+            }
+            sealed_custody_signal = False
+
+            def persist(state: str, *, failure: BaseException | None = None) -> None:
+                receipt["state"] = state
+                receipt["updated_at"] = time.time()
+                if failure is not None:
+                    receipt["failure"] = {
+                        "class": type(failure).__name__,
+                        "message": str(failure),
+                    }
+                atomic_write_json(validation_path, receipt)
+
+            def record_signal_effect(event: str) -> None:
+                if event not in {
+                    "sealed_term_requested",
+                    "sealed_term_completed",
+                    "sealed_kill_requested",
+                    "sealed_kill_completed",
+                    "reaped_without_signal",
+                }:
+                    raise BootstrapError("Runtime stop reported an invalid signal effect.")
+                receipt["effects"][event] = True
+                if event.endswith("_requested"):
+                    receipt["effects"]["signal_attempted"] = True
+                if event.endswith("_completed"):
+                    receipt["effects"]["signal_completed"] = True
+                persist("signal_in_progress")
+
+            try:
+                authenticated = validate_before_signal(
+                    require_health=False, authenticate_endpoint=True
+                )
+            except Exception as exc:
+                receipt["phases"]["authenticated_preflight"] = {
+                    "passed": False,
+                    "checks": {"identity_observation_completed": False},
+                    "observed": {"failure_class": type(exc).__name__},
+                }
+                phase_events.append({"phase": "authenticated_preflight", "result": "failed", "at": time.monotonic()})
+                persist("refused_before_fence", failure=exc)
+                raise
+            receipt["phases"]["authenticated_preflight"] = authenticated
+            if not authenticated["passed"]:
+                refusal = BootstrapError("Runtime restart refused: owner identity changed or is stale.")
+                phase_events.append({"phase": "authenticated_preflight", "result": "failed", "at": time.monotonic()})
+                persist("refused_before_fence", failure=refusal)
+                raise refusal
+            phase_events.append({"phase": "authenticated_preflight", "result": "passed", "at": time.monotonic()})
+            persist("authenticated_before_fence")
+            from runtime_protocol.lifecycle import interruption_fence
+            timeout_seconds = float(kwargs.get("interruption_timeout_seconds", 5.0))
+            try:
+                with interruption_fence(root, timeout_seconds=timeout_seconds) as fenced_idle:
+                    phase_events.append({"phase": "interruption_fence", "result": "acquired", "at": time.monotonic()})
+                    receipt["phases"]["interruption_fence"] = dict(fenced_idle)
+                    try:
+                        local_validation = validate_before_signal(
+                            require_health=False, authenticate_endpoint=False
+                        )
+                    except Exception as exc:
+                        receipt["phases"]["local_identity_revalidation"] = {
+                            "passed": False,
+                            "checks": {"identity_observation_completed": False},
+                            "observed": {"failure_class": type(exc).__name__},
+                        }
+                        phase_events.append({"phase": "local_identity_revalidation", "result": "failed", "at": time.monotonic()})
+                        persist("refused_under_fence", failure=exc)
+                        raise
+                    receipt["phases"]["local_identity_revalidation"] = local_validation
+                    if not local_validation["passed"]:
+                        refusal = BootstrapError("Runtime restart refused: owner identity changed or is stale.")
+                        phase_events.append({"phase": "local_identity_revalidation", "result": "failed", "at": time.monotonic()})
+                        persist("refused_under_fence", failure=refusal)
+                        raise refusal
+                    phase_events.append({"phase": "local_identity_revalidation", "result": "passed", "at": time.monotonic()})
+                    persist("validated_under_fence")
+                    if not self._process and getattr(self, "_detached_pid", None):
+                        detached = int(self._detached_pid)
+                        if detached != expected_pid:
+                            raise BootstrapError("Runtime restart refused: adopted owner PID changed.")
+                        persist("signal_authorized")
+                        sealed_custody_signal = self._terminate_detached_owner(
+                            support=support,
+                            expected_pid=detached,
+                            expected_birth=expected_birth,
+                            event_callback=record_signal_effect,
+                        )
+                        self._detached_pid = None
+                    else:
+                        process = self._process
+                        if process is None or process.pid != expected_pid:
+                            raise BootstrapError("Runtime restart refused: owned process handle changed.")
+                        persist("signal_authorized")
+                        sealed_custody_signal = self._terminate_direct_child_owner_with_sealed_custody(
+                            process,
+                            support=support,
+                            expected_pid=expected_pid,
+                            expected_birth=expected_birth,
+                            event_callback=record_signal_effect,
+                        )
+                        self._process = None
+                    phase_events.append({
+                        "phase": (
+                            "sealed_signal"
+                            if sealed_custody_signal
+                            else "reaped_without_signal"
+                        ),
+                        "result": "completed",
+                        "at": time.monotonic(),
+                    })
+                    persist("owner_stopped_under_fence")
+            except Exception as exc:
+                if receipt.get("state") not in {"refused_under_fence", "refused_before_fence"}:
+                    persist("stop_failed", failure=exc)
+                raise
+            self._bootstrap_credential = None
+            persist("completed")
+            return {
+                "status": "stopped",
+                "realm_id": realm_id,
+                "pid": expected_pid,
+                "interruption_audit": dict(fenced_idle),
+                "identity_validation": {
+                    "authenticated_before_fence": True,
+                    "local_fences_revalidated_under_fence": True,
+                    "http_probe_under_fence": False,
+                    "sealed_custody_signal": sealed_custody_signal,
+                    "receipt_path": str(validation_path),
+                },
+            }
+
+        # Restart and Worker-preserving handoff retain their existing live
+        # endpoint checks and do not enter the normal-down fence above.
+        require_validation(require_health=require_health)
         if preserve_worker:
             if not start_after_stop:
                 raise BootstrapError("Worker preservation requires a replacement Runtime owner.")
@@ -1268,7 +1543,7 @@ class LocalRuntimeBoundary:
             detached = int(self._detached_pid)
             if detached != expected_pid:
                 raise BootstrapError("Runtime restart refused: adopted owner PID changed.")
-            validate_before_signal(require_health=require_health)
+            require_validation(require_health=require_health)
             self._terminate_detached_owner(
                 support=support,
                 expected_pid=detached,
@@ -1279,7 +1554,7 @@ class LocalRuntimeBoundary:
             process = self._process
             if process is None or process.pid != expected_pid:
                 raise BootstrapError("Runtime restart refused: owned process handle changed.")
-            validate_before_signal()
+            require_validation(require_health=require_health)
             self._terminate(process)
             self._process = None
         if not start_after_stop:

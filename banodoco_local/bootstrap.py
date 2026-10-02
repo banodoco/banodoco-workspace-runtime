@@ -25,7 +25,6 @@ import uuid
 
 from .io import atomic_write_json, owner_only, read_json, remove_file
 from .paths import RuntimePaths
-from runtime_protocol.lifecycle import interruption_fence
 from runtime_protocol.handoff_recovery import recover_aborted_predecessor_resolution
 from runtime_protocol.orderly_handoff import HandoffRecord, digest
 
@@ -1270,13 +1269,15 @@ def _interrupt_owner_locked(
     if not callable(stop_owner):
         raise BootstrapError("Runtime boundary lacks the birth-checked stop handoff.")
     try:
-        with interruption_fence(realm_root) as idle:
-            stop_owner(
-                endpoint=endpoint, pid=pid, instance_id=instance_id,
-                process_birth_id=process_birth_id, realm_id=realm_id,
-                owner_lock=paths.instance_lock_path,
-                discovery_path=paths.discovery_path, require_health=False,
-            )
+        stopped = stop_owner(
+            endpoint=endpoint, pid=pid, instance_id=instance_id,
+            process_birth_id=process_birth_id, realm_id=realm_id,
+            owner_lock=paths.instance_lock_path,
+            discovery_path=paths.discovery_path,
+        )
+        idle = dict(stopped.get("interruption_audit", {}))
+        if not idle or idle.get("safe") is not True:
+            raise BootstrapError("Runtime stop did not return a safe fenced interruption audit.")
     except Exception as exc:
         raise BootstrapError(str(exc)) from exc
     # A stop callback must not be able to publish a replacement owner and have
