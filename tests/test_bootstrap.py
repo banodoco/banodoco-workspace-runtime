@@ -2721,6 +2721,31 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(report["state"], "stopped")
         self.assertFalse(self.paths.runtime_support.exists())
 
+    def test_doctor_reports_configured_workspace_without_discovery_as_stopped(self):
+        realm_root = self.paths.realms_dir / "configured-realm"
+        realm_root.mkdir(parents=True)
+        self.paths.runtime_support.mkdir(parents=True, exist_ok=True)
+        self.paths.catalog_path.write_text(json.dumps({
+            "version": 1,
+            "selected_realm_id": "configured-realm",
+            "realms": [{
+                "realm_id": "configured-realm",
+                "display_name": "Configured Realm",
+                "data_root": str(realm_root),
+                "readiness": "not_ready",
+                "readiness_reason": "runtime_stopped",
+            }],
+            "source_profiles": {},
+        }))
+
+        report = doctor(self.paths, self.boundary)
+
+        self.assertFalse(report["healthy"])
+        self.assertEqual(report["state"], "stopped")
+        self.assertTrue(report["catalog_present"])
+        self.assertFalse(report["discovery_present"])
+        self.assertEqual(report["realm_id"], "configured-realm")
+
     def test_source_manifest_is_validated_and_recorded(self):
         self.paths.source_profiles_dir.mkdir(parents=True)
         manifest = self.paths.source_profiles_dir / "astrid.json"

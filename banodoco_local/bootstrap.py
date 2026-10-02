@@ -1440,6 +1440,11 @@ def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict
         except BootstrapError as exc:
             report["healthy"] = False
             report["issues"].append(str(exc))
+    if discovery is None:
+        # A selected catalog entry describes configuration, not a live owner.
+        # Runtime shutdown deliberately removes discovery while retaining that
+        # catalog entry, so absence must project as stopped rather than healthy.
+        report["healthy"] = False
     if discovery is not None:
         report["pid_alive"] = bool(_pid_alive(boundary, discovery.get("pid")))
         if not report["pid_alive"]:
