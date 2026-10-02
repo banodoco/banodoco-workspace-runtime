@@ -34,6 +34,12 @@ launcher migration and print a deprecation warning. A legacy-only
 `ASTRID_LOCAL_DATA_ROOT`, resolution fails closed. Prefer the canonical
 `ASTRID_LOCAL_*` names in new configuration.
 
+Workspace creation and attachment belong to the Astrid product gateway:
+`astrid setup --create|--attach --check|--apply`. The Runtime launcher has no
+`setup` subcommand. Use `astrid-local connect` when an operator needs to read an
+existing live Runtime without starting one; use `up` for the explicit start or
+reconnect action.
+
 The installed Astrid profile records module origin, artifact digest, distribution
 version, support root, and realm identity as bounded provenance. It does not
 require an Astrid or Runtime checkout or a `PYTHONPATH` injection. An editable
@@ -51,6 +57,7 @@ managed-output receipts remain portable and do not embed them.
 ```bash
 astrid-local --provenance
 astrid-local up --profile astrid --data-root "$PWD/.astrid-data" --json
+astrid-local connect --data-root "$PWD/.astrid-data" --json
 astrid-local status --data-root "$PWD/.astrid-data" --json
 astrid-local doctor --data-root "$PWD/.astrid-data" --json
 ```
@@ -69,7 +76,8 @@ astrid-local start-worker --profile astrid \
 
 The Astrid gateway exposes the same operation as `python -m astrid worker start
 --json`. Both paths use the selected Runtime workspace and report a typed
-diagnostic; they do not launch the production GPU/RunPod worker.
+diagnostic; they launch the qualified local Worker composition and do not claim
+production GPU, RunPod, or provider behavior.
 
 Backups are verified before publication into a new inactive sibling. Replacement
 requires support custody outside the movable realm root; the default in-root
