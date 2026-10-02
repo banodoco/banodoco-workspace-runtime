@@ -1447,6 +1447,11 @@ class LocalWorkerLauncher:
             )
             if activated != second:
                 raise ConflictError("activated local worker is not the verified parked host")
+            seal_cleanup_receipt = getattr(
+                self.preparer, "seal_cleanup_receipt", None
+            )
+            if callable(seal_cleanup_receipt):
+                seal_cleanup_receipt(handle, receipt)
             # Publication is last: neither the parked process nor another
             # holder of the file can authenticate before the private grant is
             # accepted and the same process identity is observed once more.

@@ -919,6 +919,49 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise ConflictError("prepared Worker rejected activation")
         handle.activated = True
 
+    def seal_cleanup_receipt(
+        self, handle: _PreparedWorker, receipt: Mapping[str, Any]
+    ) -> None:
+        """Retain Runtime-owned cleanup authority independently of credentials."""
+
+        if (
+            not isinstance(handle, _PreparedWorker)
+            or handle is not self._active
+            or handle.closed
+            or handle.adopted
+            or not handle.activated
+            or handle.receipt is not None
+        ):
+            raise ConflictError("initial Worker cleanup receipt cannot be sealed")
+        try:
+            sealed = json.loads(
+                json.dumps(
+                    dict(receipt),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ConflictError("initial Worker cleanup receipt is invalid") from exc
+        if not isinstance(sealed, dict):
+            raise ConflictError("initial Worker cleanup receipt is invalid")
+        self._cleanup_partition(sealed)
+        for name in ("worker", "host", "engine", "engine_listener"):
+            self._receipt_process(sealed, name)
+        binding = sealed.get("engine_binding")
+        if (
+            not isinstance(binding, Mapping)
+            or binding.get("endpoint") != self.profile.engine_endpoint
+            or binding.get("supervisor_pid") != sealed["engine"]["pid"]
+            or binding.get("listener_pid") != sealed["engine_listener"]["pid"]
+            or binding.get("listener_parent_pid") != sealed["engine"]["pid"]
+            or binding.get("socket_owner_pid") != sealed["engine_listener"]["pid"]
+        ):
+            raise ConflictError("initial Worker cleanup endpoint binding is invalid")
+        handle.receipt = sealed
+
     def abort(self, handle: _PreparedWorker) -> None:
         if not isinstance(handle, _PreparedWorker) or handle.closed:
             return
@@ -1007,11 +1050,39 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     self._active = None
             else:
                 # The private Worker still owns the only live engine broker.
-                # A missing/malformed ACK or control failure cannot justify
-                # terminating that owner and discarding its cleanup authority.
-                self.cleanup_uncertain = str(failure)
-                with handle.cleanup_lock:
-                    handle.cleanup_started = False
+                # Once activation has sealed an independently verified graph
+                # snapshot, a corrupted durable credential cannot veto cleanup.
+                # Revalidate every identity from that Runtime-owned snapshot
+                # before signalling any independently owned process group.
+                if isinstance(handle.receipt, Mapping):
+                    try:
+                        try:
+                            handle.control.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        handle.control.close()
+                        self._force_cleanup_initial_graph(handle)
+                        try:
+                            handle.worker.wait(timeout=self.cleanup_timeout_seconds)
+                        except (subprocess.TimeoutExpired, TimeoutError):
+                            if handle.worker.poll() is None:
+                                raise ConflictError(
+                                    "initial Worker survived verified cleanup"
+                                )
+                        handle.closed = True
+                        if self._active is handle:
+                            self._active = None
+                        self.cleanup_uncertain = None
+                        failure = None
+                    except BaseException as cleanup_exc:
+                        self.cleanup_uncertain = str(cleanup_exc)
+                        failure = cleanup_exc
+                else:
+                    # Before activation there is no sealed graph authority.
+                    # Preserve custody for a later supported cleanup attempt.
+                    self.cleanup_uncertain = str(failure)
+                    with handle.cleanup_lock:
+                        handle.cleanup_started = False
         if failure is not None:
             raise failure
 
@@ -1119,6 +1190,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         *,
         leader: str,
         parents: Mapping[str, int | None],
+        allow_reparented: bool,
     ) -> None:
         leader_value = self._receipt_process(receipt, leader)
         group = int(leader_value["process_group"])
@@ -1132,7 +1204,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     receipt,
                     name,
                     expected_parent=parents.get(name),
-                    allow_reparented=True,
+                    allow_reparented=allow_reparented,
                 )
             ]
             if "engine_listener" in names:
@@ -1214,8 +1286,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise ConflictError("adopted cleanup group partition is invalid")
         return expected
 
-    def _force_cleanup_adopted_graph(self, handle: _PreparedWorker) -> None:
-        """Birth/executable/session checked fallback for an unresponsive Worker."""
+    def _force_cleanup_verified_graph(
+        self, handle: _PreparedWorker, *, allow_reparented: bool
+    ) -> None:
+        """Birth/executable/session checked fallback for a sealed graph."""
 
         receipt = handle.receipt
         if not isinstance(receipt, Mapping):
@@ -1228,17 +1302,22 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         # TERM and again before KILL.
         live = {
             "worker": self._verify_cleanup_member(
-                receipt, "worker", expected_parent=None, allow_reparented=True
+                receipt,
+                "worker",
+                expected_parent=int(self._receipt_process(receipt, "worker")["parent_pid"]),
+                allow_reparented=allow_reparented,
             ),
             "host": self._verify_cleanup_member(
-                receipt, "host", expected_parent=worker_pid, allow_reparented=True
+                receipt, "host", expected_parent=worker_pid,
+                allow_reparented=allow_reparented,
             ),
             "engine": self._verify_cleanup_member(
-                receipt, "engine", expected_parent=worker_pid, allow_reparented=True
+                receipt, "engine", expected_parent=worker_pid,
+                allow_reparented=allow_reparented,
             ),
             "engine_listener": self._verify_cleanup_member(
                 receipt, "engine_listener", expected_parent=engine_pid,
-                allow_reparented=True,
+                allow_reparented=allow_reparented,
             ),
         }
         if not any(live.values()):
@@ -1278,6 +1357,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 tuple(group["members"]),
                 leader=str(group["leader"]),
                 parents=parents,
+                allow_reparented=allow_reparented,
             )
         parsed = urlsplit(endpoint)
         probe = socket.socket(socket.AF_INET6 if ":" in (parsed.hostname or "") else socket.AF_INET, socket.SOCK_STREAM)
@@ -1299,6 +1379,12 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         shutil.rmtree(session_root)
         if session_root.exists() or session_root.is_symlink():
             raise ConflictError("adopted engine registry survived verified cleanup")
+
+    def _force_cleanup_adopted_graph(self, handle: _PreparedWorker) -> None:
+        self._force_cleanup_verified_graph(handle, allow_reparented=True)
+
+    def _force_cleanup_initial_graph(self, handle: _PreparedWorker) -> None:
+        self._force_cleanup_verified_graph(handle, allow_reparented=False)
 
     def control_alive(self, handle: _PreparedWorker) -> bool:
         if not isinstance(handle, _PreparedWorker) or handle.closed or handle.worker.poll() is not None:
