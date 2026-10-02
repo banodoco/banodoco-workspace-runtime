@@ -1437,6 +1437,70 @@ def test_installed_cleanup_budget_keeps_worker_control_alive_for_delayed_ack(
     assert preparer._active is None
 
 
+def test_concurrent_abort_waits_for_the_inflight_cleanup_result(
+    tmp_path, monkeypatch
+):
+    profile, _handle = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("worker", timeout)
+            return self.returncode
+
+    parent, peer = socket.socketpair()
+    worker = Worker()
+    handle = _PreparedWorker(worker, "birth", parent, {}, tmp_path / "config.json")
+    preparer = CrossProcessWorkerPreparer(
+        profile=profile,
+        config={},
+        environment={},
+        cleanup_timeout_seconds=0.5,
+        shutdown_timeout_seconds=0.75,
+    )
+    preparer._active = handle
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "birth")
+    request_seen = threading.Event()
+    release_ack = threading.Event()
+    results: list[str] = []
+
+    def delayed_ack() -> None:
+        assert _frame_receive(peer) == {"version": CONTROL_VERSION, "command": "abort"}
+        request_seen.set()
+        assert release_ack.wait(timeout=1)
+        worker.returncode = 0
+        _frame_send(peer, {"version": CONTROL_VERSION, "status": "ok"})
+
+    def abort(label: str) -> None:
+        preparer.abort(handle)
+        results.append(label)
+
+    responder = threading.Thread(target=delayed_ack)
+    first = threading.Thread(target=abort, args=("first",))
+    second = threading.Thread(target=abort, args=("second",))
+    responder.start()
+    first.start()
+    assert request_seen.wait(timeout=1)
+    second.start()
+    time.sleep(0.05)
+    assert results == []
+    release_ack.set()
+    for thread in (first, second, responder):
+        thread.join(timeout=1)
+    peer.close()
+
+    assert not any(thread.is_alive() for thread in (first, second, responder))
+    assert sorted(results) == ["first", "second"]
+    assert handle.closed is True
+    assert preparer._active is None
+
+
 def test_cancel_current_does_not_wait_unbounded_for_spawn_handoff(tmp_path):
     profile, _handle = _inspector_fixture(tmp_path)
     preparer = CrossProcessWorkerPreparer(

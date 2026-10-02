@@ -1074,10 +1074,27 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
     def abort(self, handle: _PreparedWorker) -> None:
         if not isinstance(handle, _PreparedWorker) or handle.closed:
             return
-        with handle.cleanup_lock:
-            if handle.cleanup_started:
+        # The liveness watcher and Runtime shutdown can converge on the same
+        # handle.  Cleanup is one serialized custody operation: a concurrent
+        # caller must wait for the active attempt and observe its result, not
+        # mistake ``cleanup_started`` for completed cleanup.  Returning early
+        # here can let Runtime exit while the daemon cleanup thread still owns
+        # the only live Worker/Engine control path.
+        if not handle.cleanup_lock.acquire(timeout=self.shutdown_timeout_seconds):
+            raise ConflictError(
+                "prepared Worker cleanup serialization exceeded its bounded deadline"
+            )
+        try:
+            if handle.closed:
                 return
-            handle.cleanup_started = True
+            self._abort_serialized(handle)
+        finally:
+            handle.cleanup_lock.release()
+
+    def _abort_serialized(self, handle: _PreparedWorker) -> None:
+        """Run one cleanup attempt while ``handle.cleanup_lock`` is held."""
+
+        handle.cleanup_started = True
         failure: BaseException | None = None
         try:
             worker_present = True
@@ -1186,8 +1203,10 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     # Before activation there is no sealed graph authority.
                     # Preserve custody for a later supported cleanup attempt.
                     self.cleanup_uncertain = str(failure)
-                    with handle.cleanup_lock:
-                        handle.cleanup_started = False
+                    # This method already owns cleanup_lock; make the handle
+                    # retryable without recursively acquiring a non-reentrant
+                    # lock.
+                    handle.cleanup_started = False
         if failure is not None:
             raise failure
 
