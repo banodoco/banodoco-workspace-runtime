@@ -132,6 +132,59 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _receipt_identity_digest_valid(
+    profile: LocalWorkerProfile,
+    receipt: Mapping[str, Any],
+    *,
+    workspace_uuid: str,
+    realm_root: Path,
+    support_root: Path,
+) -> bool:
+    """Validate the complete stable receipt projection and its digest.
+
+    The Worker's parent is the sole stable-field exception: it can lawfully
+    become PID 1 after a Runtime owner exits.  Every other serialized custody
+    fact remains digest-bound exactly as it was at issuance.
+    """
+
+    identity_keys = {
+        "profile_id", "workspace_uuid", "realm_root", "support_root",
+        "machine_id", "uid", "worker", "host", "engine",
+        "engine_listener", "cleanup_groups", "engine_binding",
+        "session_config_digest", "profile_revision", "profile_digest",
+        "release_digest",
+    }
+    if set(receipt) != identity_keys | {
+        "version", "evidence_digest", "executor_incarnation",
+    }:
+        return False
+    if (
+        receipt.get("version") != RECEIPT_VERSION
+        or receipt.get("profile_id") != profile.profile_id
+        or receipt.get("workspace_uuid") != str(workspace_uuid)
+        or receipt.get("realm_root") != str(Path(realm_root))
+        or receipt.get("support_root") != str(Path(support_root))
+        or receipt.get("machine_id") != profile.machine_id
+        or receipt.get("session_config_digest") != profile.session_config_digest
+        or receipt.get("profile_revision") != profile.profile_revision
+        or receipt.get("profile_digest") != profile.profile_digest
+        or receipt.get("release_digest") != profile.release_digest
+        or not isinstance(receipt.get("executor_incarnation"), str)
+        or not receipt.get("executor_incarnation")
+    ):
+        return False
+    projection = {key: receipt.get(key) for key in identity_keys}
+    worker = projection.get("worker")
+    if not isinstance(worker, Mapping):
+        return False
+    projection["worker"] = dict(worker)
+    projection["worker"].pop("parent_pid", None)
+    try:
+        return receipt.get("evidence_digest") == _digest(projection)
+    except (TypeError, ValueError):
+        return False
+
+
 def _absolute_pin(value: Path, label: str) -> Path:
     path = Path(value)
     if not path.is_absolute():
@@ -339,48 +392,13 @@ class LocalWorkerLauncher:
     def _receipt_identity_digest_valid(
         self, profile: LocalWorkerProfile, receipt: Mapping[str, Any],
     ) -> bool:
-        """Bind every serialized stable receipt field to its evidence digest.
-
-        Only the surviving Worker's parent may change after a Runtime owner
-        exits. All other process lineage, machine, endpoint, socket custody,
-        profile, and artifact fields are committed exactly as they were at
-        issuance.
-        """
-
-        identity_keys = {
-            "profile_id", "workspace_uuid", "realm_root", "support_root",
-            "machine_id", "uid", "worker", "host", "engine",
-            "engine_listener", "cleanup_groups", "engine_binding",
-            "session_config_digest", "profile_revision", "profile_digest",
-            "release_digest",
-        }
-        if set(receipt) != identity_keys | {
-            "version", "evidence_digest", "executor_incarnation",
-        }:
-            return False
-        if (
-            receipt.get("version") != RECEIPT_VERSION
-            or receipt.get("profile_id") != profile.profile_id
-            or receipt.get("workspace_uuid") != self.workspace_uuid
-            or receipt.get("realm_root") != str(self.realm_root)
-            or receipt.get("support_root") != str(self.support_root)
-            or receipt.get("machine_id") != profile.machine_id
-            or receipt.get("session_config_digest") != profile.session_config_digest
-            or receipt.get("profile_revision") != profile.profile_revision
-            or receipt.get("profile_digest") != profile.profile_digest
-            or receipt.get("release_digest") != profile.release_digest
-        ):
-            return False
-        projection = {key: receipt.get(key) for key in identity_keys}
-        worker = projection.get("worker")
-        if not isinstance(worker, Mapping):
-            return False
-        projection["worker"] = dict(worker)
-        projection["worker"].pop("parent_pid", None)
-        try:
-            return receipt.get("evidence_digest") == _digest(projection)
-        except (TypeError, ValueError):
-            return False
+        return _receipt_identity_digest_valid(
+            profile,
+            receipt,
+            workspace_uuid=self.workspace_uuid,
+            realm_root=self.realm_root,
+            support_root=self.support_root,
+        )
 
     def _profile(self, profile_id: str, expected_workspace_uuid: str) -> LocalWorkerProfile:
         if not isinstance(profile_id, str) or not profile_id:

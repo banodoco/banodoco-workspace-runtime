@@ -60,6 +60,92 @@ def _cleanup_identity(pid: int = 4321, birth_id: str = "birth") -> dict[str, obj
     }
 
 
+def _complete_cleanup_receipt(
+    profile: LocalWorkerProfile,
+    *,
+    worker: dict[str, object] | None = None,
+    host: dict[str, object] | None = None,
+    engine: dict[str, object] | None = None,
+    listener: dict[str, object] | None = None,
+) -> dict[str, object]:
+    worker = worker or {
+        **_cleanup_identity(4321, "worker-birth"),
+        "executable": str(profile.worker_executable),
+        "artifact_digest": profile.worker_artifact_digest,
+    }
+    host = host or {
+        **_cleanup_identity(4322, "host-birth"),
+        "parent_pid": worker["pid"],
+        "executable": str(profile.host_os_executable or profile.host_executable),
+        "artifact_digest": profile.host_os_artifact_digest or profile.host_artifact_digest,
+    }
+    engine = engine or {
+        **_cleanup_identity(4323, "engine-birth"),
+        "parent_pid": worker["pid"],
+        "executable": str(profile.engine_executable),
+        "artifact_digest": profile.engine_artifact_digest,
+    }
+    listener = listener or {
+        **_cleanup_identity(4324, "listener-birth"),
+        "parent_pid": engine["pid"],
+        "process_group": engine["pid"],
+        "session_id": engine["pid"],
+        "executable": str(profile.engine_listener_executable),
+        "artifact_digest": profile.engine_listener_artifact_digest,
+    }
+    receipt: dict[str, object] = {
+        "version": "runtime.local-worker-receipt/v3",
+        "profile_id": profile.profile_id,
+        "workspace_uuid": profile.workspace_uuid,
+        "realm_root": str(profile.realm_root),
+        "support_root": str(profile.support_root),
+        "machine_id": profile.machine_id,
+        "uid": os.getuid(),
+        "worker": worker,
+        "host": host,
+        "engine": engine,
+        "engine_listener": listener,
+        "cleanup_groups": [
+            {"role": "generic_pack_host", "leader": "host", "members": ["host"]},
+            {
+                "role": "engine",
+                "leader": "engine",
+                "members": ["engine", "engine_listener"],
+            },
+            {"role": "worker", "leader": "worker", "members": ["worker"]},
+        ],
+        "engine_binding": {
+            "supervisor_pid": engine["pid"],
+            "listener_pid": listener["pid"],
+            "listener_parent_pid": engine["pid"],
+            "socket_owner_pid": listener["pid"],
+            "endpoint": profile.engine_endpoint,
+        },
+        "session_config_digest": profile.session_config_digest,
+        "profile_revision": profile.profile_revision,
+        "profile_digest": profile.profile_digest,
+        "release_digest": profile.release_digest,
+        "executor_incarnation": "incarnation-1",
+    }
+    projection = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"version", "evidence_digest", "executor_incarnation"}
+    }
+    projection["worker"] = dict(projection["worker"])
+    projection["worker"].pop("parent_pid")
+    receipt["evidence_digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            projection,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return receipt
+
+
 def test_cleanup_member_accepts_only_positive_race_to_absence(tmp_path, monkeypatch):
     profile, _handle = _inspector_fixture(tmp_path)
     preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
@@ -202,7 +288,9 @@ def test_cleanup_member_matching_zombie_defers_to_remaining_graph_checks(
     ) is False
 
 
-def _adopted_cleanup_handle(tmp_path: Path) -> tuple[_PreparedWorker, socket.socket]:
+def _adopted_cleanup_handle(
+    tmp_path: Path, profile: LocalWorkerProfile
+) -> tuple[_PreparedWorker, socket.socket]:
     class AdoptedWorker:
         pid = 4321
 
@@ -210,22 +298,24 @@ def _adopted_cleanup_handle(tmp_path: Path) -> tuple[_PreparedWorker, socket.soc
         def poll():
             return 0
 
+    session_config = profile.support_root / "session" / "config.json"
+    session_config.parent.mkdir(parents=True, exist_ok=True)
+    session_config.write_bytes((tmp_path / "session" / "config.json").read_bytes())
     parent, peer = socket.socketpair()
-    receipt = {
-        "worker": _cleanup_identity(4321, "worker-birth"),
-        "host": _cleanup_identity(4322, "host-birth"),
-        "engine": _cleanup_identity(4323, "engine-birth"),
-        "engine_listener": _cleanup_identity(4324, "listener-birth"),
-    }
+    receipt = _complete_cleanup_receipt(profile)
+    encoded = json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
     return (
         _PreparedWorker(
             AdoptedWorker(),
             "worker-birth",
             parent,
             {},
-            tmp_path / "config.json",
+            session_config,
             adopted=True,
             receipt=receipt,
+            sealed_cleanup_receipt=encoded,
         ),
         peer,
     )
@@ -236,7 +326,7 @@ def test_adopted_abort_accepts_positive_graph_absence_without_signaling(
 ):
     profile, _unused = _inspector_fixture(tmp_path)
     preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
-    handle, peer = _adopted_cleanup_handle(tmp_path)
+    handle, peer = _adopted_cleanup_handle(tmp_path, profile)
     preparer._active = handle
     monkeypatch.setattr(
         composition,
@@ -265,7 +355,7 @@ def test_adopted_abort_same_birth_uses_verified_graph_cleanup(
 ):
     profile, _unused = _inspector_fixture(tmp_path)
     preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
-    handle, peer = _adopted_cleanup_handle(tmp_path)
+    handle, peer = _adopted_cleanup_handle(tmp_path, profile)
     preparer._active = handle
     forced = []
     monkeypatch.setattr(
@@ -319,7 +409,7 @@ def test_adopted_abort_unknown_or_reused_worker_fails_closed_without_signaling(
 ):
     profile, _unused = _inspector_fixture(tmp_path)
     preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
-    handle, peer = _adopted_cleanup_handle(tmp_path)
+    handle, peer = _adopted_cleanup_handle(tmp_path, profile)
     preparer._active = handle
     monkeypatch.setattr(composition, "_observe_process_birth", lambda _pid: observation)
     monkeypatch.setattr(
@@ -336,6 +426,159 @@ def test_adopted_abort_unknown_or_reused_worker_fails_closed_without_signaling(
     assert handle.closed is True
     assert preparer._active is None
     assert preparer.cleanup_uncertain
+
+
+def test_initial_cleanup_seal_is_profile_bound_and_immune_to_caller_mutation(
+    tmp_path
+):
+    profile, _unused = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    control, peer = socket.socketpair()
+    handle = _PreparedWorker(
+        Worker(),
+        "worker-birth",
+        control,
+        {},
+        profile.support_root / "session" / "config.json",
+        activated=True,
+    )
+    preparer = CrossProcessWorkerPreparer(
+        profile=profile,
+        config={"support_root": str(profile.support_root)},
+        environment={},
+    )
+    preparer._active = handle
+    receipt = _complete_cleanup_receipt(profile)
+
+    try:
+        preparer.seal_cleanup_receipt(handle, receipt)
+        receipt["engine"]["pid"] = 999999
+        handle.receipt["engine_listener"]["pid"] = 999998
+        retained = preparer._cleanup_receipt(handle)
+    finally:
+        control.close()
+        peer.close()
+
+    assert retained["engine"]["pid"] == 4323
+    assert retained["engine_listener"]["pid"] == 4324
+    assert retained["executor_incarnation"] == "incarnation-1"
+    assert retained["realm_root"] == str(profile.realm_root)
+    assert retained["support_root"] == str(profile.support_root)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda receipt: receipt.pop("engine"), "authority is invalid"),
+        (
+            lambda receipt: receipt.__setitem__("support_root", "/wrong-support"),
+            "authority is invalid",
+        ),
+        (
+            lambda receipt: receipt["engine_binding"].__setitem__(
+                "endpoint", "http://127.0.0.1:9"
+            ),
+            "authority is invalid",
+        ),
+        (
+            lambda receipt: receipt["worker"].__setitem__("pid", 999999),
+            "authority is invalid",
+        ),
+    ],
+)
+def test_initial_cleanup_seal_rejects_missing_or_mismatched_custody(
+    tmp_path, mutation, message
+):
+    profile, _unused = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    control, peer = socket.socketpair()
+    handle = _PreparedWorker(
+        Worker(), "worker-birth", control, {}, tmp_path / "config.json", activated=True
+    )
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    preparer._active = handle
+    receipt = _complete_cleanup_receipt(profile)
+    mutation(receipt)
+
+    try:
+        with pytest.raises(ConflictError, match=message):
+            preparer.seal_cleanup_receipt(handle, receipt)
+    finally:
+        control.close()
+        peer.close()
+
+    assert handle.sealed_cleanup_receipt is None
+
+
+def test_initial_control_failure_uses_independently_sealed_graph_cleanup(
+    tmp_path, monkeypatch
+):
+    profile, _unused = _inspector_fixture(tmp_path)
+
+    class Worker:
+        pid = 4321
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired("worker", timeout)
+            return self.returncode
+
+    worker = Worker()
+    control, peer = socket.socketpair()
+    handle = _PreparedWorker(
+        worker,
+        "worker-birth",
+        control,
+        {},
+        profile.support_root / "session" / "config.json",
+        activated=True,
+    )
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    preparer._active = handle
+    preparer.seal_cleanup_receipt(handle, _complete_cleanup_receipt(profile))
+    monkeypatch.setattr(preparer, "_birth", lambda _pid: "worker-birth")
+    monkeypatch.setattr(
+        preparer,
+        "_rpc_unlocked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ConflictError("mutated durable receipt rejected by Worker")
+        ),
+    )
+    cleaned = []
+
+    def clean(received):
+        assert received is handle
+        cleaned.append(preparer._cleanup_receipt(received)["evidence_digest"])
+        worker.returncode = 0
+
+    monkeypatch.setattr(preparer, "_force_cleanup_initial_graph", clean)
+    try:
+        preparer.abort(handle)
+    finally:
+        peer.close()
+
+    assert cleaned == [_complete_cleanup_receipt(profile)["evidence_digest"]]
+    assert handle.closed is True
+    assert preparer._active is None
+    assert preparer.cleanup_uncertain is None
 
 
 def test_argv_digest_preserves_argument_boundaries() -> None:
@@ -1534,25 +1777,29 @@ def test_adopted_unresponsive_worker_fallback_cleans_each_verified_nonchild_grou
             "argv_digest": _argv_digest(_process_argv(pid)),
         }
 
-    receipt = {
-        "worker": identity("worker", 1),
-        "host": identity("host", state["worker"]),
-        "engine": identity("engine", state["worker"]),
-        "engine_listener": identity("listener", state["engine"]),
-        "cleanup_groups": [
-            {"role": "generic_pack_host", "leader": "host", "members": ["host"]},
-            {
-                "role": "engine",
-                "leader": "engine",
-                "members": ["engine", "engine_listener"],
-            },
-            {"role": "worker", "leader": "worker", "members": ["worker"]},
-        ],
-        "engine_binding": {"socket_owner_pid": state["listener"]},
-    }
     profile, _ = _inspector_fixture(tmp_path)
+    process_executable = _actual_executable(int(state["worker"]))
+    process_digest = _file_digest(process_executable)
     profile = __import__("dataclasses").replace(
-        profile, engine_endpoint=f"http://127.0.0.1:{state['port']}"
+        profile,
+        support_root=support,
+        worker_executable=process_executable,
+        host_executable=process_executable,
+        engine_executable=process_executable,
+        engine_listener_executable=process_executable,
+        worker_artifact_digest=process_digest,
+        host_artifact_digest=process_digest,
+        engine_artifact_digest=process_digest,
+        engine_listener_artifact_digest=process_digest,
+        session_config_digest=_file_digest(session / "config.json"),
+        engine_endpoint=f"http://127.0.0.1:{state['port']}",
+    )
+    receipt = _complete_cleanup_receipt(
+        profile,
+        worker=identity("worker", 1),
+        host=identity("host", state["worker"]),
+        engine=identity("engine", state["worker"]),
+        listener=identity("listener", state["engine"]),
     )
     preparer = CrossProcessWorkerPreparer(
         profile=profile,
@@ -1570,6 +1817,11 @@ def test_adopted_unresponsive_worker_fallback_cleans_each_verified_nonchild_grou
         activated=True,
         adopted=True,
         receipt=receipt,
+    )
+    _sealed, handle.sealed_cleanup_receipt = preparer._validated_cleanup_receipt(
+        receipt,
+        worker_pid=state["worker"],
+        worker_birth_id=receipt["worker"]["birth_id"],
     )
     preparer._active = handle
     try:

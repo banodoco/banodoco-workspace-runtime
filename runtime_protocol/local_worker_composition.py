@@ -39,6 +39,7 @@ from .local_worker import (
     ProcessIdentity,
     PREPARATION_VERSION,
     _engine_endpoint,
+    _receipt_identity_digest_valid,
 )
 
 
@@ -302,6 +303,9 @@ class _PreparedWorker:
     cleanup_started: bool = False
     adopted: bool = False
     receipt: dict[str, Any] | None = None
+    # Canonical JSON is the immutable cleanup authority.  ``receipt`` remains
+    # a diagnostic/reporting copy; cleanup always reparses these sealed bytes.
+    sealed_cleanup_receipt: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -749,6 +753,123 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             "session_config_digest": receipt.get("session_config_digest"),
         }
 
+    @staticmethod
+    def _canonical_receipt(receipt: Mapping[str, Any]) -> tuple[dict[str, Any], bytes]:
+        try:
+            encoded = json.dumps(
+                dict(receipt),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+            sealed = json.loads(encoded)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ConflictError("Worker cleanup receipt is invalid") from exc
+        if not isinstance(sealed, dict):
+            raise ConflictError("Worker cleanup receipt is invalid")
+        return sealed, encoded
+
+    def _validated_cleanup_receipt(
+        self,
+        receipt: Mapping[str, Any],
+        *,
+        worker_pid: int | None = None,
+        worker_birth_id: str | None = None,
+    ) -> tuple[dict[str, Any], bytes]:
+        """Bind cleanup authority to this installed profile and full graph."""
+
+        sealed, encoded = self._canonical_receipt(receipt)
+        if not _receipt_identity_digest_valid(
+            self.profile,
+            sealed,
+            workspace_uuid=self.profile.workspace_uuid,
+            realm_root=self.profile.realm_root,
+            support_root=self.profile.support_root,
+        ):
+            raise ConflictError("Worker cleanup receipt authority is invalid")
+        self._cleanup_partition(sealed)
+        identities = {
+            name: self._receipt_process(sealed, name)
+            for name in ("worker", "host", "engine", "engine_listener")
+        }
+        worker = identities["worker"]
+        host = identities["host"]
+        engine = identities["engine"]
+        listener = identities["engine_listener"]
+        if worker_pid is not None and int(worker["pid"]) != int(worker_pid):
+            raise ConflictError("Worker cleanup handle identity is invalid")
+        if worker_birth_id is not None and worker["birth_id"] != worker_birth_id:
+            raise ConflictError("Worker cleanup handle identity is invalid")
+        if (
+            int(host["parent_pid"]) != int(worker["pid"])
+            or int(engine["parent_pid"]) != int(worker["pid"])
+            or int(listener["parent_pid"]) != int(engine["pid"])
+            or any(int(value["uid"]) != int(sealed.get("uid", -1)) for value in identities.values())
+            or int(sealed.get("uid", -1)) != os.getuid()
+        ):
+            raise ConflictError("Worker cleanup lineage is invalid")
+        expected_artifacts = {
+            "worker": (
+                self.profile.worker_executable,
+                self.profile.worker_artifact_digest,
+            ),
+            "host": (
+                self.profile.host_os_executable or self.profile.host_executable,
+                self.profile.host_os_artifact_digest or self.profile.host_artifact_digest,
+            ),
+            "engine": (
+                self.profile.engine_executable,
+                self.profile.engine_artifact_digest,
+            ),
+            "engine_listener": (
+                self.profile.engine_listener_executable,
+                self.profile.engine_listener_artifact_digest,
+            ),
+        }
+        for name, (executable, artifact_digest) in expected_artifacts.items():
+            identity = identities[name]
+            if (
+                Path(str(identity["executable"])) != Path(executable)
+                or identity["artifact_digest"] != artifact_digest
+            ):
+                raise ConflictError(f"Worker cleanup {name} artifact identity is invalid")
+        for leader_name in ("worker", "host", "engine"):
+            leader = identities[leader_name]
+            if (
+                int(leader["process_group"]) != int(leader["pid"])
+                or int(leader["session_id"]) != int(leader["pid"])
+            ):
+                raise ConflictError(f"Worker cleanup {leader_name} group is invalid")
+        if (
+            int(listener["process_group"]) != int(engine["pid"])
+            or int(listener["session_id"]) != int(engine["pid"])
+        ):
+            raise ConflictError("Worker cleanup listener group is invalid")
+        binding = sealed.get("engine_binding")
+        if (
+            not isinstance(binding, Mapping)
+            or binding.get("endpoint") != self.profile.engine_endpoint
+            or binding.get("supervisor_pid") != engine["pid"]
+            or binding.get("listener_pid") != listener["pid"]
+            or binding.get("listener_parent_pid") != engine["pid"]
+            or binding.get("socket_owner_pid") != listener["pid"]
+        ):
+            raise ConflictError("Worker cleanup endpoint binding is invalid")
+        return sealed, encoded
+
+    def _cleanup_receipt(self, handle: _PreparedWorker) -> dict[str, Any]:
+        encoded = handle.sealed_cleanup_receipt
+        if not isinstance(encoded, bytes):
+            raise ConflictError("Worker cleanup receipt is unavailable")
+        try:
+            receipt = json.loads(encoded)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ConflictError("Worker cleanup receipt is invalid") from exc
+        if not isinstance(receipt, dict):
+            raise ConflictError("Worker cleanup receipt is invalid")
+        return receipt
+
     def adopt_control_descriptor(
         self, descriptor: int, receipt: Mapping[str, Any]
     ) -> _PreparedWorker:
@@ -788,8 +909,15 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 _session_config_path(self.environment),
                 activated=True,
                 adopted=True,
-                receipt=dict(receipt),
+                receipt=None,
             )
+            sealed, encoded = self._validated_cleanup_receipt(
+                receipt,
+                worker_pid=pid,
+                worker_birth_id=birth_id,
+            )
+            handle.receipt = sealed
+            handle.sealed_cleanup_receipt = encoded
             self._active = handle
             return handle
         except BaseException:
@@ -805,11 +933,13 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             os.close(descriptor)
         except OSError:
             pass
+        sealed, encoded = self._validated_cleanup_receipt(receipt)
         provisional = type(
             "_ProvisionalAdoptedCustody",
             (),
             {
-                "receipt": dict(receipt),
+                "receipt": sealed,
+                "sealed_cleanup_receipt": encoded,
                 "owner_session_config_path": _session_config_path(self.environment),
             },
         )()
@@ -933,34 +1063,13 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             or handle.receipt is not None
         ):
             raise ConflictError("initial Worker cleanup receipt cannot be sealed")
-        try:
-            sealed = json.loads(
-                json.dumps(
-                    dict(receipt),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-            )
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ConflictError("initial Worker cleanup receipt is invalid") from exc
-        if not isinstance(sealed, dict):
-            raise ConflictError("initial Worker cleanup receipt is invalid")
-        self._cleanup_partition(sealed)
-        for name in ("worker", "host", "engine", "engine_listener"):
-            self._receipt_process(sealed, name)
-        binding = sealed.get("engine_binding")
-        if (
-            not isinstance(binding, Mapping)
-            or binding.get("endpoint") != self.profile.engine_endpoint
-            or binding.get("supervisor_pid") != sealed["engine"]["pid"]
-            or binding.get("listener_pid") != sealed["engine_listener"]["pid"]
-            or binding.get("listener_parent_pid") != sealed["engine"]["pid"]
-            or binding.get("socket_owner_pid") != sealed["engine_listener"]["pid"]
-        ):
-            raise ConflictError("initial Worker cleanup endpoint binding is invalid")
+        sealed, encoded = self._validated_cleanup_receipt(
+            receipt,
+            worker_pid=handle.worker.pid,
+            worker_birth_id=handle.birth_id,
+        )
         handle.receipt = sealed
+        handle.sealed_cleanup_receipt = encoded
 
     def abort(self, handle: _PreparedWorker) -> None:
         if not isinstance(handle, _PreparedWorker) or handle.closed:
@@ -1022,24 +1131,20 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     pass
                 handle.control.close()
                 try:
-                    graph_has_survivors = self._adopted_graph_has_survivors(handle)
+                    # Always run the sealed final verifier.  A process-free
+                    # graph is incomplete if its endpoint was replaced or its
+                    # authenticated session registry still survives.
+                    self._force_cleanup_adopted_graph(handle)
+                    failure = None
                 except BaseException as exc:
                     self.cleanup_uncertain = str(exc)
                     failure = exc
-                else:
-                    if graph_has_survivors:
-                        try:
-                            self._force_cleanup_adopted_graph(handle)
-                            failure = None
-                        except BaseException as exc:
-                            self.cleanup_uncertain = str(exc)
-                            failure = exc
                 if failure is None:
                     self.cleanup_uncertain = None
                 handle.closed = True
                 if self._active is handle:
                     self._active = None
-            elif failure is None:
+            elif failure is None and not handle.activated:
                 try:
                     handle.control.shutdown(socket.SHUT_RDWR)
                 except OSError:
@@ -1054,7 +1159,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 # snapshot, a corrupted durable credential cannot veto cleanup.
                 # Revalidate every identity from that Runtime-owned snapshot
                 # before signalling any independently owned process group.
-                if isinstance(handle.receipt, Mapping):
+                if isinstance(handle.sealed_cleanup_receipt, bytes):
                     try:
                         try:
                             handle.control.shutdown(socket.SHUT_RDWR)
@@ -1252,9 +1357,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise ConflictError(f"adopted {leader} process group survived verified cleanup")
 
     def _adopted_graph_has_survivors(self, handle: _PreparedWorker) -> bool:
-        receipt = handle.receipt
-        if not isinstance(receipt, Mapping):
-            return True
+        receipt = self._cleanup_receipt(handle)
         parents = {
             "worker": None,
             "host": int(self._receipt_process(receipt, "worker")["pid"]),
@@ -1291,9 +1394,14 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
     ) -> None:
         """Birth/executable/session checked fallback for a sealed graph."""
 
-        receipt = handle.receipt
-        if not isinstance(receipt, Mapping):
-            raise ConflictError("adopted Worker cleanup receipt is unavailable")
+        receipt = self._cleanup_receipt(handle)
+        _sealed, encoded = self._validated_cleanup_receipt(
+            receipt,
+            worker_pid=handle.worker.pid,
+            worker_birth_id=handle.birth_id,
+        )
+        if encoded != handle.sealed_cleanup_receipt:
+            raise ConflictError("Worker cleanup receipt changed after sealing")
         cleanup_groups = self._cleanup_partition(receipt)
         worker_pid = int(self._receipt_process(receipt, "worker")["pid"])
         engine_pid = int(self._receipt_process(receipt, "engine")["pid"])
@@ -1320,8 +1428,6 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 allow_reparented=allow_reparented,
             ),
         }
-        if not any(live.values()):
-            return
         # Prove the listener still belongs to the recorded listener before any
         # signal; this also prevents cleaning an unrelated process graph after
         # endpoint replacement.
@@ -1351,14 +1457,27 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             "engine": worker_pid,
             "engine_listener": engine_pid,
         }
-        for group in cleanup_groups:
-            self._signal_verified_group(
+        if any(live.values()):
+            for group in cleanup_groups:
+                self._signal_verified_group(
+                    receipt,
+                    tuple(group["members"]),
+                    leader=str(group["leader"]),
+                    parents=parents,
+                    allow_reparented=allow_reparented,
+                )
+        remaining = [
+            name
+            for name in ("worker", "host", "engine", "engine_listener")
+            if self._verify_cleanup_member(
                 receipt,
-                tuple(group["members"]),
-                leader=str(group["leader"]),
-                parents=parents,
+                name,
+                expected_parent=parents[name],
                 allow_reparented=allow_reparented,
             )
+        ]
+        if remaining:
+            raise ConflictError("Worker graph survived verified cleanup")
         parsed = urlsplit(endpoint)
         probe = socket.socket(socket.AF_INET6 if ":" in (parsed.hostname or "") else socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -1367,18 +1486,28 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 raise ConflictError("adopted engine listener survived verified cleanup")
         finally:
             probe.close()
-        session_root = handle.owner_session_config_path.parent
-        support_root = Path(str(self.config["support_root"])).resolve()
+        session_config_path = Path(handle.owner_session_config_path)
+        session_root = session_config_path.parent
+        support_root = Path(self.profile.support_root).resolve()
         try:
             session_root.resolve().relative_to(support_root)
-            identity = session_root.lstat()
         except (OSError, ValueError) as exc:
-            raise ConflictError("adopted engine registry root is unsafe") from exc
+            raise ConflictError("Worker engine registry root is unsafe") from exc
+        if not session_root.exists() and not session_root.is_symlink():
+            return
+        try:
+            identity = session_root.lstat()
+        except OSError as exc:
+            raise ConflictError("Worker engine registry root is unobservable") from exc
         if session_root.is_symlink() or not stat.S_ISDIR(identity.st_mode) or identity.st_uid != os.getuid():
-            raise ConflictError("adopted engine registry root is unsafe")
+            raise ConflictError("Worker engine registry root is unsafe")
+        if not session_config_path.exists() or session_config_path.is_symlink():
+            raise ConflictError("Worker engine registry custody is incomplete")
+        if _session_config_digest(session_config_path) != receipt["session_config_digest"]:
+            raise ConflictError("Worker engine registry identity changed")
         shutil.rmtree(session_root)
         if session_root.exists() or session_root.is_symlink():
-            raise ConflictError("adopted engine registry survived verified cleanup")
+            raise ConflictError("Worker engine registry survived verified cleanup")
 
     def _force_cleanup_adopted_graph(self, handle: _PreparedWorker) -> None:
         self._force_cleanup_verified_graph(handle, allow_reparented=True)
