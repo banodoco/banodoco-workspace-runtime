@@ -1,9 +1,10 @@
 """Explicit offline upgrade from retired/current formats to the canonical format.
 
-Opening a realm never upgrades it.  This module is an operator-only boundary:
-it acquires the same owner fence as the daemon, archives the complete source
-SQLite state, builds a fresh canonical database, and replaces the database only
-after lossless row and integrity checks pass.
+Opening a realm never upgrades it. This module is an operator-only boundary:
+it acquires the same owner fence as the daemon, stages a temporary copy of the
+source SQLite state for rollback, builds a fresh canonical database, and
+replaces the database only after lossless row and integrity checks pass. A
+persistent source archive is opt-in.
 """
 
 from __future__ import annotations
@@ -755,18 +756,35 @@ def _write_manifest(archive: Path, metadata: dict) -> None:
     _fsync_directory(archive)
 
 
-def upgrade_realm(root: str | Path, *, archive_root: str | Path | None = None, timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS, confirmation: str | None = None) -> dict:
-    """Upgrade one stopped v23 realm without discarding legacy evidence."""
+def upgrade_realm(
+    root: str | Path,
+    *,
+    archive_root: str | Path | None = None,
+    retain_backup: bool = False,
+    timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    confirmation: str | None = None,
+) -> dict:
+    """Upgrade one stopped v23 realm with a temporary rollback snapshot.
+
+    A durable source archive is created only when ``retain_backup`` is
+    explicitly requested. The transaction always takes a same-filesystem
+    temporary copy so it can verify and roll back the swap; that copy is
+    removed after success or successful rollback.
+    """
     root = _safe_realm_root(root)
     if not root.exists() or not root.is_dir() or root.is_symlink():
         raise RealmAdmissionError("realm root is missing or invalid")
     if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
         raise ValidationError("timeout_seconds must be positive")
-    archive_parent = Path(archive_root).expanduser().resolve() if archive_root else root / "realm-upgrade-backups"
-    try:
-        archive_parent.relative_to(root.parent)
-    except ValueError as exc:
-        raise ValidationError("archive_root must share the realm's filesystem parent") from exc
+    if archive_root is not None and not retain_backup:
+        raise ValidationError("archive_root requires retain_backup=True")
+    archive_parent = None
+    if retain_backup:
+        archive_parent = Path(archive_root).expanduser().resolve() if archive_root else root / "realm-upgrade-backups"
+        try:
+            archive_parent.relative_to(root.parent)
+        except ValueError as exc:
+            raise ValidationError("archive_root must share the realm's filesystem parent") from exc
     with _owner_fence(root):
         source_db = root / "realm.sqlite3"
         source = None
@@ -774,9 +792,18 @@ def upgrade_realm(root: str | Path, *, archive_root: str | Path | None = None, t
         target = None
         swapped = False
         archive = None
+        temporary_archive_parent = None
+        preserve_temporary_archive = False
         try:
-            archive_parent.mkdir(parents=True, exist_ok=True)
-            archive = archive_parent / f"v23-{uuid.uuid4().hex}"
+            operation_id = uuid.uuid4().hex
+            if archive_parent is None:
+                temporary_archive_parent = Path(
+                    tempfile.mkdtemp(prefix=".realm-upgrade-transaction-", dir=root.parent)
+                )
+                archive = temporary_archive_parent / f"v23-{operation_id}"
+            else:
+                archive_parent.mkdir(parents=True, exist_ok=True)
+                archive = archive_parent / f"v23-{operation_id}"
             # Archive before opening SQLite.  Even a read-only SQLite
             # connection may create/update a WAL shared-memory sidecar; the
             # source tree must remain byte-identical on every rejected plan.
@@ -845,7 +872,21 @@ def upgrade_realm(root: str | Path, *, archive_root: str | Path | None = None, t
             _fsync_directory(root)
             archive_meta.update({"state": "activated", "activated_at": now()})
             _write_manifest(archive, archive_meta)
-            return {"ok": True, "realm_id": realm_id, "archive": str(archive), "root": str(root), "source_schema_version": int(source_version), "target_schema_version": SCHEMA_VERSION, "shared_tables": fingerprints, "historical_managed_outputs": {"migrated": historical_inserted, "skipped": historical_skipped, "skipped_count": len(historical_skipped)}}
+            return {
+                "ok": True,
+                "realm_id": realm_id,
+                "archive": str(archive) if retain_backup else None,
+                "backup_retained": bool(retain_backup),
+                "root": str(root),
+                "source_schema_version": int(source_version),
+                "target_schema_version": SCHEMA_VERSION,
+                "shared_tables": fingerprints,
+                "historical_managed_outputs": {
+                    "migrated": historical_inserted,
+                    "skipped": historical_skipped,
+                    "skipped_count": len(historical_skipped),
+                },
+            }
         except Exception:
             if target is not None:
                 target.close()
@@ -853,27 +894,43 @@ def upgrade_realm(root: str | Path, *, archive_root: str | Path | None = None, t
                 # A post-swap sidecar or manifest failure must not strand a
                 # half-activated realm. Restore the archived byte snapshot;
                 # the archive remains available for operator inspection.
-                rollback = root.parent / f".{source_db.name}.rollback-{uuid.uuid4().hex}"
-                shutil.copy2(archive / source_db.name, rollback)
-                os.chmod(rollback, 0o600)
-                os.replace(rollback, source_db)
-                for suffix in ("-wal", "-shm", "-journal"):
-                    archived_sidecar = archive / f"{source_db.name}{suffix}"
-                    restored_sidecar = root / f"{source_db.name}{suffix}"
-                    if archived_sidecar.exists():
-                        shutil.copy2(archived_sidecar, restored_sidecar)
-                    elif restored_sidecar.exists() or restored_sidecar.is_symlink():
-                        restored_sidecar.unlink()
+                try:
+                    rollback = root.parent / f".{source_db.name}.rollback-{uuid.uuid4().hex}"
+                    shutil.copy2(archive / source_db.name, rollback)
+                    os.chmod(rollback, 0o600)
+                    os.replace(rollback, source_db)
+                    for suffix in ("-wal", "-shm", "-journal"):
+                        archived_sidecar = archive / f"{source_db.name}{suffix}"
+                        restored_sidecar = root / f"{source_db.name}{suffix}"
+                        if archived_sidecar.exists():
+                            shutil.copy2(archived_sidecar, restored_sidecar)
+                        elif restored_sidecar.exists() or restored_sidecar.is_symlink():
+                            restored_sidecar.unlink()
+                except Exception as rollback_error:
+                    # Keep the only rollback image if restoration itself
+                    # fails. Its path is deterministic from this exception's
+                    # operation id and the operator can recover it manually.
+                    preserve_temporary_archive = temporary_archive_parent is not None
+                    if preserve_temporary_archive:
+                        raise RuntimeError(
+                            "realm upgrade rollback failed; recovery snapshot preserved at "
+                            f"{archive}"
+                        ) from rollback_error
+                    raise
             if stage_dir is not None:
                 staged = stage_dir / "realm.sqlite3"
                 if staged.exists():
                     staged.unlink()
+            if temporary_archive_parent is not None and not preserve_temporary_archive:
+                shutil.rmtree(temporary_archive_parent, ignore_errors=True)
             raise
         finally:
             if source is not None:
                 source.close()
             if stage_dir is not None:
                 shutil.rmtree(stage_dir, ignore_errors=True)
+            if temporary_archive_parent is not None and not preserve_temporary_archive:
+                shutil.rmtree(temporary_archive_parent, ignore_errors=True)
 
 
 def _historical_filename(spec: object, output: dict) -> str | None:
