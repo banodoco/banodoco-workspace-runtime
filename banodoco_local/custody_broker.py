@@ -336,6 +336,7 @@ class RoleBoundCustodyBroker:
         self.registration: dict[str, object] | None = None
         self.ack: dict[str, object] | None = None
         self.error: BaseException | None = None
+        self._post_exec_authority_validated = False
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
@@ -385,6 +386,33 @@ class RoleBoundCustodyBroker:
             raise CustodyError("custody signal is outside the admitted set")
         if self.state not in {"sealed", "ready-bound"} or self.registration is None:
             raise CustodyError("custody admission is not sealed")
+        identity = self.registration.get("identity")
+        if not isinstance(identity, dict) or identity.get("pid") != expected_pid:
+            raise CustodyError("registered custody PID differs from the process handle")
+        observed = self.identity_provider(expected_pid)
+        if observed is None or any(
+            observed.get(name) != identity.get(name)
+            for name in ("pid", "birth_id", "uid")
+        ):
+            raise CustodyError("registered process incarnation is absent or changed")
+        signal_audit_token(self.registration["audit_token_words"], signum)  # type: ignore[arg-type]
+
+    def signal_failed_admission(self, signum: int, *, expected_pid: int) -> None:
+        """Clean up only a failed admission with authenticated post-exec authority.
+
+        A persistence or final-seal failure must not discard the live child.  This
+        path does not admit that child: it is available only after the broker has
+        authenticated the post-exec audit token and current process incarnation.
+        """
+
+        if int(signum) not in _admitted_signals():
+            raise CustodyError("custody signal is outside the admitted set")
+        if (
+            self.error is None
+            or not self._post_exec_authority_validated
+            or self.registration is None
+        ):
+            raise CustodyError("failed admission has no validated post-exec authority")
         identity = self.registration.get("identity")
         if not isinstance(identity, dict) or identity.get("pid") != expected_pid:
             raise CustodyError("registered custody PID differs from the process handle")
@@ -539,6 +567,7 @@ class RoleBoundCustodyBroker:
                 "audit_token_sha256": post["sha256"],
                 "audit_token_pidversion": post["pidversion"],
             })
+            self._post_exec_authority_validated = True
             self.sequence = 2
             self._persist("registration_post_exec")
             self.state = "sealed"

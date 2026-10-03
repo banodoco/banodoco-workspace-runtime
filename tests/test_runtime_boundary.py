@@ -473,6 +473,30 @@ def test_sealed_runtime_capability_signals_only_registered_audit_token(tmp_path)
     assert receipt["pid"] == identity["pid"]
 
 
+def test_failed_admission_can_signal_only_after_post_exec_authority(monkeypatch):
+    identity = {"pid": 4242, "birth_id": "birth-a", "uid": os.getuid()}
+    calls = []
+    broker = object.__new__(custody_broker_module.RoleBoundCustodyBroker)
+    broker.error = RuntimeError("ledger finalization failed")
+    broker._post_exec_authority_validated = True
+    broker.identity_provider = lambda _pid: identity
+    broker.registration = {
+        "identity": identity,
+        "audit_token_words": [1, os.getuid(), 3, 4, 5, 4242, 7, 8],
+    }
+    monkeypatch.setattr(
+        custody_broker_module, "signal_audit_token",
+        lambda words, signum: calls.append((list(words), signum)),
+    )
+
+    broker.signal_failed_admission(signal.SIGKILL, expected_pid=4242)
+
+    assert calls == [(broker.registration["audit_token_words"], signal.SIGKILL)]
+    broker._post_exec_authority_validated = False
+    with pytest.raises(custody_broker_module.CustodyError, match="validated post-exec"):
+        broker.signal_failed_admission(signal.SIGKILL, expected_pid=4242)
+
+
 def test_sealed_runtime_capability_admits_identity_bound_rendezvous_signal(tmp_path):
     if not hasattr(signal, "SIGUSR1"):
         pytest.skip("SIGUSR1 is unavailable")
