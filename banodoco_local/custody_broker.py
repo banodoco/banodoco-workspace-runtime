@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import ctypes
+import fcntl
 import hashlib
 import json
 import math
@@ -39,6 +40,8 @@ TASK_AUDIT_TOKEN_COUNT = 8
 FRAME_LIMIT = 16 * 1024
 DARWIN_UNIX_SOCKET_PATH_MAX_BYTES = 103
 DARWIN_CUSTODY_SOCKET_PARENT = Path("/private/tmp")
+AUTHORITY_SCOPE_LOCK = "admission.lock"
+AUTHORITY_SCOPE_CLOSED = "admission.closed.json"
 
 
 class CustodyError(RuntimeError):
@@ -301,6 +304,113 @@ def _append_owner_jsonl(path: Path, value: Mapping[str, object]) -> None:
         os.close(descriptor)
 
 
+def _open_authority_scope_lock(scope_root: Path) -> int:
+    root = Path(os.path.abspath(scope_root))
+    if not root.is_absolute() or root.is_symlink():
+        raise CustodyError("custody authority scope is unsafe")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    observed_root = os.lstat(root)
+    if (
+        not stat.S_ISDIR(observed_root.st_mode)
+        or observed_root.st_uid != os.getuid()
+        or stat.S_IMODE(observed_root.st_mode) != 0o700
+    ):
+        raise CustodyError("custody authority scope is not owner-only")
+    descriptor = os.open(
+        root / AUTHORITY_SCOPE_LOCK,
+        os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600,
+    )
+    os.set_inheritable(descriptor, False)
+    observed = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(observed.st_mode)
+        or observed.st_uid != os.getuid()
+        or stat.S_IMODE(observed.st_mode) != 0o600
+    ):
+        os.close(descriptor)
+        raise CustodyError("custody authority scope lock is not owner-only")
+    return descriptor
+
+
+def _acquire_scope_admission(scope_root: Path, *, timeout: float) -> int:
+    descriptor = _open_authority_scope_lock(scope_root)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise CustodyError("custody authority scope admission timed out")
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        if (Path(scope_root) / AUTHORITY_SCOPE_CLOSED).exists():
+            raise CustodyError("custody authority scope is closed")
+        return descriptor
+    except BaseException:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+        raise
+
+
+def close_authority_scope(scope_root: Path, *, deadline: float) -> dict[str, object]:
+    """Deny later admissions and drain every admission begun before the close."""
+
+    root = Path(os.path.abspath(scope_root))
+    descriptor = _open_authority_scope_lock(root)
+    marker = root / AUTHORITY_SCOPE_CLOSED
+    errors: list[dict[str, object]] = []
+    try:
+        try:
+            marker_descriptor = os.open(
+                marker,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            marker_descriptor = -1
+        if marker_descriptor >= 0:
+            try:
+                payload = _canonical({
+                    "version": "astrid.plan-a.authority-scope-close/v1",
+                    "closed": True,
+                }) + b"\n"
+                _write_all(marker_descriptor, payload)
+                os.fsync(marker_descriptor)
+            finally:
+                os.close(marker_descriptor)
+            directory = os.open(root, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        drained = False
+        while time.monotonic() < deadline:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                drained = True
+                break
+            except BlockingIOError:
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        if not drained:
+            errors.append({
+                "stage": "drain", "type": "TimeoutError",
+                "message": "custody authority scope admission drain exceeded its deadline",
+            })
+        return {
+            "version": "astrid.plan-a.authority-scope-close/v1",
+            "closed": True, "drained": drained, "errors": errors,
+            "deadline_monotonic": deadline,
+        }
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _read_owner_file(path: Path) -> tuple[bytes, os.stat_result]:
     if path.is_symlink():
         raise CustodyError("custody file must not be a symlink")
@@ -335,6 +445,7 @@ class RoleBoundCustodyBroker:
         ledger_root: Path,
         timeout: float = 5.0,
         authority_journal: Path | None = None,
+        authority_scope_root: Path | None = None,
     ) -> None:
         if not role or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in role):
             raise CustodyError("custody role is invalid")
@@ -347,6 +458,14 @@ class RoleBoundCustodyBroker:
             Path(os.path.abspath(authority_journal))
             if authority_journal is not None else None
         )
+        self.authority_scope_root = (
+            Path(os.path.abspath(authority_scope_root))
+            if authority_scope_root is not None else None
+        )
+        if (self.authority_journal is None) != (self.authority_scope_root is None):
+            raise CustodyError("custody authority journal and scope must be configured together")
+        self._authority_scope_descriptor: int | None = None
+        self._authority_scope_guard = threading.Lock()
         self.run_id = _digest_bytes(os.urandom(32))
         ledger_root.mkdir(parents=True, exist_ok=False, mode=0o700)
         os.chmod(ledger_root, 0o700)
@@ -370,8 +489,25 @@ class RoleBoundCustodyBroker:
                 self.socket_root.rmdir()
             except OSError:
                 pass
+            if self._authority_scope_descriptor is not None:
+                fcntl.flock(self._authority_scope_descriptor, fcntl.LOCK_UN)
+                os.close(self._authority_scope_descriptor)
+                self._authority_scope_descriptor = None
             raise
         self.listener = listener
+        try:
+            self._authority_scope_descriptor = (
+                _acquire_scope_admission(self.authority_scope_root, timeout=timeout)
+                if self.authority_scope_root is not None else None
+            )
+        except BaseException:
+            self.listener.close()
+            self.socket_path.unlink(missing_ok=True)
+            try:
+                self.socket_root.rmdir()
+            except OSError:
+                pass
+            raise
         self.sequence = 0
         self.chain_head: str | None = None
         self.state = "accepting"
@@ -382,7 +518,40 @@ class RoleBoundCustodyBroker:
         self._cleanup_deadline: float | None = None
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            self.listener.close()
+            self.socket_path.unlink(missing_ok=True)
+            try:
+                self.socket_root.rmdir()
+            except OSError:
+                pass
+            self._release_authority_scope()
+            raise
+
+    def _release_authority_scope(self) -> None:
+        with self._authority_scope_guard:
+            descriptor = self._authority_scope_descriptor
+            self._authority_scope_descriptor = None
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    def abort_before_spawn(self) -> None:
+        """Release an admission that never reached a workload Popen call."""
+
+        if self.registration is not None:
+            raise CustodyError("registered custody cannot use pre-spawn abort")
+        self.listener.close()
+        self.socket_path.unlink(missing_ok=True)
+        try:
+            self.socket_root.rmdir()
+        except OSError:
+            pass
+        self._release_authority_scope()
 
     def child_environment(self, argv: Sequence[str], *, start_new_session: bool) -> dict[str, str]:
         candidate = Path(argv[0])
@@ -658,6 +827,7 @@ class RoleBoundCustodyBroker:
                 self.socket_root.rmdir()
             except OSError:
                 pass
+            self._release_authority_scope()
 
 
 def custody_wrapper_argv(executable: str) -> list[str]:
