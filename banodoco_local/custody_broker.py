@@ -264,6 +264,43 @@ def _atomic_owner_json(path: Path, value: Mapping[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _append_owner_jsonl(path: Path, value: Mapping[str, object]) -> None:
+    """Durably append one owner-only authority record without replacing peers."""
+
+    if not path.is_absolute() or path.is_symlink():
+        raise CustodyError("custody authority journal path is unsafe")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent = os.lstat(path.parent)
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        raise CustodyError("custody authority journal parent is not owner-only")
+    encoded = _canonical(dict(value)) + b"\n"
+    if len(encoded) > FRAME_LIMIT:
+        raise CustodyError("custody authority journal record exceeds its hard limit")
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != os.getuid()
+            or stat.S_IMODE(observed.st_mode) != 0o600
+        ):
+            raise CustodyError("custody authority journal is not owner-only")
+        if os.write(descriptor, encoded) != len(encoded):
+            raise CustodyError("custody authority journal append was incomplete")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _read_owner_file(path: Path) -> tuple[bytes, os.stat_result]:
     if path.is_symlink():
         raise CustodyError("custody file must not be a symlink")
@@ -297,6 +334,7 @@ class RoleBoundCustodyBroker:
         identity_provider: Callable[[int], Mapping[str, object] | None],
         ledger_root: Path,
         timeout: float = 5.0,
+        authority_journal: Path | None = None,
     ) -> None:
         if not role or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for c in role):
             raise CustodyError("custody role is invalid")
@@ -305,6 +343,10 @@ class RoleBoundCustodyBroker:
         self.role = role
         self.identity_provider = identity_provider
         self.timeout = timeout
+        self.authority_journal = (
+            Path(os.path.abspath(authority_journal))
+            if authority_journal is not None else None
+        )
         self.run_id = _digest_bytes(os.urandom(32))
         ledger_root.mkdir(parents=True, exist_ok=False, mode=0o700)
         os.chmod(ledger_root, 0o700)
@@ -337,6 +379,7 @@ class RoleBoundCustodyBroker:
         self.ack: dict[str, object] | None = None
         self.error: BaseException | None = None
         self._post_exec_authority_validated = False
+        self._cleanup_deadline: float | None = None
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
@@ -379,6 +422,18 @@ class RoleBoundCustodyBroker:
         ):
             raise CustodyError("custody admission did not seal")
 
+    def set_cleanup_deadline(self, deadline: float) -> None:
+        self._cleanup_deadline = deadline
+
+    def _observe_registered_identity(self, pid: int) -> Mapping[str, object] | None:
+        if self.identity_provider is default_process_identity:
+            remaining = (
+                1.0 if self._cleanup_deadline is None
+                else self._cleanup_deadline - time.monotonic()
+            )
+            return default_process_identity(pid, timeout=min(1.0, remaining))
+        return self.identity_provider(pid)
+
     def signal(self, signum: int, *, expected_pid: int) -> None:
         """Signal only the sealed role and exact process incarnation."""
 
@@ -389,7 +444,7 @@ class RoleBoundCustodyBroker:
         identity = self.registration.get("identity")
         if not isinstance(identity, dict) or identity.get("pid") != expected_pid:
             raise CustodyError("registered custody PID differs from the process handle")
-        observed = self.identity_provider(expected_pid)
+        observed = self._observe_registered_identity(expected_pid)
         if observed is None or any(
             observed.get(name) != identity.get(name)
             for name in ("pid", "birth_id", "uid")
@@ -416,7 +471,7 @@ class RoleBoundCustodyBroker:
         identity = self.registration.get("identity")
         if not isinstance(identity, dict) or identity.get("pid") != expected_pid:
             raise CustodyError("registered custody PID differs from the process handle")
-        observed = self.identity_provider(expected_pid)
+        observed = self._observe_registered_identity(expected_pid)
         if observed is None or any(
             observed.get(name) != identity.get(name)
             for name in ("pid", "birth_id", "uid")
@@ -568,6 +623,25 @@ class RoleBoundCustodyBroker:
                 "audit_token_pidversion": post["pidversion"],
             })
             self._post_exec_authority_validated = True
+            if self.authority_journal is not None:
+                identity = dict(self.registration["identity"])  # type: ignore[arg-type]
+                _append_owner_jsonl(self.authority_journal, {
+                    "version": "astrid.plan-a.retained-audit-authority/v1",
+                    "role": self.role,
+                    "pid": int(frame["pid"]),
+                    "identity": identity,
+                    "audit_token_words": list(self.registration["audit_token_words"]),  # type: ignore[arg-type]
+                    "binding": {
+                        "role": self.role,
+                        "pid": int(frame["pid"]),
+                        "birth_id": identity.get("birth_id"),
+                        "uid": identity.get("uid"),
+                        "state": "post-exec-authority-validated",
+                        "registration_before_exec": True,
+                        "pre_post_exec_incarnation_bound": True,
+                        "signal_primitive": "proc_signal_with_audittoken",
+                    },
+                })
             self.sequence = 2
             self._persist("registration_post_exec")
             self.state = "sealed"
@@ -664,17 +738,30 @@ def publish_active_capability(sidecar_path: Path, broker: RoleBoundCustodyBroker
     return reference
 
 
-def default_process_identity(pid: int) -> dict[str, object] | None:
-    result = subprocess.run(
-        ["/bin/ps", "-ww", "-o", "uid=", "-o", "lstart=", "-p", str(pid)],
-        text=True, capture_output=True, check=False,
-    )
+def default_process_identity(pid: int, *, timeout: float = 1.0) -> dict[str, object] | None:
+    """Return identity, None only for proven absence, and raise on observation failure."""
+
+    if timeout <= 0:
+        raise CustodyError("process identity observation deadline expired")
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-ww", "-o", "uid=", "-o", "lstart=", "-p", str(pid)],
+            text=True, capture_output=True, check=False, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CustodyError("process identity observation failed") from exc
     rendered = result.stdout.strip()
-    if result.returncode or not rendered:
+    if result.returncode == 1 and not rendered and not result.stderr.strip():
         return None
+    if result.returncode != 0:
+        raise CustodyError(
+            f"process identity observation failed with status {result.returncode}"
+        )
+    if not rendered:
+        raise CustodyError("process identity observation returned no identity")
     parts = rendered.split(None, 1)
     if len(parts) != 2 or not parts[0].isdigit():
-        return None
+        raise CustodyError("process identity observation was malformed")
     return {"pid": pid, "uid": int(parts[0]), "birth_id": "ps-lstart:" + parts[1]}
 
 
