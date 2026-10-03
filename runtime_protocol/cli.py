@@ -49,7 +49,8 @@ def _parser():
     doctor.add_argument("--support-root")
     upgrade = sub.add_parser("upgrade", help="offline upgrade one stopped legacy realm to the canonical format")
     upgrade.add_argument("--root", required=True)
-    upgrade.add_argument("--archive-root")
+    upgrade.add_argument("--retain-backup", action="store_true", help="retain a persistent pre-upgrade backup")
+    upgrade.add_argument("--archive-root", help="backup destination; requires --retain-backup")
     upgrade.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     upgrade.add_argument("--confirm", required=True)
     variant_state = sub.add_parser("migrate-variant-state", help="offline migrate one stopped canonical v24 realm to v25")
@@ -82,6 +83,7 @@ def _parser():
     replace.add_argument("--support-root")
     replace.add_argument("--display-name", default="Workspace")
     replace.add_argument("--realm-id")
+    replace.add_argument("--retain-superseded", action="store_true", help="retain the replaced realm after activation")
     export = sub.add_parser("export", help="export structured realm state")
     export.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     export.add_argument("--destination")
@@ -166,6 +168,7 @@ def main(argv=None):
             result = upgrade_realm(
                 args.root,
                 archive_root=args.archive_root,
+                retain_backup=args.retain_backup,
                 timeout_seconds=args.timeout,
                 confirmation=args.confirm,
             )
@@ -244,7 +247,7 @@ def main(argv=None):
         try:
             # Replacement is coordinated offline so a damaged active root is
             # never admitted merely to reach the recovery command.
-            result = daemon.replace_from_backup(args.backup)
+            result = daemon.replace_from_backup(args.backup, retain_superseded=args.retain_superseded)
         finally:
             daemon.stop()
         print(json.dumps(result, sort_keys=True))

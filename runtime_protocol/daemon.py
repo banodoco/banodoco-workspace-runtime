@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -101,7 +102,9 @@ class RuntimeDaemon:
     def start(self):
         if self.httpd:
             return self
-        return self._start(rotate_credentials=False)
+        self._start(rotate_credentials=False)
+        self._cleanup_completed_replacement()
+        return self
 
     def _catalog_owner_valid(self, proof):
         return self.service is not None and self.service.validate_catalog_admission(proof)
@@ -320,21 +323,58 @@ class RuntimeDaemon:
             "pass an explicit sibling support_root so epoch, credentials, and catalog state survive the move"
         )
 
-    def _write_replacement_state(self, *, state, candidate, superseded=None, error=None):
+    def _write_replacement_state(self, *, state, candidate, superseded=None, error=None, retain_superseded=False):
         value = {
             "format_version": 1,
             "state": state,
             "active_root": str(self.root),
             "candidate_root": str(candidate),
             "superseded_root": str(superseded) if superseded else None,
+            "retain_superseded": bool(retain_superseded),
             "updated_at": now(),
         }
         if error:
             value["error"] = str(error)
         atomic_json_write(self._replacement_state_path(), value)
 
-    def activate_candidate(self, candidate_root, *, retain_superseded=True):
+    def _cleanup_completed_replacement(self):
+        """Remove an unretained old realm left by a completed prior cutover."""
+        try:
+            state = json.loads(self._replacement_state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        # Require an explicit no-retention receipt from this version. Older
+        # journals predate the field and may refer to intentionally retained
+        # recovery data, so they are never auto-cleaned.
+        if state.get("state") not in {"complete", "cleanup_pending"} or state.get("retain_superseded") is not False:
+            return
+        raw_path = state.get("superseded_root")
+        if not isinstance(raw_path, str) or not raw_path:
+            return
+        superseded = Path(raw_path)
+        if (
+            superseded.parent != self.root.parent
+            or not superseded.name.startswith(f".{self.root.name}.superseded-")
+            or superseded.is_symlink()
+            or not superseded.is_dir()
+        ):
+            return
+        try:
+            shutil.rmtree(superseded)
+        except OSError:
+            return
+        state["state"] = "complete"
+        state["superseded_root"] = None
+        state["updated_at"] = now()
+        try:
+            atomic_json_write(self._replacement_state_path(), state)
+        except OSError:
+            pass
+
+    def activate_candidate(self, candidate_root, *, retain_superseded=False):
         """Atomically activate a verified inactive candidate under one owner."""
+        if not isinstance(retain_superseded, bool):
+            raise ConflictError("retain_superseded must be a boolean")
         if self.service is None or self.httpd is None:
             raise ConflictError("replacement requires a running runtime owner")
         self._require_replacement_support_layout()
@@ -348,15 +388,16 @@ class RuntimeDaemon:
         superseded = self.root.parent / f".{self.root.name}.superseded-{uuid.uuid4().hex}"
         moved_old = False
         moved_candidate = False
+        replacement_committed = False
         try:
             validate_parent(self.root, active_identity)
             validate_parent(candidate, candidate_identity)
             first = verify_restore_candidate(candidate, directory_identity=candidate_identity)
             if self.service.realm["id"] != first["manifest"].get("realm", {}).get("id"):
                 raise ConflictError("replacement realm identity does not match the live realm")
-            self._write_replacement_state(state="verified", candidate=candidate, superseded=superseded)
+            self._write_replacement_state(state="verified", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             self.stop()
-            self._write_replacement_state(state="owner_stopped", candidate=candidate, superseded=superseded)
+            self._write_replacement_state(state="owner_stopped", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             validate_parent(self.root, active_identity)
             validate_parent(candidate, candidate_identity)
             second = verify_restore_candidate(candidate, directory_identity=candidate_identity)
@@ -367,17 +408,60 @@ class RuntimeDaemon:
             moved_old = True
             os.fsync(parent_fd)
             validate_parent(self.root, active_identity)
-            self._write_replacement_state(state="old_quarantined", candidate=candidate, superseded=superseded)
+            self._write_replacement_state(state="old_quarantined", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             os.rename(candidate.name, self.root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             moved_candidate = True
             os.fsync(parent_fd)
             validate_parent(self.root, active_identity)
-            self._write_replacement_state(state="candidate_published", candidate=candidate, superseded=superseded)
+            self._write_replacement_state(state="candidate_published", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             self.instance_id = uuid.uuid4().hex
             self._start(rotate_credentials=True)
-            self._write_replacement_state(state="complete", candidate=candidate, superseded=superseded)
-            return {"state": "complete", "realm_id": self.service.realm["id"], "runtime_epoch": self.service.health()["runtime_epoch"], "runtime_instance_id": self.instance_id, "superseded_root": str(superseded), "retained": bool(retain_superseded)}
+            # The candidate is now serving requests. From this point onward
+            # failures may affect bookkeeping or cleanup, never rollback.
+            replacement_committed = True
+            completion_receipt_pending = False
+            try:
+                self._write_replacement_state(
+                    state="complete",
+                    candidate=candidate,
+                    superseded=superseded,
+                    retain_superseded=retain_superseded,
+                )
+            except OSError:
+                completion_receipt_pending = True
+            if retain_superseded:
+                pass
+            else:
+                try:
+                    shutil.rmtree(superseded)
+                except OSError as cleanup_error:
+                    try:
+                        self._write_replacement_state(
+                            state="cleanup_pending",
+                            candidate=candidate,
+                            superseded=superseded,
+                            error=cleanup_error,
+                            retain_superseded=False,
+                        )
+                    except OSError:
+                        # The published candidate is already committed. The
+                        # earlier explicit no-retention receipt remains the
+                        # startup cleanup instruction if this update hits ENOSPC.
+                        pass
+                    return {"state": "complete", "realm_id": self.service.realm["id"], "runtime_epoch": self.service.health()["runtime_epoch"], "runtime_instance_id": self.instance_id, "superseded_root": str(superseded), "retained": False, "cleanup_pending": True, "cleanup_error": str(cleanup_error)}
+                try:
+                    self._write_replacement_state(state="complete", candidate=candidate, retain_superseded=False)
+                except OSError:
+                    # The active realm is committed and the old tree is gone;
+                    # never attempt rollback after this point.
+                    pass
+            return {"state": "complete", "realm_id": self.service.realm["id"], "runtime_epoch": self.service.health()["runtime_epoch"], "runtime_instance_id": self.instance_id, "superseded_root": str(superseded) if retain_superseded else None, "retained": bool(retain_superseded), "completion_receipt_pending": completion_receipt_pending}
         except Exception as exc:
+            if replacement_committed:
+                raise ConflictError(
+                    "replacement is active but its completion receipt or cleanup failed; "
+                    f"inspect recovery path {superseded}: {exc}"
+                ) from exc
             try:
                 self.stop()
             except Exception:
@@ -395,9 +479,22 @@ class RuntimeDaemon:
                 if moved_old and not present(self.root.name) and present(superseded.name):
                     os.rename(superseded.name, self.root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 os.fsync(parent_fd)
-                self._write_replacement_state(state="rolled_back", candidate=candidate, superseded=superseded, error=exc)
-            except Exception:
-                pass
+                self._write_replacement_state(state="rolled_back", candidate=candidate, superseded=superseded if present(superseded.name) else None, error=exc, retain_superseded=False)
+            except Exception as rollback_exc:
+                try:
+                    self._write_replacement_state(
+                        state="rollback_failed",
+                        candidate=candidate,
+                        superseded=superseded,
+                        error=rollback_exc,
+                        retain_superseded=False,
+                    )
+                except Exception:
+                    pass
+                raise ConflictError(
+                    "replacement failed and rollback failed; recovery roots are "
+                    f"candidate={candidate}, superseded={superseded}; cause={rollback_exc}"
+                ) from exc
             self.instance_id = uuid.uuid4().hex
             try:
                 self._start(rotate_credentials=True)
@@ -435,15 +532,18 @@ class RuntimeDaemon:
         finally:
             handle.close()
 
-    def replace_from_backup(self, backup_root, *, retain_superseded=True):
+    def replace_from_backup(self, backup_root, *, retain_superseded=False):
         """Replace an unadmittable active root through an offline fence.
 
         The backup is verified first and the active database is never opened.
-        The active tree is retained under a quarantine sibling, while the
-        materialized candidate is the only tree admitted after publication.
+        The active tree remains available until the materialized candidate has
+        started successfully. After success it is removed unless explicitly
+        retained; failed rollback keeps the recovery roots and reports paths.
         """
         if self.service is not None or self.httpd is not None:
             raise ConflictError("offline replacement requires a stopped runtime")
+        if not isinstance(retain_superseded, bool):
+            raise ConflictError("retain_superseded must be a boolean")
         self._require_replacement_support_layout()
         backup = _authority_path(backup_root, "backup").resolve()
         # This is deliberately independent of active-root admission.
@@ -451,19 +551,25 @@ class RuntimeDaemon:
         if self.root.is_symlink() or not self.root.is_dir():
             raise ConflictError("damaged active root must be retained as an ordinary directory")
         candidate = self.root.parent / f".{self.root.name}.candidate-{os.getpid()}-{time.time_ns()}"
-        restore_backup(backup, candidate)
+        try:
+            restore_backup(backup, candidate)
+        except Exception:
+            if candidate.exists() and not candidate.is_symlink():
+                shutil.rmtree(candidate, ignore_errors=True)
+            raise
         candidate_identity = capture_parent(candidate)
         active_identity = capture_parent(self.root)
         custody = None
         superseded = self.root.parent / f".{self.root.name}.superseded-{uuid.uuid4().hex}"
         moved_old = False
         moved_candidate = False
+        replacement_committed = False
         try:
             verify_restore_candidate(candidate, directory_identity=candidate_identity)
             custody = self._acquire_offline_custody()
             validate_parent(self.root, active_identity)
             validate_parent(candidate, candidate_identity)
-            self._write_replacement_state(state="offline_verified", candidate=candidate, superseded=superseded)
+            self._write_replacement_state(state="offline_verified", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             parent_fd = int(active_identity["_parent_fd"])
             os.rename(self.root.name, superseded.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             moved_old = True
@@ -472,18 +578,53 @@ class RuntimeDaemon:
             moved_candidate = True
             os.fsync(parent_fd)
             validate_parent(self.root, active_identity)
-            self._write_replacement_state(state="offline_candidate_published", candidate=candidate, superseded=superseded)
+            self._write_replacement_state(state="offline_candidate_published", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
             self._release_offline_custody(custody)
             custody = None
             self.instance_id = uuid.uuid4().hex
             self._start(rotate_credentials=True)
-            self._write_replacement_state(state="complete", candidate=candidate, superseded=superseded)
-            return {"state": "complete", "realm_id": self.service.realm["id"], "runtime_epoch": self.service.health()["runtime_epoch"], "runtime_instance_id": self.instance_id, "superseded_root": str(superseded), "retained": bool(retain_superseded), "offline": True}
+            # The candidate is now serving requests. From this point onward
+            # failures may affect bookkeeping or cleanup, never rollback.
+            replacement_committed = True
+            completion_receipt_pending = False
+            try:
+                self._write_replacement_state(state="complete", candidate=candidate, superseded=superseded, retain_superseded=retain_superseded)
+            except OSError:
+                completion_receipt_pending = True
+            if not retain_superseded:
+                try:
+                    shutil.rmtree(superseded)
+                except OSError as cleanup_error:
+                    try:
+                        self._write_replacement_state(
+                            state="cleanup_pending",
+                            candidate=candidate,
+                            superseded=superseded,
+                            error=cleanup_error,
+                            retain_superseded=False,
+                        )
+                    except OSError:
+                        # The published candidate is already committed. The
+                        # earlier explicit no-retention receipt remains the
+                        # startup cleanup instruction if this update hits ENOSPC.
+                        pass
+                    return {"state": "complete", "realm_id": self.service.realm["id"], "runtime_epoch": self.service.health()["runtime_epoch"], "runtime_instance_id": self.instance_id, "superseded_root": str(superseded), "retained": False, "cleanup_pending": True, "cleanup_error": str(cleanup_error), "offline": True}
+                try:
+                    self._write_replacement_state(state="complete", candidate=candidate, retain_superseded=False)
+                except OSError:
+                    pass
+            return {"state": "complete", "realm_id": self.service.realm["id"], "runtime_epoch": self.service.health()["runtime_epoch"], "runtime_instance_id": self.instance_id, "superseded_root": str(superseded) if retain_superseded else None, "retained": bool(retain_superseded), "completion_receipt_pending": completion_receipt_pending, "offline": True}
         except Exception as exc:
+            if replacement_committed:
+                raise ConflictError(
+                    "replacement is active but its completion receipt or cleanup failed; "
+                    f"inspect recovery path {superseded}: {exc}"
+                ) from exc
             try:
                 self.stop()
             except Exception:
                 pass
+            rollback_error = None
             try:
                 parent_fd = int(active_identity["_parent_fd"])
                 def present(name):
@@ -497,10 +638,35 @@ class RuntimeDaemon:
                 if moved_old and not present(self.root.name) and present(superseded.name):
                     os.rename(superseded.name, self.root.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
                 os.fsync(parent_fd)
-                self._write_replacement_state(state="rolled_back", candidate=candidate, superseded=superseded, error=exc)
+                self._write_replacement_state(state="rolled_back", candidate=candidate, superseded=None, error=exc, retain_superseded=False)
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
             finally:
                 self._release_offline_custody(custody)
                 custody = None
+            if rollback_error is None:
+                if candidate.exists() and not candidate.is_symlink():
+                    try:
+                        shutil.rmtree(candidate)
+                    except OSError as cleanup_error:
+                        raise ConflictError(
+                            f"replacement was rolled back; temporary candidate cleanup failed at {candidate}: {cleanup_error}"
+                        ) from exc
+            else:
+                try:
+                    self._write_replacement_state(
+                        state="rollback_failed",
+                        candidate=candidate,
+                        superseded=superseded,
+                        error=rollback_error,
+                        retain_superseded=False,
+                    )
+                except Exception:
+                    pass
+                raise ConflictError(
+                    "replacement failed and rollback failed; recovery roots are "
+                    f"candidate={candidate}, superseded={superseded}; cause={rollback_error}"
+                ) from exc
             raise
         finally:
             if custody is not None:

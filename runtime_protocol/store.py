@@ -1180,6 +1180,100 @@ class RealmStore:
                     details={"project_id": project_id, "object_id": object_id},
                 )
 
+    def _managed_render_object_bytes(self, project_id, object_id, *, media_type, expected_size=None):
+        """Read one reachable prepared-scene object under project/CAS integrity."""
+        match = OBJECT_ID_RE.fullmatch(object_id) if isinstance(object_id, str) else None
+        if match is None or object_id != "sha256:" + match.group(1):
+            raise ValidationError("prepared scene requires canonical SHA-256 object identities")
+        digest = match.group(1)
+        row = self.conn.execute(
+            "SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest "
+            "WHERE po.project_id=? AND o.digest=? AND po.relation='managed'",
+            (project_id, digest),
+        ).fetchone()
+        if row is None:
+            raise ConflictError("prepared scene object is not associated with the task project", details={"object_id": object_id})
+        if row["media_type"] != media_type or (expected_size is not None and row["size"] != expected_size):
+            raise ConflictError("prepared scene object metadata does not match its package", details={"object_id": object_id})
+        root_fd = prefix_fd = fd = None
+        try:
+            root_fd = os.open(self.cas_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            prefix_fd = os.open(digest[:2], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            fd = os.open(digest[2:], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=prefix_fd)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != row["size"] or metadata.st_size > 64 * 1024 * 1024:
+                raise ConflictError("prepared scene object size or file integrity failed", details={"object_id": object_id})
+            chunks = []
+            while block := os.read(fd, 1024 * 1024):
+                chunks.append(block)
+            data = b"".join(chunks)
+            if len(data) != row["size"] or hashlib.sha256(data).hexdigest() != digest:
+                raise ConflictError("prepared scene object digest or size integrity failed", details={"object_id": object_id})
+            return data
+        except OSError as exc:
+            raise ConflictError("prepared scene object bytes are missing or inaccessible", details={"object_id": object_id}) from exc
+        finally:
+            for value in (fd, prefix_fd, root_fd):
+                if value is not None:
+                    os.close(value)
+
+    def _freeze_prepared_scene_objects(self, project_id, config, ordered_input_ids):
+        """Derive only the current self-contained package/HTML scene closure."""
+        def reject_json_constant(value):
+            raise ValueError(f"invalid JSON constant {value}")
+
+        scene_objects = []
+        verified = {}
+        for clip in config.get("clips", []):
+            if not isinstance(clip, dict) or clip.get("clipType") != "com.reigh.astrid.liveScene":
+                continue
+            app = clip.get("app")
+            scene = app.get("liveScene") if isinstance(app, dict) else None
+            source = scene.get("source") if isinstance(scene, dict) else None
+            if not isinstance(source, dict) or not isinstance(scene.get("revision"), str) or source.get("objectId") != scene.get("revision") or source.get("revision") != scene.get("revision"):
+                raise ValidationError("prepared scene source and package revision must match")
+            package_id = source["objectId"]
+            if package_id not in verified:
+                package_bytes = self._managed_render_object_bytes(project_id, package_id, media_type="application/json")
+                try:
+                    package_body = package_bytes.decode("utf-8")
+                    body = json.loads(package_body, parse_constant=reject_json_constant)
+                except (UnicodeError, ValueError) as exc:
+                    raise ValidationError("prepared scene package must contain valid UTF-8 JSON") from exc
+                manifest = body.get("manifest") if isinstance(body, dict) else None
+                entry = body.get("entry") if isinstance(body, dict) else None
+                if not isinstance(manifest, dict) or type(manifest.get("formatVersion")) is not int or manifest["formatVersion"] != 1:
+                    raise ValidationError("unsupported prepared scene manifest format")
+                entry_name = manifest.get("entry")
+                if not isinstance(entry_name, str) or not re.fullmatch(r"[\w./-]+\.html", entry_name) or ".." in entry_name.split("/"):
+                    raise ValidationError("invalid prepared scene manifest entry")
+                for key in ("duration", "authoredFps"):
+                    value = manifest.get(key)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                        raise ValidationError(f"invalid prepared scene manifest {key}")
+                if body.get("assets") != []:
+                    raise ValidationError("prepared scene assets must be an empty array")
+                if not isinstance(entry, dict) or entry.get("object_id") != entry.get("digest") or entry.get("media_type") != "text/html" or type(entry.get("size")) is not int or entry["size"] < 1:
+                    raise ValidationError("invalid prepared scene entry metadata")
+                if entry.get("filename") is not None and (not isinstance(entry["filename"], str) or not entry["filename"]):
+                    raise ValidationError("invalid prepared scene entry filename")
+                entry_bytes = self._managed_render_object_bytes(project_id, entry["object_id"], media_type="text/html", expected_size=entry["size"])
+                try:
+                    html = entry_bytes.decode("utf-8")
+                except UnicodeError as exc:
+                    raise ValidationError("prepared scene entry must contain UTF-8 HTML") from exc
+                if not html.strip():
+                    raise ValidationError("prepared scene entry must not be empty")
+                verified[package_id] = (package_body, html, entry, len(package_bytes))
+            package_body, html, entry, package_size = verified[package_id]
+            if scene.get("packageBody") != package_body or scene.get("html") != html:
+                raise ConflictError("prepared scene inline envelope disagrees with immutable package or entry bytes")
+            for object_id in (package_id, entry["object_id"]):
+                if object_id not in ordered_input_ids:
+                    ordered_input_ids.append(object_id)
+            scene_objects.append({"clip_id": clip.get("id"), "package_object_id": package_id, "package_size": package_size, "entry_object_id": entry["object_id"], "entry_size": entry["size"]})
+        return scene_objects
+
     def _freeze_managed_render_inputs(self, project_id, spec, supplied_input_object_ids):
         """Freeze a managed ``rendering.render`` timeline at admission.
 
@@ -1218,7 +1312,7 @@ class RealmStore:
             ("timeline_snapshot", "managed rendering timeline_snapshot is Runtime-owned"),
             ("timeline_authority", "managed rendering timeline_authority is Runtime-owned"),
         ):
-            if inputs.get(field) not in (None, ""):
+            if any(location.get(field) not in (None, "") for location in (inputs, params, frozen)):
                 raise ValidationError(message)
         supplied_input_ref = inputs.get("timeline_ref")
         if supplied_input_ref not in (None, "", timeline_ref):
@@ -1238,7 +1332,7 @@ class RealmStore:
             raise ValidationError("render output_policy must be an object")
 
         rows = self.conn.execute(
-            "SELECT id, archived_at FROM timelines WHERE project_id=? ORDER BY created_at, id",
+            "SELECT id, archived_at, version FROM timelines WHERE project_id=? ORDER BY created_at, id",
             (project_id,),
         ).fetchall()
         matches = []
@@ -1264,6 +1358,51 @@ class RealmStore:
                 "timeline_ref identifies an archived timeline",
                 details={"timeline_id": row["id"], "timeline_ref": timeline_ref},
             )
+        head = self.conn.execute(
+            "SELECT revision_id FROM parent_composition_heads WHERE project_id=? AND timeline_id=?",
+            (project_id, row["id"]),
+        ).fetchone()
+        parent = None
+        dependency_digests = []
+        occurrences = []
+        if head is not None and head["revision_id"] is not None:
+            parent = self.conn.execute(
+                "SELECT * FROM parent_composition_revisions WHERE project_id=? AND timeline_id=? AND id=?",
+                (project_id, row["id"], head["revision_id"]),
+            ).fetchone()
+            if parent is None:
+                raise ConflictError("canonical parent head is outside its project/timeline or missing")
+            payload = json.loads(parent["payload_json"])
+            if "sha256:" + hashlib.sha256(canonical_json(payload).encode()).hexdigest() != parent["content_digest"]:
+                raise ConflictError("canonical parent revision content integrity failed")
+            if not isinstance(payload, dict):
+                raise ValidationError("canonical parent payload must be an object")
+            occurrences = payload.get("occurrences")
+            if not isinstance(occurrences, list):
+                raise ValidationError("canonical parent occurrences must be a list")
+            if occurrences:
+                raise ValidationError("canonical occurrence render requires the existing pinned child projection route")
+            content = {**content, "config": copy.deepcopy(payload.get("config")), "registry": copy.deepcopy(payload.get("registry"))}
+            config_clips = content["config"].get("clips", []) if isinstance(content["config"], dict) else None
+            parent_clips = payload.get("clips", [])
+            if not isinstance(config_clips, list) or not isinstance(parent_clips, list):
+                raise ValidationError("canonical parent/config clips must be lists")
+            if config_clips and parent_clips and config_clips != parent_clips:
+                raise ConflictError("canonical parent clips and config.clips disagree")
+            content["config"]["clips"] = copy.deepcopy(parent_clips or config_clips)
+            dependency_digests = [dict(item) for item in self.conn.execute(
+                "SELECT dependency_kind, dependency_id, content_digest FROM composition_revision_dependencies WHERE parent_revision_id=? ORDER BY ordinal, dependency_kind, dependency_id",
+                (parent["id"],),
+            )]
+        expectations = {
+            "canonical_project_id": project_id,
+            "canonical_parent_document_id": row["id"],
+            "canonical_head_revision_id": parent["id"] if parent is not None else None,
+            "canonical_occurrence_ids": [item.get("occurrence_id") for item in occurrences],
+        }
+        for key, actual in expectations.items():
+            if key in params and params[key] != actual:
+                raise ConflictError(f"render {key} does not match the canonical timeline", details={"expected": params[key], "actual": actual})
         if not isinstance(content, dict) or not isinstance(content.get("config"), dict) or not isinstance(content.get("registry"), dict):
             raise ValidationError("canonical timeline config and registry must be objects")
         config = content["config"]
@@ -1329,6 +1468,7 @@ class RealmStore:
                     f"canonical render registry contains conflicting digests for media_id {media_id!r}"
                 )
             managed_media[media_id] = normalized
+        scene_objects = self._freeze_prepared_scene_objects(project_id, expanded_config, ordered_input_ids)
         supplied = list(supplied_input_object_ids or [])
         if supplied:
             normalized_supplied = []
@@ -1372,6 +1512,15 @@ class RealmStore:
             "materialized_registry_hash": materialized_registry_hash,
             "managed_media_admissions": managed_media,
         }
+        if parent is not None:
+            authority.update({
+                "parent_revision_id": parent["id"],
+                "parent_content_digest": parent["content_digest"],
+                "dependency_digests": dependency_digests,
+                "snapshot_digest": "sha256:" + hashlib.sha256(canonical_json({"config": expanded_config, "registry": expanded_registry}).encode()).hexdigest(),
+                "input_object_ids": list(ordered_input_ids),
+                "scene_objects": scene_objects,
+            })
         frozen["timeline_snapshot"] = {"config": expanded_config, "registry": expanded_registry}
         inputs["timeline_ref"] = timeline_ref
         inputs["timeline_authority"] = authority
@@ -1573,7 +1722,7 @@ class RealmStore:
         if isinstance(spec, dict) and "required_facts" in spec:
             spec = dict(spec)
             spec["required_facts"] = normalize_execution_facts(spec["required_facts"], field="required_facts")
-        with self._mutex:
+        with self._mutex, (self._transaction() if capability == "rendering.render" else nullcontext()):
             project_id = self._project(project)["id"] if project else None
             if capability == "rendering.render":
                 admitted_spec = spec.get("spec") if isinstance(spec, dict) else None
@@ -4619,6 +4768,32 @@ class RealmStore:
                     if expected != event["event_hash"]:
                         event_errors.append({"run_id": run[0], "event_id": event["id"], "reason": "hash_mismatch"})
                     previous = event["event_hash"]
+        publication_events = {}
+        timeline_chain_valid = {}
+        if "timeline_events" in actual_tables:
+            previous_by_timeline = {}
+            for event in self.conn.execute("SELECT * FROM timeline_events ORDER BY id"):
+                timeline_id = event["timeline_id"]
+                previous = previous_by_timeline.get(timeline_id, "")
+                payload = json.loads(event["payload_json"])
+                event_ok = True
+                if event["previous_hash"] != previous:
+                    event_errors.append({"stream": "timeline", "timeline_id": timeline_id, "event_id": event["id"], "reason": "broken_link"})
+                    event_ok = False
+                expected = hashlib.sha256(canonical_json({"timeline_id": timeline_id, "kind": event["kind"], "payload": payload, "previous_hash": event["previous_hash"], "created_at": event["created_at"]}).encode()).hexdigest()
+                if expected != event["event_hash"]:
+                    event_errors.append({"stream": "timeline", "timeline_id": timeline_id, "event_id": event["id"], "reason": "hash_mismatch"})
+                    event_ok = False
+                timeline_chain_valid[timeline_id] = timeline_chain_valid.get(timeline_id, True) and event_ok
+                previous_by_timeline[timeline_id] = event["event_hash"]
+                if event["kind"] == "parent.composition.published":
+                    parent_id = payload.get("new_head") if isinstance(payload, dict) else None
+                    if isinstance(parent_id, str) and parent_id:
+                        publication_events.setdefault((timeline_id, parent_id), []).append({
+                            "event_id": event["id"],
+                            "payload": payload,
+                            "chain_valid": timeline_chain_valid[timeline_id],
+                        })
         relational_errors = []
         revision_errors = []
 
@@ -4664,8 +4839,10 @@ class RealmStore:
                 payload = shot_payloads.get(row["id"])
                 if isinstance(payload, dict) and payload.get("internal_timeline_revision_id") != row["internal_timeline_revision_id"]:
                     revision_issue("shot_revisions", row["id"], "declared_internal_timeline_revision_mismatch", declared=payload.get("internal_timeline_revision_id"), row_value=row["internal_timeline_revision_id"])
+        parent_rows = {}
         if {"parent_composition_revisions", "timelines", "projects"}.issubset(actual_tables):
             for row in self.conn.execute("SELECT * FROM parent_composition_revisions"):
+                parent_rows[row["id"]] = row
                 parent_payloads[row["id"]] = revision_payload(row, "parent_composition_revisions")
                 timeline = self.conn.execute("SELECT project_id FROM timelines WHERE id=?", (row["timeline_id"],)).fetchone()
                 project = self.conn.execute("SELECT id FROM projects WHERE id=?", (row["project_id"],)).fetchone()
@@ -4755,6 +4932,30 @@ class RealmStore:
                         actual=actual_sequence,
                     )
 
+        parent_ids_by_timeline = {}
+        for parent_id, row in parent_rows.items():
+            parent_ids_by_timeline.setdefault(row["timeline_id"], set()).add(parent_id)
+        publication_commands = {}
+        if "command_idempotency" in actual_tables:
+            for timeline_id in parent_ids_by_timeline:
+                for command in self.conn.execute(
+                    "SELECT result_json, event_ids_json FROM command_idempotency WHERE command_kind=? AND aggregate_id=?",
+                    ("parent_composition.publish", timeline_id),
+                ):
+                    result = json.loads(command["result_json"])
+                    if isinstance(result, dict) and isinstance(result.get("data"), dict):
+                        result = result["data"]
+                    event_ids = json.loads(command["event_ids_json"]) if command["event_ids_json"] else []
+                    published_id = (
+                        result.get("parent_revision_id", result.get("revision_id", result.get("new_head")))
+                        if isinstance(result, dict) else None
+                    )
+                    publication_commands.setdefault(timeline_id, []).append({
+                        "result": result,
+                        "published_id": published_id,
+                        "event_ids": event_ids,
+                    })
+
         if {"composition_revision_dependencies", "parent_composition_revisions", "shot_revisions", "internal_timeline_revisions", "objects", "project_objects"}.issubset(actual_tables):
             for row in self.conn.execute("SELECT * FROM composition_revision_dependencies"):
                 parent = self.conn.execute("SELECT project_id FROM parent_composition_revisions WHERE id=?", (row["parent_revision_id"],)).fetchone()
@@ -4796,6 +4997,27 @@ class RealmStore:
                         found.update(payload_media(child))
                 return found
 
+            def normalized_publication_media(manifest):
+                if not isinstance(manifest, dict) or not isinstance(manifest.get("media"), list):
+                    return None
+                normalized = []
+                seen = set()
+                for item in manifest["media"]:
+                    if not isinstance(item, dict):
+                        return None
+                    media_id = item.get("media_id")
+                    content_digest = item.get("content_digest")
+                    if (
+                        not isinstance(media_id, str)
+                        or not re.fullmatch(r"sha256:[0-9a-f]{64}", media_id)
+                        or content_digest != media_id
+                        or media_id in seen
+                    ):
+                        return None
+                    normalized.append(("media", media_id, content_digest))
+                    seen.add(media_id)
+                return normalized
+
             for parent_id, parent in parent_payloads.items():
                 if not isinstance(parent, dict):
                     continue
@@ -4825,6 +5047,102 @@ class RealmStore:
                 for child in child_payloads:
                     for media in sorted(payload_media(child)):
                         expected.append(("media", media, media))
+                parent_row = parent_rows.get(parent_id)
+                if parent_row is not None:
+                    timeline_id = parent_row["timeline_id"]
+                    published_events = publication_events.get((timeline_id, parent_id), [])
+                    event_ids = {str(item["event_id"]) for item in published_events}
+                    command_records = [
+                        item for item in publication_commands.get(timeline_id, [])
+                        if item["published_id"] == parent_id
+                        or (
+                            isinstance(item["event_ids"], list)
+                            and any(str(event_id) in event_ids for event_id in item["event_ids"])
+                        )
+                    ]
+                    # Payload-only closure is valid for genuinely old revisions
+                    # that have no publication ledger at all. Once either side
+                    # of the modern event/receipt pair survives, require the
+                    # complete pair so deleting evidence cannot turn a modern
+                    # manifest into an apparently valid legacy revision.
+                    if published_events or command_records:
+                        paired_manifests = []
+                        evidence_valid = True
+                        event_by_id = {str(item["event_id"]): item for item in published_events}
+                        commands_by_event = {}
+                        for command_record in command_records:
+                            ids = command_record["event_ids"]
+                            if not isinstance(ids, list) or len(ids) != 1:
+                                evidence_valid = False
+                                continue
+                            commands_by_event.setdefault(str(ids[0]), []).append(command_record)
+                        for publication in published_events:
+                            event_id = str(publication["event_id"])
+                            matches = commands_by_event.get(event_id, [])
+                            if len(matches) != 1:
+                                evidence_valid = False
+                                continue
+                            command_record = matches[0]
+                            command_result = command_record["result"]
+                            event_payload = publication["payload"]
+                            if (
+                                not publication["chain_valid"]
+                                or not isinstance(command_result, dict)
+                                or event_payload.get("project_id") != parent_row["project_id"]
+                                or event_payload.get("timeline_id") != timeline_id
+                                or event_payload.get("new_head") != parent_id
+                                or event_payload.get("content_digest") != parent_row["content_digest"]
+                            ):
+                                evidence_valid = False
+                                continue
+                            result_payload = command_result.get("payload")
+                            result_digest = (
+                                "sha256:" + hashlib.sha256(canonical_json(result_payload).encode("utf-8")).hexdigest()
+                                if isinstance(result_payload, dict) else None
+                            )
+                            command_valid = (
+                                command_record["published_id"] == parent_id
+                                and command_result.get("project_id") == parent_row["project_id"]
+                                and command_result.get("timeline_id") == timeline_id
+                                and command_result.get("parent_revision_id", command_result.get("revision_id")) == parent_id
+                                and command_result.get("content_digest") == parent_row["content_digest"]
+                                and result_digest == parent_row["content_digest"]
+                                and str(command_result.get("event_id")) == event_id
+                                and command_record["event_ids"] == [event_id]
+                                and ("dependency_manifest" in command_result) == ("dependency_manifest" in event_payload)
+                            )
+                            if not command_valid:
+                                evidence_valid = False
+                                continue
+                            if "dependency_manifest" in event_payload:
+                                event_manifest = event_payload["dependency_manifest"]
+                                if canonical_json(command_result["dependency_manifest"]) != canonical_json(event_manifest):
+                                    evidence_valid = False
+                                    continue
+                                media_dependencies = normalized_publication_media(event_manifest)
+                                if media_dependencies is None:
+                                    evidence_valid = False
+                                    continue
+                                paired_manifests.append((canonical_json(event_manifest), media_dependencies))
+                        # A command can otherwise be silently orphaned, point at
+                        # a missing event, or make a duplicate claim to one.
+                        for command_record in command_records:
+                            ids = command_record["event_ids"]
+                            if (
+                                not isinstance(ids, list)
+                                or len(ids) != 1
+                                or str(ids[0]) not in event_by_id
+                                or len(commands_by_event.get(str(ids[0]), [])) != 1
+                            ):
+                                evidence_valid = False
+                        if paired_manifests and len(paired_manifests) != len(published_events):
+                            evidence_valid = False
+                        if paired_manifests and any(value[0] != paired_manifests[0][0] for value in paired_manifests[1:]):
+                            evidence_valid = False
+                        if not evidence_valid:
+                            revision_issue("parent_composition_revisions", parent_id, "publication_evidence_mismatch")
+                        elif paired_manifests:
+                            expected.extend(paired_manifests[0][1])
                 # The publication canonicalizes each dependency family, but
                 # older migrated parents may retain the same valid closure in
                 # a different family order. Compare the complete multiset so

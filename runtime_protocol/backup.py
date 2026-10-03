@@ -814,4 +814,16 @@ def structured_export(store) -> dict:
     shot_items = rows("SELECT * FROM shot_items ORDER BY shot_id, sort_key, id", lambda value: value | {"metadata": json.loads(value.pop("metadata_json"))})
     text_bindings = rows("SELECT * FROM shot_text_bindings ORDER BY project_id, id")
     text_binding_events = rows("SELECT * FROM shot_text_binding_events ORDER BY project_id, binding_id, seq", lambda value: value | {"payload": json.loads(value.pop("payload_json"))})
-    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events}
+    media_relations = rows(
+        "SELECT * FROM media_relations ORDER BY project_id, from_digest, to_digest, kind, ordinal",
+        lambda value: {
+            "project_id": value["project_id"],
+            "from_object_id": "sha256:" + value["from_digest"],
+            "to_object_id": "sha256:" + value["to_digest"],
+            "kind": value["kind"],
+            "ordinal": int(value["ordinal"]),
+            "metadata": json.loads(value["metadata_json"]),
+            "created_at": value["created_at"],
+        },
+    )
+    return {"format_version": 1, "exported_at": now(), "realm": store.realm, "projects": projects, "objects": rows("SELECT * FROM objects ORDER BY digest"), "project_objects": rows("SELECT * FROM project_objects ORDER BY project_id, digest, relation"), "media_relations": media_relations, "documents": documents, "runs": runs, "tasks": tasks, "events": events, "capabilities": capabilities, "executors": executors, "reservations": reservations, "generations": generations, "variants": variants, "shots": shots, "shot_items": shot_items, "shot_text_bindings": text_bindings, "shot_text_binding_events": text_binding_events}
