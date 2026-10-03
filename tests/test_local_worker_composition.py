@@ -171,7 +171,7 @@ def test_cleanup_member_accepts_only_positive_race_to_absence(tmp_path, monkeypa
         {"worker": _cleanup_identity()},
         "worker",
         expected_parent=None,
-        allow_reparented=True,
+        cleanup_owner="adopted",
     ) is False
 
 
@@ -244,7 +244,7 @@ def test_cleanup_member_unknown_live_or_reused_pid_fails_closed(
             {"worker": _cleanup_identity()},
             "worker",
             expected_parent=None,
-            allow_reparented=True,
+            cleanup_owner="adopted",
         )
 
 
@@ -284,8 +284,67 @@ def test_cleanup_member_matching_zombie_defers_to_remaining_graph_checks(
         {"worker": _cleanup_identity()},
         "worker",
         expected_parent=None,
-        allow_reparented=True,
+        cleanup_owner="adopted",
     ) is False
+
+
+def test_real_cleanup_verifier_distinguishes_initial_owner_from_adopter(tmp_path):
+    """Exercise the real OS verifier for an authentic direct Worker child."""
+
+    profile, _handle = _inspector_fixture(tmp_path)
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    worker = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        executable = None
+        previous = None
+        for _attempt in range(100):
+            current = _actual_executable(worker.pid)
+            if current == previous:
+                executable = current
+                break
+            previous = current
+            time.sleep(0.01)
+        assert executable is not None
+        birth_id = process_birth_identity(worker.pid)
+        assert birth_id is not None
+        argv = _process_argv(worker.pid)
+        assert argv
+        receipt = {
+            "worker": {
+                "pid": worker.pid,
+                "birth_id": birth_id,
+                "uid": os.getuid(),
+                "parent_pid": os.getpid(),
+                "process_group": os.getpgid(worker.pid),
+                "session_id": os.getsid(worker.pid),
+                "executable": str(executable),
+                "artifact_digest": _file_digest(executable),
+                "command_line": _ps(worker.pid, "command"),
+                "argv_digest": _argv_digest(argv),
+            }
+        }
+
+        assert preparer._verify_cleanup_member(
+            receipt,
+            "worker",
+            expected_parent=os.getpid(),
+            cleanup_owner="initial",
+        ) is True
+        with pytest.raises(ConflictError, match="parent identity is invalid"):
+            preparer._verify_cleanup_member(
+                receipt,
+                "worker",
+                expected_parent=None,
+                cleanup_owner="adopted",
+            )
+    finally:
+        worker.terminate()
+        worker.wait(timeout=5)
 
 
 def _adopted_cleanup_handle(
@@ -590,14 +649,14 @@ def test_initial_sealed_cleanup_allows_only_verified_init_reparenting(
     monkeypatch.setattr(
         preparer,
         "_force_cleanup_verified_graph",
-        lambda received, *, allow_reparented: observed.append(
-            (received, allow_reparented)
+        lambda received, *, cleanup_owner: observed.append(
+            (received, cleanup_owner)
         ),
     )
 
     preparer._force_cleanup_initial_graph(handle)
 
-    assert observed == [(handle, True)]
+    assert observed == [(handle, "initial")]
 
 
 def test_argv_digest_preserves_argument_boundaries() -> None:

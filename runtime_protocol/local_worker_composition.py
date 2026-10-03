@@ -1227,7 +1227,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         name: str,
         *,
         expected_parent: int | None,
-        allow_reparented: bool = False,
+        cleanup_owner: str,
     ) -> bool:
         expected = self._receipt_process(receipt, name)
         pid = int(expected["pid"])
@@ -1289,13 +1289,20 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             ) from exc
         if uid != int(expected["uid"]):
             raise ConflictError(f"adopted {name} cleanup UID changed")
-        if allow_reparented:
-            # An adopted member may still have its receipt parent, or PID 1
-            # after that parent exits.  B itself can never become its parent.
-            if parent not in {int(expected["parent_pid"]), 1} or parent == os.getpid():
-                raise ConflictError(f"adopted {name} parent identity is invalid")
-        elif expected_parent is not None and parent != int(expected_parent):
+        if cleanup_owner not in {"initial", "adopted"}:
+            raise ConflictError("Worker cleanup ownership mode is invalid")
+        recorded_parent = int(expected["parent_pid"])
+        if expected_parent is not None and recorded_parent != int(expected_parent):
             raise ConflictError(f"adopted {name} cleanup parent identity changed")
+        # A sealed member may still have its receipt parent, or PID 1 after
+        # that parent exits.  The original Runtime is the authentic recorded
+        # parent of its initial Worker and must remain eligible.  A successor
+        # adopting somebody else's graph can never become a member's parent.
+        if (
+            parent not in {recorded_parent, 1}
+            or (cleanup_owner == "adopted" and parent == os.getpid())
+        ):
+            raise ConflictError(f"adopted {name} parent identity is invalid")
         if group != int(expected["process_group"]) or session != int(expected["session_id"]):
             raise ConflictError(f"adopted {name} cleanup process group/session changed")
         executable = Path(str(expected["executable"]))
@@ -1314,7 +1321,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         *,
         leader: str,
         parents: Mapping[str, int | None],
-        allow_reparented: bool,
+        cleanup_owner: str,
     ) -> None:
         leader_value = self._receipt_process(receipt, leader)
         group = int(leader_value["process_group"])
@@ -1328,7 +1335,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     receipt,
                     name,
                     expected_parent=parents.get(name),
-                    allow_reparented=allow_reparented,
+                    cleanup_owner=cleanup_owner,
                 )
             ]
             if "engine_listener" in names:
@@ -1388,7 +1395,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 receipt,
                 name,
                 expected_parent=parents[name],
-                allow_reparented=True,
+                cleanup_owner="adopted",
             ):
                 return True
         return False
@@ -1409,7 +1416,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         return expected
 
     def _force_cleanup_verified_graph(
-        self, handle: _PreparedWorker, *, allow_reparented: bool
+        self, handle: _PreparedWorker, *, cleanup_owner: str
     ) -> None:
         """Birth/executable/session checked fallback for a sealed graph."""
 
@@ -1432,19 +1439,19 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 receipt,
                 "worker",
                 expected_parent=int(self._receipt_process(receipt, "worker")["parent_pid"]),
-                allow_reparented=allow_reparented,
+                cleanup_owner=cleanup_owner,
             ),
             "host": self._verify_cleanup_member(
                 receipt, "host", expected_parent=worker_pid,
-                allow_reparented=allow_reparented,
+                cleanup_owner=cleanup_owner,
             ),
             "engine": self._verify_cleanup_member(
                 receipt, "engine", expected_parent=worker_pid,
-                allow_reparented=allow_reparented,
+                cleanup_owner=cleanup_owner,
             ),
             "engine_listener": self._verify_cleanup_member(
                 receipt, "engine_listener", expected_parent=engine_pid,
-                allow_reparented=allow_reparented,
+                cleanup_owner=cleanup_owner,
             ),
         }
         # Prove the listener still belongs to the recorded listener before any
@@ -1483,7 +1490,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     tuple(group["members"]),
                     leader=str(group["leader"]),
                     parents=parents,
-                    allow_reparented=allow_reparented,
+                    cleanup_owner=cleanup_owner,
                 )
         remaining = [
             name
@@ -1492,7 +1499,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 receipt,
                 name,
                 expected_parent=parents[name],
-                allow_reparented=allow_reparented,
+                cleanup_owner=cleanup_owner,
             )
         ]
         if remaining:
@@ -1529,14 +1536,14 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise ConflictError("Worker engine registry survived verified cleanup")
 
     def _force_cleanup_adopted_graph(self, handle: _PreparedWorker) -> None:
-        self._force_cleanup_verified_graph(handle, allow_reparented=True)
+        self._force_cleanup_verified_graph(handle, cleanup_owner="adopted")
 
     def _force_cleanup_initial_graph(self, handle: _PreparedWorker) -> None:
         # A failed/closed Worker control path may let a still-authenticated
         # child reparent to init before the sealed fallback runs.  Accept only
         # that kernel lineage transition; every birth, UID, executable, argv,
         # group, session, listener, and receipt check remains mandatory.
-        self._force_cleanup_verified_graph(handle, allow_reparented=True)
+        self._force_cleanup_verified_graph(handle, cleanup_owner="initial")
 
     def control_alive(self, handle: _PreparedWorker) -> bool:
         if not isinstance(handle, _PreparedWorker) or handle.closed or handle.worker.poll() is not None:
