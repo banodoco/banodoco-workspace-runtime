@@ -306,6 +306,11 @@ def _normalize_execution_request(value, input_object_ids):
         raise ValidationError("caller-supplied execution_binding is not accepted")
     request = json.loads(canonical_json(value))
     request["target"] = _normalize_execution_target(request.get("target"))
+    if "remote_activation_required" in request:
+        if not isinstance(request["remote_activation_required"], bool):
+            raise ValidationError("execution_request.remote_activation_required must be a boolean")
+        if request["remote_activation_required"] and request["target"]["kind"] != "runpod":
+            raise ValidationError("remote activation requires a RunPod execution target")
     if "inputs" in request:
         inputs = request["inputs"]
         if not isinstance(inputs, list):

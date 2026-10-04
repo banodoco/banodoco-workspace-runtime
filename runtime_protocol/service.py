@@ -45,7 +45,6 @@ MEDIA_IMPORT_CAPABILITY = "runtime.media.import.v1"
 MEDIA_IMPORT_EXECUTOR = "runtime-host-media-import"
 MEDIA_IMPORT_CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(MEDIA_IMPORT_CAPABILITY.encode()).hexdigest()
 TARGETED_EXECUTION_BINDING_CAPABILITY = "execution_binding.targeted.v1"
-QUALIFIED_REMOTE_CAPABILITY = "h3_av.transform"
 PLACEMENT_RECOVERY_SCHEMA_VERSION = 1
 PLACEMENT_LOSS_EVIDENCE_MAX_AGE_SECONDS = 15 * 60
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
@@ -681,21 +680,118 @@ class RuntimeService:
             return None
         return json.loads(row["payload_json"])
 
+    def _remote_drain(self, task_id, activation_id=None):
+        rows = self.store.conn.execute(
+            "SELECT payload_json FROM events WHERE task_id=? "
+            "AND kind='task.remote_activation_draining' ORDER BY id DESC",
+            (str(task_id),),
+        ).fetchall()
+        for row in rows:
+            marker = json.loads(row["payload_json"])
+            if activation_id is not None:
+                if marker["qualification"]["activation_id"] == activation_id:
+                    return marker
+                continue
+            latest = self._latest_remote_activation(task_id)
+            return marker if latest is None or latest == marker["qualification"] else None
+        return None
+
+    def _task_drain(self, task_id):
+        row = self.store.conn.execute("SELECT spec_json FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        lineage = json.loads(row["spec_json"]).get("delegated_parent") if row else None
+        owner_id = lineage.get("parent_task_id") if isinstance(lineage, dict) else task_id
+        return self._remote_drain(owner_id)
+
+    def _drain_continuation_matches(self, task_id, marker):
+        cutoff = marker.get("parent_attempt")
+        if cutoff is None or str(task_id) == marker["qualification"]["task_id"]:
+            return False
+        row = self.store.conn.execute("SELECT spec_json FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        if row is None:
+            return False
+        lineage = json.loads(row["spec_json"]).get("delegated_parent")
+        return isinstance(lineage, dict) and all(lineage.get(key) == value for key, value in cutoff.items())
+
+    def _assert_exact_drain_generation(self, task_id, qualification, identity, *, allow_revoked=False):
+        if self._require_placement_recovery_owner(identity) != "owner":
+            raise AuthorizationError("remote drain requires the Runtime owner actor")
+        if not isinstance(qualification, dict) or qualification.get("task_id") != str(task_id):
+            raise ConflictError("remote drain generation is missing or foreign")
+        latest = self._latest_remote_activation(task_id)
+        marker = self._remote_drain(task_id, qualification.get("activation_id"))
+        revoked = any(kind == "task.remote_activation_revoked" for kind, _ in
+                      self._remote_activation_history(task_id, qualification.get("activation_id")))
+        if latest != qualification and not (allow_revoked and revoked
+                                             and marker is not None and marker["qualification"] == qualification):
+            raise ConflictError("remote drain generation changed")
+        from .remote_worker_deployment import deployment_binding_from_task
+        binding = deployment_binding_from_task(self._task_resource(self.store.get_task(task_id)))
+        stale_runtime = (qualification.get("runtime_session_id") != self.runtime_session_id
+                         or qualification.get("runtime_epoch") != self.store._current_runtime_epoch())
+        if ((stale_runtime and not (allow_revoked and marker is not None and marker["qualification"] == qualification))
+                or qualification.get("binding_digest") != binding.digest()
+                or qualification.get("effective_target") != binding.placement.effective_target):
+            raise ConflictError("remote drain generation is stale or binding changed")
+        return marker, revoked
+
+    @_durable_mutation
+    def begin_remote_drain(self, task_id, qualification, *, identity=None):
+        marker, _ = self._assert_exact_drain_generation(task_id, qualification, identity)
+        if marker is not None:
+            return {"state": "pending", "activation_id": qualification["activation_id"]}
+        parent = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        cutoff = None
+        if parent["status"] in {"running", "cancel_requested"}:
+            attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (parent["attempt_id"],)).fetchone()
+            if (attempt is None or int(attempt["settled"] or 0)
+                    or attempt["executor_id"] != qualification["credential_actor"]
+                    or attempt["lease_id"] != parent["lease_token"]
+                    or attempt["fence"] != parent["lease_fence"]
+                    or attempt["runtime_epoch"] != qualification["runtime_epoch"]):
+                raise ConflictError("running parent attempt cannot be captured for drain")
+            cutoff = {"parent_task_id": str(task_id), "parent_attempt_id": attempt["id"],
+                      "parent_lease_id": attempt["lease_id"], "parent_fence": attempt["fence"],
+                      "executor_id": attempt["executor_id"], "runtime_epoch": attempt["runtime_epoch"]}
+        marker = {"qualification": qualification, "parent_attempt": cutoff, "begun_at": now()}
+        self.store._append_event(parent["run_id"], str(task_id), "task.remote_activation_draining", marker)
+        return {"state": "pending", "activation_id": qualification["activation_id"]}
+
+    @_durable_mutation
+    def finish_remote_drain(self, task_id, qualification, *, identity=None):
+        marker, revoked = self._assert_exact_drain_generation(task_id, qualification, identity, allow_revoked=True)
+        if marker is None or marker["qualification"] != qualification:
+            raise ConflictError("remote drain has not begun for this exact generation")
+        task_ids = [str(task_id)] + [row["id"] for row, _ in self._delegated_children(str(task_id))]
+        pending = []
+        for current_id in task_ids:
+            task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (current_id,)).fetchone()
+            binding = self.store.execution_binding(current_id)
+            if (task["status"] not in {"completed", "failed", "cancelled"}
+                    or task["waiting_reason"] == "provider_state_unknown"
+                    or self.store.conn.execute("SELECT 1 FROM attempts WHERE task_id=? AND settled=0 LIMIT 1", (current_id,)).fetchone()
+                    or self.store.conn.execute("SELECT 1 FROM reservations WHERE task_id=? AND released_at IS NULL LIMIT 1", (current_id,)).fetchone()
+                    or (binding is not None and binding["status"] == "claimed")):
+                pending.append(current_id)
+        if pending:
+            return {"state": "pending", "activation_id": qualification["activation_id"], "task_ids": pending}
+        if not revoked:
+            self.revoke_remote_activation(task_id, qualification["activation_id"], identity=identity)
+        return {"state": "drained", "activation_id": qualification["activation_id"]}
+
     def _task_requires_remote_activation(self, task_id):
         row = self.store.conn.execute(
-            "SELECT capability, execution_request_json, spec_json FROM tasks WHERE id=?",
+            "SELECT execution_request_json, spec_json FROM tasks WHERE id=?",
             (str(task_id),),
         ).fetchone()
         if row is None:
             return False
-        try:
-            request = json.loads(row["execution_request_json"] or "null")
-        except (TypeError, json.JSONDecodeError):
-            request = None
-        if (row["capability"] == QUALIFIED_REMOTE_CAPABILITY
-                and isinstance(request, dict)
-                and isinstance(request.get("target"), dict)
-                and request["target"].get("kind") == "runpod"):
+        if any(kind == "task.remote_activation_qualified" for kind, _ in self._remote_activation_history(task_id)):
+            return True
+        request = self.store._execution_request_from_row(row)
+        target = self.store.effective_execution_target(task_id)
+        if (isinstance(request, dict)
+                and request.get("remote_activation_required") is True
+                and isinstance(target, dict) and target.get("kind") == "runpod"):
             return True
         try:
             spec = json.loads(row["spec_json"] or "{}")
@@ -807,8 +903,18 @@ class RuntimeService:
             expiry = datetime.fromisoformat(recorded["expires_at"].replace("Z", "+00:00"))
         except (KeyError, TypeError, ValueError):
             return False
-        if require_fresh and (expiry.tzinfo is None or expiry <= datetime.now(timezone.utc)):
-            return False
+        marker = self._remote_drain(owner_id, recorded.get("activation_id"))
+        if marker is not None:
+            if marker["qualification"] != recorded:
+                return False
+            if str(task_id) != owner_id and not self._drain_continuation_matches(task_id, marker):
+                return False
+        if require_fresh:
+            if marker is not None:
+                if not self._drain_continuation_matches(task_id, marker):
+                    return False
+            elif expiry.tzinfo is None or expiry <= datetime.now(timezone.utc):
+                return False
         if (recorded.get("task_id") != owner_id
                 or recorded.get("executor_incarnation") != placement.get("executor_incarnation")
                 or recorded.get("evidence_digest") != placement.get("verification", {}).get("evidence_digest")
@@ -867,7 +973,7 @@ class RuntimeService:
             expiry = datetime.fromisoformat(qualification["expires_at"].replace("Z", "+00:00"))
         except (AttributeError, ValueError) as exc:
             raise ValidationError("remote activation expiry is invalid") from exc
-        if expiry.tzinfo is None or expiry <= datetime.now(timezone.utc):
+        if expiry.tzinfo is None:
             raise ConflictError("remote activation has expired")
         if not all(isinstance(qualification[field], str) and qualification[field] for field in
                    ("activation_id", "credential_actor", "executor_incarnation")):
@@ -878,8 +984,12 @@ class RuntimeService:
             if any(kind == "task.remote_activation_revoked" for kind, _payload in history):
                 raise ConflictError("remote activation generation is permanently revoked")
             if any(kind == "task.remote_activation_qualified" and payload == qualification for kind, payload in history):
+                # An exact owner replay is only a receipt for the prior
+                # commit. It can arrive after the activation TTL or a claim.
                 return qualification
             raise ConflictError("remote activation generation was already used")
+        if expiry <= datetime.now(timezone.utc):
+            raise ConflictError("remote activation has expired")
         if latest is not None:
             raise ConflictError("another remote activation is already qualified")
         self.store._append_event(
@@ -907,6 +1017,20 @@ class RuntimeService:
         self._assert_executor_identity(identity, row["executor_id"])
         if identity is None:
             return
+        activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
+        if isinstance(activation, dict):
+            marker = self._remote_drain(activation.get("task_id"), activation.get("activation_id"))
+            cutoff = marker.get("parent_attempt") if marker else None
+            # Checkpoint rows authorize an exact pre-existing resume replay;
+            # their fresh resume path is gated separately before any mutation.
+            if (cutoff is not None and str(row["task_id"]) == activation.get("task_id")
+                    and "checkpoint_path" not in row.keys() and "id" in row.keys()
+                    and not int(row["settled"] or 0)):
+                expected = {"id": cutoff["parent_attempt_id"], "lease_id": cutoff["parent_lease_id"],
+                            "fence": cutoff["parent_fence"], "executor_id": cutoff["executor_id"],
+                            "runtime_epoch": cutoff["runtime_epoch"]}
+                if any(row[field] != value for field, value in expected.items()):
+                    raise AuthorizationError("attempt is outside remote drain cutoff")
         qualified_identity = (
             isinstance(identity, dict)
             and isinstance(identity.get("qualified_activation"), dict)
@@ -4970,8 +5094,12 @@ class RuntimeService:
         activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
         if self._task_requires_remote_activation(parent["id"]) or isinstance(activation, dict):
             placement = self._trusted_execution_placement(identity)
+            marker = self._remote_drain(parent["id"], activation.get("activation_id") if isinstance(activation, dict) else None)
+            cutoff = marker.get("parent_attempt") if marker else None
+            if marker is not None and (cutoff is None or any(payload.get(key) != value for key, value in cutoff.items())):
+                raise AuthorizationError("child authority is outside remote drain cutoff")
             if not self._remote_activation_matches(
-                parent["id"], identity, placement, require_fresh=True
+                parent["id"], identity, placement, require_fresh=marker is None
             ):
                 raise AuthorizationError("remote activation is missing, expired, revoked, or foreign")
             if not self._activation_allows_child(parent, activation, effective_target, placement_version):
@@ -5801,6 +5929,8 @@ class RuntimeService:
             replay = self._command_replay("task.retry", task_id, idempotency_key, request_hash, project_id=project_id)
             if replay is not None:
                 return replay
+            if self._task_drain(task_id) is not None:
+                raise ConflictError("remote drain blocks fresh task retries")
             status = current["task"]["status"]
             if current["task"].get("waiting_reason") == "provider_state_unknown":
                 raise ConflictError(
@@ -5956,6 +6086,26 @@ class RuntimeService:
         if verified_facts is not None:
             result["verified_facts"] = verified_facts
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
+
+    def executor_observation(self, executor_id, *, identity):
+        """Return one exact registered executor for owner-side observation."""
+        if self._require_placement_recovery_owner(identity) != "owner":
+            raise AuthorizationError("executor observation requires the Runtime owner")
+        if not isinstance(executor_id, str) or not executor_id:
+            raise ValidationError("executor_id is required")
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM executors WHERE id=?", (executor_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("executor not found")
+            value = self.store._executor_result(row)
+            value["executor_id"] = value.pop("id")
+            value["runtime_session_id"] = self.runtime_session_id
+            return {key: value[key] for key in (
+                "executor_id", "max_concurrency", "resource_keys", "capabilities",
+                "protocol", "runtime_epoch", "readiness", "readiness_reason",
+                "last_seen_at", "source_digest", "dependency_digest", "source_epoch",
+                "runtime_session_id",
+            ) if key in value} | ({"verified_facts": value["verified_facts"]} if "verified_facts" in value else {})
 
     @_durable_mutation
     def claim_next(self, body, *, idempotency_key=None, identity=None):
@@ -7310,6 +7460,10 @@ class RuntimeService:
                 attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (receipt["attempt_id"],)).fetchone()
                 if attempt:
                     return {"receipt": receipt, "attempt": attempt_resource(attempt)}
+            activation = identity.get("qualified_activation") if isinstance(identity, dict) else None
+            owner_id = activation.get("task_id") if isinstance(activation, dict) else row["task_id"]
+            if self._task_drain(owner_id) is not None:
+                raise ConflictError("remote drain blocks fresh checkpoint resume")
             if row["state"] not in {"recovered", "reboot_requested", "executed"}:
                 raise ConflictError("checkpoint is not ready for resume", details={"state": row["state"]})
             checkpoint_bytes = Path(row["checkpoint_path"]).read_bytes()

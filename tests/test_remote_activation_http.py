@@ -64,11 +64,13 @@ def test_remote_activation_rpc_uses_daemon_owner_and_resident_service(tmp_path):
             "capability_digest": capability_digest,
             "input_object_ids": [],
             "spec": {},
-            "execution_request": {"schema_version": 1, "target": target},
+            "execution_request": {"schema_version": 1, "target": target,
+                                  "remote_activation_required": True},
             "idempotency_key": "remote-activation-admit",
         }, enforce_readiness=True)
         task_id = admitted["task"]["id"]
         qualification = _qualification(service, task_id)
+        assert service._task_requires_remote_activation(task_id)
         route = f"/v1/tasks/{task_id}/remote-activation"
 
         owner = WorkspaceClient(daemon.endpoint, daemon.token)
@@ -120,23 +122,25 @@ def test_remote_activation_rpc_uses_daemon_owner_and_resident_service(tmp_path):
         daemon.stop()
 
 
-def test_resident_remote_credential_is_disabled_until_recorded_activation(tmp_path):
+@pytest.mark.parametrize("capability", ["remote.activation.credential", "pack.render"])
+def test_resident_remote_credential_bootstraps_before_final_activation(tmp_path, capability):
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()
     daemon = RuntimeDaemon(realm, support_root=tmp_path / "support", production_worker_credentials=True).start()
     try:
         service = daemon.service
-        capability = "remote.activation.credential"
         digest = "sha256:" + hashlib.sha256(capability.encode()).hexdigest()
         target = {"kind": "runpod", "pod_id": "pod-1", "provider_account_ref": "account-1"}
         service.register_capability({"capability_id": capability, "definition_digest": digest})
         task_id = service.create_task({
             "capability_id": capability, "capability_digest": digest,
             "input_object_ids": [], "spec": {},
-            "execution_request": {"schema_version": 1, "target": target},
+            "execution_request": {"schema_version": 1, "target": target,
+                                  "remote_activation_required": True},
             "idempotency_key": "credential-admission",
         }, enforce_readiness=True)["task"]["id"]
         qualification = _qualification(service, task_id)
+        assert service._task_requires_remote_activation(task_id)
         qualification["credential_actor"] = "astrid-pack-host"
         placement = {
             "actual": target,
@@ -162,11 +166,26 @@ def test_resident_remote_credential_is_disabled_until_recorded_activation(tmp_pa
         })
         assert result["credential_actor"] == "astrid-pack-host"
         assert daemon.credentials.actor_metadata("astrid-pack-host")["qualified_activation"] == qualification
-        with pytest.raises(RuntimeError):
-            owner.control_remote_credential(task_id, {"action": "enable", "activation_id": qualification["activation_id"]})
-        with pytest.raises(Exception):
-            daemon.credentials.require(daemon.credentials.path_for("astrid-pack-host").read_text().strip(), "worker:execute")
+        token = daemon.credentials.path_for("astrid-pack-host").read_text().strip()
+        worker = Api(daemon.endpoint, token)
+        with pytest.raises(RuntimeError) as error:
+            worker.handshake()
+        assert error.value.status == 401
+        assert owner.control_remote_credential(task_id, {"action": "enable", "activation_id": qualification["activation_id"]}) == {"enabled": True}
+        assert worker.handshake()["actor_id"] == "astrid-pack-host"
+        worker.register_executor("astrid-pack-host", [capability])
+        assert service._latest_remote_activation(task_id) is None
+        assert owner.control_remote_credential(task_id, {"action": "verify", "activation_id": qualification["activation_id"]}) == {"fresh": False}
+        claim = {"executor_id": "astrid-pack-host", "capability_ids": [capability],
+                 "runtime_epoch": service.store._current_runtime_epoch(), "target": target}
+        blocked = worker.request("POST", "/v1/tasks/claim", claim, headers={"Idempotency-Key": "precommit-claim"})
+        assert blocked["waiting_reason"] == "remote_activation_missing"
+        assert "attempt_id" not in blocked
+        assert service.store.get_task(task_id)["task"]["status"] == "queued"
         owner.record_remote_activation(task_id, qualification)
+        admitted = worker.request("POST", "/v1/tasks/claim", claim, headers={"Idempotency-Key": "postcommit-claim"})
+        assert admitted["task_id"] == task_id
+        assert admitted["attempt_id"]
         assert owner.control_remote_credential(task_id, {"action": "enable", "activation_id": qualification["activation_id"]}) == {"enabled": True}
         assert owner.control_remote_credential(task_id, {"action": "verify", "activation_id": qualification["activation_id"]}) == {"fresh": True}
         assert owner.control_remote_credential(task_id, {"action": "revoke", "activation_id": qualification["activation_id"]}) == {"revoked": True}

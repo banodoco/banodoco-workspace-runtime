@@ -59,6 +59,7 @@
       "properties": {
         "schema_version": { "type": "integer", "const": 1 },
         "target": { "$ref": "#/definitions/ExecutionTarget" },
+        "remote_activation_required": { "type": "boolean" },
         "inputs": { "type": "array", "items": { "type": "object" } },
         "workflow": { "type": "object" }, "execution": { "type": "object" },
         "retry_policy": { "type": "object" }, "lifecycle": { "type": "object" },

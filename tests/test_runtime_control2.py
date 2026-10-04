@@ -99,6 +99,61 @@ def test_named_resource_reservation_blocks_and_releases_with_attempt_lease(tmp_p
         service.close()
 
 
+def test_single_gpu_worker_allows_local_orchestration_to_progress(tmp_path):
+    """The caller orchestrates locally while one actual remote GPU task runs."""
+    service = _service(tmp_path / "realm")
+    executor_id = "runpod-host"
+    capabilities = {
+        "gpu.sample.a": {"definition_digest": _digest("gpu.sample.a"), "required_resource_keys": ["gpu"]},
+        "gpu.sample.b": {"definition_digest": _digest("gpu.sample.b"), "required_resource_keys": ["gpu"]},
+    }
+    try:
+        for capability_id, definition in capabilities.items():
+            service.register_capability({"capability_id": capability_id, **definition})
+        service.register_executor({
+            "executor_id": executor_id,
+            "max_concurrency": 1,
+            "resource_keys": ["gpu"],
+            "capabilities": [
+                {"capability_id": capability_id, "definition_digest": definition["definition_digest"],
+                 "required_resource_keys": definition["required_resource_keys"]}
+                for capability_id, definition in capabilities.items()
+            ],
+        }, idempotency_key="runpod-host-register")
+
+        def admit(capability_id: str, key: str) -> str:
+            return service.create_task({
+                "capability_id": capability_id,
+                "capability_digest": capabilities[capability_id]["definition_digest"],
+                "input_object_ids": [], "spec": {}, "idempotency_key": key,
+            })["task"]["id"]
+
+        gpu_first = admit("gpu.sample.a", "gpu-first")
+        claim_body = {"executor_id": executor_id, "capability_ids": list(capabilities),
+                      "runtime_epoch": service.health()["runtime_epoch"]}
+        first_gpu = service.claim_next(claim_body, idempotency_key="gpu-claim-1")
+        assert first_gpu["task_id"] == gpu_first
+        # The local caller can read progress and admit its next executor stage
+        # while the GPU stage runs; it occupies no remote executor slot.
+        assert service.task(gpu_first)["task"]["status"] == "running"
+        gpu_second = admit("gpu.sample.b", "gpu-second")
+        blocked = service.claim_next(claim_body, idempotency_key="gpu-claim-2")
+        assert blocked["task"]["task_id"] == gpu_second
+        assert blocked["task"]["state"] == "queued"
+        assert blocked["waiting_reason"] == "waiting_for_worker"
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE executor_id=? AND status='running'", (executor_id,),
+        ).fetchone()[0] == 1
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM reservations WHERE resource_key='gpu' AND released_at IS NULL",
+        ).fetchone()[0] == 1
+        _settle_attempt(service, first_gpu, idempotency_key="gpu-first-settle")
+        next_gpu = service.claim_next(claim_body, idempotency_key="gpu-claim-3")
+        assert next_gpu["task_id"] == gpu_second
+    finally:
+        service.close()
+
+
 def test_missing_named_resource_has_exact_resource_waiting_reason(tmp_path):
     service = _service(tmp_path / "realm")
     try:
@@ -169,8 +224,10 @@ def test_http_executor_claim_heartbeat_and_release_surface(tmp_path):
         second = owner.request("POST", "/v1/tasks", task_body, headers={**headers, "Idempotency-Key": "task-http-2"})
         worker = Api(daemon.endpoint, daemon.worker_token)
         first_attempt = worker.request("POST", "/v1/tasks/claim", {"executor_id": "executor", "capability_ids": ["render.gpu"], "runtime_epoch": worker.health()["runtime_epoch"]}, headers={"Idempotency-Key": "claim-http-1"})
+        assert first_attempt["task_id"] == first["data"]["task_id"]
         assert first_attempt["fence"] == 1
         blocked = worker.request("POST", "/v1/tasks/claim", {"executor_id": "executor", "capability_ids": ["render.gpu"], "runtime_epoch": worker.health()["runtime_epoch"]}, headers={"Idempotency-Key": "claim-http-2"})
+        assert blocked["task"]["task_id"] == second["data"]["task_id"]
         assert blocked["waiting_reason"] == "waiting_for_worker"
         renewed = worker.request("POST", f"/v1/attempts/{first_attempt['attempt_id']}/heartbeat", {"lease_id": first_attempt["lease_id"], "fence": first_attempt["fence"], "lease_seconds": 60, "runtime_epoch": worker.health()["runtime_epoch"]}, headers={"Idempotency-Key": "heartbeat-http-1"})
         assert renewed["data"]["fence"] == first_attempt["fence"] and renewed["data"]["lease_expires_at"] > first_attempt["lease_expires_at"]
@@ -280,6 +337,7 @@ def test_settlement_effect_rejects_undeclared_stale_and_duplicate(tmp_path):
         }
         duplicate = service.create_task({"capability_id": "render.gpu", "capability_digest": _digest("render.gpu-v1"), "settlement_effect": valid_effect, "idempotency_key": "effect-duplicate"})["task"]["id"]
         duplicate_attempt = _claim_attempt(service, idempotency_key="effect-claim-duplicate")
+        assert duplicate_attempt["task_id"] == duplicate
         settled = _settle_attempt(service, duplicate_attempt, effect=valid_effect, idempotency_key="effect-settle-duplicate")
         assert settled["data"]["state"] == "succeeded"
         assert service.get_project(project["id"])["name"] == "Settled Effect"

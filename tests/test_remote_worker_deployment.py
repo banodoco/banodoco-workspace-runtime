@@ -89,7 +89,7 @@ def _reference(tmp_path: Path) -> DeploymentReference:
             spec_digest=_digest("c"),
             request_digest=_digest("d"),
         ),
-        capability_identity=CapabilityIdentity("h3_av.transform", _digest("e")),
+        capability_identity=CapabilityIdentity("pack.render", _digest("e")),
         original_target={
             "kind": "runpod",
             "pod_id": "pod-1",
@@ -123,12 +123,20 @@ def test_projection_is_deterministic_and_secret_free(tmp_path: Path) -> None:
     assert first.argv[first.argv.index("--credential-file") + 1] == "/tmp/astrid-pack-host.token"
     assert first.argv[first.argv.index("--source-checkout-digest") + 1] == "b" * 64
     assert first.argv.count("--pack-root") == 1
+    assert reference.capacity == 1
+    assert first.argv[first.argv.index("--max-concurrency") + 1] == "1"
     assert env["ASTRID_EXECUTION_TARGET_JSON"] == (
         '{"kind":"runpod","pod_id":"pod-1","provider_account_ref":"runpod"}'
     )
     assert "rpa_live_secret" not in env.values()
     assert "sk-live-secret" not in env.values()
     assert tuple(sorted(first.env_items)) == first.env_items
+
+
+@pytest.mark.parametrize("capacity", [0, 2, True])
+def test_projection_rejects_capacity_without_a_real_worker_loop(tmp_path: Path, capacity) -> None:
+    with pytest.raises(DeploymentReferenceError, match="single GenericPackHost"):
+        DeploymentReference(**{**_reference(tmp_path).__dict__, "capacity": capacity})
 
 
 def test_projection_rejects_conflicting_target(tmp_path: Path) -> None:
@@ -189,7 +197,7 @@ def _task_projection(*, recovered: bool = False) -> dict:
         "run_id": "run-1",
         "project_id": "project-1",
         "idempotency_key": "admission-1",
-        "capability": "h3_av.transform",
+        "capability": "pack.render",
         "capability_digest": _digest("2"),
         "input_object_ids": [_digest("1")],
         "spec": {"schema_version": 1, "input_object_ids": [_digest("1")], "spec": {"prompt": "same"}},
@@ -306,7 +314,7 @@ def admitted_omitted_input_task(tmp_path: Path):
         )["data"]["digest"]
         ids = {"input_bundle": bundle, "request": request}
         admitted = service.create_task({
-            "capability_id": "h3_av.transform",
+            "capability_id": "pack.render",
             "capability_digest": _digest("2"),
             "project": project["id"],
             "input_object_ids": [bundle, request],
@@ -395,7 +403,7 @@ def test_omitted_request_inputs_accept_public_zero_input_task(tmp_path: Path) ->
     service = RuntimeService(root)
     try:
         admitted = service.create_task({
-            "capability_id": "h3_av.transform", "capability_digest": _digest("2"),
+            "capability_id": "pack.render", "capability_digest": _digest("2"),
             "input_object_ids": [], "spec": {"inputs": {"prompt": "hello"}},
             "execution_request": {"schema_version": 1, "target": {
                 "kind": "runpod", "pod_id": "pod-old", "provider_account_ref": "account-a",

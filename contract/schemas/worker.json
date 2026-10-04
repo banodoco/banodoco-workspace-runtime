@@ -62,7 +62,57 @@
         "verified_facts": { "$ref": "#/definitions/VerifiedFacts" },
         "runtime_epoch": { "type": ["integer", "null"], "minimum": 1 },
         "readiness": { "type": "string", "enum": ["ready", "not_ready"] },
-        "readiness_reason": { "type": ["string", "null"] }
+        "readiness_reason": { "type": ["string", "null"] },
+        "last_seen_at": { "type": ["string", "null"] },
+        "runtime_session_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LocalWorkerGeneration": {
+      "type": "object", "additionalProperties": false,
+      "required": ["executor_incarnation", "evidence_digest", "profile_id", "workspace_uuid", "state"],
+      "properties": {
+        "executor_incarnation": { "type": "string", "minLength": 1 },
+        "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "profile_id": { "type": "string", "minLength": 1 },
+        "workspace_uuid": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "enum": ["active", "fencing", "fenced", "stop_unknown", "stopped"] }
+      }
+    },
+    "LocalWorkerRelinquishRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["executor_incarnation", "evidence_digest"],
+      "properties": {
+        "executor_incarnation": { "type": "string", "minLength": 1 },
+        "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "LocalWorkerRelinquishResult": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "executor_incarnation"],
+      "properties": {
+        "state": { "type": "string", "const": "relinquished" },
+        "executor_incarnation": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LocalWorkerStartRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile_id", "expected_workspace_uuid"],
+      "properties": {
+        "profile_id": { "type": "string", "minLength": 1 },
+        "expected_workspace_uuid": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LocalWorkerStartResult": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state", "operation_id", "profile_id", "workspace_uuid", "machine_id", "executor_incarnation", "evidence_digest"],
+      "properties": {
+        "state": { "type": "string", "const": "active" },
+        "operation_id": { "type": "string", "minLength": 1 },
+        "profile_id": { "type": "string", "minLength": 1 },
+        "workspace_uuid": { "type": "string", "minLength": 1 },
+        "machine_id": { "type": "string", "minLength": 1 },
+        "executor_incarnation": { "type": "string", "minLength": 1 },
+        "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
       }
     },
     "VerifiedFacts": {
