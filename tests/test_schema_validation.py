@@ -6,8 +6,20 @@ import json
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
+import yaml
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_complete_openapi_document_parses_source_frame_response() -> None:
+    document = yaml.safe_load((ROOT / "contract/openapi/workspace-v1.yaml").read_text())
+    route = document["paths"]["/v1/projects/{project_id}/thumbnails/source-frame"]
+    assert route["get"]["operationId"] == "getSourceFrameThumbnail"
+    assert route["post"]["operationId"] == "ensureSourceFrameThumbnail"
+    schema = route["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["required"] == ["thumbnail"]
+    assert "thumbnail" in schema["properties"]
 
 
 def validate(schema_name: str, fixture_name: str, *, definition: str | None = None) -> None:

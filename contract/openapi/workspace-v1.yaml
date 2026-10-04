@@ -547,7 +547,7 @@ paths:
         - { name: source_time_seconds, in: query, required: true, schema: { type: number, minimum: 0, maximum: 4000000000, multipleOf: 0.000001 } }
         - { name: recipe_version, in: query, required: false, schema: { type: integer, const: 1, default: 1 } }
       responses:
-        '200': { description: Matching source-frame thumbnail or no match, content: { application/json: { schema: { type: object, required: [thumbnail], properties: { thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] } } } } }
+        '200': { description: Matching source-frame thumbnail or no match, content: { application/json: { schema: { type: object, required: [thumbnail], properties: { thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] } } } } } }
     post:
       operationId: ensureSourceFrameThumbnail
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
