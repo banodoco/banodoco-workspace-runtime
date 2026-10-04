@@ -1,4 +1,5 @@
 import test from "node:test";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { ApiError, WorkspaceClient } from "../dist/generated.js";
 
@@ -85,4 +86,65 @@ test("generated TypeScript recovery routes preserve path identity and 201 checkp
   assert.equal(calls[0].path, "/v1/attempts/a%2F1/prepare-reboot");
   assert.equal(calls[0].body.attempt_id, undefined);
   assert.equal(calls[1].path, "/v1/attempts/a%2F1/checkpoint");
+});
+
+const preference = JSON.parse(readFileSync(new URL("../../../conformance/fixtures/preferences-user.json", import.meta.url), "utf8"));
+
+test("preference clients preserve user null receipts and committed project receipts", async () => {
+  const calls = [];
+  const transport = async (method, path, headers, body) => {
+    calls.push({ method, path, headers, body: body ? JSON.parse(new TextDecoder().decode(body)) : undefined });
+    const data = path.includes("project") ? { ...preference, scope: "project", actor_id: null, project_id: "p /?", document_id: "preferences:project:p /?" } : preference;
+    return { status: 200, headers: {}, body: json(method === "GET" ? data : { data, receipt: data.scope === "user" ? null : { receipt_id: "project-commit" } }) };
+  };
+  const client = new WorkspaceClient("http://runtime", "token", transport);
+  assert.deepEqual(await client.getPreferences("user"), preference);
+  const user = await client.updatePreferences("user", preference.content, 0, "write-1");
+  assert.equal(user.receipt, null);
+  assert.equal(user.content, preference.content);
+  assert.deepEqual(calls.at(-1).body, { content: preference.content, expected_version: 0 });
+  assert.equal(calls.at(-1).headers["Idempotency-Key"], "write-1");
+  assert.equal(calls.at(-1).headers.Authorization, "Bearer token");
+  const project = await client.updatePreferences("project", "text", 0, "write-2", "p /?");
+  assert.equal(project.receipt.receipt_id, "project-commit");
+  assert.equal(calls.at(-1).path, "/v1/preferences/project?project_id=p%20%2F%3F");
+  await client.getPreferences("project");
+  assert.equal(calls.at(-1).path, "/v1/preferences/project");
+});
+
+test("preference clients reject caller ownership and malformed null receipt results", async () => {
+  const noTransport = new WorkspaceClient("http://runtime", undefined, async () => { throw new Error("transport called"); });
+  await assert.rejects(() => noTransport.getPreferences("user", "p"), /cannot select a project/);
+  await assert.rejects(() => noTransport.updatePreferences("user", "text", 0, "key", "p"), /cannot select a project/);
+  await assert.rejects(() => noTransport.getPreferences("invalid"), /scope must be/);
+  for (const response of [
+    { data: preference, receipt: {} },
+    { data: preference },
+    { data: { ...preference, content: {} }, receipt: null },
+    { data: { ...preference, version: true }, receipt: null },
+    { data: { ...preference, actor_id: null }, receipt: null },
+    { data: { ...preference, project_id: "forged" }, receipt: null },
+    { data: { ...preference, document_id: "other" }, receipt: null },
+    { data: { ...preference, extra: "value" }, receipt: null },
+    { data: preference, receipt: null, extra: "value" },
+  ]) {
+    const client = new WorkspaceClient("http://runtime", undefined, async () => ({ status: 200, headers: {}, body: json(response) }));
+    await assert.rejects(() => client.updatePreferences("user", "text", 0, "key"), /invalid/);
+  }
+});
+
+test("null preference receipts do not weaken ordinary or project mutation decoding", async () => {
+  const data = { ...preference, scope: "project", actor_id: null, project_id: "p", document_id: "preferences:project:p" };
+  const client = new WorkspaceClient("http://runtime", undefined, async () => ({ status: 200, headers: {}, body: json({ data, receipt: null }) }));
+  await assert.rejects(() => client.updatePreferences("project", "text", 0, "key"), /committed receipt/);
+  await assert.rejects(() => client.updateDocument("p", "d", 1, "key", "text"), /committed receipt/);
+});
+
+test("document kind filter preserves existing pagination arguments and escapes query values", async () => {
+  const client = new WorkspaceClient("http://runtime", undefined, async (method, path) => {
+    assert.equal(method, "GET");
+    assert.equal(path, "/v1/projects/p%20%2F/documents?limit=5&cursor=next%2Fpage&kind=astrid.note%20%2F%3F");
+    return { status: 200, headers: {}, body: json({ items: [], next_cursor: null }) };
+  });
+  assert.deepEqual(await client.listDocuments("p /", "next/page", 5, "astrid.note /?"), { items: [], next_cursor: null });
 });

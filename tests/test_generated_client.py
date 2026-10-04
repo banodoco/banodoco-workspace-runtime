@@ -335,3 +335,104 @@ def test_python_client_source_is_tracked_and_generated_check_is_not_self_referen
     assert check.returncode != 0
     subprocess.run([sys.executable, str(root / "generators" / "generate.py"), "--python-output", str(isolated)], check=True, cwd=root)
     assert isolated.read_bytes() == output.read_bytes() == original
+
+
+def _preference_fixture(name: str = "preferences-user.json") -> dict:
+    return json.loads((Path(__file__).parents[1] / "conformance" / "fixtures" / name).read_text())
+
+
+def test_preferences_generated_client_typed_user_result_and_encoded_project_selector() -> None:
+    from banodoco_workspace_client import PreferenceMutationResult, PreferenceResource
+
+    resource = _preference_fixture()
+    calls = []
+
+    def transport(method, path, headers, body):
+        calls.append((method, path, headers, json.loads(body) if body else None))
+        data = dict(resource)
+        if "project" in path:
+            data.update(scope="project", actor_id=None, project_id="p /?", document_id="preferences:project:p /?")
+        if method == "GET":
+            return 200, {}, json.dumps(data).encode()
+        return 200, {}, json.dumps({"data": data, "receipt": {"receipt_id": "committed-project"} if data["scope"] == "project" else None}).encode()
+
+    client = WorkspaceClient("http://runtime", "token", transport=transport)
+    assert isinstance(client.get_preferences("user"), PreferenceResource)
+    user = client.update_preferences("user", resource["content"], 0, "user-write")
+    assert isinstance(user, PreferenceMutationResult)
+    assert isinstance(user.data, PreferenceResource)
+    assert user.content == resource["content"] and user.receipt is None
+    assert calls[-1][3] == {"content": resource["content"], "expected_version": 0}
+    assert calls[-1][2]["Idempotency-Key"] == "user-write"
+    assert calls[-1][2]["Authorization"] == "Bearer token"
+    project = client.update_preferences("project", "text", 1, "project-write", "p /?")
+    assert project.receipt == {"receipt_id": "committed-project"}
+    assert calls[-1][1] == "/v1/preferences/project?project_id=p%20%2F%3F"
+    client.get_preferences("project")
+    assert calls[-1][1] == "/v1/preferences/project"
+
+
+@pytest.mark.parametrize("scope,selector", [("user", "p"), ("invalid", None)])
+def test_preferences_generated_client_rejects_invalid_scope_and_user_project_selector(scope, selector) -> None:
+    client = WorkspaceClient("http://runtime", transport=lambda *args: pytest.fail("transport called"))
+    with pytest.raises(ValueError):
+        client.get_preferences(scope, selector)
+    with pytest.raises(ValueError):
+        client.update_preferences(scope, "content", 0, "key", selector)
+
+
+@pytest.mark.parametrize("response", [
+    {"data": _preference_fixture(), "receipt": {}},
+    {"data": _preference_fixture()},
+    {"data": {**_preference_fixture(), "content": {}}, "receipt": None},
+    {"data": {**_preference_fixture(), "version": True}, "receipt": None},
+    {"data": {**_preference_fixture(), "actor_id": None}, "receipt": None},
+    {"data": {**_preference_fixture(), "project_id": "forged"}, "receipt": None},
+    {"data": {**_preference_fixture(), "document_id": "other"}, "receipt": None},
+    {"data": {**_preference_fixture(), "extra": "value"}, "receipt": None},
+    {"data": _preference_fixture(), "receipt": None, "extra": "value"},
+])
+def test_preferences_user_null_receipt_decoder_is_narrow(response) -> None:
+    client = WorkspaceClient("http://runtime", transport=lambda *args: (200, {}, json.dumps(response).encode()))
+    with pytest.raises(ApiError, match="invalid_response"):
+        client.update_preferences("user", "content", 0, "key")
+
+
+def test_preferences_project_and_ordinary_mutations_still_require_receipts() -> None:
+    resource = {**_preference_fixture(), "scope": "project", "actor_id": None, "project_id": "p", "document_id": "preferences:project:p"}
+    client = WorkspaceClient("http://runtime", transport=lambda *args: (200, {}, json.dumps({"data": resource, "receipt": None}).encode()))
+    with pytest.raises(ApiError, match="committed receipt"):
+        client.update_preferences("project", "content", 0, "key")
+    with pytest.raises(ApiError, match="committed receipt"):
+        client.update_document("p", "doc", expected_version=1, idempotency_key="key", content="content")
+
+
+def test_update_document_distinguishes_omitted_content_from_json_null() -> None:
+    payloads = []
+
+    def transport(method, path, headers, body):
+        assert method == "PATCH" and path == "/v1/projects/p/documents/doc"
+        payload = json.loads(body)
+        payloads.append(payload)
+        resource = {
+            "document_id": "doc", "project_id": "p", "kind": "pack.note",
+            "content": payload.get("content", "previous"), "version": 2,
+            "created_at": "2026-10-02T00:00:00Z", "updated_at": "2026-10-02T00:00:01Z",
+        }
+        return 200, {}, json.dumps({"data": resource, "receipt": {}}).encode()
+
+    client = WorkspaceClient("http://runtime", transport=transport)
+    client.update_document("p", "doc", expected_version=1, idempotency_key="null", content=None)
+    client.update_document("p", "doc", expected_version=1, idempotency_key="omitted")
+    assert payloads == [
+        {"expected_version": 1, "content": None},
+        {"expected_version": 1},
+    ]
+
+
+def test_list_documents_generated_client_kind_filter_is_encoded() -> None:
+    def transport(method, path, headers, body):
+        assert method == "GET"
+        assert path == "/v1/projects/p%20%2F/documents?limit=5&cursor=next%2Fpage&kind=astrid.note%20%2F%3F"
+        return 200, {}, b'{"items": [], "next_cursor": null}'
+    assert WorkspaceClient("http://runtime", transport=transport).list_documents("p /", cursor="next/page", limit=5, kind="astrid.note /?") == ([], None)

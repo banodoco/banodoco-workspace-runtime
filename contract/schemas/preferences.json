@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://banodoco.dev/workspace/v1/schemas/preferences.json",
+  "title": "Actor or project preferences",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scope",
+    "actor_id",
+    "project_id",
+    "document_id",
+    "content",
+    "version",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "scope": {
+      "enum": [
+        "user",
+        "project"
+      ]
+    },
+    "actor_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "project_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "document_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "content": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updated_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "scope": {
+          "const": "user"
+        },
+        "actor_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "properties": {
+        "scope": {
+          "const": "project"
+        },
+        "actor_id": {
+          "type": "null"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      }
+    }
+  ]
+}

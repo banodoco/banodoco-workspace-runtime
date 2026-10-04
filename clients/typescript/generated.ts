@@ -4,11 +4,11 @@
  */
 export const PROTOCOL = "workspace.v1" as const;
 export const GENERATOR = "GENERATOR-TYPESCRIPT-CONFORMANCE" as const;
-export const COMPONENT_MANIFEST_SHA256 = "fcae767eaba85e406658ac3b14f3c3447e11073dffcb5e1256e223bdb84f51f4" as const;
-export const CONTRACT_SHA256 = "ee67d6429040d0c13cdcb5bec3027e2b828802a2fac9dff4b953027262081f99" as const;
-export const SCHEMA_MANIFEST_SHA256 = "7843950c0c6e723debda80484265f5b6590d3cc496aa83a5d64c9e17c03ca2af" as const;
-export const SCHEMA_DIGEST = "sha256:d2f5a6d546f5220b0e33b52dec114e502d1aa9be58f83a376d6efc9ede8d7860" as const;
-export const OPERATIONS = ["addShotItem","admitDelegatedTask","admitTask","adoptManagedOutput","archiveProjectReference","archiveProjectShot","archiveReference","archiveShot","archiveTimeline","associateReference","attachVariantThumbnail","cancelRun","cancelTask","checkpointAttempt","claimTask","controlRemoteCredential","createBackup","createDocument","createGeneration","createMediaRelation","createProject","createProjectReference","createProjectShot","createReference","createShot","createTimeline","createTimelineDocument","createTimelineView","createVariant","currentProject","diffTimeline","doctor","ensureSourceFrameThumbnail","exportManagedOutput","exportRealm","failAttempt","getDocument","getGeneration","getManagedOutput","getObject","getProject","getProjectMediaImport","getProjectObjectLocation","getProjectParentCompositionRevision","getProjectReference","getProjectShot","getProjectShotRevision","getProjectShotTextBinding","getProjectTimeline","getProjectTimelineRevision","getRealm","getReference","getRun","getShot","getSourceFrameThumbnail","getTask","getVariant","handshake","headObject","health","heartbeatAttempt","importProjectMedia","ingestObject","ingestProjectObject","inspectTimeline","issueChildAuthority","linkReferences","listCapabilities","listDocuments","listEvents","listGenerations","listManagedOutputs","listMediaRelations","listProjectObjects","listProjectReferences","listProjectRuns","listProjectShotTextBindings","listProjectShots","listProjectTasks","listProjects","listRunEvents","listTimelineHistory","listTimelines","listVariants","markGenerationVariantsViewed","markVariantViewed","prepareReboot","promoteProjectShotCandidate","publishParentComposition","publishTimelineRender","purgeRealm","rebindProjectShotTextBinding","recordRemoteActivation","recoverProjectReference","recoverProjectShot","recoverRealm","recoverReference","recoverShot","recoverTaskPlacement","recoverTimeline","registerCapability","registerExecutor","removeShotItem","reorderShotItems","replaceParentCompositionMedia","replaceTimelineClip","requestReboot","restoreBackup","resumeAttempt","retryRun","retryTask","revokeRemoteActivation","selectProject","setPrimaryReference","setProjectShotTextBinding","setProjectShotTextBindingById","settleAttempt","tombstoneRealm","updateDocument","updateManagedOutputLifecycle","updateProject","updateProjectReference","updateProjectShot","updateReference","updateShot","updateTimeline"] as const;
+export const COMPONENT_MANIFEST_SHA256 = "43db3374e0235750a3d0dd6590926cccba73e6e67de317573f86fd812cbcf082" as const;
+export const CONTRACT_SHA256 = "ae5177f64959c27346b7e09fe26ec32cb5c2d42c1645a8d52915e688e9768cc3" as const;
+export const SCHEMA_MANIFEST_SHA256 = "ef9b12f20ddcb5a1b5315c4d1180aa702b8a196ab9ba044b89a4564ddfc13d50" as const;
+export const SCHEMA_DIGEST = "sha256:21ee7cecb9a230e1dee787db5cb65f5ccf03ccdfb4fcce68e7b062ae1a38e9d6" as const;
+export const OPERATIONS = ["addShotItem","admitDelegatedTask","admitTask","adoptManagedOutput","archiveProjectReference","archiveProjectShot","archiveReference","archiveShot","archiveTimeline","associateReference","attachVariantThumbnail","cancelRun","cancelTask","checkpointAttempt","claimTask","controlRemoteCredential","createBackup","createDocument","createGeneration","createMediaRelation","createProject","createProjectReference","createProjectShot","createReference","createShot","createTimeline","createTimelineDocument","createTimelineView","createVariant","currentProject","diffTimeline","doctor","ensureSourceFrameThumbnail","exportManagedOutput","exportRealm","failAttempt","getDocument","getGeneration","getManagedOutput","getObject","getPreferences","getProject","getProjectMediaImport","getProjectObjectLocation","getProjectParentCompositionRevision","getProjectReference","getProjectShot","getProjectShotRevision","getProjectShotTextBinding","getProjectTimeline","getProjectTimelineRevision","getRealm","getReference","getRun","getShot","getSourceFrameThumbnail","getTask","getVariant","handshake","headObject","health","heartbeatAttempt","importProjectMedia","ingestObject","ingestProjectObject","inspectTimeline","issueChildAuthority","linkReferences","listCapabilities","listDocuments","listEvents","listGenerations","listManagedOutputs","listMediaRelations","listProjectObjects","listProjectReferences","listProjectRuns","listProjectShotTextBindings","listProjectShots","listProjectTasks","listProjects","listRunEvents","listTimelineHistory","listTimelines","listVariants","markGenerationVariantsViewed","markVariantViewed","prepareReboot","promoteProjectShotCandidate","publishParentComposition","publishTimelineRender","purgeRealm","rebindProjectShotTextBinding","recordRemoteActivation","recoverProjectReference","recoverProjectShot","recoverRealm","recoverReference","recoverShot","recoverTaskPlacement","recoverTimeline","registerCapability","registerExecutor","removeShotItem","reorderShotItems","replaceParentCompositionMedia","replaceTimelineClip","requestReboot","restoreBackup","resumeAttempt","retryRun","retryTask","revokeRemoteActivation","selectProject","setPrimaryReference","setProjectShotTextBinding","setProjectShotTextBindingById","settleAttempt","tombstoneRealm","updateDocument","updateManagedOutputLifecycle","updatePreferences","updateProject","updateProjectReference","updateProjectShot","updateReference","updateShot","updateTimeline"] as const;
 export type HeadersLike = Record<string, string>;
 export type Transport = (method: string, path: string, headers: HeadersLike, body?: Uint8Array) => Promise<{ status: number; headers: HeadersLike; body: Uint8Array }>;
 export interface ObjectLocation { object_id: string; digest: string; size: number; media_type: string; filename?: string | null; local_path: string; storage: "runtime_cas"; verified: true }
@@ -45,6 +45,9 @@ export interface ManagedOutput {
 export interface ManagedOutputPage { items: ManagedOutput[]; next_cursor: string | null; }
 export interface ManagedOutputAdoption { association_id?: string; manifest_ref?: string | null; object_id?: string; digest?: string; size?: number; filename?: string; media_type?: string; output_port?: string; selector?: Record<string, unknown>; ordinal?: number; role?: string; durability?: ManagedOutputDurability; }
 export interface ManagedOutputLifecycle { operation: "lease" | "release" | "pin" | "unpin" | "expire" | "reclaim" | "promote"; expected_version: number; lease_id?: string; lease_owner?: string; lease_seconds?: number; provenance?: Record<string, unknown>; }
+export type PreferenceScope = "user" | "project";
+export interface PreferenceResource { scope: PreferenceScope; actor_id: string | null; project_id: string | null; document_id: string; content: string; version: number; created_at: string | null; updated_at: string | null }
+export type PreferenceMutationResult = PreferenceResource & { readonly receipt: Record<string, unknown> | null };
 export type MutationResult<T> = T & { readonly receipt: Record<string, unknown> };
 
 export class ApiError extends Error {
@@ -89,6 +92,37 @@ export class WorkspaceClient {
     const value = this.json<{ data?: T; receipt?: Record<string, unknown> }>(body);
     if (!value.data || !value.receipt) throw new Error("invalid mutation response: committed receipt is required");
     return Object.assign(value.data, { receipt: value.receipt }) as MutationResult<T>;
+  }
+  private preferencesPath(scope: PreferenceScope, projectId?: string): string {
+    if (scope !== "user" && scope !== "project") throw new Error("preference scope must be user or project");
+    if (scope === "user" && projectId !== undefined) throw new Error("user preferences cannot select a project");
+    return "/v1/preferences/" + scope + (projectId !== undefined ? "?project_id=" + encodeURIComponent(projectId) : "");
+  }
+  private preferenceResource(value: unknown, scope: PreferenceScope): PreferenceResource {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid preference resource");
+    const v = value as Record<string, unknown>;
+    const fields = ["scope", "actor_id", "project_id", "document_id", "content", "version", "created_at", "updated_at"];
+    if (Object.keys(v).length !== fields.length || fields.some(key => !(key in v))) throw new Error("invalid preference resource fields");
+    const owner = scope === "user" ? v.actor_id : v.project_id;
+    const other = scope === "user" ? v.project_id : v.actor_id;
+    if (v.scope !== scope || typeof owner !== "string" || !owner || other !== null || v.document_id !== "preferences:" + scope + ":" + owner || typeof v.content !== "string" || !Number.isInteger(v.version) || (v.version as number) < 0 || [v.created_at, v.updated_at].some(item => item !== null && typeof item !== "string")) throw new Error("invalid preference resource ownership, content or version");
+    return v as unknown as PreferenceResource;
+  }
+  private preferenceMutation(body: Uint8Array, scope: PreferenceScope): PreferenceMutationResult {
+    const value = this.json<Record<string, unknown>>(body);
+    if (!value || Object.keys(value).length !== 2 || !("data" in value) || !("receipt" in value)) throw new Error("invalid preference mutation response");
+    const resource = this.preferenceResource(value.data, scope);
+    if (scope === "project") return this.mutation<PreferenceResource>(body);
+    if (value.receipt !== null) throw new Error("invalid user preference mutation: null receipt is required");
+    Object.defineProperty(resource, "receipt", { value: null, enumerable: false, writable: false });
+    return resource as PreferenceMutationResult;
+  }
+  async getPreferences(scope: PreferenceScope, projectId?: string): Promise<PreferenceResource> {
+    return this.preferenceResource(this.json((await this.call("getPreferences", "GET", this.preferencesPath(scope, projectId))).body), scope);
+  }
+  async updatePreferences(scope: PreferenceScope, content: string, expectedVersion: number, idempotencyKey: string, projectId?: string): Promise<PreferenceMutationResult> {
+    const path = this.preferencesPath(scope, projectId);
+    return this.preferenceMutation((await this.call("updatePreferences", "PUT", path, new TextEncoder().encode(JSON.stringify({ content, expected_version: expectedVersion })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body, scope);
   }
   async handshake(clientName: string, clientVersion: string, requestedScopes: string[]): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("handshake", "POST", "/v1/handshake", new TextEncoder().encode(JSON.stringify({ protocol: PROTOCOL, client_name: clientName, client_version: clientVersion, requested_scopes: requestedScopes })), { "Content-Type": "application/json" })).body);
@@ -138,6 +172,10 @@ export class WorkspaceClient {
   }
   async getProjectTimelineRevision(projectId: string, timelineId: string, revision: string): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("getProjectTimelineRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/revisions/" + encodeURIComponent(revision))).body);
+  }
+  async listDocuments(projectId: string, cursor?: string, limit = 50, kind?: string): Promise<{ items: Record<string, unknown>[]; next_cursor: string | null }> {
+    const query = "?limit=" + limit + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "") + (kind !== undefined ? "&kind=" + encodeURIComponent(kind) : "");
+    return this.page<Record<string, unknown>>((await this.call("listDocuments", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/documents" + query)).body);
   }
   async getProjectTimeline(projectId: string, timelineId: string): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("getProjectTimeline", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId))).body);

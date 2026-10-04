@@ -107,10 +107,26 @@ paths:
       responses:
         '200': { description: Persisted actor-scoped selection with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
         '404': { $ref: '#/components/responses/NotFound' }
+  /v1/preferences/{scope}:
+    get:
+      operationId: getPreferences
+      description: Read actor-owned user preferences or preferences for an explicit or selected project. Absent preferences return empty Markdown and version zero without writing. User scope rejects any project_id selector.
+      parameters: [ { $ref: '#/components/parameters/PreferenceScope' }, { $ref: '#/components/parameters/PreferenceProjectId' } ]
+      responses:
+        '200': { description: Preference resource, content: { application/json: { schema: { $ref: '#/components/schemas/PreferenceResource' } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: updatePreferences
+      description: Write Markdown with compare-and-swap and durable idempotency. User ownership comes exclusively from bearer identity; user scope rejects any project_id selector. Project scope uses a committed project-document receipt.
+      parameters: [ { $ref: '#/components/parameters/PreferenceScope' }, { $ref: '#/components/parameters/PreferenceProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdatePreferences' } } } }
+      responses:
+        '200': { description: Preference mutation, content: { application/json: { schema: { $ref: '#/components/schemas/PreferenceMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
   /v1/projects/{project_id}/documents:
     get:
       operationId: listDocuments
-      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' } ]
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/Cursor' }, { $ref: '#/components/parameters/Limit' }, { name: kind, in: query, schema: { type: string } } ]
       responses: { '200': { description: Project documents, content: { application/json: { schema: { $ref: '#/components/schemas/DocumentPage' } } } } }
     post:
       operationId: createDocument
@@ -774,6 +790,16 @@ components:
   securitySchemes:
     bearerAuth: { type: http, scheme: bearer, bearerFormat: workspace-scoped-token }
   parameters:
+    PreferenceScope:
+      name: scope
+      in: path
+      required: true
+      schema: { type: string, enum: [user, project] }
+    PreferenceProjectId:
+      name: project_id
+      in: query
+      description: Optional explicit project selector for project scope; forbidden for user scope.
+      schema: { type: string, minLength: 1 }
     Cursor: { name: cursor, in: query, required: false, schema: { type: string, minLength: 1 } }
     Limit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
     IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$' } }
@@ -1261,6 +1287,27 @@ components:
       additionalProperties: false
       required: [shot_id, project_id, name, metadata, version, items, archived]
       properties: { shot_id: { type: string }, project_id: { type: string }, name: { type: string, minLength: 1 }, metadata: { type: object }, version: { type: integer, minimum: 1 }, items: { type: array, items: { $ref: '#/components/schemas/ShotItem' } }, archived: { type: boolean }, revision_id: { type: string }, internal_timeline_revision_id: { type: string }, content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }, created_at: { type: string }, updated_at: { type: string } }
+    PreferenceResource:
+      $ref: './schemas/preferences.json'
+    UpdatePreferences:
+      type: object
+      additionalProperties: false
+      required: [content, expected_version]
+      properties: { content: { type: string }, expected_version: { type: integer, minimum: 0 } }
+    PreferenceMutation:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [data, receipt]
+          properties:
+            data:
+              allOf: [ { $ref: '#/components/schemas/PreferenceResource' }, { properties: { scope: { const: user } } } ]
+            receipt: { type: 'null' }
+        - allOf:
+            - { $ref: '#/components/schemas/CommittedMutation' }
+            - properties:
+                data:
+                  allOf: [ { $ref: '#/components/schemas/PreferenceResource' }, { properties: { scope: { const: project } } } ]
     CommittedMutation:
       type: object
       additionalProperties: false

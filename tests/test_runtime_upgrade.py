@@ -9,7 +9,7 @@ import sys
 import pytest
 
 from runtime_protocol.errors import OwnerBusyError, RealmAdmissionError, ValidationError
-from runtime_protocol.store import RealmStore
+from runtime_protocol.store import SCHEMA_VERSION, RealmStore
 from runtime_protocol.upgrade import (
     inspect_canonical_schema,
     migrate_canonical_to_current,
@@ -39,6 +39,7 @@ def _legacy_realm(root, *, register_indexes=True):
             DROP TABLE managed_output_lifecycle;
             DROP TABLE managed_output_associations;
             DROP TABLE runtime_schema;
+            DROP TABLE user_preferences;
             CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
             CREATE TABLE canonical_receipt_backfills(id INTEGER PRIMARY KEY, detail TEXT);
             CREATE TABLE lost_and_found(id INTEGER PRIMARY KEY, payload BLOB);
@@ -95,29 +96,36 @@ def _legacy_realm(root, *, register_indexes=True):
     return realm_id
 
 
-def test_upgrade_archives_legacy_state_and_preserves_canonical_rows(tmp_path):
+@pytest.mark.parametrize("retain_backup", [False, True])
+def test_upgrade_preserves_canonical_rows_and_retains_backup_only_when_requested(tmp_path, retain_backup):
     root = tmp_path / "realm"
     realm_id = _legacy_realm(root)
 
-    result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    result = upgrade_realm(root, retain_backup=retain_backup, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     assert result["ok"] is True
-    archive = tmp_path / "realm" / "realm-upgrade-backups" / result["archive"].split("/")[-1]
-    manifest = json.loads((archive / "manifest.json").read_text())
-    assert manifest["source_schema_version"] == 23
-    assert manifest["target_schema_version"] == 26
-    assert manifest["historical_managed_outputs"]["migrated"] == 1
-    assert set(manifest["legacy_tables"]) >= {"schema_migrations", "lost_and_found"}
-    assert (archive / "realm.sqlite3").is_file()
-    archived = sqlite3.connect(archive / "realm.sqlite3")
-    try:
-        assert archived.execute("SELECT payload FROM lost_and_found WHERE id=1").fetchone()[0] == b"legacy-bytes"
-    finally:
-        archived.close()
+    assert result["backup_retained"] is retain_backup
+    assert not list(tmp_path.glob(".realm-upgrade-transaction-*"))
+    if retain_backup:
+        archive = tmp_path / "realm" / "realm-upgrade-backups" / result["archive"].split("/")[-1]
+        manifest = json.loads((archive / "manifest.json").read_text())
+        assert manifest["source_schema_version"] == 23
+        assert manifest["target_schema_version"] == SCHEMA_VERSION
+        assert manifest["historical_managed_outputs"]["migrated"] == 1
+        assert set(manifest["legacy_tables"]) >= {"schema_migrations", "lost_and_found"}
+        assert (archive / "realm.sqlite3").is_file()
+        archived = sqlite3.connect(archive / "realm.sqlite3")
+        try:
+            assert archived.execute("SELECT payload FROM lost_and_found WHERE id=1").fetchone()[0] == b"legacy-bytes"
+        finally:
+            archived.close()
+    else:
+        assert result["archive"] is None
+        assert not (root / "realm-upgrade-backups").exists()
 
     reopened = RealmStore(root)
     try:
         row = reopened.conn.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
-        assert tuple(row) == ("astrid-runtime-sqlite-v1", 26)
+        assert tuple(row) == ("astrid-runtime-sqlite-v1", SCHEMA_VERSION)
         assert reopened.conn.execute("SELECT id FROM realm").fetchone()[0] == realm_id
         assert reopened.conn.execute("SELECT id FROM generations").fetchone()[0] == "generation-1"
         migrated_output = reopened.list_managed_outputs("task-1")
@@ -167,6 +175,7 @@ def test_canonical_v24_variant_state_migration_is_additive_and_refuses_repeat(tm
         connection.execute("DROP TABLE generation_variants_v25")
         connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
         connection.execute("DROP TABLE execution_bindings")
+        connection.execute("DROP TABLE user_preferences")
         connection.execute("UPDATE runtime_schema SET version=24 WHERE id=1")
         connection.commit()
     finally:
@@ -225,6 +234,7 @@ def test_execution_binding_migration_adds_only_the_targeted_contract(tmp_path):
     try:
         connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
         connection.execute("DROP TABLE execution_bindings")
+        connection.execute("DROP TABLE user_preferences")
         connection.execute("UPDATE runtime_schema SET version=25 WHERE id=1")
         realm_id = connection.execute("SELECT id FROM realm LIMIT 1").fetchone()[0]
         connection.commit()
@@ -248,9 +258,19 @@ def test_execution_binding_migration_adds_only_the_targeted_contract(tmp_path):
 
 
 def _canonical_fixture(root, version):
-    RealmStore.initialize(root, realm_id=f"realm-v{version}").close()
+    store = RealmStore.initialize(root, realm_id=f"realm-v{version}")
+    project = store.create_project("kept", "Kept project", idempotency_key="fixture-project")
+    timestamp = "2026-10-02T00:00:00Z"
+    store.conn.execute(
+        "INSERT INTO project_documents(id, project_id, kind, content_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("kept-doc", project["id"], "markdown", json.dumps("# Kept\n\nDocument"), 3, timestamp, timestamp),
+    )
+    store.conn.commit()
+    store.close()
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
+        if version < 27:
+            connection.execute("DROP TABLE user_preferences")
         if version <= 25:
             connection.execute("ALTER TABLE tasks DROP COLUMN execution_request_json")
             connection.execute("DROP TABLE execution_bindings")
@@ -277,25 +297,44 @@ def _canonical_fixture(root, version):
     return f"realm-v{version}"
 
 
-@pytest.mark.parametrize("source_version, expected_steps", [(24, 2), (25, 1)])
-def test_complete_canonical_migration_chain_reaches_exact_v26(tmp_path, source_version, expected_steps):
+@pytest.mark.parametrize("source_version, expected_steps", [(24, 3), (25, 2), (26, 1)])
+def test_complete_canonical_migration_chain_reaches_exact_v27(tmp_path, source_version, expected_steps):
     root = tmp_path / f"realm-{source_version}"
     realm_id = _canonical_fixture(root, source_version)
+    assert inspect_canonical_schema(root)["kind"] == f"v{source_version}"
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        projects_before = connection.execute("SELECT * FROM projects ORDER BY id").fetchall()
+        documents_before = connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall()
     result = migrate_canonical_to_current(
         root,
         confirmation=f"MIGRATE CANONICAL {realm_id}",
         expected_realm_id=realm_id,
     )
     assert result["source_schema_version"] == source_version
-    assert result["target_schema_version"] == 26
+    assert result["target_schema_version"] == 27
     assert len(result["steps"]) == expected_steps
-    assert inspect_canonical_schema(root, expected_realm_id=realm_id)["version"] == 26
+    assert inspect_canonical_schema(root, expected_realm_id=realm_id)["version"] == 27
+
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        assert connection.execute("SELECT * FROM projects ORDER BY id").fetchall() == projects_before
+        assert connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall() == documents_before
+        assert connection.execute("SELECT COUNT(*) FROM user_preferences").fetchone()[0] == 0
+    reopened = RealmStore(root)
+    try:
+        assert reopened.integrity_report()["ok"] is True
+    finally:
+        reopened.close()
 
 
 def test_current_canonical_migration_is_read_only_idempotent(tmp_path):
     root = tmp_path / "realm-current"
-    realm_id = _canonical_fixture(root, 26)
+    realm_id = _canonical_fixture(root, SCHEMA_VERSION)
     database = root / "realm.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO user_preferences VALUES (?, ?, ?, ?, ?, ?)",
+            ("actor-a", "preferences-a", "# Saved preferences", 4, "created", "updated"),
+        )
     before = database.read_bytes()
     first = migrate_canonical_to_current(
         root,
@@ -316,11 +355,11 @@ def test_current_canonical_migration_is_read_only_idempotent(tmp_path):
 @pytest.mark.parametrize("mutation, message", [("newer", "newer than supported"), ("alternate", "layout")])
 def test_unknown_canonical_layout_is_rejected_without_mutation(tmp_path, mutation, message):
     root = tmp_path / mutation
-    realm_id = _canonical_fixture(root, 26)
+    realm_id = _canonical_fixture(root, SCHEMA_VERSION)
     connection = sqlite3.connect(root / "realm.sqlite3")
     try:
         if mutation == "newer":
-            connection.execute("UPDATE runtime_schema SET version=27 WHERE id=1")
+            connection.execute("UPDATE runtime_schema SET version=28 WHERE id=1")
         else:
             connection.execute("ALTER TABLE tasks ADD COLUMN distributed_binding_json TEXT")
         connection.commit()
@@ -336,6 +375,18 @@ def test_unknown_canonical_layout_is_rejected_without_mutation(tmp_path, mutatio
         )
     assert database.read_bytes() == before
     assert not (root / ".runtime-owner.lock").exists()
+
+
+@pytest.mark.parametrize("source_version", [24, 25, 26])
+def test_historical_canonical_version_rejects_preferences_table(tmp_path, source_version):
+    root = tmp_path / "wrong-historical-shape"
+    realm_id = _canonical_fixture(root, source_version)
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        connection.execute("CREATE TABLE user_preferences(actor_id TEXT PRIMARY KEY, content TEXT)")
+    before = (root / "realm.sqlite3").read_bytes()
+    with pytest.raises(ValidationError, match="unexpected tables: user_preferences"):
+        migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {realm_id}")
+    assert (root / "realm.sqlite3").read_bytes() == before
 
 
 def test_canonical_identity_fence_precedes_mutation(tmp_path):
@@ -373,9 +424,53 @@ def test_complete_chain_rolls_back_if_second_step_is_interrupted(tmp_path, monke
     assert inspect_canonical_schema(root, expected_realm_id=realm_id)["version"] == 24
 
 
+@pytest.mark.parametrize("source_version", [24, 25, 26])
+def test_preferences_migration_rolls_back_entire_chain_on_interruption(tmp_path, monkeypatch, source_version):
+    import runtime_protocol.upgrade as upgrade_module
+
+    root = tmp_path / "interrupted-preferences"
+    realm_id = _canonical_fixture(root, source_version)
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        documents_before = connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall()
+    original = upgrade_module._apply_v26_to_v27
+
+    def interrupted(connection):
+        original(connection)
+        raise RuntimeError("injected preferences interruption")
+
+    monkeypatch.setattr(upgrade_module, "_apply_v26_to_v27", interrupted)
+    with pytest.raises(RuntimeError, match="injected preferences interruption"):
+        migrate_canonical_to_current(root, confirmation=f"MIGRATE CANONICAL {realm_id}")
+    assert inspect_canonical_schema(root)["version"] == source_version
+    with sqlite3.connect(root / "realm.sqlite3") as connection:
+        assert connection.execute("SELECT * FROM project_documents ORDER BY id").fetchall() == documents_before
+        assert not connection.execute("SELECT name FROM sqlite_master WHERE name='user_preferences'").fetchall()
+
+
+def test_preferences_table_actor_key_and_stable_id_constraints(tmp_path):
+    root = tmp_path / "preferences-constraints"
+    store = RealmStore.initialize(root)
+    try:
+        row = ("actor-a", "preferences-a", "# Preferences", 1, "created", "updated")
+        store.conn.execute("INSERT INTO user_preferences VALUES (?, ?, ?, ?, ?, ?)", row)
+        store.conn.commit()
+        assert store.conn.execute("SELECT content FROM user_preferences WHERE actor_id=?", ("actor-a",)).fetchone()[0] == "# Preferences"
+        for conflicting in (
+            ("actor-a", "preferences-b", "other", 1, "created", "updated"),
+            ("actor-b", "preferences-a", "other", 1, "created", "updated"),
+            (None, "preferences-b", "other", 1, "created", "updated"),
+            ("actor-b", "preferences-b", "other", 0, "created", "updated"),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                store.conn.execute("INSERT INTO user_preferences VALUES (?, ?, ?, ?, ?, ?)", conflicting)
+            store.conn.rollback()
+    finally:
+        store.close()
+
+
 def test_current_inspection_and_noop_reject_symlink_alias_without_mutation(tmp_path):
     root = tmp_path / "canonical"
-    realm_id = _canonical_fixture(root, 26)
+    realm_id = _canonical_fixture(root, SCHEMA_VERSION)
     alias = tmp_path / "alias"
     alias.symlink_to(root, target_is_directory=True)
     before = (root / "realm.sqlite3").read_bytes()
@@ -539,7 +634,7 @@ os._exit(0)
     )
     assert (root / "realm.sqlite3-wal").is_file()
 
-    result = upgrade_realm(root, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
+    result = upgrade_realm(root, retain_backup=True, timeout_seconds=30, confirmation=f"UPGRADE {realm_id}")
     archive = root / "realm-upgrade-backups" / result["archive"].split("/")[-1]
     manifest = json.loads((archive / "manifest.json").read_text())
     assert "realm.sqlite3-wal" in manifest["components"]

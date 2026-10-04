@@ -147,5 +147,14 @@ def test_generation_schema_reserves_direct_thumbnail_descriptor() -> None:
         "updated_at": "2026-09-22T00:00:00Z",
     }
     assert not list(Draft202012Validator(schema).iter_errors(generation))
+    generation["metadata"]["thumbnail"]["selection"] = {
+        "kind": "source_frame", "source_time_seconds": 12.345678,
+    }
+    assert not list(Draft202012Validator(schema).iter_errors(generation))
+    generation["metadata"]["thumbnail"]["selection"]["source_time_seconds"] = 12.3456789
+    assert list(Draft202012Validator(schema).iter_errors(generation))
+    generation["metadata"]["thumbnail"]["selection"] = {"kind": "source_frame"}
+    assert list(Draft202012Validator(schema).iter_errors(generation))
+    generation["metadata"]["thumbnail"].pop("selection")
     generation["metadata"]["thumbnail"]["recipe_version"] = 2
     assert list(Draft202012Validator(schema).iter_errors(generation))

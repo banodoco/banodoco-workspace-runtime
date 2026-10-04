@@ -208,6 +208,9 @@ export interface ManagedOutput {
 export interface ManagedOutputPage { items: ManagedOutput[]; next_cursor: string | null; }
 export interface ManagedOutputAdoption { association_id?: string; manifest_ref?: string | null; object_id?: string; digest?: string; size?: number; filename?: string; media_type?: string; output_port?: string; selector?: Record<string, unknown>; ordinal?: number; role?: string; durability?: ManagedOutputDurability; }
 export interface ManagedOutputLifecycle { operation: "lease" | "release" | "pin" | "unpin" | "expire" | "reclaim" | "promote"; expected_version: number; lease_id?: string; lease_owner?: string; lease_seconds?: number; provenance?: Record<string, unknown>; }
+export type PreferenceScope = "user" | "project";
+export interface PreferenceResource { scope: PreferenceScope; actor_id: string | null; project_id: string | null; document_id: string; content: string; version: number; created_at: string | null; updated_at: string | null }
+export type PreferenceMutationResult = PreferenceResource & { readonly receipt: Record<string, unknown> | null };
 export type MutationResult<T> = T & { readonly receipt: Record<string, unknown> };
 
 export class ApiError extends Error {
@@ -252,6 +255,37 @@ export class WorkspaceClient {
     const value = this.json<{ data?: T; receipt?: Record<string, unknown> }>(body);
     if (!value.data || !value.receipt) throw new Error("invalid mutation response: committed receipt is required");
     return Object.assign(value.data, { receipt: value.receipt }) as MutationResult<T>;
+  }
+  private preferencesPath(scope: PreferenceScope, projectId?: string): string {
+    if (scope !== "user" && scope !== "project") throw new Error("preference scope must be user or project");
+    if (scope === "user" && projectId !== undefined) throw new Error("user preferences cannot select a project");
+    return "/v1/preferences/" + scope + (projectId !== undefined ? "?project_id=" + encodeURIComponent(projectId) : "");
+  }
+  private preferenceResource(value: unknown, scope: PreferenceScope): PreferenceResource {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid preference resource");
+    const v = value as Record<string, unknown>;
+    const fields = ["scope", "actor_id", "project_id", "document_id", "content", "version", "created_at", "updated_at"];
+    if (Object.keys(v).length !== fields.length || fields.some(key => !(key in v))) throw new Error("invalid preference resource fields");
+    const owner = scope === "user" ? v.actor_id : v.project_id;
+    const other = scope === "user" ? v.project_id : v.actor_id;
+    if (v.scope !== scope || typeof owner !== "string" || !owner || other !== null || v.document_id !== "preferences:" + scope + ":" + owner || typeof v.content !== "string" || !Number.isInteger(v.version) || (v.version as number) < 0 || [v.created_at, v.updated_at].some(item => item !== null && typeof item !== "string")) throw new Error("invalid preference resource ownership, content or version");
+    return v as unknown as PreferenceResource;
+  }
+  private preferenceMutation(body: Uint8Array, scope: PreferenceScope): PreferenceMutationResult {
+    const value = this.json<Record<string, unknown>>(body);
+    if (!value || Object.keys(value).length !== 2 || !("data" in value) || !("receipt" in value)) throw new Error("invalid preference mutation response");
+    const resource = this.preferenceResource(value.data, scope);
+    if (scope === "project") return this.mutation<PreferenceResource>(body);
+    if (value.receipt !== null) throw new Error("invalid user preference mutation: null receipt is required");
+    Object.defineProperty(resource, "receipt", { value: null, enumerable: false, writable: false });
+    return resource as PreferenceMutationResult;
+  }
+  async getPreferences(scope: PreferenceScope, projectId?: string): Promise<PreferenceResource> {
+    return this.preferenceResource(this.json((await this.call("getPreferences", "GET", this.preferencesPath(scope, projectId))).body), scope);
+  }
+  async updatePreferences(scope: PreferenceScope, content: string, expectedVersion: number, idempotencyKey: string, projectId?: string): Promise<PreferenceMutationResult> {
+    const path = this.preferencesPath(scope, projectId);
+    return this.preferenceMutation((await this.call("updatePreferences", "PUT", path, new TextEncoder().encode(JSON.stringify({ content, expected_version: expectedVersion })), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body, scope);
   }
   async handshake(clientName: string, clientVersion: string, requestedScopes: string[]): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("handshake", "POST", "/v1/handshake", new TextEncoder().encode(JSON.stringify({ protocol: PROTOCOL, client_name: clientName, client_version: clientVersion, requested_scopes: requestedScopes })), { "Content-Type": "application/json" })).body);
@@ -302,6 +336,10 @@ export class WorkspaceClient {
   async getProjectTimelineRevision(projectId: string, timelineId: string, revision: string): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("getProjectTimelineRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/revisions/" + encodeURIComponent(revision))).body);
   }
+  async listDocuments(projectId: string, cursor?: string, limit = 50, kind?: string): Promise<{ items: Record<string, unknown>[]; next_cursor: string | null }> {
+    const query = "?limit=" + limit + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "") + (kind !== undefined ? "&kind=" + encodeURIComponent(kind) : "");
+    return this.page<Record<string, unknown>>((await this.call("listDocuments", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/documents" + query)).body);
+  }
   async getProjectTimeline(projectId: string, timelineId: string): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("getProjectTimeline", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId))).body);
   }
@@ -339,7 +377,7 @@ function fixtureBytes(manifest) {
   for (const item of [...manifest.fixtures].sort((a, b) => a.name.localeCompare(b.name))) {
     const name = safeRelative(item.name, "fixture name");
     if (!item.value || typeof item.value !== "object" || Array.isArray(item.value)) throw new Error(`fixture ${name} must contain an object value`);
-    result[`fixture-${name}`] = Buffer.from(`${JSON.stringify(sortedValue(item.value))}\n`, "utf8");
+    result[`fixture-${name}`] = Buffer.from(JSON.stringify(sortedValue(item.value)) + (item.trailing_newline === false ? "" : "\n"), "utf8");
   }
   return result;
 }
