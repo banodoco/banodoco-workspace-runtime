@@ -5411,6 +5411,8 @@ class RuntimeService:
             resource["execution_binding"] = binding
         if generation_intent is not None:
             resource["generation_intent"] = generation_intent
+        if task.get("expected_effect") is not None:
+            resource["expected_effect"] = dict(task["expected_effect"])
         if "required_facts" in spec:
             resource["required_facts"] = dict(spec["required_facts"])
         if "storage_estimate" in spec:

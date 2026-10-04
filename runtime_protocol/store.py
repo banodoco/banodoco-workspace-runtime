@@ -1775,6 +1775,7 @@ class RealmStore:
                 aggregate_id = project_id or "unscoped"
                 old = None
                 old_task = None
+                receipt = None
                 if idempotency_key:
                     old = self.conn.execute(
                         "SELECT * FROM runs WHERE project_id IS ? AND idempotency_key=?",
@@ -1784,21 +1785,45 @@ class RealmStore:
                         old_task = self.conn.execute(
                             "SELECT * FROM tasks WHERE run_id=?", (old["id"],)
                         ).fetchone()
+                        if old_task is None:
+                            raise ConflictError("persisted task admission identity is unavailable")
                         old_spec = json.loads(old["spec_json"])
                         old_request = self._execution_request_from_row(old_task)
+                        # Receipt refresh/reconstruction is permitted only
+                        # when persisted admission evidence proves replay
+                        # equivalence. The catalog is current readiness, not
+                        # the digest authority for an already admitted task.
+                        stored_digest = old_task["capability_digest"]
+                        spec_digest = old_spec.get("capability_digest")
+                        digest_conflict = (
+                            any(value is not None and (not isinstance(value, str) or not value)
+                                for value in (stored_digest, spec_digest))
+                            or (stored_digest is not None and spec_digest is not None
+                                and stored_digest != spec_digest)
+                        )
+                        admitted_digest = stored_digest if stored_digest is not None else spec_digest
+                        if capability_digest is not None:
+                            digest_conflict = digest_conflict or (
+                                not isinstance(admitted_digest, str) or not admitted_digest
+                                or capability_digest != admitted_digest
+                            )
+                        stored_effect = json.loads(old_task["expected_effect_json"]) if old_task["expected_effect_json"] else None
                         if (
-                            canonical_task_spec_for_compare(old_spec)
-                            != canonical_task_spec_for_compare(spec)
+                            canonical_json(canonical_task_spec_for_compare(old_spec))
+                            != canonical_json(canonical_task_spec_for_compare(spec))
                             or old["capability"] != capability
-                            or old_request != execution_request
+                            or old_task["capability"] != capability
+                            or canonical_json(old_request) != canonical_json(execution_request)
+                            or canonical_json(stored_effect or None) != canonical_json(expected_effect or None)
+                            or digest_conflict
                         ):
                             raise ConflictError("idempotency key was already used with different input")
                 if idempotency_key:
                     receipt = self.conn.execute(
-                        "SELECT result_json, request_hash FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+                        "SELECT result_json, request_hash, txn_id FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
                         (aggregate_id, idempotency_key),
                     ).fetchone()
-                    if receipt:
+                    if receipt and receipt["txn_id"] is not None:
                         if receipt["request_hash"] == request_hash:
                             return json.loads(receipt["result_json"])
                         if old is None:
@@ -1815,11 +1840,26 @@ class RealmStore:
                         return result
                 if old:
                     result = self._task_result(old, old_task)
-                    self.conn.execute(
-                        "INSERT INTO command_idempotency(command_kind, aggregate_id, idempotency_key, request_hash, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        ("task.create", aggregate_id, idempotency_key, request_hash, canonical_json(result), old["created_at"]),
+                    # An absent or legacy partial receipt needs the complete
+                    # existing command contract for generated HTTP readback.
+                    # Identity was proven above; recording this receipt emits
+                    # no new task event and changes no admitted task evidence.
+                    if receipt:
+                        self.conn.execute(
+                            "DELETE FROM command_idempotency WHERE command_kind='task.create' AND aggregate_id=? AND idempotency_key=?",
+                            (aggregate_id, idempotency_key),
+                        )
+                    stream_seq = self.conn.execute(
+                        "SELECT COUNT(*) FROM events WHERE run_id=?", (old["id"],)
+                    ).fetchone()[0]
+                    self._record_command_receipt(
+                        "task.create", aggregate_id, idempotency_key, request_hash,
+                        result, project_id=project_id or "unscoped", event_ids=(),
+                        primary_stream_id=old["id"], resulting_stream_seq=stream_seq,
                     )
                     return result
+                if receipt:
+                    raise ConflictError("persisted task admission identity is unavailable")
                 registered = self.conn.execute("SELECT * FROM capabilities WHERE id=?", (capability,)).fetchone()
                 if registered:
                     registered_digest = registered["definition_digest"]

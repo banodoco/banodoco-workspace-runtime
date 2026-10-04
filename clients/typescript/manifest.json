@@ -3,7 +3,7 @@
     {
       "byte_length": 3130,
       "path": "contract-metadata.ts",
-      "sha256": "650e3afc62e8b8510b3da60882b3b353f539137a557fbda3080be09e8de9c835"
+      "sha256": "282d64a3eff650bad81af60b6f75f156dca6a0cae5e86368d4885ff06a680a22"
     },
     {
       "byte_length": 215,
@@ -48,7 +48,7 @@
     {
       "byte_length": 20657,
       "path": "generated.ts",
-      "sha256": "14ed6cc2b92f45ea74bf5fbe07b8bb1d4f54f022a81c27cb163177bb8cbf8f5e"
+      "sha256": "d0050b23b2add824e45fde7a050aa05297f27a820e596d045ff1c324b3be2686"
     }
   ],
   "component_manifest_id": "GENERATOR-CONFORMANCE-ID",
@@ -186,7 +186,7 @@
     "updateTimeline"
   ],
   "protocol": "workspace.v1",
-  "schema_digest": "sha256:a89b699d9521dc55fa6a279bf92d84866d3d3233d2609f9ee0b84d1b4ffb93b8",
+  "schema_digest": "sha256:83ac089275bf79da4774ab05461739bf98d772771fb42348e69289c97bab302c",
   "schema_manifest_sha256": "ef9b12f20ddcb5a1b5315c4d1180aa702b8a196ab9ba044b89a4564ddfc13d50",
   "schema_version": 1
 }
