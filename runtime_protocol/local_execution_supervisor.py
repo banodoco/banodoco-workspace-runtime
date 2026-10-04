@@ -494,6 +494,7 @@ class NativeHostSession:
         from banodoco_local.custody_broker import RoleBoundCustodyBroker, default_process_identity, custody_wrapper_argv
         self.timeout = timeout
         self.preparation = preparation
+        self.config = dict(config)
         self.retained = None
         self.control, control_child = socket.socketpair()
         self.activation, activation_child = socket.socketpair()
@@ -543,11 +544,51 @@ class NativeHostSession:
         send_frame(self.control, request)
         return receive_frame(self.control)
 
-    def activate(self, grant):
-        # The machine path requires a Runtime-owned durable acceptance receipt.
-        # Its publication placement and forwarding are outside this checkpoint.
-        # Do not send a bootstrap grant or expose credentials to the host.
-        raise RelayError("local activation acceptance integration is unresolved")
+    def begin_activation(self, grant):
+        required = {"version", "operation_id", "channel_id", "credential_file", "executor_incarnation", "evidence_digest", "acceptance_mode", "activation_id"}
+        if not isinstance(grant, Mapping) or set(grant) != required or grant.get("version") != "runtime.local-worker-activation/v1" or grant.get("acceptance_mode") != "runtime-owner-receipt/v1" or any(grant.get(k) != self.preparation[k] for k in ("operation_id", "channel_id")):
+            raise RelayError("local activation lacks exact identified Runtime grant")
+        if not isinstance(grant["activation_id"], str) or not grant["activation_id"] or len(grant["activation_id"]) > 256 or not isinstance(grant["executor_incarnation"], str) or not grant["executor_incarnation"] or not isinstance(grant["evidence_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", grant["evidence_digest"]):
+            raise RelayError("local activation identity/evidence digest is invalid")
+        if Path(grant["credential_file"]) != Path(self.config["credential_file"]):
+            raise RelayError("local activation credential reference differs from selected binding")
+        self.retained.verify()
+        frame = {**grant, "host": {"pid": self.retained.child.pid, "birth_id": self.bridge.host_birth_id}}
+        if getattr(self, "activation_frame", None) is not None:
+            if self.activation_frame != frame:
+                raise RelayError("local activation replay changed grant or host")
+            return json.loads(canonical_json(self.activation_request))
+        self.activation_frame = json.loads(canonical_json(frame))
+        send_frame(self.activation, frame)
+        request = receive_frame(self.activation)
+        expected = {"version": "astrid.local-worker-activation-request/v1", "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+            "grant": {k: grant[k] for k in ("activation_id", "credential_file", "executor_incarnation", "evidence_digest")}, "host": frame["host"]}
+        if request != expected:
+            raise RelayError("host activation request differs from retained grant/incarnation")
+        self.retained.verify()
+        self.activation_request = expected
+        return json.loads(canonical_json(expected))
+
+    def finish_activation(self, receipt):
+        expected = {**self.activation_request, "version": "runtime.local-worker-activation-recorded/v1"}
+        if dict(receipt) != expected:
+            raise RelayError("Runtime activation receipt differs from exact host request")
+        self.retained.verify()
+        if getattr(self, "activation_accepted", None) is not None:
+            return json.loads(canonical_json(self.activation_accepted))
+        send_frame(self.activation, expected)
+        self.activation.shutdown(socket.SHUT_WR)
+        # EOF applies only to this dedicated activation FD. The separate
+        # persistent host-control channel remains retained after activation.
+        accepted = receive_frame(self.activation)
+        frame = self.activation_frame
+        expected_ack = {"version": "astrid.local-worker-activation-accepted/v1", **{k: frame[k] for k in ("operation_id", "channel_id", "executor_incarnation", "evidence_digest", "host", "activation_id")}}
+        if accepted != expected_ack:
+            raise RelayError("host final activation ACK differs from recorded grant")
+        self.retained.verify()
+        self.activation_accepted = expected_ack
+        self.activation.close()
+        return json.loads(canonical_json(expected_ack))
 
     def reap_host(self):
         import signal
@@ -631,9 +672,15 @@ def serve_control(channel, *, session_factory=NativeHostSession.create, referenc
                     continue
                 response = {"version": CONTROL_VERSION, "status": "ok", "report": report(reply)}
             elif command == "activate":
-                # Preparation proof grants no activation authority. Preserve
-                # the host parked until the Runtime receipt path is integrated.
-                raise RelayError("local activation acceptance integration is unresolved")
+                if set(request) != {"version", "command", "grant"} or session is None or terminal_abort is not None or session.bridge._prepared is None:
+                    raise RelayError("relay activation lacks a retained prepared graph")
+                activation_request = session.begin_activation(request["grant"])
+                send_frame(channel, {"version": CONTROL_VERSION, "status": "activation_requested", "request": activation_request})
+                confirmation = receive_frame(channel)
+                if set(confirmation) != {"version", "command", "receipt"} or confirmation.get("version") != CONTROL_VERSION or confirmation.get("command") != "record_activation_receipt":
+                    raise RelayError("relay activation receipt forwarding frame is invalid")
+                accepted = session.finish_activation(confirmation["receipt"])
+                response = {"version": CONTROL_VERSION, "status": "ok", "accepted": accepted}
             elif command == "abort":
                 if set(request) != {"version", "command"} or session is None:
                     raise RelayError("relay abort has no retained launch")

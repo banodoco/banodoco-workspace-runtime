@@ -887,3 +887,238 @@ def test_private_owner_route_does_not_take_sqlite_mutex(tmp_path):
         assert forbidden.value.status == 401
     finally:
         daemon.stop()
+
+
+def _relay_activation_fixture(tmp_path, *, lose_ack=False, before_request=None, at_binding=None):
+    """Actual Runtime/relay/activation code with synthetic owned process facts."""
+    import copy
+    import json
+    import socket
+    from types import SimpleNamespace
+    from test_local_execution_supervisor import _prepare_case, _cleaned_reply
+    from runtime_protocol.local_execution_supervisor import (
+        NativeHostSession, LocalExecutionRelay, serve_control, send_frame, receive_frame,
+        HOST_PREPARATION_VERSION, RelayError, digest,
+    )
+    from runtime_protocol.local_worker_composition import CrossProcessWorkerPreparer, _PreparedWorker
+    from runtime_protocol.local_worker import _selected_profile_payload
+    selected, _ = _prepare_case()
+    profile = replace(_profile(tmp_path, "workspace"), engine_launch=selected["profile"]["engine_launch"], session_config_digest=selected["profile"]["session_config_digest"])
+    observed = _observation(profile, 77)
+    observed = replace(observed, engine=replace(observed.engine, parent_pid=observed.host.pid))
+    scope = tmp_path / "support" / "local-execution-custody" / "fixture"
+    scope.mkdir(parents=True, mode=0o700)
+    refs = {}
+    for role, identity in (("relay", observed.worker), ("host", observed.host), ("engine", observed.engine), ("engine_listener", observed.engine_listener)):
+        refs[role] = {"version": "runtime.role-custody-reference/v1", "scope_root": str(scope), "role": role, "generation": 1,
+            "target": {"pid": identity.pid, "birth_id": identity.birth_id, "uid": os.getuid(), "audit_token_sha256": "sha256:" + "2" * 64, "audit_token_pidversion": identity.pid + 1}}
+    observed = replace(observed, owner_epoch="runtime-epoch", custody_scope=str(scope), custody_capabilities=refs)
+    store = CredentialStore(tmp_path / "credentials")
+    runtime, relay = socket.socketpair()
+    host_control, host_peer = socket.socketpair()
+    activation, activation_peer = socket.socketpair()
+    for channel in (runtime, relay, host_control, host_peer, activation, activation_peer):
+        channel.settimeout(2)
+    events = []
+    errors = []
+    host_prepared = {"version": HOST_PREPARATION_VERSION, "status": "prepared", "owner_epoch": "runtime-epoch",
+        "processes": {role: {"pid": getattr(observed, role).pid, "birth_id": getattr(observed, role).birth_id} for role in ("host", "engine", "engine_listener")},
+        "engine_binding": {"supervisor_pid": observed.engine.pid, "listener_pid": observed.engine_listener.pid, "listener_parent_pid": observed.engine.pid, "socket_owner_pid": observed.engine_listener.pid},
+        "session_config_digest": profile.session_config_digest, "custody_capabilities": {role: refs[role] for role in ("engine", "engine_listener")}}
+
+    class Retained:
+        def __init__(self, identity):
+            self.child = SimpleNamespace(pid=identity.pid)
+        def poll(self):
+            return None
+        def verify(self):
+            return {"pid": self.child.pid}
+
+    session = NativeHostSession.__new__(NativeHostSession)
+    session.config = {"credential_file": str(store.path_for(WORKER_ACTOR))}
+    session.activation = activation
+    session.retained = Retained(observed.host)
+    session.reap_host = lambda: events.append("host-wait") or 0
+    def exchange(value):
+        send_frame(host_control, value)
+        return receive_frame(host_control)
+    session.bridge = LocalExecutionRelay(host_pid=observed.host.pid, host_birth_id=observed.host.birth_id, exchange=exchange, verify_host=session.retained.verify)
+    def factory(preparation, _config, *, retain):
+        session.preparation = preparation
+        retain(session)
+        return session
+    def host_loop():
+        try:
+            while True:
+                value = receive_frame(host_peer)
+                if value["command"] == "abort_local_execution":
+                    send_frame(host_peer, _cleaned_reply(value, host_prepared))
+                    return
+                send_frame(host_peer, host_prepared)
+        except RelayError as exc:
+            if "channel closed" not in str(exc):
+                errors.append(exc)
+    def host_activation_loop():
+        try:
+            grant = receive_frame(activation_peer)
+            events.append("grant")
+            token = store.path_for(WORKER_ACTOR).read_text()
+            with pytest.raises(AuthorizationError):
+                store.load(token)
+            assert grant["acceptance_mode"] == "runtime-owner-receipt/v1"
+            if before_request:
+                before_request(store, grant)
+            request = {"version": "astrid.local-worker-activation-request/v1", "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+                "grant": {k: grant[k] for k in ("activation_id", "credential_file", "executor_incarnation", "evidence_digest")}, "host": grant["host"]}
+            send_frame(activation_peer, request)
+            recorded = receive_frame(activation_peer)
+            assert recorded == {**request, "version": "runtime.local-worker-activation-recorded/v1"}
+            record = json.loads((scope / "activation-record.json").read_text())
+            assert record["receipt"] == recorded
+            assert record["original_owner_epoch"] == "runtime-epoch"
+            assert record["custody_capabilities"] == refs
+            assert "credential" not in record
+            assert token not in json.dumps(record)
+            events.append("record-visible")
+            with pytest.raises(AuthorizationError):
+                store.load(token)
+            assert activation_peer.recv(1) == b""
+            events.append("activation-eof")
+            if lose_ack:
+                activation_peer.close()
+                return
+            send_frame(activation_peer, {"version": "astrid.local-worker-activation-accepted/v1", **{k: grant[k] for k in ("operation_id", "channel_id", "activation_id", "executor_incarnation", "evidence_digest", "host")}})
+            events.append("final-ack")
+        except (RelayError, OSError) as exc:
+            if before_request is None:
+                errors.append(exc)
+        except BaseException as exc:
+            errors.append(exc)
+    def relay_loop():
+        try:
+            serve_control(relay, session_factory=factory, reference_reader=lambda _, role: refs[role], relay_identity=lambda: {"pid": observed.worker.pid, "birth_id": observed.worker.birth_id})
+        except (RelayError, OSError) as exc:
+            if "channel closed" not in str(exc) and not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                errors.append(exc)
+
+    class Preparer(CrossProcessWorkerPreparer):
+        def bind_activation_acceptor(self, handle, grant, acceptor):
+            super().bind_activation_acceptor(handle, grant, acceptor)
+            if at_binding:
+                at_binding(handle, grant, acceptor)
+        def prepare(self, profile, *, operation_id, channel_id):
+            from runtime_protocol.local_execution_supervisor import host_prepare_request, CONTROL_VERSION
+            host_prepared.update(operation_id=operation_id, channel_id=channel_id)
+            preparation = host_prepare_request(operation_id=operation_id, channel_id=channel_id, owner_epoch="runtime-epoch", runtime_owner={"pid": 77, "uid": os.getuid(), "birth_id": "runtime-birth", "runtime_instance_id": "runtime-epoch", "coordinator_epoch": "runtime-epoch"}, profile=_selected_profile_payload(profile), custody_scope=str(scope))
+            handle = _PreparedWorker(SimpleNamespace(pid=observed.worker.pid), observed.worker.birth_id, runtime, {}, tmp_path / "config.json", relay=True, retained=Retained(observed.worker), owner_epoch="runtime-epoch", custody_scope=str(scope))
+            self._active = handle
+            handle.report_value = self._rpc(handle, {"version": CONTROL_VERSION, "command": "prepare", "preparation": preparation, "config": {}})["report"]
+            return handle
+        def _birth(self, _pid):
+            return observed.worker.birth_id
+        def abort(self, _handle):
+            events.append("cleanup-retained")
+        def control_alive(self, handle):
+            return handle is self._active
+
+    preparer = Preparer(profile=profile, config={}, environment={})
+    inspector = FakeInspector(store, observed)
+    launcher = _launcher(store, profile, preparer, inspector, 77)
+    threads = [threading.Thread(target=host_loop), threading.Thread(target=host_activation_loop), threading.Thread(target=relay_loop)]
+    for thread in threads:
+        thread.start()
+    def close():
+        launcher._watch_stop.set()
+        for channel in (runtime, activation_peer, host_control):
+            try:
+                channel.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            channel.close()
+        for thread in threads:
+            thread.join(3)
+        for channel in (relay, host_peer, activation):
+            channel.close()
+        assert all(not thread.is_alive() for thread in threads)
+    return launcher, store, profile, scope, events, errors, close
+
+
+def test_identified_relay_activation_records_before_eof_ack_and_enablement(tmp_path):
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path)
+    launcher._start_watcher = lambda: None
+    try:
+        assert launcher.start(profile.profile_id, profile.workspace_uuid)["state"] == "active"
+        assert events == ["grant", "record-visible", "activation-eof", "final-ack"]
+        assert store.load(store.path_for(WORKER_ACTOR).read_text())["actor"] == WORKER_ACTOR
+        assert (scope / "activation-record.json").exists()
+        assert errors == []
+    finally:
+        close()
+
+
+def test_lost_final_relay_activation_ack_retains_record_and_fences_credential(tmp_path):
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path, lose_ack=True)
+    try:
+        with pytest.raises(ConflictError, match="acknowledgement"):
+            launcher.start(profile.profile_id, profile.workspace_uuid)
+        assert (scope / "activation-record.json").exists()
+        assert store.actor_metadata(WORKER_ACTOR) is None
+        assert events[-1] == "cleanup-retained"
+        assert launcher._active_handle is None
+        assert errors == []
+    finally:
+        close()
+
+
+def test_activation_record_exact_replay_and_conflict_without_republishing(tmp_path):
+    import json
+    seen = []
+    def replay(_handle, grant, accept):
+        request = {"version": "astrid.local-worker-activation-request/v1", "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+            "grant": {k: grant[k] for k in ("activation_id", "credential_file", "executor_incarnation", "evidence_digest")}, "host": {"pid": 1001, "birth_id": "birth-1001"}}
+        first = accept(request)
+        second = accept(request)
+        assert second == first
+        changed = {**request, "host": {"pid": 1001, "birth_id": "different"}}
+        with pytest.raises(ConflictError, match="exact grant/host"):
+            accept(changed)
+        seen.append(first)
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path, at_binding=replay)
+    launcher._start_watcher = lambda: None
+    try:
+        assert launcher.start(profile.profile_id, profile.workspace_uuid)["state"] == "active"
+        assert len(seen) == 1
+        assert json.loads((scope / "activation-record.json").read_text())["receipt"] == seen[0]
+        assert errors == []
+    finally:
+        close()
+
+
+def test_changed_credential_generation_before_activation_request_is_fenced(tmp_path):
+    def rotate(store, _grant):
+        metadata = store.actor_metadata(WORKER_ACTOR)
+        store.provision(WORKER_ACTOR, metadata["scopes"], metadata={k: v for k, v in metadata.items() if k not in {"actor", "scopes"}}, rotate=True, enabled=False)
+    launcher, store, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path, before_request=rotate)
+    try:
+        with pytest.raises(ConflictError, match="generation changed"):
+            launcher.start(profile.profile_id, profile.workspace_uuid)
+        assert not (scope / "activation-record.json").exists()
+        assert store.actor_metadata(WORKER_ACTOR) is None
+        assert events[-1] == "cleanup-retained"
+    finally:
+        close()
+
+
+def test_restarted_relay_owner_honors_existing_durable_cleanup_fence(tmp_path):
+    import json
+    from test_local_execution_supervisor import _prepare_case
+    profile = replace(_profile(tmp_path, "workspace"), engine_launch=_prepare_case()[0]["profile"]["engine_launch"])
+    profile.support_root.mkdir(parents=True)
+    (profile.support_root / "orderly-handoff-cleanup-uncertain.json").write_text(json.dumps({"version": 1, "state": "cleanup_uncertain"}))
+    store = CredentialStore(tmp_path / "credentials")
+    observed = _observation(profile, 77)
+    preparer = FakePreparer(store, observed)
+    launcher = _launcher(store, profile, preparer, FakeInspector(store, observed), 77)
+    with pytest.raises(ConflictError, match="cleanup is uncertain"):
+        launcher.start(profile.profile_id, profile.workspace_uuid)
+    assert preparer.events == []

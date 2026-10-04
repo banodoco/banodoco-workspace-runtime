@@ -106,6 +106,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         self.timeout_seconds = float(timeout_seconds)
         self.cleanup_timeout_seconds = max(0.05, float(cleanup_timeout_seconds))
         self._active: _PreparedWorker | None = None
+        self._activation_binding = None
         self._prepare_cancel = threading.Event()
         # The only uninterruptible handoff is spawn -> handle construction ->
         # publication. Cancellation waits for this tiny critical section so a
@@ -358,11 +359,37 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         handle.report_value = report
         return report
 
+    def bind_activation_acceptor(self, handle, grant, acceptor):
+        if handle is not self._active or not handle.relay or handle.closed or not callable(acceptor):
+            raise ConflictError("Runtime activation publisher lacks this retained relay")
+        self._activation_binding = (handle, json.loads(json.dumps(dict(grant))), acceptor)
+
     def activate(self, handle: _PreparedWorker, grant: Mapping[str, Any]) -> None:
-        response = self._rpc(handle, {"version": "runtime.local-execution-control/v1" if handle.relay else CONTROL_VERSION, "command": "activate", "grant": dict(grant)})
-        if response.get("status") != "ok":
-            raise ConflictError("prepared Worker rejected activation")
-        handle.activated = True
+        if not handle.relay:
+            response = self._rpc(handle, {"version": CONTROL_VERSION, "command": "activate", "grant": dict(grant)})
+            if response.get("status") != "ok":
+                raise ConflictError("prepared Worker rejected activation")
+            handle.activated = True
+            return
+        from .local_execution_supervisor import send_frame, receive_frame, CONTROL_VERSION as relay_version
+        binding = self._activation_binding
+        if binding is None or binding[0] is not handle or binding[1] != dict(grant):
+            raise ConflictError("local relay has no exact Runtime activation publisher")
+        with handle.rpc_lock:
+            handle.retained.verify()
+            send_frame(handle.control, {"version": relay_version, "command": "activate", "grant": dict(grant)})
+            response = receive_frame(handle.control)
+            if set(response) != {"version", "status", "request"} or response.get("version") != relay_version or response.get("status") != "activation_requested":
+                raise ConflictError("relay has no exact host activation request")
+            recorded = binding[2](response["request"])
+            # Publisher returns only after its protected file+directory fsync.
+            send_frame(handle.control, {"version": relay_version, "command": "record_activation_receipt", "receipt": recorded})
+            final = receive_frame(handle.control)
+            expected = {"version": "astrid.local-worker-activation-accepted/v1", **{k: grant[k] for k in ("operation_id", "channel_id", "activation_id", "executor_incarnation", "evidence_digest")}, "host": response["request"]["host"]}
+            if final != {"version": relay_version, "status": "ok", "accepted": expected}:
+                raise ConflictError("relay final activation acknowledgement differs from recorded grant")
+            handle.retained.verify()
+            handle.activated = True
 
     def abort(self, handle: _PreparedWorker) -> None:
         if isinstance(handle, _PreparedWorker) and handle.closed:
@@ -522,6 +549,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         return None if handle is None or handle.closed else handle
 
     def reconnect(self, receipt: Mapping[str, Any]) -> _PreparedWorker | None:
+        if self.profile.engine_launch is not None:
+            # The activation record does not confer recovery/signal authority.
+            # Until capability recovery is implemented, a restarted owner may
+            # not replace a surviving graph merely because control is absent.
+            raise ConflictError("local relay capability recovery remains unresolved")
         handle = self._active
         if handle is None or handle.closed or not handle.activated:
             return None

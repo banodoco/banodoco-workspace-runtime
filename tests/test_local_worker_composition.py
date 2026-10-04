@@ -441,3 +441,12 @@ def test_relay_stop_without_retained_control_never_uses_numeric_signal(tmp_path,
     monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("numeric fallback"))
     with pytest.raises(ConflictError, match="retained control"):
         preparer.stop_owned({})
+
+
+def test_relay_restart_cannot_treat_missing_control_as_absent_generation():
+    from test_local_execution_supervisor import _prepare_case
+    selected = _prepare_case()[0]["profile"]
+    profile = LocalWorkerProfile(**{k: Path(v) if k in {"realm_root", "support_root", "worker_executable", "host_executable", "engine_executable", "engine_listener_executable"} else v for k, v in selected.items()})
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    with pytest.raises(ConflictError, match="capability recovery remains unresolved"):
+        preparer.reconnect({"version": "runtime.local-worker-receipt/v4"})

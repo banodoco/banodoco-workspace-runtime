@@ -303,6 +303,12 @@ class LocalWorkerLauncher:
         self._orderly_handoff: _OrderlyHandoff | None = None
         self._cleanup_uncertain: str | None = None
         self._startup_receipt_rejection: str | None = None
+        if any(profile.engine_launch is not None for profile in self.profiles.values()):
+            marker = self.support_root / "orderly-handoff-cleanup-uncertain.json"
+            if marker.exists():
+                # Reuse the existing durable cleanup fence on owner restart;
+                # credential revocation cannot erase an unresolved graph.
+                self._cleanup_uncertain = "retained cleanup uncertainty requires capability recovery"
         for method in ("control_alive", "current_handle"):
             if not callable(getattr(preparer, method, None)):
                 raise ValueError(f"local worker preparer must implement {method}")
@@ -757,7 +763,18 @@ class LocalWorkerLauncher:
                 raise ConflictError("local Worker generation is no longer active")
             # Fencing and enablement share the lifecycle lock. A failed durable
             # revoke therefore cannot be followed by a stale enable operation.
-            self.credentials.enable_actor(self.actor)
+            if self._active_profile is not None and self._active_profile.engine_launch is not None:
+                from banodoco_local.custody_broker import _read_owner_file
+                with self.credentials._lock:
+                    record = json.loads(_read_owner_file(Path(self._active_identity["custody_scope"]) / "activation-record.json")[0])
+                    commit = self.credentials.path_for(self.actor).with_suffix(".commit")
+                    generation = "sha256:" + hashlib.sha256(_read_owner_file(commit)[0]).hexdigest()
+                    metadata = self.credentials.actor_metadata(self.actor)
+                    if record.get("credential_generation") != generation or record.get("executor_incarnation") != self._active_receipt.get("executor_incarnation") or metadata is None or metadata.get("local_launch_receipt") != self._active_receipt:
+                        raise ConflictError("local activation credential generation changed before enablement")
+                    self.credentials.enable_actor(self.actor)
+            else:
+                self.credentials.enable_actor(self.actor)
 
     def _start_watcher(self) -> None:
         with self._state_lock:
@@ -1457,6 +1474,68 @@ class LocalWorkerLauncher:
         result["state"] = "reconnected"
         return result
 
+    def _activation_acceptor(self, *, handle, profile, report, identity, receipt, grant, credential_path):
+        """Return the one Runtime-owned durable receipt publisher for a launch."""
+        from banodoco_local.custody_broker import _read_owner_file, _atomic_owner_json
+        expected_request = {
+            "version": "astrid.local-worker-activation-request/v1",
+            "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+            "grant": {k: grant[k] for k in ("activation_id", "credential_file", "executor_incarnation", "evidence_digest")},
+            "host": {k: receipt["host"][k] for k in ("pid", "birth_id")},
+        }
+        with self.credentials._lock:
+            generation = "sha256:" + hashlib.sha256(_read_owner_file(credential_path.with_suffix(".commit"))[0]).hexdigest()
+            expected_metadata = self.credentials.actor_metadata(self.actor)
+        scope = Path(identity["custody_scope"])
+        record_path = scope / "activation-record.json"
+
+        def accept(request):
+            if not isinstance(request, Mapping) or dict(request) != expected_request:
+                raise ConflictError("local activation request differs from exact grant/host")
+            with self._state_lock, self.credentials._lock:
+                if self._shutdown.is_set() or self._prepare_cancel.is_set() or self._preparing_handle is not handle:
+                    raise ConflictError("local activation owner was fenced")
+                current = self.credentials.actor_metadata(self.actor)
+                current_generation = "sha256:" + hashlib.sha256(_read_owner_file(credential_path.with_suffix(".commit"))[0]).hexdigest()
+                if current != expected_metadata or current_generation != generation or not isinstance(current, Mapping) or current.get("local_launch_receipt") != receipt:
+                    raise ConflictError("local activation credential generation changed or was revoked")
+                observed = self._validate_observation(profile, self.inspector.observe(handle), report=report,
+                    operation_id=grant["operation_id"], channel_id=grant["channel_id"])
+                if observed != identity:
+                    raise ConflictError("local activation graph changed before durable acceptance")
+                recorded = {**expected_request, "version": "runtime.local-worker-activation-recorded/v1"}
+                record = {"version": "runtime.local-worker-activation-record/v1", "state": "recorded",
+                    "operation_id": grant["operation_id"], "channel_id": grant["channel_id"],
+                    "workspace_uuid": self.workspace_uuid, "profile_id": profile.profile_id,
+                    "profile_digest": profile.profile_digest, "profile_binding_digest": identity["profile_binding_digest"],
+                    "original_owner_epoch": identity["owner_epoch"], "host": receipt["host"],
+                    "executor_incarnation": receipt["executor_incarnation"], "evidence_digest": receipt["evidence_digest"],
+                    "custody_capabilities": identity["custody_capabilities"], "credential_generation": generation,
+                    "request": expected_request, "receipt": recorded}
+                if record_path.exists():
+                    previous = json.loads(_read_owner_file(record_path)[0])
+                    if previous != record:
+                        raise ConflictError("local activation replay conflicts with durable acceptance")
+                    # A previous writer may have lost its ACK after rename
+                    # but before directory fsync. Replay reestablishes durability
+                    # of the exact retained record before returning the receipt.
+                    descriptor = os.open(record_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    directory = os.open(scope, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                else:
+                    _atomic_owner_json(record_path, record)
+                # _atomic_owner_json fsyncs file and containing directory before
+                # this exact echo is allowed onto the private control channel.
+                return json.loads(_canonical(recorded))
+        return accept
+
     def start(self, profile_id: str, expected_workspace_uuid: str) -> dict[str, Any]:
         if not self._operation_lock.acquire(blocking=False):
             raise ConflictError("a local worker launch operation is already in progress")
@@ -1536,6 +1615,12 @@ class LocalWorkerLauncher:
                 enabled=False,
             )
             credential_issued = True
+            if profile.engine_launch is not None:
+                directory = os.open(credential_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
             final = self._validate_observation(
                 profile, self.inspector.observe(handle), report=report,
                 operation_id=operation_id, channel_id=channel_id,
@@ -1550,6 +1635,13 @@ class LocalWorkerLauncher:
                 "executor_incarnation": incarnation,
                 "evidence_digest": second["evidence_digest"],
             }
+            if profile.engine_launch is not None:
+                grant.update(acceptance_mode="runtime-owner-receipt/v1", activation_id=uuid.uuid4().hex)
+                bind = getattr(self.preparer, "bind_activation_acceptor", None)
+                if not callable(bind):
+                    raise ConflictError("local relay cannot retain Runtime activation receipt publisher")
+                bind(handle, grant, self._activation_acceptor(handle=handle, profile=profile, report=report,
+                    identity=second, receipt=receipt, grant=grant, credential_path=credential_path))
             self.preparer.activate(handle, grant)
             activated = self._validate_observation(
                 profile, self.inspector.observe(handle), report=report,
