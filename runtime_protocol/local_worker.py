@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from .auth import CredentialStore
 from .errors import ConflictError, ValidationError
+from .util import atomic_json_write
 
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -50,6 +51,13 @@ class LocalWorkerProfile:
     profile_revision: str
     profile_digest: str
     release_digest: str
+    # Framework interpreters can launch through one executable artifact while
+    # the kernel reports a different executable for the live process (notably
+    # macOS Python.framework).  These optional pins preserve both identities:
+    # host_executable remains the launch artifact shared with the Worker ABI,
+    # while the OS pins are used for independent live-process observation.
+    host_os_executable: Path | None = None
+    host_os_artifact_digest: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,13 @@ class ProcessIdentity:
     session_id: int
     executable: Path
     artifact_digest: str
+    # Exact kernel/ps-rendered command line observed at issuance.  It is part
+    # of receipt-v3 evidence and lets an adopter refuse to signal a different
+    # process that merely reused a PID/group/executable tuple.
+    command_line: str = ""
+    # Lossless, length-delimited kernel argv digest.  The rendered command
+    # remains diagnostic only because ps output cannot preserve boundaries.
+    argv_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -93,6 +108,11 @@ class LocalWorkerPreparer(Protocol):
     def current_handle(self) -> object | None: ...
     def set_prepare_cancel_event(self, event: threading.Event) -> None: ...
     def cancel_current(self) -> None: ...
+    def handoff_command(self, handle: object, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
+    def export_control_descriptor(self, handle: object) -> int: ...
+    def release_exported(self, handle: object) -> None: ...
+    def adopt_control_descriptor(self, descriptor: int, receipt: Mapping[str, Any]) -> object: ...
+    def abort_adopted_descriptor(self, descriptor: int, receipt: Mapping[str, Any]) -> None: ...
 
 
 class LocalWorkerInspector(Protocol):
@@ -110,6 +130,59 @@ def _canonical(value: object) -> bytes:
 
 def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
+
+
+def _receipt_identity_digest_valid(
+    profile: LocalWorkerProfile,
+    receipt: Mapping[str, Any],
+    *,
+    workspace_uuid: str,
+    realm_root: Path,
+    support_root: Path,
+) -> bool:
+    """Validate the complete stable receipt projection and its digest.
+
+    The Worker's parent is the sole stable-field exception: it can lawfully
+    become PID 1 after a Runtime owner exits.  Every other serialized custody
+    fact remains digest-bound exactly as it was at issuance.
+    """
+
+    identity_keys = {
+        "profile_id", "workspace_uuid", "realm_root", "support_root",
+        "machine_id", "uid", "worker", "host", "engine",
+        "engine_listener", "cleanup_groups", "engine_binding",
+        "session_config_digest", "profile_revision", "profile_digest",
+        "release_digest",
+    }
+    if set(receipt) != identity_keys | {
+        "version", "evidence_digest", "executor_incarnation",
+    }:
+        return False
+    if (
+        receipt.get("version") != RECEIPT_VERSION
+        or receipt.get("profile_id") != profile.profile_id
+        or receipt.get("workspace_uuid") != str(workspace_uuid)
+        or receipt.get("realm_root") != str(Path(realm_root))
+        or receipt.get("support_root") != str(Path(support_root))
+        or receipt.get("machine_id") != profile.machine_id
+        or receipt.get("session_config_digest") != profile.session_config_digest
+        or receipt.get("profile_revision") != profile.profile_revision
+        or receipt.get("profile_digest") != profile.profile_digest
+        or receipt.get("release_digest") != profile.release_digest
+        or not isinstance(receipt.get("executor_incarnation"), str)
+        or not receipt.get("executor_incarnation")
+    ):
+        return False
+    projection = {key: receipt.get(key) for key in identity_keys}
+    worker = projection.get("worker")
+    if not isinstance(worker, Mapping):
+        return False
+    projection["worker"] = dict(worker)
+    projection["worker"].pop("parent_pid", None)
+    try:
+        return receipt.get("evidence_digest") == _digest(projection)
+    except (TypeError, ValueError):
+        return False
 
 
 def _absolute_pin(value: Path, label: str) -> Path:
@@ -151,6 +224,21 @@ def _engine_endpoint(value: str) -> str:
     return f"http://{host}:{port}"
 
 
+@dataclass
+class _OrderlyHandoff:
+    handoff_id: str
+    handle: object
+    profile: LocalWorkerProfile
+    identity: dict[str, Any]
+    receipt: dict[str, Any]
+    generation: dict[str, str]
+    common: dict[str, Any]
+    registered_state: dict[str, Any]
+    phase: str
+    old_owner: dict[str, Any] | None = None
+    new_owner: dict[str, Any] | None = None
+
+
 class LocalWorkerLauncher:
     """Serialize prepare/verify/issue/activate for the reserved Worker actor."""
 
@@ -190,6 +278,9 @@ class LocalWorkerLauncher:
         self._active_receipt: dict[str, Any] | None = None
         self._cleanup_handles: list[object] = []
         self._prepare_cancel = threading.Event()
+        self._orderly_handoff: _OrderlyHandoff | None = None
+        self._cleanup_uncertain: str | None = None
+        self._startup_receipt_rejection: str | None = None
         for method in ("control_alive", "current_handle"):
             if not callable(getattr(preparer, method, None)):
                 raise ValueError(f"local worker preparer must implement {method}")
@@ -203,6 +294,22 @@ class LocalWorkerLauncher:
             # pre-I-06 generation has no receipt and can never be revalidated.
             credentials.disable_actor(actor)
             if not self._receipt_shape_valid(existing):
+                receipt = existing.get("local_launch_receipt")
+                profile = (
+                    self.profiles.get(receipt.get("profile_id"))
+                    if isinstance(receipt, Mapping) else None
+                )
+                if (
+                    isinstance(receipt, Mapping)
+                    and profile is not None
+                    and receipt.get("workspace_uuid") == self.workspace_uuid
+                    and receipt.get("profile_revision") == profile.profile_revision
+                    and receipt.get("profile_digest") == profile.profile_digest
+                    and receipt.get("release_digest") == profile.release_digest
+                ):
+                    self._startup_receipt_rejection = (
+                        "existing local Worker receipt contradicts current profile authority"
+                    )
                 self._revoke_actor()
 
     def _revoke_actor(self) -> None:
@@ -212,6 +319,23 @@ class LocalWorkerLauncher:
             self.credentials.revoke(self.actor)
         except OSError:
             pass
+
+    def _latch_cleanup_uncertain(self, reason: BaseException | str) -> None:
+        """Persist a fail-closed replacement fence at the first cleanup failure."""
+
+        message = type(reason).__name__ if isinstance(reason, BaseException) else str(reason)
+        with self._state_lock:
+            if self._cleanup_uncertain is None:
+                self._cleanup_uncertain = message
+        atomic_json_write(
+            self.support_root / "orderly-handoff-cleanup-uncertain.json",
+            {
+                "version": 1,
+                "state": "cleanup_uncertain",
+                "runtime_pid": self.runtime_pid,
+                "reason": self._cleanup_uncertain,
+            },
+        )
 
     def _receipt_shape_valid(self, metadata: Mapping[str, Any]) -> bool:
         receipt = metadata.get("local_launch_receipt")
@@ -227,6 +351,15 @@ class LocalWorkerLauncher:
         actual = binding.get("actual") if isinstance(binding, Mapping) else None
         incarnation = receipt.get("executor_incarnation")
         evidence = receipt.get("evidence_digest")
+        expected_cleanup_groups = [
+            {"role": "generic_pack_host", "leader": "host", "members": ["host"]},
+            {
+                "role": "engine",
+                "leader": "engine",
+                "members": ["engine", "engine_listener"],
+            },
+            {"role": "worker", "leader": "worker", "members": ["worker"]},
+        ]
         try:
             endpoint = _engine_endpoint(engine_binding.get("endpoint")) if isinstance(engine_binding, Mapping) else None
         except ValidationError:
@@ -238,6 +371,7 @@ class LocalWorkerLauncher:
             and isinstance(receipt.get("session_config_digest"), str)
             and bool(_DIGEST.fullmatch(receipt.get("session_config_digest")))
             and all(isinstance(receipt.get(name), Mapping) for name in ("worker", "host", "engine", "engine_listener"))
+            and receipt.get("cleanup_groups") == expected_cleanup_groups
             and endpoint == profile.engine_endpoint
             and isinstance(incarnation, str) and incarnation
             and isinstance(evidence, str) and _DIGEST.fullmatch(evidence)
@@ -252,6 +386,18 @@ class LocalWorkerLauncher:
             and actual.get("profile_revision") == profile.profile_revision
             and actual.get("profile_digest") == profile.profile_digest
             and actual.get("release_digest") == profile.release_digest
+            and self._receipt_identity_digest_valid(profile, receipt)
+        )
+
+    def _receipt_identity_digest_valid(
+        self, profile: LocalWorkerProfile, receipt: Mapping[str, Any],
+    ) -> bool:
+        return _receipt_identity_digest_valid(
+            profile,
+            receipt,
+            workspace_uuid=self.workspace_uuid,
+            realm_root=self.realm_root,
+            support_root=self.support_root,
         )
 
     def _profile(self, profile_id: str, expected_workspace_uuid: str) -> LocalWorkerProfile:
@@ -273,6 +419,13 @@ class LocalWorkerLauncher:
             "engine_listener_executable",
         ):
             _absolute_pin(Path(getattr(profile, field)), field)
+        if (profile.host_os_executable is None) != (profile.host_os_artifact_digest is None):
+            raise ValidationError(
+                "host_os_executable and host_os_artifact_digest must be provided together"
+            )
+        if profile.host_os_executable is not None:
+            _absolute_pin(Path(profile.host_os_executable), "host_os_executable")
+            _require_digest(str(profile.host_os_artifact_digest), "host_os_artifact_digest")
         if _engine_endpoint(profile.engine_endpoint) != profile.engine_endpoint:
             raise ValidationError("engine_endpoint must be canonical")
         for field in (
@@ -303,6 +456,17 @@ class LocalWorkerLauncher:
             "host": self._process_payload(observed.host),
             "engine": self._process_payload(observed.engine),
             "engine_listener": self._process_payload(observed.engine_listener),
+            # State the independently-owned cleanup groups explicitly.  An
+            # adopter must never infer the signal partition from field names.
+            "cleanup_groups": [
+                {"role": "generic_pack_host", "leader": "host", "members": ["host"]},
+                {
+                    "role": "engine",
+                    "leader": "engine",
+                    "members": ["engine", "engine_listener"],
+                },
+                {"role": "worker", "leader": "worker", "members": ["worker"]},
+            ],
             "engine_binding": {
                 "supervisor_pid": observed.engine.pid,
                 "listener_pid": observed.engine_listener.pid,
@@ -367,10 +531,11 @@ class LocalWorkerLauncher:
         )
         self._validate_process(
             observed.host, label="host", parent_pid=observed.worker.pid,
-            executable=profile.host_executable, artifact_digest=profile.host_artifact_digest,
+            executable=profile.host_os_executable or profile.host_executable,
+            artifact_digest=profile.host_os_artifact_digest or profile.host_artifact_digest,
         )
         self._validate_process(
-            observed.engine, label="engine", parent_pid=observed.worker.pid,
+            observed.engine, label="engine", parent_pid=observed.host.pid,
             executable=profile.engine_executable, artifact_digest=profile.engine_artifact_digest,
         )
         self._validate_process(
@@ -453,17 +618,21 @@ class LocalWorkerLauncher:
             if any(handle is current for current in self._cleanup_handles):
                 return
             self._cleanup_handles.append(handle)
+        failures: list[BaseException] = []
         def cleanup() -> None:
             try:
                 self.preparer.abort(handle)
-            except BaseException:
+            except BaseException as exc:
                 # The adapter must itself signal only positively identified
                 # owned children. Cleanup failure cannot restore authority.
-                pass
+                failures.append(exc)
+                self._latch_cleanup_uncertain(exc)
 
         thread = threading.Thread(target=cleanup, name="local-worker-abort", daemon=True)
         thread.start()
         thread.join(max(0.0, float(timeout)))
+        if thread.is_alive():
+            self._latch_cleanup_uncertain("cleanup_deadline_exceeded")
 
     def _control_alive(self, handle: object) -> bool:
         return bool(self.preparer.control_alive(handle))
@@ -569,6 +738,405 @@ class LocalWorkerLauncher:
             )
             self._watch_thread.start()
 
+    def prepare_orderly_handoff(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Pause an idle host without disabling or mutating owner authority."""
+
+        handoff_id = str(request.get("handoff_id") or "")
+        if not handoff_id:
+            raise ValidationError("handoff_id is required")
+        with self._operation_lock:
+            with self._state_lock:
+                if self._shutdown.is_set() or self._orderly_handoff is not None:
+                    raise ConflictError("local Worker is not available for orderly handoff")
+                handle = self._active_handle
+                profile = self._active_profile
+                identity = self._active_identity
+                receipt = self._active_receipt
+            if handle is None or profile is None or identity is None or receipt is None:
+                raise ConflictError("no active local Worker can be handed off")
+            if not self._control_alive(handle):
+                raise ConflictError("local Worker control channel is not alive")
+            generation = self.credentials.generation_snapshot(self.actor)
+            if request.get("credential_generation") != generation:
+                raise ConflictError("handoff credential generation changed")
+            if request.get("receipt_evidence_digest") != receipt.get("evidence_digest"):
+                raise ConflictError("handoff receipt evidence digest changed")
+            response = dict(self.preparer.handoff_command(handle, request))
+            if response.get("status") == "active_work":
+                return {
+                    "state": "active_work",
+                    "handoff_id": handoff_id,
+                    "ack": response,
+                }
+            host_ack = response.get("host_ack")
+            registered_state = (
+                host_ack.get("registered_state") if isinstance(host_ack, Mapping) else None
+            )
+            if not isinstance(registered_state, Mapping):
+                raise ConflictError("handoff prepare acknowledgement lacks registered state")
+            session = _OrderlyHandoff(
+                handoff_id=handoff_id,
+                handle=handle,
+                profile=profile,
+                identity=dict(identity),
+                receipt=dict(receipt),
+                generation=dict(generation),
+                common={
+                    key: request[key]
+                    for key in (
+                        "version",
+                        "handoff_id",
+                        "nonce_digest",
+                        "sealed_record_digest",
+                        "deadline_monotonic",
+                        "deadline_unix_ms",
+                    )
+                },
+                registered_state=dict(registered_state),
+                phase="host_paused",
+                old_owner=dict(request["old_owner"]),
+            )
+            with self._state_lock:
+                if self._active_handle is not handle or self._orderly_handoff is not None:
+                    raise ConflictError("local Worker ownership changed during handoff prepare")
+                self._orderly_handoff = session
+            return {
+                "state": "host_paused",
+                "handoff_id": handoff_id,
+                "ack": response,
+                "registered_state": dict(registered_state),
+            }
+
+    def orderly_handoff_source_facts(self) -> dict[str, Any]:
+        """Return secret-free facts needed to bind A's sealed request."""
+
+        with self._state_lock:
+            handle = self._active_handle
+            receipt = self._active_receipt
+            identity = self._active_identity
+        if handle is None or receipt is None or identity is None or not self._control_alive(handle):
+            raise ConflictError("no live local Worker can be handed off")
+        return {
+            "receipt": dict(receipt),
+            "identity": dict(identity),
+            "credential_generation": self.credentials.generation_snapshot(self.actor),
+        }
+
+    def fence_orderly_handoff(self, handoff_id: str) -> dict[str, Any]:
+        """Disable the retained bearer after the caller holds the DB fence."""
+
+        with self._operation_lock:
+            with self._state_lock:
+                session = self._orderly_handoff
+                if session is None or session.handoff_id != handoff_id:
+                    raise ConflictError("orderly handoff is not host-paused")
+                if session.phase != "host_paused":
+                    raise ConflictError("orderly handoff phase is invalid")
+                if self._active_handle is not session.handle:
+                    raise ConflictError("local Worker ownership changed before fencing")
+                self.credentials.disable_actor(self.actor)
+                if self.credentials.generation_snapshot(self.actor) != session.generation:
+                    raise ConflictError("handoff credential generation changed while fencing")
+                observed = self._validate_observation(
+                    session.profile,
+                    self.inspector.observe(session.handle),
+                    report=None,
+                    reconnect=True,
+                )
+                if observed != session.identity:
+                    raise ConflictError("local Worker identity changed while fencing handoff")
+                session.phase = "prepared"
+                self._watch_stop.set()
+                return {
+                    "state": "PREPARED",
+                    "handoff_id": handoff_id,
+                    "receipt": dict(session.receipt),
+                    "identity": dict(session.identity),
+                    "credential_generation": dict(session.generation),
+                    "registered_state": dict(session.registered_state),
+                }
+
+    def cancel_orderly_handoff(self, handoff_id: str, *, reason_code: str) -> None:
+        """Rollback A custody before descriptor export."""
+
+        with self._operation_lock:
+            with self._state_lock:
+                session = self._orderly_handoff
+                if session is None or session.handoff_id != handoff_id:
+                    return
+            payload = {
+                **session.common,
+                "command": "handoff_abort",
+                "reason_code": str(reason_code),
+                "old_owner": dict(session.old_owner or {}),
+            }
+            response = self.preparer.handoff_command(session.handle, payload)
+            if response.get("worker_phase") != "owned":
+                raise ConflictError("Worker did not restore owner A custody")
+            if self.credentials.generation_snapshot(self.actor) != session.generation:
+                raise ConflictError("handoff credential generation changed during rollback")
+            self.credentials.enable_actor(self.actor)
+            with self._state_lock:
+                self._orderly_handoff = None
+            self._start_watcher()
+
+    def export_orderly_handoff(self, handoff_id: str) -> tuple[int, dict[str, Any]]:
+        with self._operation_lock:
+            with self._state_lock:
+                session = self._orderly_handoff
+                if session is None or session.handoff_id != handoff_id or session.phase != "prepared":
+                    raise ConflictError("orderly handoff is not prepared for export")
+            descriptor = self.preparer.export_control_descriptor(session.handle)
+            session.phase = "exported"
+            return descriptor, {
+                "receipt": dict(session.receipt),
+                "identity": dict(session.identity),
+                "credential_generation": dict(session.generation),
+                "registered_state": dict(session.registered_state),
+            }
+
+    def seal_orderly_handoff(
+        self, handoff_id: str, request: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Make Worker verify the nonce/export digest chain before FD release."""
+
+        with self._operation_lock:
+            with self._state_lock:
+                session = self._orderly_handoff
+                if (
+                    session is None
+                    or session.handoff_id != handoff_id
+                    or session.phase != "exported"
+                ):
+                    raise ConflictError("orderly handoff is not exported for sealing")
+            response = dict(self.preparer.handoff_command(session.handle, request))
+            if response.get("worker_phase") != "export_sealed":
+                raise ConflictError("Worker did not verify the export seal")
+            session.phase = "export_sealed"
+            return response
+
+    def release_exported_handoff(self, handoff_id: str) -> None:
+        """Relinquish A's Worker descriptor after coordinator custody ack."""
+
+        with self._operation_lock:
+            with self._state_lock:
+                session = self._orderly_handoff
+                if session is None or session.handoff_id != handoff_id or session.phase != "export_sealed":
+                    raise ConflictError("orderly handoff was not exported")
+                self._watch_stop.set()
+                self._active_handle = None
+                self._active_profile = None
+                self._active_identity = None
+                self._active_receipt = None
+            self.preparer.release_exported(session.handle)
+            session.phase = "released"
+
+    def adopt_orderly_handoff(
+        self,
+        *,
+        descriptor: int,
+        profile_id: str,
+        receipt: Mapping[str, Any],
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Prepare B custody while retaining disabled registration-only authority."""
+
+        with self._operation_lock:
+            handle = None
+            try:
+                profile = self._profile(profile_id, self.workspace_uuid)
+                if self._orderly_handoff is not None or self._active_handle is not None:
+                    raise ConflictError("Runtime B already owns a local Worker")
+                metadata = self.credentials.actor_metadata(self.actor)
+                if not isinstance(metadata, Mapping) or metadata.get("local_launch_receipt") != receipt:
+                    raise ConflictError("handoff receipt does not match retained credential metadata")
+                generation = self.credentials.generation_snapshot(self.actor)
+                if request.get("credential_generation") != generation:
+                    raise ConflictError("handoff credential generation changed before adoption")
+                # From this point B is the committed custodian. The cleanup
+                # boundary begins before any fallible descriptor adaptation,
+                # rather than after a fully constructed handle is returned.
+                handle = self.preparer.adopt_control_descriptor(descriptor, receipt)
+                first = self._validate_observation(
+                    profile, self.inspector.observe(handle), report=None, reconnect=True
+                )
+                second = self._validate_observation(
+                    profile, self.inspector.observe(handle), report=None, reconnect=True
+                )
+                if first != second or first.get("evidence_digest") != receipt.get("evidence_digest"):
+                    raise ConflictError("handoff graph identity changed before adoption")
+                response = dict(self.preparer.handoff_command(handle, request))
+                if response.get("worker_phase") != "adopt_prepared":
+                    raise ConflictError("Worker did not prepare adopter custody")
+                host_ack = response.get("host_ack")
+                registered_state = (
+                    host_ack.get("registered_state")
+                    if isinstance(host_ack, Mapping)
+                    else None
+                )
+                if not isinstance(registered_state, Mapping):
+                    raise ConflictError("handoff adopter acknowledgement lacks registered state")
+                session = _OrderlyHandoff(
+                    handoff_id=str(request["handoff_id"]),
+                    handle=handle,
+                    profile=profile,
+                    identity=second,
+                    receipt=dict(receipt),
+                    generation=dict(generation),
+                    common={
+                        key: request[key]
+                        for key in (
+                            "version",
+                            "handoff_id",
+                            "nonce_digest",
+                            "sealed_record_digest",
+                            "deadline_monotonic",
+                            "deadline_unix_ms",
+                        )
+                    },
+                    registered_state=dict(registered_state),
+                    phase="adopt_prepared",
+                    old_owner=dict(request["old_owner"]),
+                    new_owner=dict(request["new_owner"]),
+                )
+                self._install_active(handle, profile, second, receipt)
+                self.credentials.disable_actor(self.actor)
+                self._orderly_handoff = session
+                return {
+                    "state": "adopt_prepared",
+                    "ack": response,
+                    "registered_state": dict(registered_state),
+                }
+            except BaseException:
+                self.credentials.disable_actor(self.actor)
+                try:
+                    # B already owns the preserved graph at this point.  A
+                    # plain descriptor close would orphan the Worker, host,
+                    # engine and listener.  Run the adopted non-child cleanup
+                    # path, which uses receipt-bound full identities and
+                    # deliberately never waitpid(2)s these processes.
+                    if handle is None:
+                        cleanup = getattr(self.preparer, "abort_adopted_descriptor", None)
+                        if not callable(cleanup):
+                            raise ConflictError(
+                                "adopted descriptor cleanup capability is unavailable"
+                            )
+                        cleanup(descriptor, receipt)
+                    else:
+                        self.preparer.abort(handle)
+                except BaseException as cleanup_error:
+                    self._latch_cleanup_uncertain(cleanup_error)
+                    raise ConflictError(
+                        "adopted local Worker graph cleanup is uncertain"
+                    ) from cleanup_error
+                raise
+
+    def _handoff_phase_command(
+        self,
+        handoff_id: str,
+        *,
+        command: str,
+        extras: Mapping[str, Any],
+        expected_phase: str,
+    ) -> dict[str, Any]:
+        with self._operation_lock:
+            with self._state_lock:
+                session = self._orderly_handoff
+                if session is None or session.handoff_id != handoff_id:
+                    raise ConflictError("orderly handoff adopter is unavailable")
+            request = {**session.common, "command": command, **dict(extras)}
+            response = dict(self.preparer.handoff_command(session.handle, request))
+            if response.get("worker_phase") != expected_phase:
+                raise ConflictError("Worker handoff phase acknowledgement is invalid")
+            session.phase = expected_phase
+            return response
+
+    def commit_orderly_handoff(
+        self, handoff_id: str, *, new_runtime: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        with self._state_lock:
+            session = self._orderly_handoff
+            if session is None or session.phase != "adopt_prepared":
+                raise ConflictError("orderly handoff is not adoption-prepared")
+            if self.credentials.generation_snapshot(self.actor) != session.generation:
+                raise ConflictError("handoff credential generation changed before commit")
+            self.credentials.enable_actor(self.actor)
+        try:
+            return self._handoff_phase_command(
+                handoff_id,
+                command="handoff_commit",
+                extras={
+                    "new_owner": dict(session.new_owner or {}),
+                    "new_runtime": dict(new_runtime),
+                    "credential_generation": dict(session.generation),
+                    "registered_state": dict(session.registered_state),
+                },
+                expected_phase="rebind_committed",
+            )
+        except BaseException:
+            self.credentials.disable_actor(self.actor)
+            raise
+
+    def resume_orderly_handoff(
+        self, handoff_id: str, *, new_runtime: Mapping[str, Any], commit: bool
+    ) -> dict[str, Any]:
+        expected_before = (
+            frozenset({"resume_armed"})
+            if commit
+            else frozenset({"rebind_committed", "resume_armed"})
+        )
+        with self._state_lock:
+            session = self._orderly_handoff
+            if session is None or session.phase not in expected_before:
+                raise ConflictError("orderly handoff resume phase is invalid")
+        return self._handoff_phase_command(
+            handoff_id,
+            command="resume_commit" if commit else "resume_prepare",
+            extras={
+                "new_owner": dict(session.new_owner or {}),
+                "new_runtime": dict(new_runtime),
+            },
+            expected_phase="resumed" if commit else "resume_armed",
+        )
+
+    def finalize_orderly_handoff(self, handoff_id: str) -> dict[str, Any]:
+        """Terminally consume handoff authority before Runtime publishes ready."""
+
+        with self._state_lock:
+            session = self._orderly_handoff
+            if session is None or session.handoff_id != handoff_id or session.phase != "resumed":
+                raise ConflictError("orderly handoff has not completed resume")
+            if self.credentials.generation_snapshot(self.actor) != session.generation:
+                raise ConflictError("handoff credential generation changed before publication")
+            new_runtime = session.registered_state.get("runtime")
+            if not isinstance(new_runtime, Mapping):
+                raise ConflictError("handoff registered Runtime identity is unavailable")
+        request = {
+            **session.common,
+            "command": "handoff_finalize",
+            "new_owner": dict(session.new_owner or {}),
+        }
+        response = self._handoff_phase_command(
+            handoff_id,
+            command="handoff_finalize",
+            extras={"new_owner": dict(session.new_owner or {})},
+            expected_phase="finalized",
+        )
+        with self._state_lock:
+            if self._orderly_handoff is not session or session.phase != "finalized":
+                raise ConflictError("orderly handoff terminal state changed")
+            self._orderly_handoff = None
+        self._start_watcher()
+        host_ack = response.get("host_ack")
+        if not isinstance(host_ack, Mapping):
+            raise ConflictError("Worker final acknowledgement lacks the host acknowledgement")
+        return {
+            "request_digest": _digest(request),
+            "worker_ack_digest": _digest(response),
+            "host_ack_digest": _digest(host_ack),
+            "ack": response,
+        }
+
     @staticmethod
     def _watch_liveness(
         owner_ref: "weakref.ReferenceType[LocalWorkerLauncher]",
@@ -623,12 +1191,25 @@ class LocalWorkerLauncher:
             self._abort(handle)
         return True
 
+    def cleanup_receipt_snapshot(self) -> dict[str, Any] | None:
+        """Return the secret-free receipt before shutdown clears custody."""
+
+        with self._state_lock:
+            return dict(self._active_receipt) if self._active_receipt is not None else None
+
     def begin_shutdown(self) -> list[object]:
         """Fence authority synchronously; return owned handles for later cleanup."""
         self._shutdown.set()
         self._watch_stop.set()
         self._prepare_cancel.set()
         with self._state_lock:
+            active_before_fence = self._active_handle
+            preparing_before_fence = self._preparing_handle
+            owned_before_fence = (
+                active_before_fence,
+                preparing_before_fence,
+                self.preparer.current_handle(),
+            )
             self._revoke_actor()
             self._active_handle = None
             self._active_profile = None
@@ -636,7 +1217,14 @@ class LocalWorkerLauncher:
             self._active_receipt = None
             self._preparing_handle = None
         cancel_current = getattr(self.preparer, "cancel_current", None)
-        if callable(cancel_current):
+        # A steady active graph is cleaned exactly once by finish_shutdown(),
+        # where the acknowledgement and custody result remain observable.  The
+        # cancellation hook exists for the narrower prepare-in-flight window;
+        # using it for an already-active graph raced the watcher/cleanup path,
+        # swallowed the concrete failure, and could leave only a generic
+        # cleanup-uncertain latch even after every child had exited.
+        cancel_prepare = active_before_fence is None
+        if cancel_prepare and callable(cancel_current):
             try:
                 cancel_current()
             except BaseException:
@@ -654,8 +1242,7 @@ class LocalWorkerLauncher:
         with self._state_lock:
             handles = [
                 value for value in (
-                    self._active_handle,
-                    self._preparing_handle,
+                    *owned_before_fence,
                     self.preparer.current_handle(),
                 )
                 if value is not None
@@ -670,15 +1257,63 @@ class LocalWorkerLauncher:
         watcher = self._watch_thread
         if watcher is not None and watcher is not threading.current_thread():
             watcher.join(0.5)
+        failures = []
         for handle in handles:
-            self._abort(handle)
+            completed = threading.Event()
+            failure: list[BaseException] = []
+
+            def cleanup() -> None:
+                try:
+                    self.preparer.abort(handle)
+                except BaseException as exc:
+                    failure.append(exc)
+                finally:
+                    completed.set()
+
+            thread = threading.Thread(target=cleanup, name="local-worker-final-cleanup", daemon=True)
+            thread.start()
+            timeout = max(
+                1.0,
+                float(getattr(
+                    self.preparer,
+                    "shutdown_timeout_seconds",
+                    getattr(self.preparer, "cleanup_timeout_seconds", 0.1),
+                )),
+            )
+            thread.join(timeout)
+            if not completed.is_set():
+                failures.append(ConflictError("local Worker cleanup exceeded its bounded deadline"))
+            failures.extend(failure)
+        uncertain = getattr(self.preparer, "cleanup_uncertain", None)
+        if failures or uncertain:
+            # Preserve a bounded, credential-free operational reason.  The
+            # caller persists this after the private control channel is gone;
+            # replacing it with a generic ConflictError made a failed ACK,
+            # timeout, and malformed response indistinguishable in retained
+            # product-down evidence.
+            details: list[str] = []
+            for failure in failures:
+                value = " ".join(str(failure).split())[:384]
+                details.append(f"{type(failure).__name__}:{value or 'no_detail'}")
+            if uncertain:
+                value = " ".join(str(uncertain).split())[:384]
+                entry = f"preparer:{value or 'no_detail'}"
+                if entry not in details:
+                    details.append(entry)
+            detail = ";".join(details)[:768]
+            raise ConflictError(
+                "local Worker graph cleanup is uncertain"
+                + (f" [{detail}]" if detail else "")
+            )
 
     def _try_reconnect(self, profile: LocalWorkerProfile, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         receipt = metadata.get("local_launch_receipt")
         if not isinstance(receipt, Mapping) or receipt.get("version") != RECEIPT_VERSION:
-            return None
+            raise ConflictError("surviving local Worker receipt shape or version is invalid")
         if receipt.get("profile_id") != profile.profile_id or receipt.get("workspace_uuid") != self.workspace_uuid:
-            return None
+            raise ConflictError("surviving local Worker receipt authority differs")
+        if not self._receipt_identity_digest_valid(profile, receipt):
+            raise ConflictError("surviving local Worker receipt identity digest is invalid")
         handle = self.preparer.reconnect(receipt)
         if handle is None:
             return None
@@ -715,6 +1350,68 @@ class LocalWorkerLauncher:
                 self._abort(handle)
             raise
 
+    def _current_active_result(
+        self, profile: LocalWorkerProfile, metadata: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return the already-owned generation without reconnect side effects.
+
+        A repeated start request can arrive while this Runtime still owns the
+        active handle.  The durable credential is public-to-the-owner input,
+        not cleanup custody: if its receipt or binding was replaced, reject it
+        before disabling authority, reconnecting, preparing, or signaling the
+        verified graph.  This also gives installed negative controls a real
+        consumer boundary without corrupting cleanup authority.
+        """
+
+        with self._state_lock:
+            handle = self._active_handle
+            active_profile = self._active_profile
+            active_identity = (
+                dict(self._active_identity)
+                if self._active_identity is not None else None
+            )
+            active_receipt = (
+                dict(self._active_receipt)
+                if self._active_receipt is not None else None
+            )
+        if handle is None:
+            return None
+        if active_profile != profile or active_identity is None or active_receipt is None:
+            raise ConflictError("active local Worker custody is incomplete")
+        receipt = metadata.get("local_launch_receipt")
+        binding = metadata.get("execution_binding")
+        verification = binding.get("verification") if isinstance(binding, Mapping) else None
+        actual = binding.get("actual") if isinstance(binding, Mapping) else None
+        if (
+            not isinstance(receipt, Mapping)
+            or dict(receipt) != active_receipt
+            or not isinstance(binding, Mapping)
+            or binding.get("executor_incarnation")
+            != active_receipt.get("executor_incarnation")
+            or not isinstance(verification, Mapping)
+            or verification.get("verified") is not True
+            or verification.get("evidence_digest")
+            != active_receipt.get("evidence_digest")
+            or not isinstance(actual, Mapping)
+            or actual.get("kind") != "machine"
+            or actual.get("id") != active_identity.get("machine_id")
+            or actual.get("profile_revision") != profile.profile_revision
+            or actual.get("profile_digest") != profile.profile_digest
+            or actual.get("release_digest") != profile.release_digest
+        ):
+            raise ConflictError(
+                "active local Worker durable receipt differs from Runtime custody"
+            )
+        observed = self.inspector.observe(handle)
+        current = self._validate_observation(
+            profile, observed, report=None, reconnect=True,
+        )
+        if current != active_identity:
+            raise ConflictError("active local Worker identity changed")
+        result = dict(active_receipt)
+        result["state"] = "reconnected"
+        return result
+
     def start(self, profile_id: str, expected_workspace_uuid: str) -> dict[str, Any]:
         if not self._operation_lock.acquire(blocking=False):
             raise ConflictError("a local worker launch operation is already in progress")
@@ -723,12 +1420,20 @@ class LocalWorkerLauncher:
         try:
             if self._shutdown.is_set():
                 raise ConflictError("Runtime owner is shutting down")
+            if self._startup_receipt_rejection is not None:
+                raise ConflictError(self._startup_receipt_rejection)
+            if self._cleanup_uncertain is not None or getattr(self.preparer, "cleanup_uncertain", None):
+                raise ConflictError("local Worker graph cleanup is uncertain")
             profile = self._profile(profile_id, expected_workspace_uuid)
             with self._state_lock:
                 if self._shutdown.is_set():
                     raise ConflictError("Runtime owner is shutting down")
                 self._prepare_cancel.clear()
             existing = self.credentials.actor_metadata(self.actor)
+            if existing:
+                active = self._current_active_result(profile, existing)
+                if active is not None:
+                    return active
             if existing:
                 self.credentials.disable_actor(self.actor)
                 try:
@@ -807,6 +1512,11 @@ class LocalWorkerLauncher:
             )
             if activated != second:
                 raise ConflictError("activated local worker is not the verified parked host")
+            seal_cleanup_receipt = getattr(
+                self.preparer, "seal_cleanup_receipt", None
+            )
+            if callable(seal_cleanup_receipt):
+                seal_cleanup_receipt(handle, receipt)
             # Publication is last: neither the parked process nor another
             # holder of the file can authenticate before the private grant is
             # accepted and the same process identity is observed once more.

@@ -8,6 +8,7 @@ real loopback daemon process and a generated-client-shaped connection.
 from __future__ import annotations
 
 import json
+import uuid
 import os
 from pathlib import Path
 import signal
@@ -22,6 +23,16 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .bootstrap import BootstrapError, SourceProfile
+from .custody_broker import (
+    ACTIVE_CAPABILITY_NAME,
+    CustodyError,
+    RoleBoundCustodyBroker,
+    close_authority_scope,
+    custody_wrapper_argv,
+    default_process_identity,
+    publish_active_capability,
+    signal_sealed_capability,
+)
 
 
 PROTOCOL_VERSION = "workspace.v1"
@@ -45,6 +56,15 @@ def _admission_timeout_from_environment() -> float:
     if not (value > 0 and value != float("inf") and value == value):
         raise BootstrapError(f"{ADMISSION_TIMEOUT_ENV} must be a finite positive number.")
     return value
+
+
+class RuntimeCustodyLaunchUncertain(BootstrapError):
+    """Retain a created child even when admission/publication failed."""
+
+    def __init__(self, message: str, *, process: subprocess.Popen[str], broker: RoleBoundCustodyBroker):
+        super().__init__(message)
+        self.process = process
+        self.broker = broker
 
 
 class RuntimeConnection:
@@ -321,6 +341,46 @@ class LocalRuntimeBoundary:
             raise BootstrapError("Runtime realm inspection returned invalid metadata.")
         return report
 
+    def _spawn_runtime(self, argv: list[str], *, support_root: Path, stdout):
+        """Publish exact child custody before any admission wait can fail."""
+        run_id = uuid.uuid4().hex
+        ledger_root = support_root / "runtime-custody" / run_id
+        ledger_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        scope = support_root / "runtime-custody-scopes" / run_id
+        scope.mkdir(mode=0o700, parents=True)
+        broker = RoleBoundCustodyBroker(
+            role="runtime_owner",
+            identity_provider=default_process_identity,
+            ledger_root=ledger_root,
+            timeout=min(10.0, self.admission_timeout_seconds),
+            authority_scope_root=scope,
+            authority_journal=scope / "retained-authority.jsonl",
+        )
+        environment = dict(os.environ)
+        environment.update(broker.child_environment(argv, start_new_session=True))
+        try:
+            process = subprocess.Popen(
+                custody_wrapper_argv(argv[0]), stdout=stdout,
+                stderr=subprocess.STDOUT, text=True, env=environment,
+                start_new_session=False, close_fds=True,
+            )
+        except BaseException:
+            broker.abort_before_spawn()
+            raise
+        # This object is the sole reaper; adopted owners cannot use this fact.
+        process._runtime_boundary_owner = self
+        process._runtime_boundary_sole_reaper = True
+        process._runtime_custody_broker = broker
+        self._process = process
+        try:
+            broker.wait_until_sealed()
+        except CustodyError as exc:
+            raise RuntimeCustodyLaunchUncertain(
+                "Runtime child exists but custody admission is uncertain.",
+                process=process, broker=broker,
+            ) from exc
+        return process, broker
+
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
         if self._process and self._process.poll() is None:
             raise BootstrapError("runtime boundary already owns a live daemon")
@@ -345,7 +405,7 @@ class LocalRuntimeBoundary:
             # Preserve the daemon's structured startup failure on the existing
             # operator log boundary; successful stdout is only its one-line
             # launch record.
-            self._process = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            self._process, broker = self._spawn_runtime(argv, support_root=support_root, stdout=log)
         except Exception:
             log.close()
             token_file.unlink(missing_ok=True)
@@ -357,6 +417,13 @@ class LocalRuntimeBoundary:
         try:
             endpoint = self._wait_endpoint(support_root, self._process)
             discovery = self._read_discovery(support_root)
+            identity = default_process_identity(self._process.pid)
+            if identity is None:
+                raise BootstrapError("Ready Runtime child disappeared before custody publication.")
+            if identity.get("birth_id") != discovery.get("process_birth_id"):
+                raise BootstrapError("Ready Runtime birth identity differs from discovery.")
+            broker.bind_ready_token(expected_pid=self._process.pid, expected_identity=identity)
+            publish_active_capability(support_root / ACTIVE_CAPABILITY_NAME, broker)
         except Exception:
             self._terminate(self._process)
             token_file.unlink(missing_ok=True)
@@ -604,33 +671,49 @@ class LocalRuntimeBoundary:
         if pid <= 0:
             return False
         try:
-            os.kill(pid, 0)
+            return default_process_identity(pid) is not None
+        except CustodyError:
+            # Unknown observation protects the incumbent; it never grants signal authority.
             return True
-        except PermissionError:
-            # EPERM means the kernel found a process but this sandbox/user is
-            # not permitted to signal it. Treat that as alive; callers use
-            # liveness to protect incumbent discovery and must not revoke a
-            # healthy owner merely because signaling is denied.
-            return True
-        except OSError:
-            return False
 
     @staticmethod
     def _terminate(process: subprocess.Popen[str]):
-        if process.poll() is not None:
-            return
+        primary = sys.exc_info()[1]
+        broker = getattr(process, "_runtime_custody_broker", None)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+            if not getattr(process, "_runtime_boundary_sole_reaper", False):
+                raise CustodyError("Runtime child has no authoritative sole-reaper ownership")
+            if process.poll() is not None:
+                return
+            if not isinstance(broker, RoleBoundCustodyBroker):
+                raise CustodyError("Runtime child has no registered kernel custody")
+            deadline = time.monotonic() + 7.0
+            broker.set_cleanup_deadline(deadline)
+            if broker.authority_scope_root is not None:
+                close_authority_scope(broker.authority_scope_root, deadline=deadline)
+            signal_owned = broker.signal_failed_admission if broker.error is not None else broker.signal
+            for signum, timeout in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+                if process.poll() is not None:
+                    return
+                try:
+                    signal_owned(signum, expected_pid=process.pid)
+                except CustodyError:
+                    # Only the retained, reaped direct-child handle proves this exit race.
+                    if process.poll() is not None:
+                        return
+                    raise
+                try:
+                    process.wait(timeout=timeout)
+                    return
+                except subprocess.TimeoutExpired:
+                    continue
+            raise CustodyError("Runtime child remains alive after bounded kernel-custody cleanup")
+        except (CustodyError, OSError) as exc:
+            failure = BootstrapError(f"Runtime cleanup remains uncertain: {exc}")
+            process._runtime_cleanup_error = failure
+            if primary is not None:
+                raise primary.with_traceback(primary.__traceback__) from failure
+            raise failure from exc
 
     def stop(self, **_kwargs):
         if self._process:
@@ -741,7 +824,14 @@ class LocalRuntimeBoundary:
             if detached != expected_pid:
                 raise BootstrapError("Runtime restart refused: adopted owner PID changed.")
             validate_before_signal(require_health=require_health)
-            os.killpg(detached, signal.SIGTERM)
+            try:
+                signal_sealed_capability(
+                    support / ACTIVE_CAPABILITY_NAME,
+                    expected_identity={"pid": detached, "birth_id": expected_birth, "uid": os.getuid()},
+                    signum=signal.SIGTERM,
+                )
+            except CustodyError as exc:
+                raise BootstrapError(f"Runtime detached cleanup remains uncertain: {exc}") from exc
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and self.is_pid_alive(detached):
                 time.sleep(0.05)
@@ -749,7 +839,19 @@ class LocalRuntimeBoundary:
                 # Revalidate again before escalation; PID reuse or a changed
                 # group must never receive a signal from this boundary.
                 validate_before_signal(require_health=False)
-                os.killpg(detached, signal.SIGKILL)
+                try:
+                    signal_sealed_capability(
+                        support / ACTIVE_CAPABILITY_NAME,
+                        expected_identity={"pid": detached, "birth_id": expected_birth, "uid": os.getuid()},
+                        signum=signal.SIGKILL,
+                    )
+                except CustodyError as exc:
+                    raise BootstrapError(f"Runtime detached cleanup remains uncertain: {exc}") from exc
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and self.is_pid_alive(detached):
+                time.sleep(0.05)
+            if self.is_pid_alive(detached):
+                raise BootstrapError("Runtime detached cleanup remains uncertain after bounded wait.")
             self._detached_pid = None
         else:
             process = self._process
