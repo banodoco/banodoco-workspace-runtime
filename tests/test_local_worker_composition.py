@@ -379,3 +379,65 @@ def test_control_probe_rejects_buffered_data_from_closed_peer(tmp_path, monkeypa
         assert preparer.control_alive(handle) is False
     finally:
         parent.close()
+
+
+def test_explicit_relay_profile_translates_exact_engine_launch_without_worker_environment(tmp_path):
+    from test_local_execution_supervisor import _prepare_case
+    document, _source, support, _packs = _profile_document(tmp_path)
+    selected, _ = _prepare_case()
+    document.pop("worker_environment")
+    document["engine_launch"] = selected["profile"]["engine_launch"]
+    document["session_config_digest"] = selected["profile"]["session_config_digest"]
+    path = tmp_path / "relay-profile.json"
+    path.write_text(json.dumps(document))
+    composition = load_local_worker_composition(path, workspace_uuid="realm", realm_root=tmp_path / "realm", support_root=support, runtime_instance_id="runtime-epoch")
+    assert composition.profiles["astrid"].engine_launch == document["engine_launch"]
+    assert "ASTRID_WORKER_ENVIRONMENT" not in composition.preparer.environment
+    assert composition.preparer.config["runtime_instance_id"] == "runtime-epoch"
+
+
+def test_relay_receipt_v4_binds_epoch_scope_roles_and_selected_profile(tmp_path):
+    from dataclasses import replace
+    from test_local_execution_supervisor import _prepare_case
+    from runtime_protocol.local_execution_supervisor import preparation_report, digest
+    from runtime_protocol.local_worker import LocalWorkerLauncher, LocalWorkerObservation, _selected_profile_payload, _receipt_identity_digest_valid
+    selected, host_report = _prepare_case()
+    profile = LocalWorkerProfile(**{k: Path(v) if k in {"realm_root", "support_root", "worker_executable", "host_executable", "engine_executable", "engine_listener_executable"} else v for k, v in selected["profile"].items()})
+    refs = dict(host_report["custody_capabilities"])
+    for role, pid, birth in (("relay", 20, "relay-birth"), ("host", 21, "host-birth")):
+        refs[role] = {**refs["engine"], "role": role, "target": {**refs["engine"]["target"], "pid": pid, "birth_id": birth}}
+    for ref in refs.values():
+        ref["target"] = {**ref["target"], "uid": os.getuid()}
+    host_report = {**host_report, "custody_capabilities": {role: refs[role] for role in ("engine", "engine_listener")}}
+    report = preparation_report(selected, host_report, relay_process={"pid": 20, "birth_id": "relay-birth"}, relay_reference=refs["relay"], host_reference=refs["host"])
+    processes = {}
+    for role, pid, parent, birth in (("worker", 20, 19, "relay-birth"), ("host", 21, 20, "host-birth"), ("engine", 22, 21, "engine-birth"), ("engine_listener", 23, 22, "listener-birth")):
+        exe_name = "worker" if role == "worker" else role
+        processes[role] = ProcessIdentity(pid, birth, os.getuid(), parent, 22 if role == "engine_listener" else pid, 22 if role == "engine_listener" else pid, getattr(profile, exe_name + "_executable"), getattr(profile, exe_name + "_artifact_digest"))
+    observed = LocalWorkerObservation(profile.machine_id, os.getuid(), profile.workspace_uuid, profile.realm_root, profile.support_root, **processes, engine_listener_socket_owner_pid=23, engine_endpoint=profile.engine_endpoint, session_config_digest=profile.session_config_digest, owner_epoch="runtime-epoch", custody_scope=selected["custody_scope"], custody_capabilities=refs)
+    launcher = object.__new__(LocalWorkerLauncher)
+    launcher.runtime_pid = 19
+    launcher.workspace_uuid = profile.workspace_uuid
+    launcher.realm_root = profile.realm_root
+    launcher.support_root = profile.support_root
+    identity = launcher._validate_observation(profile, observed, report=report, operation_id="operation", channel_id="channel")
+    receipt = {"version": "runtime.local-worker-receipt/v4", **identity, "executor_incarnation": "incarnation"}
+    assert identity["profile_binding_digest"] == digest(_selected_profile_payload(profile))
+    args = dict(workspace_uuid=profile.workspace_uuid, realm_root=profile.realm_root, support_root=profile.support_root)
+    assert _receipt_identity_digest_valid(profile, receipt, **args)
+    changed = {**receipt, "owner_epoch": "replacement-runtime"}
+    assert not _receipt_identity_digest_valid(profile, changed, **args)
+    changed_report = {**report, "owner_epoch": "replacement-runtime"}
+    with pytest.raises(ConflictError, match="independently verified custody"):
+        launcher._validate_observation(profile, observed, report=changed_report, operation_id="operation", channel_id="channel")
+
+
+def test_relay_stop_without_retained_control_never_uses_numeric_signal(tmp_path, monkeypatch):
+    from dataclasses import replace
+    document, _, support, _ = _profile_document(tmp_path)
+    profile = LocalWorkerProfile(**{k: Path(v) if k in {"realm_root", "support_root", "worker_executable", "host_executable", "engine_executable", "engine_listener_executable"} else v for k, v in __import__("test_local_execution_supervisor")._prepare_case()[0]["profile"].items()})
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    monkeypatch.setattr(os, "kill", lambda *_: pytest.fail("numeric fallback"))
+    monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("numeric fallback"))
+    with pytest.raises(ConflictError, match="retained control"):
+        preparer.stop_owned({})

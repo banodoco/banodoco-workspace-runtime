@@ -34,6 +34,7 @@ from .local_worker import (
     LocalWorkerProfile,
     ProcessIdentity,
     _engine_endpoint,
+    _selected_profile_payload,
 )
 
 
@@ -88,6 +89,11 @@ class _PreparedWorker:
     rpc_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_lock: threading.Lock = field(default_factory=threading.Lock)
     cleanup_started: bool = False
+    relay: bool = False
+    retained: Any = None
+    broker: Any = None
+    owner_epoch: str | None = None
+    custody_scope: str | None = None
 
 
 class CrossProcessWorkerPreparer(LocalWorkerPreparer):
@@ -148,13 +154,14 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         }
 
     def _rpc_unlocked(self, handle: _PreparedWorker, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if handle.closed or handle.worker.poll() is not None:
+        if handle.closed or (handle.retained.poll() if handle.relay else handle.worker.poll()) is not None:
             raise ConflictError("prepared Worker is not alive")
         if self._birth(handle.worker.pid) != handle.birth_id:
             raise ConflictError("prepared Worker identity changed")
         _frame_send(handle.control, payload)
         response = _frame_receive(handle.control)
-        if response.get("version") != CONTROL_VERSION:
+        expected_version = "runtime.local-execution-control/v1" if handle.relay else CONTROL_VERSION
+        if response.get("version") != expected_version:
             raise ConflictError("prepared Worker control version is invalid")
         if response.get("status") != "ok":
             raise ConflictError(str(response.get("error") or "prepared Worker rejected the operation"))
@@ -165,6 +172,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             return self._rpc_unlocked(handle, payload)
 
     def prepare(self, profile: LocalWorkerProfile, *, operation_id: str, channel_id: str) -> _PreparedWorker:
+        if profile.engine_launch is not None:
+            return self._prepare_relay(profile, operation_id=operation_id, channel_id=channel_id)
         if self._active is not None:
             self.abort(self._active)
         if self._prepare_cancel.is_set():
@@ -250,8 +259,99 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                     pass
             raise
 
+    def _prepare_relay(self, profile, *, operation_id, channel_id):
+        from .local_execution_supervisor import host_prepare_request, RetainedProcess
+        from banodoco_local.custody_broker import RoleBoundCustodyBroker, default_process_identity, custody_wrapper_argv
+        if self._active is not None:
+            self.abort(self._active)
+        if self._prepare_cancel.is_set():
+            raise ConflictError("local execution preparation cancelled")
+        selected = _selected_profile_payload(profile)
+        epoch = self.config.get("runtime_instance_id")
+        owner = default_process_identity(os.getpid())
+        if owner is None or not isinstance(epoch, str) or not epoch:
+            raise ConflictError("Runtime launch owner identity is unavailable")
+        owner.update(runtime_instance_id=epoch, coordinator_epoch=epoch)
+        owner.pop("parent_pid", None)
+        # Operation IDs originate in Runtime. Reject path syntax before using
+        # one to select this private, launch-specific protected scope.
+        if not isinstance(operation_id, str) or not operation_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in operation_id):
+            raise ConflictError("Runtime local execution operation identity is invalid")
+        scope = profile.support_root / "local-execution-custody" / operation_id
+        request = host_prepare_request(operation_id=operation_id, channel_id=channel_id, owner_epoch=epoch,
+            runtime_owner=owner, profile=selected, custody_scope=str(scope))
+        if _actual_executable(os.getpid()) != profile.worker_executable or _file_digest(profile.worker_executable) != profile.worker_artifact_digest:
+            raise ConflictError("selected relay interpreter differs from current Runtime kernel artifact")
+        parent, child = socket.socketpair()
+        broker = None
+        handle = None
+        try:
+            with self._handoff_lock:
+                broker = RoleBoundCustodyBroker(role="relay", identity_provider=default_process_identity,
+                    ledger_root=scope / "relay-admission", authority_scope_root=scope,
+                    authority_journal=scope / "admissions.jsonl", owner_epoch=epoch,
+                    timeout=min(self.timeout_seconds, 60.0))
+                argv = [sys.executable, "-I", "-m", "runtime_protocol.local_execution_supervisor", "--prepared-control-fd", str(child.fileno())]
+                environment = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONHOME"} and not k.startswith("ASTRID_RUNTIME_CUSTODY_")}
+                environment.update({k: v for k, v in self.environment.items() if k in {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "XDG_RUNTIME_DIR", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ASTRID_EXECUTION_TARGET_JSON"}})
+                environment.update(broker.child_environment(argv, start_new_session=True))
+                process = subprocess.Popen(custody_wrapper_argv(sys.executable), cwd=str(profile.support_root),
+                    env=environment, stdin=subprocess.DEVNULL, close_fds=True, pass_fds=(child.fileno(),))
+                retained = RetainedProcess(process)
+                # Publish before birth/token/seal observations can fail.
+                handle = _PreparedWorker(process, "", parent, {}, Path(profile.engine_launch["session_root"]) / "config.json",
+                    relay=True, retained=retained, broker=broker, owner_epoch=epoch, custody_scope=str(scope))
+                self._active = handle
+                child.close()
+                parent.settimeout(self.timeout_seconds)
+                broker.wait_until_sealed()
+                retained.bind_actor()
+                handle.birth_id = retained.verify()["birth_id"]
+            response = self._rpc(handle, {"version": "runtime.local-execution-control/v1", "command": "prepare", "preparation": request, "config": dict(self.config)})
+            value = response.get("report")
+            if not isinstance(value, dict):
+                raise ConflictError("neutral relay returned no process report")
+            handle.report_value = value
+            return handle
+        except BaseException as primary:
+            child.close()
+            if handle is None:
+                parent.close()
+                if broker is not None:
+                    broker.abort_before_spawn()
+            else:
+                # Retain the launch obligation; failed sealing grants no PID
+                # cleanup fallback and cannot be represented as closed.
+                try:
+                    self.abort(handle)
+                except BaseException as cleanup:
+                    primary.add_note("local execution cleanup remains unresolved: " + type(cleanup).__name__)
+            raise
+
+    def _relay_abort(self, handle):
+        with handle.cleanup_lock:
+            return self._relay_abort_locked(handle)
+
+    def _relay_abort_locked(self, handle):
+        if handle.closed:
+            return
+        response = self._rpc(handle, {"version": "runtime.local-execution-control/v1", "command": "abort"})
+        if not isinstance(response.get("host_exit_code"), int) or isinstance(response["host_exit_code"], bool) or response.get("host_result", {}).get("status") != "cleaned":
+            raise ConflictError("relay has no verified full host cleanup acknowledgement")
+        if handle.retained.poll() is None:
+            handle.broker.signal(signal.SIGTERM, expected_pid=handle.worker.pid)
+            try:
+                handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
+            except BaseException:
+                handle.broker.signal(signal.SIGKILL, expected_pid=handle.worker.pid)
+                handle.retained.wait(max(1.0, self.cleanup_timeout_seconds))
+        handle.control.close()
+        handle.closed = True
+        if self._active is handle:
+            self._active = None
+
     def report(self, handle: _PreparedWorker) -> Mapping[str, Any]:
-        response = self._rpc(handle, {"version": CONTROL_VERSION, "command": "report"})
+        response = self._rpc(handle, {"version": "runtime.local-execution-control/v1" if handle.relay else CONTROL_VERSION, "command": "report"})
         report = response.get("report")
         if not isinstance(report, dict):
             raise ConflictError("prepared Worker returned no process report")
@@ -259,12 +359,16 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         return report
 
     def activate(self, handle: _PreparedWorker, grant: Mapping[str, Any]) -> None:
-        response = self._rpc(handle, {"version": CONTROL_VERSION, "command": "activate", "grant": dict(grant)})
+        response = self._rpc(handle, {"version": "runtime.local-execution-control/v1" if handle.relay else CONTROL_VERSION, "command": "activate", "grant": dict(grant)})
         if response.get("status") != "ok":
             raise ConflictError("prepared Worker rejected activation")
         handle.activated = True
 
     def abort(self, handle: _PreparedWorker) -> None:
+        if isinstance(handle, _PreparedWorker) and handle.closed:
+            return
+        if isinstance(handle, _PreparedWorker) and handle.relay:
+            return self._relay_abort(handle)
         if not isinstance(handle, _PreparedWorker) or handle.closed:
             return
         with handle.cleanup_lock:
@@ -324,6 +428,15 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         gone. A missing or reused PID is already absent from this generation;
         an unobservable PID leaves the handover unresolved.
         """
+        if self.profile.engine_launch is not None:
+            retained = handle or self._active
+            if not isinstance(retained, _PreparedWorker) or not retained.relay or retained.closed:
+                raise ConflictError("relay capability recovery requires retained control")
+            worker = receipt.get("worker")
+            if not isinstance(worker, Mapping) or (worker.get("pid"), worker.get("birth_id")) != (retained.worker.pid, retained.birth_id) or receipt.get("custody_capabilities") != retained.report_value.get("custody_capabilities"):
+                raise ConflictError("relay retained control differs from exact custody receipt")
+            self.abort(retained)
+            return True
         names = ("engine_listener", "engine", "host", "worker")
         processes = []
         for name in names:
@@ -383,7 +496,7 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         return True
 
     def control_alive(self, handle: _PreparedWorker) -> bool:
-        if not isinstance(handle, _PreparedWorker) or handle.closed or handle.worker.poll() is not None:
+        if not isinstance(handle, _PreparedWorker) or handle.closed or (handle.retained.poll() if handle.relay else handle.worker.poll()) is not None:
             return False
         if not handle.rpc_lock.acquire(blocking=False):
             # A Runtime-owned RPC currently holds the channel. Its bounded
@@ -567,8 +680,8 @@ class OSProcessInspector:
         if not all(isinstance(item, Mapping) for item in (worker_data, host_data, engine_data, listener_data)):
             raise ConflictError("Worker process report is incomplete")
         worker = self._identity(int(worker_data["pid"]), str(worker_data["birth_id"]), self.profile.worker_executable, self.profile.worker_artifact_digest, parent_pid=os.getpid(), session_owner=True)
-        host = self._identity(int(host_data["pid"]), str(host_data["birth_id"]), self.profile.host_executable, self.profile.host_artifact_digest, parent_pid=worker.pid, session_owner=True)
-        engine = self._identity(int(engine_data["pid"]), str(engine_data["birth_id"]), self.profile.engine_executable, self.profile.engine_artifact_digest, parent_pid=worker.pid, session_owner=True)
+        host = self._identity(int(host_data["pid"]), str(host_data["birth_id"]), self.profile.host_os_executable or self.profile.host_executable, self.profile.host_os_artifact_digest or self.profile.host_artifact_digest, parent_pid=worker.pid, session_owner=True)
+        engine = self._identity(int(engine_data["pid"]), str(engine_data["birth_id"]), self.profile.engine_executable, self.profile.engine_artifact_digest, parent_pid=host.pid if self.profile.engine_launch is not None else worker.pid, session_owner=True)
         listener = self._identity(int(listener_data["pid"]), str(listener_data["birth_id"]), self.profile.engine_listener_executable, self.profile.engine_listener_artifact_digest, parent_pid=engine.pid, session_owner=False)
         reported_socket_owner = int(binding.get("socket_owner_pid", -1))
         observed_socket_owner, observed_endpoint = _listening_socket_owner(
@@ -589,6 +702,25 @@ class OSProcessInspector:
             raise ConflictError("engine session configuration does not match profile")
         if str(report.get("session_config_digest")) != observed_session_digest:
             raise ConflictError("Worker session configuration claim disagrees with owner observation")
+        custody = None
+        if self.profile.engine_launch is not None:
+            from banodoco_local.custody_broker import RoleCustodyAuthority, current_process_audit_token, default_process_identity, _incarnation
+            from .local_execution_supervisor import validate_role_reference
+            custody = report.get("custody_capabilities")
+            if not handle.relay or not isinstance(custody, Mapping) or set(custody) != {"relay", "host", "engine", "engine_listener"} or report.get("owner_epoch") != handle.owner_epoch or report.get("custody_scope") != handle.custody_scope:
+                raise ConflictError("relay report lacks exact retained Runtime scope/epoch")
+            if report.get("profile_binding_digest") != "sha256:" + hashlib.sha256(json.dumps(_selected_profile_payload(self.profile), sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest():
+                raise ConflictError("relay report selected profile binding differs")
+            actors = {}
+            for role, pid in (("relay", os.getpid()), ("host", worker.pid), ("engine", host.pid), ("engine_listener", host.pid)):
+                observed = default_process_identity(pid)
+                if observed is None:
+                    raise ConflictError("retained cleanup actor is unavailable")
+                actors[role] = _incarnation(observed, current_process_audit_token(pid))
+            for role, identity in (("relay", worker), ("host", host), ("engine", engine), ("engine_listener", listener)):
+                validate_role_reference(custody[role], role=role, scope_root=handle.custody_scope, process={"pid": identity.pid, "birth_id": identity.birth_id})
+                RoleCustodyAuthority(Path(handle.custody_scope), role).verify_reference(custody[role],
+                    expected_actor=actors[role], owner_epoch=handle.owner_epoch)
         return LocalWorkerObservation(
             machine_id=observed_machine,
             uid=os.getuid(),
@@ -602,6 +734,9 @@ class OSProcessInspector:
             engine_listener_socket_owner_pid=observed_socket_owner,
             engine_endpoint=observed_endpoint,
             session_config_digest=observed_session_digest,
+            owner_epoch=handle.owner_epoch if self.profile.engine_launch is not None else None,
+            custody_scope=handle.custody_scope if self.profile.engine_launch is not None else None,
+            custody_capabilities=json.loads(json.dumps(custody)) if custody is not None else None,
         )
 
 
@@ -643,6 +778,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         "engine_artifact_digest", "engine_listener_artifact_digest", "session_config_digest", "profile_revision",
         "profile_digest", "release_digest", "source_checkout", "pack_root", "boot_manifest_path",
         "boot_manifest_hash", "capability_matrix", "environment", "worker_timeout_seconds",
+        "engine_launch", "host_os_executable", "host_os_artifact_digest",
     }
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -651,7 +787,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
     host_executable = _path(raw.get("host_executable"), "host_executable", directory=False)
     engine_executable = _path(raw.get("engine_executable"), "engine_executable", directory=False)
     listener_executable = _path(raw.get("engine_listener_executable"), "engine_listener_executable", directory=False)
-    worker_environment = _path(raw.get("worker_environment"), "worker_environment", directory=True)
+    worker_environment = _path(raw.get("worker_environment"), "worker_environment", directory=True) if raw.get("engine_launch") is None else None
     environment = raw.get("environment", {})
     if not isinstance(environment, Mapping) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in environment.items()):
         raise ValidationError("worker profile environment must be a string mapping")
@@ -683,8 +819,13 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
         profile_revision=str(raw.get("profile_revision") or ""),
         profile_digest=str(raw.get("profile_digest") or ""),
         release_digest=str(raw.get("release_digest") or ""),
+        engine_launch=raw.get("engine_launch"),
+        host_os_executable=_path(raw["host_os_executable"], "host_os_executable", directory=False) if raw.get("host_os_executable") else None,
+        host_os_artifact_digest=raw.get("host_os_artifact_digest"),
     )
-    if profile.engine_endpoint != f"http://127.0.0.1:{engine_port}":
+    if profile.engine_launch is not None:
+        _selected_profile_payload(profile)
+    if profile.engine_launch is None and profile.engine_endpoint != f"http://127.0.0.1:{engine_port}":
         raise ValidationError("worker profile engine_endpoint does not match the Worker launch port")
     source_checkout = _path(raw.get("source_checkout"), "source_checkout", directory=True)
     pack_root = _path(raw.get("pack_root"), "pack_root", directory=True)
@@ -713,7 +854,7 @@ def load_local_worker_composition(path: str | Path, *, workspace_uuid: str, real
     preparer = CrossProcessWorkerPreparer(
         profile=profile,
         config=config,
-        environment={**{str(k): str(v) for k, v in environment.items()}, "ASTRID_WORKER_ENVIRONMENT": str(worker_environment)},
+        environment={**{str(k): str(v) for k, v in environment.items()}, **({"ASTRID_WORKER_ENVIRONMENT": str(worker_environment)} if worker_environment is not None else {})},
         timeout_seconds=float(raw.get("worker_timeout_seconds") or 900.0),
     )
     inspector = OSProcessInspector(profile)

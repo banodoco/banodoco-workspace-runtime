@@ -29,6 +29,12 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 PREPARATION_VERSION = "runtime.local-worker-preparation/v2"
 ACTIVATION_VERSION = "runtime.local-worker-activation/v1"
 RECEIPT_VERSION = "runtime.local-worker-receipt/v3"
+RELAY_RECEIPT_VERSION = "runtime.local-worker-receipt/v4"
+RELAY_PREPARATION_VERSION = "runtime.local-worker-preparation/v3"
+
+
+def _receipt_version(profile):
+    return RELAY_RECEIPT_VERSION if profile.engine_launch is not None else RECEIPT_VERSION
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,17 @@ class LocalWorkerProfile:
     # while the OS pins are used for independent live-process observation.
     host_os_executable: Path | None = None
     host_os_artifact_digest: str | None = None
+    # Explicit selected Vibe package/launch/seam closure. Absence keeps the
+    # historical profile on its legacy ABI; it never selects ambient Vibe.
+    engine_launch: Mapping[str, Any] | None = None
+
+
+def _selected_profile_payload(profile: LocalWorkerProfile) -> dict[str, Any]:
+    from .local_execution_supervisor import PROFILE_FIELDS, validate_selected_profile
+    payload = {name: str(getattr(profile, name)) if isinstance(getattr(profile, name), Path) else getattr(profile, name) for name in PROFILE_FIELDS}
+    if profile.host_os_executable is not None:
+        payload.update(host_os_executable=str(profile.host_os_executable), host_os_artifact_digest=profile.host_os_artifact_digest)
+    return validate_selected_profile(payload)
 
 
 @dataclass(frozen=True)
@@ -93,6 +110,9 @@ class LocalWorkerObservation:
     engine_listener_socket_owner_pid: int
     engine_endpoint: str
     session_config_digest: str
+    owner_epoch: str | None = None
+    custody_scope: str | None = None
+    custody_capabilities: Mapping[str, Any] | None = None
 
 
 class LocalWorkerPreparer(Protocol):
@@ -154,12 +174,14 @@ def _receipt_identity_digest_valid(
         "session_config_digest", "profile_revision", "profile_digest",
         "release_digest",
     }
+    if profile.engine_launch is not None:
+        identity_keys |= {"owner_epoch", "custody_scope", "custody_capabilities", "profile_binding_digest"}
     if set(receipt) != identity_keys | {
         "version", "evidence_digest", "executor_incarnation",
     }:
         return False
     if (
-        receipt.get("version") != RECEIPT_VERSION
+        receipt.get("version") != _receipt_version(profile)
         or receipt.get("profile_id") != profile.profile_id
         or receipt.get("workspace_uuid") != str(workspace_uuid)
         or receipt.get("realm_root") != str(Path(realm_root))
@@ -340,7 +362,7 @@ class LocalWorkerLauncher:
     def _receipt_shape_valid(self, metadata: Mapping[str, Any]) -> bool:
         receipt = metadata.get("local_launch_receipt")
         binding = metadata.get("execution_binding")
-        if not isinstance(receipt, Mapping) or receipt.get("version") != RECEIPT_VERSION:
+        if not isinstance(receipt, Mapping) or receipt.get("version") not in {RECEIPT_VERSION, RELAY_RECEIPT_VERSION}:
             return False
         profile_id = receipt.get("profile_id")
         if not isinstance(profile_id, str):
@@ -436,6 +458,9 @@ class LocalWorkerLauncher:
             _require_digest(str(getattr(profile, field)), field)
         if not profile.profile_revision:
             raise ValidationError("profile_revision is required")
+        if profile.engine_launch is not None:
+            from .local_execution_supervisor import validate_selected_profile
+            validate_selected_profile(_selected_profile_payload(profile))
         return profile
 
     @staticmethod
@@ -445,7 +470,7 @@ class LocalWorkerLauncher:
         return payload
 
     def _identity_payload(self, profile: LocalWorkerProfile, observed: LocalWorkerObservation) -> dict[str, Any]:
-        return {
+        payload = {
             "profile_id": profile.profile_id,
             "workspace_uuid": observed.workspace_uuid,
             "realm_root": str(observed.realm_root),
@@ -479,6 +504,11 @@ class LocalWorkerLauncher:
             "profile_digest": profile.profile_digest,
             "release_digest": profile.release_digest,
         }
+        if profile.engine_launch is not None:
+            payload.update({"owner_epoch": observed.owner_epoch, "custody_scope": observed.custody_scope,
+                            "custody_capabilities": json.loads(_canonical(observed.custody_capabilities)),
+                            "profile_binding_digest": _digest(_selected_profile_payload(profile))})
+        return payload
 
     def _validate_process(
         self,
@@ -535,7 +565,7 @@ class LocalWorkerLauncher:
             artifact_digest=profile.host_os_artifact_digest or profile.host_artifact_digest,
         )
         self._validate_process(
-            observed.engine, label="engine", parent_pid=observed.host.pid,
+            observed.engine, label="engine", parent_pid=observed.host.pid if profile.engine_launch is not None else observed.worker.pid,
             executable=profile.engine_executable, artifact_digest=profile.engine_artifact_digest,
         )
         self._validate_process(
@@ -562,14 +592,29 @@ class LocalWorkerLauncher:
             raise ConflictError("observed engine endpoint does not match the installed profile")
         if observed.session_config_digest != profile.session_config_digest:
             raise ConflictError("engine session configuration does not match the installed profile")
+        if profile.engine_launch is not None:
+            from .local_execution_supervisor import validate_role_reference
+            if not isinstance(observed.owner_epoch, str) or not observed.owner_epoch or not isinstance(observed.custody_scope, str) or not Path(observed.custody_scope).is_absolute():
+                raise ConflictError("relay observation lacks retained ownership epoch/scope")
+            capabilities = observed.custody_capabilities
+            if not isinstance(capabilities, Mapping) or set(capabilities) != {"relay", "host", "engine", "engine_listener"}:
+                raise ConflictError("relay observation lacks independently verified role custody")
+            for role, process in (("relay", observed.worker), ("host", observed.host), ("engine", observed.engine), ("engine_listener", observed.engine_listener)):
+                validate_role_reference(capabilities[role], role=role, scope_root=observed.custody_scope, process={"pid": process.pid, "birth_id": process.birth_id})
+                if capabilities[role]["target"]["uid"] != observed.uid:
+                    raise ConflictError("relay custody target UID differs from observed owner")
+            if report is not None and any(report.get(k) != v for k, v in {"owner_epoch": observed.owner_epoch, "custody_scope": observed.custody_scope, "custody_capabilities": capabilities, "profile_binding_digest": _digest(_selected_profile_payload(profile))}.items()):
+                raise ConflictError("relay report conflicts with independently verified custody")
         if report is not None:
             expected_keys = {
                 "version", "operation_id", "channel_id", "processes", "engine_binding",
                 "session_config_digest",
             }
+            if profile.engine_launch is not None:
+                expected_keys |= {"owner_epoch", "custody_scope", "custody_capabilities", "profile_binding_digest"}
             if not isinstance(report, Mapping) or set(report) != expected_keys:
                 raise ConflictError("Worker preparation report has an invalid shape")
-            if report.get("version") != PREPARATION_VERSION or report.get("operation_id") != operation_id or report.get("channel_id") != channel_id:
+            if report.get("version") != (RELAY_PREPARATION_VERSION if profile.engine_launch is not None else PREPARATION_VERSION) or report.get("operation_id") != operation_id or report.get("channel_id") != channel_id:
                 raise ConflictError("Worker preparation report came from the wrong private channel")
             process_reports = report.get("processes")
             if not isinstance(process_reports, Mapping) or set(process_reports) != {
@@ -1308,7 +1353,7 @@ class LocalWorkerLauncher:
 
     def _try_reconnect(self, profile: LocalWorkerProfile, metadata: Mapping[str, Any]) -> dict[str, Any] | None:
         receipt = metadata.get("local_launch_receipt")
-        if not isinstance(receipt, Mapping) or receipt.get("version") != RECEIPT_VERSION:
+        if not isinstance(receipt, Mapping) or receipt.get("version") != _receipt_version(profile):
             raise ConflictError("surviving local Worker receipt shape or version is invalid")
         if receipt.get("profile_id") != profile.profile_id or receipt.get("workspace_uuid") != self.workspace_uuid:
             raise ConflictError("surviving local Worker receipt authority differs")
@@ -1465,7 +1510,7 @@ class LocalWorkerLauncher:
                 raise ConflictError("local worker identity changed before credential issuance")
             incarnation = uuid.uuid4().hex
             receipt = {
-                "version": RECEIPT_VERSION,
+                "version": _receipt_version(profile),
                 **second,
                 "executor_incarnation": incarnation,
             }

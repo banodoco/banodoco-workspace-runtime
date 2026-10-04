@@ -481,6 +481,37 @@ class AuthenticatedCleanupActor:
                      *, identity_provider: Callable[[int], Mapping[str, object] | None] | None = None) -> AuthenticatedCleanupActor:
         return cls(lambda: _peer_token(channel), identity_provider or default_process_identity)
 
+    @classmethod
+    def retained_child(cls, child: subprocess.Popen[bytes], *,
+                       reap_guard: threading.RLock,
+                       identity_provider=None, token_provider=None) -> AuthenticatedCleanupActor:
+        """Bind a directly owned launch, never an inherited socket's creator.
+
+        The owning launch must route every poll/wait/reap through reap_guard
+        and must be the sole waiter. Popen's own waitpid lock additionally
+        excludes its concurrent waiters while the initial token is captured.
+        No arbitrary waitpid or SIGCHLD auto-reaper may own this child.
+        """
+        identity_provider = identity_provider or default_process_identity
+        token_provider = token_provider or current_process_audit_token
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            raise CustodyError("retained child cannot bind with automatic reaping")
+        wait_guard = getattr(child, "_waitpid_lock", None)
+        if wait_guard is None:
+            raise CustodyError("retained child has no serialized wait ownership")
+        with reap_guard, wait_guard:
+            if child.returncode is not None:
+                raise CustodyError("retained child already has an exit observation")
+            observed_before = identity_provider(child.pid)
+            before = dict(observed_before) if observed_before is not None else None
+            if before is None or before.get("parent_pid") != os.getpid():
+                raise CustodyError("retained child launch lineage is unavailable")
+            actor = cls(lambda: token_provider(child.pid), identity_provider)
+            after = identity_provider(child.pid)
+            if after != before or actor._pinned["pid"] != child.pid:
+                raise CustodyError("retained child changed during kernel identity binding")
+        return actor
+
     def verify(self) -> dict[str, object]:
         token = dict(self._token_reader())
         identity = self._identity_provider(int(self._pinned["pid"]))
@@ -637,6 +668,22 @@ class RoleCustodyAuthority:
     def reference(self) -> dict[str, object]:
         with self._guard(exclusive=False):
             return self._reference(self._read())
+
+    def verify_reference(self, reference: Mapping[str, object], *,
+                         expected_actor: Mapping[str, object], owner_epoch: str,
+                         identity_provider=None, token_provider=None) -> dict[str, object]:
+        """Read-only independent proof; a reference never grants authority."""
+        identity_provider = identity_provider or default_process_identity
+        token_provider = token_provider or current_process_audit_token
+        with self._guard(exclusive=False):
+            record = self._read()
+            if record["state"] != "active" or self._reference(record) != dict(reference) or record["actor"] != dict(expected_actor) or record["owner_epoch"] != owner_epoch:
+                raise CustodyError("custody designation differs from selected owner/reference")
+            for identity in (record["actor"], reference["target"]):
+                observed = identity_provider(int(identity["pid"]))
+                if observed is None or _incarnation(observed, token_provider(int(identity["pid"]))) != dict(identity):
+                    raise CustodyError("custody designation has unavailable or changed kernel identity")
+            return self._reference(record)
 
     def signal(self, *, actor: AuthenticatedCleanupActor, generation: int,
                expected_target: Mapping[str, object], signum: int,

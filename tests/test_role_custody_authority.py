@@ -182,3 +182,40 @@ def test_bounded_exclusive_lock_timeout_leaves_authority_unchanged(graph):
         with pytest.raises(custody.CustodyError, match="timed out"):
             transfer(graph)
     assert authority.reference()["generation"] == 1
+
+
+def test_inherited_creator_credentials_do_not_bind_retained_child(graph, monkeypatch):
+    from types import SimpleNamespace
+    _, _, identities, tokens = graph
+    child = SimpleNamespace(pid=103, returncode=None, _waitpid_lock=threading.Lock())
+    identities[103]["parent_pid"] = __import__("os").getpid()
+    monkeypatch.setattr(custody, "_peer_token", lambda _: tokens[101])
+    actor = custody.AuthenticatedCleanupActor.retained_child(child, reap_guard=threading.RLock(), identity_provider=identities.get, token_provider=tokens.get)
+    assert actor.verify()["pid"] == 103
+    identities[103]["birth_id"] = "reused"
+    with pytest.raises(custody.CustodyError, match="changed"):
+        actor.verify()
+
+
+def test_retained_binding_serializes_waiter_and_refuses_changed_capture(graph):
+    from types import SimpleNamespace
+    _, _, identities, tokens = graph
+    identities[103]["parent_pid"] = __import__("os").getpid()
+    wait_guard = threading.Lock()
+    child = SimpleNamespace(pid=103, returncode=None, _waitpid_lock=wait_guard)
+    def token(pid):
+        assert wait_guard.locked(), "waiter must be excluded throughout kernel binding"
+        identities[103] = {**identities[103], "birth_id": "replacement"}
+        return tokens[pid]
+    with pytest.raises(custody.CustodyError, match="changed"):
+        custody.AuthenticatedCleanupActor.retained_child(child, reap_guard=threading.RLock(), identity_provider=identities.get, token_provider=token)
+
+
+def test_reference_verification_is_read_only_and_requires_exact_designated_actor(graph):
+    authority, actors, identities, tokens = graph
+    ref = authority.reference()
+    before = authority.path.read_bytes()
+    assert authority.verify_reference(ref, expected_actor=actors[101].verify(), owner_epoch="runtime-A", identity_provider=identities.get, token_provider=tokens.get) == ref
+    assert authority.path.read_bytes() == before
+    with pytest.raises(custody.CustodyError, match="designation differs"):
+        authority.verify_reference(ref, expected_actor=actors[102].verify(), owner_epoch="runtime-A", identity_provider=identities.get, token_provider=tokens.get)
