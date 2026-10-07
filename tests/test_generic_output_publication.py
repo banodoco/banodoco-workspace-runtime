@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from runtime_protocol.errors import ConflictError
+from runtime_protocol.errors import AuthorizationError, ConflictError, LeaseError, ValidationError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 
@@ -183,6 +184,201 @@ def test_generic_filmstrip_outputs_are_associated_by_fenced_settlement(tmp_path:
         assert service.store.conn.execute(
             "SELECT COUNT(*) FROM project_objects WHERE project_id=?", (project["id"],)
         ).fetchone()[0] == 2
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("inline", [False, True], ids=["bound-uploads", "inline-staging"])
+def test_distinct_outputs_with_identical_bytes_settle_in_one_attempt(tmp_path: Path, inline: bool) -> None:
+    service = _new_service(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "equal-content", "name": "Equal content"})
+        task, attempt = _filmstrip_attempt(service, project["id"])
+        identity = {"actor": "filmstrip-worker", "scopes": ["objects:write", "worker:execute"]}
+        payload = b"identical-audio-bytes"
+        outputs = [
+            {
+                **_descriptor(
+                    payload,
+                    name=f"audio/tile-{index}.wav",
+                    filename=f"tile-{index}.wav",
+                    output_port="audio",
+                    primary=True,
+                    media_type="audio/wav",
+                ),
+                "variant_key": f"tile-{index}",
+            }
+            for index in (1, 2)
+        ]
+        upload_keys = []
+        for output in outputs:
+            if inline:
+                output["data_base64"] = base64.b64encode(payload).decode()
+                continue
+            key, binding = _upload_binding(
+                payload,
+                attempt=attempt,
+                project_id=project["id"],
+                run_id=task["run"]["id"],
+                executor_id="filmstrip-worker",
+                output_key=output["name"],
+                output_port=output["output_port"],
+                filename=output["filename"],
+                media_type=output["media_type"],
+            )
+            service.ingest_object(
+                payload,
+                media_type=output["media_type"],
+                original_name=output["filename"],
+                idempotency_key=key,
+                identity=identity,
+                upload_binding=binding,
+            )
+            upload_keys.append(key)
+        if not inline:
+            assert upload_keys[0] != upload_keys[1]
+        body = _settle_body(attempt, outputs)
+        with pytest.raises(AuthorizationError):
+            service.settle_attempt(
+                attempt["attempt_id"], body, idempotency_key="equal-content-wrong-worker",
+                identity={"actor": "other-worker", "scopes": identity["scopes"]},
+            )
+        with pytest.raises(LeaseError):
+            service.settle_attempt(
+                attempt["attempt_id"], body | {"fence": attempt["fence"] - 1},
+                idempotency_key="equal-content-stale-fence", identity=identity,
+            )
+        settled = service.settle_attempt(
+            attempt["attempt_id"], body, idempotency_key="equal-content-settle", identity=identity,
+        )
+        assert service.task(attempt["task_id"])["task"]["status"] == "completed"
+        assert service.task(attempt["task_id"])["task"]["result"]["outputs"] == [
+            {key: value for key, value in output.items() if key not in {"durability", "data_base64"}}
+            for output in outputs
+        ]
+        associations = service.managed_outputs(attempt["task_id"])
+        assert len(associations) == 2
+        assert len({item["association_id"] for item in associations}) == 2
+        for output in outputs:
+            association = next(item for item in associations if item["variant_key"] == output["variant_key"])
+            assert service.managed_output(association["association_id"]) == association
+            for field in ("filename", "output_port", "variant_key", "digest", "size", "media_type"):
+                assert association[field] == output[field]
+            assert association["task_id"] == attempt["task_id"]
+            assert association["attempt_id"] == attempt["attempt_id"]
+            assert association["run_id"] == task["run"]["id"]
+            assert association["project_id"] == project["id"]
+            assert association["provenance"] == output["provenance"] | {
+                "task_id": attempt["task_id"], "attempt_id": attempt["attempt_id"],
+                "capability_id": "rendering.timeline_visualize", "executor_id": "filmstrip-worker",
+                "fence": attempt["fence"], "runtime_epoch": attempt["runtime_epoch"],
+            }
+        digest = hashlib.sha256(payload).hexdigest()
+        assert service.store.conn.execute("SELECT COUNT(*) FROM objects WHERE digest=?", (digest,)).fetchone()[0] == 1
+        assert service.store.conn.execute("SELECT COUNT(*) FROM project_objects WHERE digest=?", (digest,)).fetchone()[0] == 1
+        assert service.cas.path_for(digest).read_bytes() == payload
+        assert [path for path in service.cas.root.rglob("*") if path.is_file()] == [service.cas.path_for(digest)]
+        assert service.settle_attempt(
+            attempt["attempt_id"], body, idempotency_key="equal-content-settle", identity=identity,
+        ) == settled
+        assert service.managed_outputs(attempt["task_id"]) == associations
+        with pytest.raises(ConflictError):
+            service.settle_attempt(
+                attempt["attempt_id"], body | {"outputs": outputs[:1]},
+                idempotency_key="equal-content-settle", identity=identity,
+            )
+        assert service.managed_outputs(attempt["task_id"]) == associations
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("duplicate_association", [False, True], ids=["missing-second-receipt", "duplicate-association"])
+def test_equal_content_does_not_bypass_output_association_protections(tmp_path: Path, duplicate_association: bool) -> None:
+    service = _new_service(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "protected", "name": "Protected"})
+        task, attempt = _filmstrip_attempt(service, project["id"])
+        identity = {"actor": "filmstrip-worker", "scopes": ["objects:write", "worker:execute"]}
+        payload = b"equal-content-with-one-receipt"
+        first = _descriptor(payload, name="first", filename="first.wav", output_port="audio", primary=True, media_type="audio/wav")
+        second = _descriptor(payload, name="second", filename="second.wav", output_port="audio", primary=True, media_type="audio/wav")
+        if not duplicate_association:
+            second["variant_key"] = "second"
+        key, binding = _upload_binding(
+            payload, attempt=attempt, project_id=project["id"], run_id=task["run"]["id"],
+            executor_id="filmstrip-worker", output_key=first["name"], output_port=first["output_port"],
+            filename=first["filename"], media_type=first["media_type"],
+        )
+        service.ingest_object(
+            payload, media_type=first["media_type"], original_name=first["filename"],
+            idempotency_key=key, identity=identity, upload_binding=binding,
+        )
+        expected_error = ValidationError if duplicate_association else ConflictError
+        expected_message = "duplicate associations" if duplicate_association else "outside the task project"
+        with pytest.raises(expected_error, match=expected_message):
+            service.settle_attempt(
+                attempt["attempt_id"], _settle_body(attempt, [first, second]),
+                idempotency_key="protected-settle", identity=identity,
+            )
+        assert service.task(attempt["task_id"])["task"]["status"] == "running"
+        assert service.managed_outputs(attempt["task_id"]) == []
+        assert service.store.conn.execute("SELECT COUNT(*) FROM project_objects WHERE project_id=?", (project["id"],)).fetchone()[0] == 0
+        assert service.cas.path_for(hashlib.sha256(payload).hexdigest()).read_bytes() == payload
+    finally:
+        service.close()
+
+
+def test_inline_equal_content_rejects_conflicting_object_metadata(tmp_path: Path) -> None:
+    service = _new_service(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "metadata", "name": "Metadata"})
+        _task, attempt = _filmstrip_attempt(service, project["id"])
+        payload = b"same-inline-content"
+        outputs = [
+            {
+                **_descriptor(payload, name=f"output-{index}", filename=f"output-{index}.bin",
+                              output_port=f"output-{index}", primary=True, media_type=media_type),
+                "data_base64": base64.b64encode(payload).decode(),
+            }
+            for index, media_type in enumerate(("audio/wav", "application/octet-stream"))
+        ]
+        with pytest.raises(ConflictError, match="output metadata does not match existing object"):
+            service.settle_attempt(
+                attempt["attempt_id"], _settle_body(attempt, outputs), idempotency_key="metadata-settle",
+            )
+        assert service.task(attempt["task_id"])["task"]["status"] == "running"
+        assert service.managed_outputs(attempt["task_id"]) == []
+        assert service.store.conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0] == 0
+        assert not service.cas.path_for(hashlib.sha256(payload).hexdigest()).exists()
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("kind", ["document", "value"])
+def test_non_object_outputs_keep_existing_digest_uniqueness(tmp_path: Path, kind: str) -> None:
+    service = _new_service(tmp_path / "realm")
+    try:
+        project = service.create_project({"slug": "non-object", "name": "Non object"})
+        _task, attempt = _filmstrip_attempt(service, project["id"])
+        outputs = [
+            {
+                **_descriptor(payload, name="output", filename="output.bin", output_port="output",
+                              primary=True, media_type="application/octet-stream"),
+                "kind": kind, "data_base64": base64.b64encode(payload).decode(),
+            }
+            for payload in (b"first-content", b"second-content")
+        ]
+        with pytest.raises(ValidationError, match="duplicate digests"):
+            service.settle_attempt(
+                attempt["attempt_id"], _settle_body(attempt, [outputs[0], outputs[0] | {"name": "second"}]),
+                idempotency_key="non-object-duplicate-settle",
+            )
+        service.settle_attempt(
+            attempt["attempt_id"], _settle_body(attempt, outputs), idempotency_key="non-object-settle",
+        )
+        assert service.task(attempt["task_id"])["task"]["status"] == "completed"
+        assert len(service.task(attempt["task_id"])["task"]["result"]["outputs"]) == 2
+        assert service.managed_outputs(attempt["task_id"]) == []
     finally:
         service.close()
 

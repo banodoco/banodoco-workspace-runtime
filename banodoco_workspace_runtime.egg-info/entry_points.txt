@@ -1,0 +1,4 @@
+[console_scripts]
+astrid-runtime = banodoco_local.cli:main
+banodoco-local = banodoco_local.cli:main
+banodoco-runtime = runtime_protocol.cli:main

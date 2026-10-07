@@ -1,0 +1,333 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import sqlite3
+import shutil
+import time
+from pathlib import Path
+
+from .daemon import RuntimeDaemon, WORKER_SCOPES
+from .local_worker_composition import load_local_worker_composition
+from .backup import create_backup, restore_backup, structured_export
+from .errors import RuntimeErrorBase
+from .store import RealmStore
+from .upgrade import (
+    DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION,
+    migrate_historical_managed_outputs,
+    migrate_canonical_v24_to_v25,
+    repair_generic_media_types,
+    upgrade_realm,
+)
+
+
+def _parser():
+    parser = argparse.ArgumentParser(prog="banodoco-runtime", description="Neutral loopback workspace runtime")
+    sub = parser.add_subparsers(dest="command", required=True)
+    start = sub.add_parser("start", help="start the loopback daemon")
+    start.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    start.add_argument("--support-root")
+    start.add_argument("--export-root", help="existing absolute directory for exact managed-output exports")
+    start.add_argument("--host", default="127.0.0.1")
+    start.add_argument("--port", type=int, default=0)
+    start.add_argument("--display-name", default="Workspace")
+    start.add_argument("--realm-id")
+    start.add_argument("--owner-lock")
+    start.add_argument("--bootstrap-token-file")
+    start.add_argument("--admission-timeout", type=float, help="bounded startup integrity budget in seconds")
+    start.add_argument("--worker-profile", help="absolute installed local Worker composition profile")
+    create = sub.add_parser("create", help="explicitly create one fresh canonical realm")
+    create.add_argument("--root", required=True)
+    create.add_argument("--display-name", default="Workspace")
+    create.add_argument("--realm-id")
+    doctor = sub.add_parser("doctor", help="read-only runtime health check")
+    doctor.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--support-root")
+    upgrade = sub.add_parser("upgrade", help="offline upgrade one stopped legacy realm to the canonical format")
+    upgrade.add_argument("--root", required=True)
+    upgrade.add_argument("--archive-root")
+    upgrade.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    upgrade.add_argument("--confirm", required=True)
+    variant_state = sub.add_parser("migrate-variant-state", help="offline migrate one stopped canonical v24 realm to v25")
+    variant_state.add_argument("--root", required=True)
+    variant_state.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    variant_state.add_argument("--confirm", required=True)
+    reconcile = sub.add_parser("migrate-managed-outputs", help="materialize verified associations for historical settled render outputs")
+    reconcile.add_argument("--root", required=True)
+    reconcile.add_argument("--project-id")
+    reconcile.add_argument("--task-id")
+    reconcile.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    reconcile.add_argument("--confirm", required=True)
+    repair = sub.add_parser("repair-media-types", help="repair generic published MIME values from managed filenames")
+    repair.add_argument("--root", required=True)
+    repair.add_argument("--project-id")
+    repair.add_argument("--task-id")
+    repair.add_argument("--generation-id")
+    repair.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    repair.add_argument("--confirm", required=True)
+    backup = sub.add_parser("backup", help="create a verified self-contained realm backup")
+    backup.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    backup.add_argument("--support-root")
+    backup.add_argument("--destination", required=True)
+    restore = sub.add_parser("restore", help="restore a backup into a new inactive realm")
+    restore.add_argument("--backup", required=True)
+    restore.add_argument("--destination", required=True)
+    replace = sub.add_parser("replace", help="activate a verified backup as the running realm")
+    replace.add_argument("--root", required=True)
+    replace.add_argument("--backup", required=True)
+    replace.add_argument("--support-root")
+    replace.add_argument("--display-name", default="Workspace")
+    replace.add_argument("--realm-id")
+    export = sub.add_parser("export", help="export structured realm state")
+    export.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    export.add_argument("--destination")
+    export.add_argument("--json", action="store_true")
+    audit = sub.add_parser(
+        "audit-timelines",
+        help="read-only audit of active canonical timeline heads and legacy shells",
+    )
+    audit.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
+    audit.add_argument("--project-id")
+    purge = sub.add_parser("purge", help="irreversibly remove a tombstoned realm (offline only)")
+    purge.add_argument("--root", required=True)
+    purge.add_argument("--confirm", required=True)
+    identity = sub.add_parser("identity", help="capture or verify local release identities")
+    identity.add_argument("operation", choices=("pre-live", "candidate-core", "verify"))
+    identity.add_argument("--component", action="append", default=[])
+    identity.add_argument("--pre-live")
+    identity.add_argument("--receipt")
+    identity.add_argument("--output")
+    return parser
+
+
+def main(argv=None):
+    args = _parser().parse_args(argv)
+    if args.command == "identity":
+        from . import release_identity
+        try:
+            if args.operation == "verify":
+                if not args.receipt:
+                    raise release_identity.ReleaseIdentityError("identity verify requires --receipt")
+                result = {"ok": True, "identity": release_identity.load_receipt(args.receipt)["identity"]}
+            else:
+                components = {}
+                for value in args.component:
+                    if "=" not in value:
+                        raise release_identity.ReleaseIdentityError("--component must use COMPONENT_ID=CHECKOUT")
+                    component, checkout = value.split("=", 1)
+                    components[component] = checkout
+                if args.operation == "pre-live":
+                    result = release_identity.create_pre_live_identity(components, output=args.output)
+                else:
+                    if not args.pre_live:
+                        raise release_identity.ReleaseIdentityError("candidate-core requires --pre-live")
+                    result = release_identity.create_candidate_core_identity(args.pre_live, components, output=args.output)
+            print(json.dumps(result, sort_keys=True, indent=2))
+            return 0
+        except release_identity.ReleaseIdentityError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+            return 1
+    if args.command == "doctor":
+        root = Path(args.root)
+        result = RealmStore.inspect_realm(
+            root,
+            catalog_path=(Path(args.support_root) / "catalog.json") if args.support_root else None,
+        )
+        if result.get("state") == "uninitialized":
+            result["next_action"] = "banodoco-runtime create --root <realm>"
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("ok") else 1
+    if args.command == "audit-timelines":
+        from .timeline_cutover import audit_active_timeline_heads
+
+        # This command is deliberately read-only and must also work while the
+        # resident daemon owns the realm.  Opening RealmStore would acquire
+        # the writer lock and rerun the full startup-integrity budget, which
+        # is both unnecessary for an audit and can time out on a large realm.
+        root = Path(args.root).expanduser().resolve()
+        database = root / "realm.sqlite3"
+        if not database.is_file() or database.is_symlink():
+            print(json.dumps({"status": "unavailable", "reason": "realm database is unavailable", "root": str(root)}, sort_keys=True))
+            return 1
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30.0)
+        connection.row_factory = sqlite3.Row
+        try:
+            result = audit_active_timeline_heads(connection, project_id=args.project_id)
+        finally:
+            connection.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result.get("status") == "ok" else 1
+    if args.command == "upgrade":
+        try:
+            result = upgrade_realm(
+                args.root,
+                archive_root=args.archive_root,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "migrate-variant-state":
+        try:
+            result = migrate_canonical_v24_to_v25(
+                args.root,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "migrate-managed-outputs":
+        try:
+            result = migrate_historical_managed_outputs(
+                args.root,
+                project_id=args.project_id,
+                task_id=args.task_id,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "repair-media-types":
+        try:
+            result = repair_generic_media_types(
+                args.root,
+                project_id=args.project_id,
+                task_id=args.task_id,
+                generation_id=args.generation_id,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "create":
+        store = RealmStore.initialize(args.root, display_name=args.display_name, realm_id=args.realm_id)
+        try:
+            result = {"state": "created", "realm_id": store.realm["id"], "root": str(store.root)}
+        finally:
+            store.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "backup":
+        # Online backup goes through the owning HTTP service. The CLI is an
+        # offline surface and must acquire that same realm-owner fence.
+        store = RealmStore(args.root)
+        try:
+            key_path = (Path(args.support_root).expanduser().resolve() / "backup-auth.key") if args.support_root else None
+            result = create_backup(store, args.destination, key_path=key_path)
+        finally:
+            store.close()
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "restore":
+        result = restore_backup(args.backup, args.destination)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "replace":
+        root = Path(args.root).expanduser().resolve()
+        daemon = RuntimeDaemon(root, support_root=args.support_root, display_name=args.display_name, realm_id=args.realm_id, production_worker_credentials=True)
+        try:
+            # Replacement is coordinated offline so a damaged active root is
+            # never admitted merely to reach the recovery command.
+            result = daemon.replace_from_backup(args.backup)
+        finally:
+            daemon.stop()
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "export":
+        # Export is an offline surface; share the same owner fence as startup
+        # instead of opening a second connection with a different authority.
+        store = RealmStore(args.root)
+        try:
+            value = structured_export(store)
+        finally:
+            store.close()
+        if args.destination:
+            from .util import atomic_json_write
+            atomic_json_write(Path(args.destination).expanduser().resolve(), value)
+        print(json.dumps(value, sort_keys=True))
+        return 0
+    if args.command == "purge":
+        root = Path(args.root).expanduser().resolve()
+        # Refuse even a correctly confirmed purge while a daemon owns the
+        # realm.  The destructive operation remains explicit and offline.
+        store = RealmStore(root)
+        try:
+            realm_id = store.realm["id"]
+            if args.confirm != f"PURGE {realm_id}":
+                raise SystemExit(f"confirmation must be exactly: PURGE {realm_id}")
+            if store.realm_lifecycle()["state"] != "tombstoned":
+                raise SystemExit("realm must be tombstoned before purge")
+        finally:
+            store.close()
+        shutil.rmtree(root)
+        print(json.dumps({"state": "purged", "realm_id": realm_id, "root": str(root)}, sort_keys=True))
+        return 0
+    try:
+        composition = None
+        if getattr(args, "worker_profile", None):
+            if not args.realm_id:
+                raise RuntimeErrorBase("--worker-profile requires --realm-id")
+            composition = load_local_worker_composition(
+                args.worker_profile,
+                workspace_uuid=args.realm_id,
+                realm_root=Path(args.root).expanduser().resolve(),
+                support_root=Path(args.support_root).expanduser().resolve() if args.support_root else Path(args.root).expanduser().resolve() / "support",
+                runtime_instance_id="pending-startup",
+            )
+        daemon = RuntimeDaemon(
+            args.root,
+            support_root=args.support_root,
+            export_root=args.export_root,
+            display_name=args.display_name,
+            host=args.host,
+            port=args.port,
+            realm_id=args.realm_id,
+            owner_lock=args.owner_lock,
+            bootstrap_token_file=args.bootstrap_token_file,
+            production_worker_credentials=True,
+            admission_timeout=args.admission_timeout,
+            local_worker_profiles=composition.profiles if composition else None,
+            local_worker_preparer=composition.preparer if composition else None,
+            local_worker_inspector=composition.inspector if composition else None,
+        ).start()
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        # Installed operator entrypoints must fail as a stable JSON boundary;
+        # never leak a traceback for an unsupported format or bad root.
+        error = exc.as_dict() if isinstance(exc, RuntimeErrorBase) else {"code": "startup_error", "message": str(exc)}
+        print(json.dumps({"ok": False, "error": error}, sort_keys=True))
+        return 1
+    print(json.dumps({"endpoint": daemon.endpoint, "realm_id": daemon.service.realm["id"], "credential_file": str(daemon.credential_path), "worker_credential_file": str(daemon.worker_credential_path), "worker_actor": "astrid-pack-host", "worker_scopes": list(WORKER_SCOPES), "worker_profile_configured": bool(daemon.local_worker_profiles)}, sort_keys=True), flush=True)
+    stop = False
+    def handle(*_):
+        nonlocal stop
+        stop = True
+    signal.signal(signal.SIGINT, handle)
+    signal.signal(signal.SIGTERM, handle)
+    try:
+        while not stop:
+            time.sleep(0.2)
+    finally:
+        daemon.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -27,6 +27,7 @@ WORKER_SCOPES = (
     "handshake",
     "worker:register",
     "worker:execute",
+    "projects:read",
     "tasks:read",
     "objects:read",
     "objects:write",
@@ -236,6 +237,10 @@ class RuntimeDaemon:
         return self.local_worker_launcher.start(profile_id, expected_workspace_uuid)
 
     def remote_credential_control(self, task_id, body, *, identity):
+        with self.service.store._mutex:
+            return self._remote_credential_control(task_id, body, identity=identity)
+
+    def _remote_credential_control(self, task_id, body, *, identity):
         """Keep the remote Worker's credential generation in the resident owner.
 
         The caller must already have authenticated as the exact daemon owner.
@@ -251,11 +256,14 @@ class RuntimeDaemon:
         binding = deployment_binding_from_task(task)
         actor = WORKER_ACTOR
         if body["action"] == "provision":
+            if self.service._latest_remote_activation(task_id) is not None:
+                raise ConflictError("remote credential requires an unactivated task")
             if set(body) != {"action", "qualification", "placement"}:
                 raise ProtocolError("remote credential provision has invalid fields")
             qualification, placement = body["qualification"], body["placement"]
             if not isinstance(qualification, dict) or not isinstance(placement, dict):
                 raise ProtocolError("remote credential proof is missing")
+            self.service.assert_remote_activation_admissible(task_id, qualification)
             if (qualification.get("task_id") != task_id
                     or qualification.get("run_id") != binding.admission_identity.run_id
                     or qualification.get("credential_actor") != actor
@@ -270,6 +278,13 @@ class RuntimeDaemon:
                     or placement["verification"].get("verified") is not True
                     or placement["verification"].get("evidence_digest") != qualification.get("evidence_digest")):
                 raise ConflictError("remote credential proof does not match Runtime task binding")
+            metadata = self.credentials.actor_metadata(actor)
+            existing = metadata.get("qualified_activation") if isinstance(metadata, dict) else None
+            if isinstance(existing, dict) and not any(
+                    kind == "task.remote_activation_revoked"
+                    for kind, _ in self.service._remote_activation_history(
+                        existing.get("task_id"), existing.get("activation_id"))):
+                raise ConflictError("another remote credential generation remains unfenced")
             _, path = self.credentials.provision(
                 actor, list(WORKER_SCOPES), rotate=True, enabled=False,
                 metadata={"execution_binding": placement, "qualified_activation": qualification},
@@ -284,7 +299,9 @@ class RuntimeDaemon:
             if any(kind == "task.remote_activation_revoked" for kind, _ in history):
                 return {"revoked": True}
             raise ConflictError("remote credential generation is unavailable")
-        if not isinstance(qualification, dict) or qualification.get("activation_id") != body["activation_id"]:
+        if (not isinstance(qualification, dict) or qualification.get("activation_id") != body["activation_id"]
+                or qualification.get("task_id") != task_id
+                or qualification.get("run_id") != binding.admission_identity.run_id):
             raise ConflictError("remote credential generation changed")
         placement = metadata.get("execution_binding")
         matched = self.service._remote_activation_matches(
@@ -301,8 +318,11 @@ class RuntimeDaemon:
             latest = self.service._latest_remote_activation(task_id)
             if latest is not None and latest != qualification:
                 raise ConflictError("remote activation generation changed before revocation")
-            if latest == qualification:
-                self.service.revoke_remote_activation(task_id, body["activation_id"], identity=identity)
+            if not any(kind == "task.remote_activation_revoked"
+                       for kind, _ in self.service._remote_activation_history(task_id, body["activation_id"])):
+                self.service.revoke_remote_activation(
+                    task_id, body["activation_id"], identity=identity, qualification=qualification,
+                )
         self.credentials.revoke(actor)
         return {"revoked": True}
 

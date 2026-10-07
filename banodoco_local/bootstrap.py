@@ -37,6 +37,7 @@ WORKER_SCOPES = (
     "handshake",
     "worker:register",
     "worker:execute",
+    "projects:read",
     "tasks:read",
     "objects:read",
     "objects:write",

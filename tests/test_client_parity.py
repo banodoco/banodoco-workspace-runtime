@@ -73,6 +73,10 @@ def test_product_clients_match_canonical_contract_projection() -> None:
     assert "actual_target?: ExecutionTarget" in typescript_source
     assert "executor_incarnation?: string" in typescript_source
     assert "provider_state_unknown" in typescript_source
+    assert "export interface ChildAuthorityRequest" in typescript_source
+    assert "child?: ChildAuthorityChild" in typescript_source
+    assert "derived_inputs?: DerivedInputDescriptor[]" in typescript_source
+    assert "body: ChildAuthorityRequest" in typescript_source
 
     component_digest = "sha256:" + hashlib.sha256((ROOT / "contract" / "component-manifest.json").read_bytes()).hexdigest()
     from generators.generate import contract_digest
@@ -83,3 +87,14 @@ def test_product_clients_match_canonical_contract_projection() -> None:
     assert PYTHON_SCHEMA_DIGEST == contract_digest_value
     assert f'COMPONENT_MANIFEST_SHA256 = "{component_digest}"' in typescript_metadata
     assert f'SCHEMA_DIGEST = "{contract_digest_value}"' in typescript_metadata
+
+
+def test_recoverable_snapshot_client_projection_is_canonical() -> None:
+    typescript = (ROOT / "packages/typescript/src/generated.ts").read_text()
+    python = (ROOT / "packages/python/banodoco_workspace_client/generated.py").read_text()
+    assert "publishRecoverableSnapshot" in _operation_ids()
+    assert "publish_recoverable_snapshot" in _python_methods()
+    assert "body: RecoverableSnapshotRequest" in typescript
+    assert "Promise<MutationResult<ManagedOutput>>" in typescript
+    assert '/recoverable-snapshots' in typescript and '/recoverable-snapshots' in python
+    assert 'output: DerivedInputDescriptor' in typescript
