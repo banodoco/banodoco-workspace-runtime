@@ -37,7 +37,7 @@ from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain
 from .shot_dependencies import analyze_invalidation
 from .timeline_inspection import inspect as inspect_timeline_closure
 from .timeline_view import markdown as render_timeline_markdown, png as render_timeline_png
-from .visual_seam import admit_closure
+from .visual_seam import evaluate_closure
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
@@ -2741,9 +2741,13 @@ class RuntimeService:
         }
         if any(isinstance(item, dict) and item.get("dependency_kind") in {"composition", "parent_composition", "nested"} for item in manifest_source.get("timelines", [])):
             raise ValidationError("one-level composition cannot depend on another composition")
-        # Complete immutable bytes, inside the publication transaction and after
-        # durable replay/CAS. No caller-supplied report can grant admission.
-        seam_report, _ = admit_closure(
+        # Authoring publication records seam diagnostics but does not apply a
+        # render-readiness gate to an otherwise valid parent edit. Existing
+        # canonical timelines may predate seam intent metadata; blocking a
+        # track reorder here would make ordinary authoring persistence depend
+        # on render migration. Strict seam admission remains at the enforced
+        # render/task boundary, and this report is still returned for review.
+        seam_report, _ = evaluate_closure(
             parent_payload, resolved_shots,
             {v["revision_id"]: v for v in resolved_internal.values()},
             timeline_id=timeline_id,
