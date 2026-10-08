@@ -15,7 +15,7 @@ from collections import defaultdict
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import canonical_json
 from .visual_boundary import VERSION, DISCLOSURE_VERSION, boundary_report, finite, js_round, transition_frames
-from .seam_intent import intent_context, cue_identity as portable_cue_identity
+from .seam_intent import intent_context, cue_identity as portable_cue_identity, pause_covers, relevant_intent_owners, opaque_activation_cues
 
 MAX_METADATA_CLIPS = 20_000
 AUXILIARY = frozenset({"end-spanning-layer", "effect-layer", "frame-overlay", "text"})
@@ -216,7 +216,7 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             # remain opaque instead of invoking an interpreter.
             if not isinstance(effect, dict):
                 raise ValidationError("clip effects must be objects")
-            effect_clip = {"id": effect.get("id", str(i)), "clipType": effect.get("type", "unknown"), "at": clip["at"], "hold": duration,
+            effect_clip = {**effect, "id": effect.get("id", str(i)), "clipType": effect.get("type", "unknown"), "at": clip["at"], "hold": duration,
                            "params": effect.get("params", effect), "track": track}
             effect_path = path + ["effect", str(effect_clip["id"])]
             d = boundary_report({"clip": effect_clip, "fps": fps, "startFrame": start, "endFrame": end, "originFrame": raw_start, "path": effect_path, "source": source})
@@ -277,13 +277,12 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             covered = lower
             for picture in pictures:
                 if picture["startFrame"] > covered:
-                    pause = any(isinstance(p, dict) and p.get("kind") == "pause" and p.get("track") == o["track"]
-                                and p.get("startFrame") == covered and p.get("endFrame") == picture["startFrame"] for p in policy.get("gaps", []))
+                    pause = pause_covers(policy.get("gaps"), o["track"], covered, picture["startFrame"])
                     if not pause:
                         structural.append({"code": "boundary/child-picture-gap", "path": path,
                                            "startFrame": covered, "endFrame": picture["startFrame"]})
                 covered = max(covered, picture["endFrame"])
-            if covered < upper:
+            if covered < upper and not pause_covers(policy.get("gaps"), o["track"], covered, upper):
                 structural.append({"code": "boundary/child-picture-gap", "path": path, "startFrame": covered, "endFrame": upper})
         # Timeline-scoped effects are authored data too. Attach them to the
         # occurrence's rendered children; retain existing clip-local effects.
@@ -293,6 +292,8 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
                 if not isinstance(local_effects, list):
                     raise ValidationError("clip effects must be a list")
                 rendered["effects"] = copy.deepcopy(local_effects + body["effects"])
+                rendered.setdefault("app", {})["canonicalEffects"] = {
+                    "localCount": len(local_effects), "timeline": copy.deepcopy(body["effects"])}
         for i, e in enumerate(body.get("effects", [])):
             add({**e, "id": e.get("id", str(i)), "clipType": e.get("type", "unknown"), "hold": e.get("hold", end - offset), "track": e.get("track", "fx")},
                 body.get("registry", {}), path + ["effect", str(e.get("id", i))], offset=offset, bound=(offset, end), render=False)
@@ -336,8 +337,7 @@ def analyze_normalized(metadata):
                 frame = b["startFrame"]
                 gap = frame - a.get("rawEndFrame", a["endFrame"])
                 valid_transition = _transition(a, b, fps)
-                pause = any(isinstance(p, dict) and p.get("kind") == "pause" and p.get("track") == track
-                            and p.get("startFrame") == a["endFrame"] and p.get("endFrame") == frame for p in policy.get("gaps", []))
+                pause = pause_covers(policy.get("gaps"), track, a["endFrame"], frame)
                 if gap < 0 and not valid_transition:
                     issues.append({"code": "boundary/overlap", "frame": frame, "paths": [a["path"], b["path"]], "frames": -gap})
                 elif gap > 0 and not pause:
@@ -348,6 +348,7 @@ def analyze_normalized(metadata):
     cues = []
     for s in spans:
         cues.extend(s["disclosure"]["cues"])
+    cues.extend(opaque_activation_cues(spans, candidates))
     cues.sort(key=lambda c: (c["frame"], cue_identity(c)))
     frames = [c["frame"] for c in cues]
     opaque = sorted((s for s in spans if s["disclosure"]["opaque"]), key=lambda s: s["startFrame"])
@@ -369,8 +370,7 @@ def analyze_normalized(metadata):
         live_opaque = {p: s for p, s in live_opaque.items() if s["endFrame"] > frame}
         # Bind only participants and their relevant timing/source metadata.
         # Intent/report bytes and unrelated edits never affect this context.
-        relevant = {tuple(s["path"]): s for s in owners}
-        relevant.update({tuple(c["path"]): span_by_path[tuple(c["path"])] for c in nearby})
+        relevant = {tuple(s["path"]): s for s in relevant_intent_owners(spans + metadata["occurrences"], owners, nearby)}
         # A cue-free cut cannot acknowledge additional cues. Defer content
         # fingerprinting until there is known behavior to acknowledge.
         context = "sha256:" + hashlib.sha256((DISCLOSURE_VERSION + "|" + str(fps) + "|" + str(frame) + "|"

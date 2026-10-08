@@ -125,6 +125,8 @@ def boundary_report(context):
                     cue(1 if phase == "entrance" else max(0, end - origin - js_round(duration) + 1), "motion-start", phase)
         if "continuous" in clip:
             report["opaque"].append("unsupported continuous timing")
+        if "children" in clip or "effect" in path and "effects" in clip:
+            report["opaque"].append("unsupported nested effect timing")
         if "transition" in clip and transition_frames(clip["transition"], fps) is None:
             report["opaque"].append("unsupported transition timing")
         if kind == "end-spanning-layer":

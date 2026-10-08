@@ -56,13 +56,182 @@ def test_historical_pinned_closure_metadata_is_labeled_and_digest_verified():
     assert report["spans"]
 
 
-def _normalized(clips, policy=None):
+def _normalized(clips, policy=None, *, tracks=None, effects=None, assets=None):
     parent = {
-        "config": {"output": {"fps": 30}, "tracks": [{"id": "v", "kind": "visual"}],
+        "config": {"output": {"fps": 30}, "tracks": tracks or [{"id": "v", "kind": "visual"}], "effects": effects or [],
                    "app": {"visualSeamContract": policy or {}}},
-        "registry": {"assets": {}}, "clips": clips, "occurrences": [],
+        "registry": {"assets": assets or {}}, "clips": clips, "occurrences": [],
     }
     return evaluate_closure(parent, {}, {}, timeline_id="t")[0]
+
+
+def _portable_policy(report, frame, kind="synchronized"):
+    boundary = next(b for b in report["boundaries"] if b["frame"] == frame)
+    return {"intents": {str(frame): {"contextVersion": "visual-seam/v1", "frame": frame, "kind": kind,
+                                    "context": boundary["canonicalContext"],
+                                    "participants": boundary["canonicalCueIds"] if kind == "synchronized" else []}}}
+
+
+def _motion_keys():
+    return [{"at": 0, "x": 0, "y": 0, "width": 100, "height": 100, "opacity": 1},
+            {"at": 0.5, "x": 10, "y": 0, "width": 100, "height": 100, "opacity": 1}]
+
+
+@pytest.mark.parametrize("empty", [[], {}])
+def test_optional_empty_effects_match_absence_without_erasing_real_effects(empty):
+    clips = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+             {"id": "b", "clipType": "media", "track": "v", "at": 1, "hold": 1, "entrance": "fade"}]
+    absent = _normalized(clips)
+    policy = _portable_policy(absent, 30)
+    clips[1]["effects"] = empty
+    current = _normalized(clips, policy)
+    assert current["boundaries"][0]["canonicalContext"] == absent["boundaries"][0]["canonicalContext"]
+    assert not current["blocked"]
+    real = [{"id": "real", "type": "animated-media-transform", "params": {"keyframes": _motion_keys()}}]
+    clips[1]["effects"] = real
+    changed = _normalized(clips, policy)
+    owner = next(o for o in changed["boundaries"][0]["canonicalContext"]["owners"] if o["path"] == ["clip", "b"])
+    assert owner["clip"]["effects"] == real
+    assert changed["boundaries"][0]["canonicalContext"] != absent["boundaries"][0]["canonicalContext"]
+    assert changed["blocked"]
+
+
+def test_historical_phase_and_motion_require_named_portable_acknowledgement():
+    vector = next(v for v in _fixture(ROOT / "conformance/fixtures/visual-boundary-v1.json")["vectors"]
+                  if v["name"] == "old EndSpanning phase 1259 then geometry 1260")
+    effect = vector["context"]["clip"]
+    clips = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1259 / 30},
+             {"id": "b", "clipType": "media", "track": "v", "at": 1259 / 30, "hold": 20}, effect]
+    assets = {effect["asset"]: {"file": vector["context"]["source"], "type": "video"}}
+    baseline = _normalized(clips, assets=assets)
+    assert baseline["blocked"]
+    boundary = baseline["boundaries"][0]
+    assert (1259, "phase-change", "iteration") in [(c["frame"], c["kind"], c["id"]) for c in boundary["cues"]]
+    assert (1260, "motion-start", "move-up") in [(c["frame"], c["kind"], c["id"]) for c in boundary["cues"]]
+    assert all(c["path"] == ["parent", "t", "clip", effect["id"]] for c in boundary["cues"])
+    assert not baseline["opaqueElements"]
+    policy = _portable_policy(baseline, 1259)
+    assert not _normalized(clips, policy, assets=assets)["blocked"]
+    policy["intents"]["1259"]["participants"].pop()
+    assert _normalized(clips, policy, assets=assets)["blocked"]
+
+
+def test_continuous_and_deeper_nested_effects_retain_known_motion_and_opaque_reasons():
+    clips = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+             {"id": "b", "clipType": "media", "track": "v", "at": 1, "hold": 1,
+              "effects": [{"id": "nested", "type": "animated-media-transform", "entrance": "fade",
+                           "continuous": "drift", "effects": [{"id": "deeper", "type": "submitted"}],
+                           "params": {"keyframes": _motion_keys()}}]}]
+    report = _normalized(clips)
+    assert report["blocked"]
+    path = ["parent", "t", "clip", "b", "effect", "nested"]
+    opaque = next(o for o in report["opaqueElements"] if o["span"]["path"] == path)
+    assert opaque["opaque"] == ["unsupported continuous timing", "unsupported nested effect timing"]
+    assert any(c["path"] == path and c["id"] == "key-0" for c in report["cues"])
+    assert any(c["path"] == path and c["id"] == "entrance" for c in report["cues"])
+
+
+@pytest.mark.parametrize("kind", ["hard-cut", "transition", "synchronized"])
+def test_incoming_crossfade_never_grants_an_unrelated_parent_effect(kind):
+    clips = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+             {"id": "b", "clipType": "media", "track": "v", "at": 0.8, "hold": 1,
+              "transition": {"type": "crossfade", "duration": 0.2}}]
+    assert not _normalized(clips)["blocked"]
+    effects = [{"id": "unrelated", "type": "animated-media-transform", "at": 0.8, "hold": 1,
+                "params": {"keyframes": _motion_keys()}}]
+    baseline = _normalized(clips, effects=effects)
+    assert not baseline["structuralIssues"]
+    assert baseline["boundaries"][0]["requiresIntent"]
+    assert all(c["path"] == ["parent", "t", "effect", "unrelated"] for c in baseline["boundaries"][0]["cues"])
+    assert _normalized(clips, _portable_policy(baseline, 24, kind), effects=effects)["blocked"] is (kind != "synchronized")
+
+
+def test_opaque_owner_activation_is_known_without_claiming_internal_phase_timing():
+    clips = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+             {"id": "b", "clipType": "media", "track": "v", "at": 1, "hold": 1},
+             {"id": "fx", "clipType": "submitted", "track": "fx", "at": 1, "hold": 1}]
+    baseline = _normalized(clips)
+    assert baseline["blocked"]
+    assert baseline["boundaries"][0]["cues"] == [
+        {"frame": 30, "kind": "activation", "id": "owner-activation", "path": ["parent", "t", "clip", "fx"]}]
+    acknowledged = _normalized(clips, _portable_policy(baseline, 30))
+    assert not acknowledged["blocked"]
+    assert acknowledged["boundaries"][0]["opaquePaths"] == [["parent", "t", "clip", "fx"]]
+
+
+def test_opaque_primary_picture_owner_is_represented_by_the_cut_not_auxiliary_activation():
+    clips = [{"id": "a", "clipType": "com.reigh.astrid.liveScene", "track": "v", "at": 0, "hold": 1},
+             {"id": "b", "clipType": "com.reigh.astrid.liveScene", "track": "v", "at": 1, "hold": 1}]
+    report = _normalized(clips)
+    assert not report["blocked"]
+    assert report["boundaries"][0]["opaquePaths"] == [["parent", "t", "clip", "b"]]
+    assert not report["cues"]
+
+
+def test_spanning_cue_free_secondary_picture_is_not_an_intent_owner():
+    tracks = [{"id": "v", "kind": "visual"}, {"id": "secondary", "kind": "visual"}]
+    clips = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+             {"id": "b", "clipType": "media", "track": "v", "at": 1, "hold": 1, "entrance": "fade"},
+             {"id": "spanning", "clipType": "media", "track": "secondary", "at": 0, "hold": 4}]
+    baseline = _normalized(clips, tracks=tracks)
+    owners = baseline["boundaries"][0]["canonicalContext"]["owners"]
+    assert [o["path"] for o in owners] == [["clip", "a"], ["clip", "b"]]
+    policy = _portable_policy(baseline, 30)
+    assert not _normalized(clips, policy, tracks=tracks)["blocked"]
+    clips[2]["opacity"] = 0.5
+    assert not _normalized(clips, policy, tracks=tracks)["blocked"]
+    clips[1]["entrance"] = {"type": "fade", "duration": 0.7}
+    assert _normalized(clips, policy, tracks=tracks)["blocked"]
+
+
+@pytest.mark.parametrize("pause", [
+    {"kind": "pause", "track": "v", "startFrame": 29, "endFrame": 60},
+    {"kind": "pause", "track": "v", "startFrame": 30, "endFrame": 61},
+    {"kind": "pause", "track": "secondary", "startFrame": 30, "endFrame": 60},
+    {"kind": "pause", "track": "v", "startFrame": True, "endFrame": 60},
+])
+def test_pause_grants_only_its_exact_picture_interval(pause):
+    clips = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+             {"id": "b", "clipType": "media", "track": "v", "at": 2, "hold": 1,
+              "app": {"visualBoundary": {"intentionalPause": True}}}]
+    assert _normalized(clips)["blocked"]
+    assert _normalized(clips, {"gaps": [pause]})["blocked"]
+    policy = {"gaps": [{"kind": "pause", "track": "v", "startFrame": 30, "endFrame": 60}]}
+    assert not _normalized(clips, policy)["blocked"]
+    clips.append({"id": "c", "clipType": "media", "track": "v", "at": 4, "hold": 1})
+    assert [i["frame"] for i in _normalized(clips, policy)["structuralIssues"]] == [120]
+
+
+@pytest.mark.parametrize("shape", [
+    {"entrance": "fade", "exit": ["fade", {"id": "slide-up", "durationFrames": 6}], "transition": "crossfade"},
+    {"entrance": ["fade", {"id": "slide-up", "durationFrames": 6}], "exit": "fade", "transition": ["crossfade"]},
+])
+def test_materialization_retains_effect_shapes_and_child_parent_scope(shape):
+    parent = _unsafe_publication("p")["parent_composition"]
+    parent["occurrences"][0]["placement"]["start_ms"] = 1000
+    local = {"id": "local", "type": "animated-media-transform", "params": {"keyframes": _motion_keys()}}
+    child_effect = {"id": "child", "type": "animated-media-transform", "at": 1, "hold": 1, "params": {"keyframes": _motion_keys()}}
+    parent_effect = {"id": "parent", "type": "animated-media-transform", "at": 2, "hold": 1, "params": {"keyframes": _motion_keys()}}
+    parent["config"]["effects"] = [parent_effect]
+    child = {"tracks": [{"id": "v", "kind": "visual"}], "clips": [
+        {"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1, **shape, "effects": [local]},
+        {"id": "b", "clipType": "media", "track": "v", "at": 1, "hold": 1}], "effects": [child_effect]}
+    original = copy.deepcopy(child)
+    report, metadata = evaluate_closure(parent, {("s", "unsafe-shot"): {"internal_timeline_revision_id": "unsafe-child"}},
+                                       {"unsafe-child": {"payload": child}}, timeline_id="main", materialize=True)
+    rendered = metadata["render_config"]["clips"][0]
+    assert all(rendered[k] == v for k, v in shape.items())
+    assert rendered["effects"] == [local, child_effect]
+    assert rendered["app"]["canonicalEffects"] == {"localCount": 1, "timeline": [child_effect]}
+    assert metadata["render_config"]["effects"] == [parent_effect]
+    assert child == original
+    boundary = next(b for b in report["boundaries"] if b["frame"] == 60)
+    assert any(c["path"] == ["parent", "main", "occurrence", "o", "effect", "child"] for c in boundary["cues"])
+    assert any(c["path"] == ["parent", "main", "effect", "parent"] for c in boundary["cues"])
+    assert report["blocked"]
+    parent["config"]["app"] = {"visualSeamContract": _portable_policy(report, 60)}
+    assert not evaluate_closure(parent, {("s", "unsafe-shot"): {"internal_timeline_revision_id": "unsafe-child"}},
+                                {"unsafe-child": {"payload": child}}, timeline_id="main")[0]["blocked"]
 
 
 def test_disclosure_is_opaque_for_unknown_effect_and_caller_report_is_ignored():
