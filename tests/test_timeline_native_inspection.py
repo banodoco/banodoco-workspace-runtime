@@ -9,6 +9,7 @@ from runtime_protocol.errors import ConflictError, NotFoundError, ValidationErro
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
+from runtime_protocol.timeline_inspection import MAX_RESPONSE_BYTES
 
 from banodoco_workspace_client import WorkspaceClient
 
@@ -95,6 +96,7 @@ def test_config_only_parent_clips_project_maple_and_parent_media_rows(tmp_path):
         assert maple["duration"] == [353, 2]
         assert maple["track_id"] == "V1"
         assert maple["clip_type"] == "com.reigh.astrid.liveScene"
+        assert maple["track_ref"] == {"scope": "parent_composition", "scope_id": "parent-1", "track_id": "V1"}
         assert result["parent_clip_count"] == 3
     finally:
         service.close()
@@ -355,6 +357,15 @@ def test_inspection_continuation_is_stable_bounded_and_query_bound(tmp_path):
         assert flatten(third) == ["clip-6"]
         assert first["next_cursor"] and second["next_cursor"] and third["next_cursor"] is None
         assert all(len(flatten(page)) <= options["limit"] for page in (first, second, third))
+        assert {key: first["page"][key] for key in (
+            "offset", "limit", "total_selected_clips", "returned_clips", "remaining_clips", "has_continuation"
+        )} == {"offset": 0, "limit": 3, "total_selected_clips": 7,
+              "returned_clips": 3, "remaining_clips": 4, "has_continuation": True}
+        assert first["page"]["response_bytes"] <= MAX_RESPONSE_BYTES
+        assert second["page"]["offset"] == 3 and second["page"]["remaining_clips"] == 1
+        assert third["page"]["offset"] == 6 and third["page"]["has_continuation"] is False
+        assert first["bounds"]["max_selected_clips_per_page"] == 100
+        assert first["bounds"]["max_closure_clips"] == 2000
         for changed in ({"occurrence": "other", "limit": 3}, {"occurrence": "first", "limit": 2},
                         {"occurrence": "first", "range": "0..1", "limit": 3}):
             with pytest.raises(ValidationError, match="cursor does not match"):
@@ -366,6 +377,124 @@ def test_inspection_continuation_is_stable_bounded_and_query_bound(tmp_path):
         service.publish_parent_composition(project, "main", later, idempotency_key="publish-new-head")
         with pytest.raises(ValidationError, match="cursor does not match"):
             service.inspect_timeline(project, "main", {**options, "cursor": first["next_cursor"]})
+    finally:
+        service.close()
+
+
+def test_authored_aliases_track_scopes_and_media_provenance_are_explicit(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["config"]["tracks"] = [
+            {"id": "shared-track", "kind": "visual", "label": "Parent picture"},
+        ]
+        publication["parent_composition"]["registry"] = {"assets": {
+            "same-key": {"media_id": "parent-media", "content_sha256": "parent-digest", "type": "video"},
+        }}
+        publication["parent_composition"]["clips"] = [{
+            "id": "parent-effect", "clip_type": "effect", "track": "shared-track",
+            "at_ms": 25, "duration_ms": 300, "asset": "same-key", "props": {"glow": 0.75},
+            "elementRef": "effects.glow", "label": "Parent glow",
+            "extensions": {"vendor": {"keep": [1, 2]}}, "presentation": {"blend": "screen"},
+        }]
+        internal = publication["internal_timeline_revisions"][0]["payload"]
+        internal["tracks"] = [{"id": "shared-track", "kind": "audio", "label": "Internal audio"}]
+        internal["registry"] = {"assets": {
+            "same-key": {"media_id": "internal-media", "content_sha256": "internal-digest", "type": "audio"},
+        }}
+        internal["clips"] = [{
+            "id": "internal-effect", "clip_type": "effect", "track": "shared-track",
+            "at_ms": 50, "duration_ms": 250, "asset": "same-key", "params": {"opacity": 0.4},
+            "element_ref": {"element": "opacity", "version": 2}, "label": "Internal fade",
+            "extensions": {"vendor": {"retain": True}}, "presentation": {"anchor": "center"},
+            "x": 12, "opacity": 0.4,
+        }]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-authored-fields")
+
+        result = service.inspect_timeline(project, "main", {"limit": 10})
+        child = result["selected"][0]["clips"][0]
+        parent = result["selected_parent_clips"][0]
+        assert child["parameters"] == {"opacity": 0.4}
+        assert child["parameters_source"] == "params"
+        assert child["element_ref"] == {"element": "opacity", "version": 2}
+        assert child["extensions"] == {"vendor": {"retain": True}}
+        assert child["presentation"] == {"anchor": "center"}
+        assert child["presentation_fields"] == {"x": 12, "opacity": 0.4}
+        assert child["authored_fields"]["params"] == {"opacity": 0.4}
+        assert child["track_ref"] == {"scope": "internal_timeline", "scope_id": "internal-1", "track_id": "shared-track"}
+        assert child["track_status"] == "resolved"
+        assert child["track"]["label"] == "Internal audio"
+        assert child["media_provenance"]["resolution"] == "ambiguous_registry_key"
+        assert child["source_object_id"] is None
+        assert {candidate["scope"] for candidate in child["media_provenance"]["candidates"]} == {
+            "internal_timeline:internal-1", "parent_composition:parent-1",
+        }
+        assert parent["parameters"] == {"glow": 0.75}
+        assert parent["parameters_source"] == "props"
+        assert parent["element_ref"] == "effects.glow"
+        assert parent["track_ref"] == {"scope": "parent_composition", "scope_id": "parent-1", "track_id": "shared-track"}
+        assert parent["track"]["label"] == "Parent picture"
+        assert parent["source_object_id"] == "parent-media"
+        assert parent["media_provenance"]["registry_scopes"] == ["parent_composition:parent-1"]
+        assert parent["time_bounds"]["timeline_end"] == [13, 40]
+        assert parent["authored_timing"]["duration_ms"] == 300
+    finally:
+        service.close()
+
+
+def test_oversize_authored_values_are_omitted_with_byte_evidence(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = publication["parent_composition"]["occurrences"][:1]
+        publication["internal_timeline_revisions"][0]["payload"]["clips"] = [{
+            "id": "large-authored", "clip_type": "effect", "track": "picture", "at_ms": 0,
+            "duration_ms": 500, "params": {"blob": "p" * 12000},
+            "extensions": {"large": "e" * 9000}, "text": "t" * 6000,
+        }]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-oversize-authored")
+
+        result = service.inspect_timeline(project, "main", {"occurrence": "first", "limit": 1})
+        clip = result["selected"][0]["clips"][0]
+        omissions = {item["path"]: item for item in clip["omitted_fields"]}
+        assert clip["parameters"] is None
+        assert clip["extensions"] is None
+        assert clip["authored_fields"] is None
+        assert clip["text"] == ""
+        assert omissions["parameters"]["byte_length"] > omissions["parameters"]["limit_bytes"]
+        assert omissions["extensions"]["sha256"]
+        assert omissions["authored_fields"]["reason"] == "byte_limit"
+        assert omissions["text"]["limit_bytes"] == 2000
+        assert result["omission_metadata"]["authored_values_omitted"] >= 4
+        assert result["bounds"]["max_authored_fields_bytes_per_clip"] == 8192
+        assert len(json.dumps(result, ensure_ascii=False).encode("utf-8")) < 50000
+    finally:
+        service.close()
+
+
+def test_response_budget_pages_at_clip_boundaries_with_truthful_cursor(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        clips = [
+            {**_clip(f"large-{index}", at_ms=index * 5, duration_ms=5),
+             "params": {"payload": "x" * 3500}}
+            for index in range(100)
+        ]
+        _with_clips(publication, clips)
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-budget")
+
+        first = service.inspect_timeline(project, "main", {"occurrence": "first", "limit": 100})
+        assert first["bounds"]["max_response_bytes"] == MAX_RESPONSE_BYTES
+        assert first["page"]["response_bytes"] <= MAX_RESPONSE_BYTES
+        assert first["page"]["returned_clips"] < first["page"]["total_selected_clips"]
+        assert first["next_cursor"]
+
+        second = service.inspect_timeline(project, "main", {
+            "occurrence": "first", "limit": 100, "cursor": first["next_cursor"]
+        })
+        assert second["page"]["response_bytes"] <= MAX_RESPONSE_BYTES
+        assert second["page"]["offset"] == first["page"]["returned_clips"]
     finally:
         service.close()
 

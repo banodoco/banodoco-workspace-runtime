@@ -20,6 +20,18 @@ MAX_OCCURRENCES = 500
 # larger; selectors and pagination must be applied before presentation limits.
 MAX_SELECTED_CLIPS = 100
 MAX_CLOSURE_CLIPS = 2000
+MAX_RESPONSE_BYTES = 256 * 1024
+MAX_AUTHORED_VALUE_BYTES = 4096
+MAX_AUTHORED_FIELDS_BYTES = 8192
+MAX_TRACK_FIELDS_BYTES = 2048
+MAX_BINDINGS_BYTES = 8192
+
+_PRESENTATION_KEYS = (
+    "x", "y", "width", "height", "cropTop", "cropBottom", "cropLeft",
+    "cropRight", "opacity", "scale", "fit", "blendMode", "entrance",
+    "exit", "continuous", "transition", "effects", "keyframes",
+)
+_TIMING_KEYS = ("at", "at_ms", "duration", "duration_ms", "hold", "from", "from_ms", "to", "to_ms", "speed")
 
 
 def _fraction(value, label, *, milliseconds=False):
@@ -116,6 +128,86 @@ def _digest(payload):
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
+def _value_bytes(value):
+    return canonical_json(value).encode("utf-8")
+
+
+def _bounded_value(value, limit, path, omissions):
+    """Keep a JSON value whole, or record exactly why its bytes were omitted."""
+    encoded = _value_bytes(value)
+    if len(encoded) <= limit:
+        return value
+    omissions.append({"path": path, "reason": "byte_limit", "byte_length": len(encoded),
+                      "sha256": hashlib.sha256(encoded).hexdigest(), "limit_bytes": limit})
+    return None
+
+
+def _authored_projection(raw):
+    """Expose authored values while keeping each clip's optional data bounded."""
+    omissions = []
+    authored = _bounded_value(raw, MAX_AUTHORED_FIELDS_BYTES, "authored_fields", omissions)
+    result = {"authored_fields": authored}
+    parameters_key = next((key for key in ("parameters", "params", "props") if key in raw), None)
+    parameters = raw.get(parameters_key) if parameters_key else {}
+    if not isinstance(parameters, dict):
+        # Preserve malformed or future-shaped authored input in authored_fields,
+        # while retaining the historical mapping-shaped convenience field.
+        result["parameters"] = {}
+    else:
+        result["parameters"] = _bounded_value(parameters, MAX_AUTHORED_VALUE_BYTES, "parameters", omissions)
+    result["parameters_source"] = parameters_key
+    for source, target in (("elementRef", "element_ref"), ("element_ref", "element_ref")):
+        if source in raw:
+            value = raw[source]
+            result[target] = _bounded_value(value, MAX_AUTHORED_VALUE_BYTES, target, omissions)
+            break
+    if "element_ref" not in result:
+        result["element_ref"] = None
+    for key in ("label", "labels", "extensions", "presentation"):
+        if key in raw:
+            result[key] = _bounded_value(raw[key], MAX_AUTHORED_VALUE_BYTES, key, omissions)
+    presentation_fields = {key: raw[key] for key in _PRESENTATION_KEYS if key in raw}
+    if presentation_fields:
+        result["presentation_fields"] = _bounded_value(
+            presentation_fields, MAX_AUTHORED_FIELDS_BYTES, "presentation_fields", omissions
+        )
+    timing = {key: raw[key] for key in _TIMING_KEYS if key in raw}
+    if timing:
+        result["authored_timing"] = _bounded_value(timing, MAX_AUTHORED_VALUE_BYTES, "authored_timing", omissions)
+    if omissions:
+        result["omitted_fields"] = omissions
+    return result
+
+
+def _track_catalog(raw_tracks):
+    """Index authored track records without merging parent and child scopes."""
+    tracks = {}
+    if not isinstance(raw_tracks, list):
+        return tracks
+    for track in raw_tracks:
+        if isinstance(track, dict) and isinstance(track.get("id"), str):
+            tracks.setdefault(track["id"], []).append(track)
+    return tracks
+
+
+def _track_projection(track_id, track_scope, tracks):
+    reference = {"scope": track_scope["kind"], "scope_id": track_scope["id"], "track_id": track_id}
+    if not isinstance(track_id, str) or not track_id:
+        return {"track_ref": reference, "track_status": "unassigned", "track": None}
+    matches = tracks.get(track_id, [])
+    if not matches:
+        return {"track_ref": reference, "track_status": "unresolved", "track": None}
+    if len(matches) > 1:
+        return {"track_ref": reference, "track_status": "ambiguous", "track": None,
+                "track_match_count": len(matches)}
+    omissions = []
+    projected = _bounded_value(matches[0], MAX_TRACK_FIELDS_BYTES, "track", omissions)
+    result = {"track_ref": reference, "track_status": "resolved", "track": projected}
+    if omissions:
+        result["track_omitted_fields"] = omissions
+    return result
+
+
 def _encode_cursor(scope, offset):
     payload = canonical_json({"scope": scope, "offset": offset}).encode()
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
@@ -135,15 +227,66 @@ def _decode_cursor(cursor):
     return payload["scope"], payload["offset"]
 
 
-def _asset(clip, registry):
-    key = clip.get("asset", clip.get("asset_id"))
-    assets = registry.get("assets", {}) if isinstance(registry, dict) else {}
-    metadata = assets.get(key, {}) if isinstance(assets, dict) and isinstance(key, str) else {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    return {"asset_id": key, "source_object_id": metadata.get("media_id") or metadata.get("object_id") or clip.get("media_id") or clip.get("object_id"),
-            "content_digest": metadata.get("content_sha256") or metadata.get("digest") or clip.get("content_sha256"),
-            "kind": metadata.get("type")}
+def _asset(clip, registries):
+    """Resolve a media alias while retaining the identity and owner evidence."""
+    key = clip.get("asset", clip.get("asset_id", clip.get("assetId")))
+    candidates = []
+    omissions = []
+    if isinstance(key, str):
+        for scope, assets in registries:
+            if isinstance(assets, dict) and key in assets and isinstance(assets[key], dict):
+                metadata = assets[key]
+                candidates.append({
+                    "scope": scope,
+                    "source_object_id": metadata.get("source_object_id") or metadata.get("media_id") or metadata.get("object_id"),
+                    "content_digest": next((metadata.get(name) for name in ("content_sha256", "digest", "sha256", "hash") if metadata.get(name) is not None), None),
+                    "media_type": metadata.get("media_type") or metadata.get("type"),
+                    "source_provenance": metadata.get("provenance"),
+                })
+    identities = {}
+    for item in candidates:
+        identity = canonical_json([item["source_object_id"], item["content_digest"], item["media_type"]])
+        identities.setdefault(identity, item)
+    direct_object = next((clip.get(name) for name in ("source_object_id", "source_media_id", "media_id", "object_id") if isinstance(clip.get(name), str)), None)
+    direct_digest = next((clip.get(name) for name in ("content_sha256", "content_digest", "digest", "sha256", "hash") if isinstance(clip.get(name), str)), None)
+    if len(identities) == 1:
+        resolved = next(iter(identities.values()))
+        source_object_id, content_digest, media_type = resolved["source_object_id"], resolved["content_digest"], resolved["media_type"]
+        provenance = {"resolution": "registry", "registry_key": key,
+                      "registry_scopes": [item["scope"] for item in candidates],
+                      "candidate_count": len(candidates)}
+        source_provenance = resolved["source_provenance"]
+    elif len(identities) > 1:
+        source_object_id = direct_object
+        content_digest = direct_digest
+        media_type = clip.get("media_type") or clip.get("type")
+        projected_candidates = []
+        for index, item in enumerate(candidates):
+            source_provenance = _bounded_value(item.pop("source_provenance"), MAX_AUTHORED_VALUE_BYTES,
+                                                f"media_provenance.candidates[{index}].source_provenance", omissions)
+            projected_candidates.append({**item, "source_provenance": source_provenance})
+        provenance = {"resolution": "ambiguous_registry_key", "registry_key": key,
+                      "candidate_count": len(candidates), "candidates": projected_candidates}
+        source_provenance = clip.get("provenance")
+    else:
+        source_object_id = direct_object
+        content_digest = direct_digest
+        media_type = clip.get("media_type") or clip.get("type")
+        provenance = {"resolution": "clip_fields" if direct_object or direct_digest else "unresolved",
+                      "source_fields": [name for name in ("source_object_id", "source_media_id", "media_id", "object_id") if name in clip]}
+        source_provenance = clip.get("provenance")
+    bounded = {}
+    for name, value in (("asset_id", key), ("source_object_id", source_object_id),
+                        ("content_digest", content_digest), ("media_type", media_type),
+                        ("source_provenance", source_provenance), ("source_uuid", clip.get("source_uuid"))):
+        bounded[name] = _bounded_value(value, MAX_AUTHORED_VALUE_BYTES, name, omissions) if value is not None else None
+    result = {"asset_id": bounded["asset_id"], "source_object_id": bounded["source_object_id"],
+              "content_digest": bounded["content_digest"], "kind": bounded["media_type"],
+              "media_type": bounded["media_type"], "media_provenance": provenance,
+              "source_provenance": bounded["source_provenance"], "source_uuid": bounded["source_uuid"]}
+    if omissions:
+        result["omitted_fields"] = omissions
+    return result
 
 
 def _shot_name(payload, shot_id):
@@ -161,7 +304,7 @@ def _shot_name(payload, shot_id):
     return next(value for value in candidates if isinstance(value, str) and value.strip())
 
 
-def _clip(raw, registry, occurrence, start, end):
+def _clip(raw, registries, occurrence, start, end, track_scope, tracks):
     if not isinstance(raw, dict):
         raise ConflictError("pinned internal timeline contains an invalid clip")
     cid = raw.get("id")
@@ -184,12 +327,24 @@ def _clip(raw, registry, occurrence, start, end):
     visible_end = min(absolute + duration, end)
     if duration < 0 or visible_end <= absolute or absolute >= end:
         return None
-    asset = _asset(raw, registry)
-    return {"occurrence_id": occurrence["occurrence_id"], "shot_id": occurrence["shot_id"],
+    clip_end = absolute + duration
+    asset = _asset(raw, registries)
+    authored = _authored_projection(raw)
+    result = {"occurrence_id": occurrence["occurrence_id"], "shot_id": occurrence["shot_id"],
             "clip_id": cid, "track_id": raw.get("track"), "clip_type": raw.get("clipType", raw.get("clip_type", raw.get("type", "media"))),
             "start": _wire(absolute), "duration": _wire(visible_end - absolute), "source_from": raw.get("from_ms", raw.get("from")),
             "source_to": raw.get("to_ms", raw.get("to")), "speed": _wire(speed), "gain": raw.get("volume", 1),
-            "mute": bool(raw.get("mute", False)), "text": str(raw.get("text", ""))[:2000], **asset}
+            "mute": bool(raw.get("mute", False)), "text": raw.get("text", ""),
+            "time_bounds": {"timeline_start": _wire(absolute), "timeline_end": _wire(visible_end),
+                            "declared_end": _wire(clip_end), "end_clipped_to_occurrence": visible_end < clip_end},
+            **_track_projection(raw.get("track"), track_scope, tracks), **authored, **asset}
+    if isinstance(result.get("text"), (str, dict, list)):
+        omissions = result.setdefault("omitted_fields", [])
+        bounded_text = _bounded_value(result["text"], 2000, "text", omissions)
+        result["text"] = bounded_text if bounded_text is not None else ""
+    elif "text" in result:
+        result["text"] = ""
+    return result
 
 
 def _canonical_parent_clips(payload):
@@ -206,7 +361,7 @@ def _canonical_parent_clips(payload):
     return parent_clips or config_clips
 
 
-def _parent_clip(raw, registry):
+def _parent_clip(raw, registries, track_scope, tracks):
     """Project an ordinary parent-level effect/code clip without shot identity."""
     if not isinstance(raw, dict):
         raise ConflictError("parent composition contains an invalid clip")
@@ -228,22 +383,26 @@ def _parent_clip(raw, registry):
     duration = source_duration / speed
     if duration <= 0:
         return None
-    parameters = raw.get("parameters", raw.get("params", raw.get("props", {})))
-    if not isinstance(parameters, dict):
-        parameters = {}
-    element_ref = raw.get("elementRef", raw.get("element_ref"))
-    if element_ref is not None and not isinstance(element_ref, (str, dict)):
-        element_ref = None
-    asset = _asset(raw, registry)
-    return {
+    asset = _asset(raw, registries)
+    authored = _authored_projection(raw)
+    result = {
         "target_kind": "parent_clip", "clip_id": cid, "track_id": raw.get("track"),
         "clip_type": raw.get("clipType", raw.get("clip_type", raw.get("type", "media"))),
         "start": _wire(start), "duration": _wire(duration),
         "source_from": raw.get("from_ms", raw.get("from")), "source_to": raw.get("to_ms", raw.get("to")),
         "speed": _wire(speed), "gain": raw.get("volume", raw.get("gain", 1)),
-        "mute": bool(raw.get("mute", False)), "text": str(raw.get("text", ""))[:2000],
-        "parameters": parameters, "element_ref": element_ref, **asset,
+        "mute": bool(raw.get("mute", False)), "text": raw.get("text", ""),
+        "time_bounds": {"timeline_start": _wire(start), "timeline_end": _wire(start + duration),
+                        "declared_end": _wire(start + duration), "end_clipped_to_occurrence": False},
+        **_track_projection(raw.get("track"), track_scope, tracks), **authored, **asset,
     }
+    if isinstance(result.get("text"), (str, dict, list)):
+        omissions = result.setdefault("omitted_fields", [])
+        bounded_text = _bounded_value(result["text"], 2000, "text", omissions)
+        result["text"] = bounded_text if bounded_text is not None else ""
+    elif "text" in result:
+        result["text"] = ""
+    return result
 
 
 def inspect(connection, project_id, timeline_id, options):
@@ -271,6 +430,10 @@ def inspect(connection, project_id, timeline_id, options):
     assets = source_registry.get("assets") if isinstance(source_registry, dict) else None
     if isinstance(assets, dict):
         parent_registry["assets"].update(assets)
+    config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+    parent_tracks_raw = config.get("tracks", payload.get("tracks", []))
+    parent_tracks = _track_catalog(parent_tracks_raw)
+    parent_track_scope = {"kind": "parent_composition", "id": revision}
     seen = set()
     closure_clips = 0
     for ordinal, raw in enumerate(occurrences):
@@ -288,14 +451,21 @@ def inspect(connection, project_id, timeline_id, options):
         duration = _fraction(raw.get("duration_ms", 0), "occurrence duration", milliseconds=True)
         internal_payload = json.loads(internal["payload_json"])
         shot_payload = json.loads(shot["payload_json"])
-        registry = {"assets": {}}
-        for source_registry in (payload.get("registry"), internal_payload.get("registry")):
-            assets = source_registry.get("assets") if isinstance(source_registry, dict) else None
-            if isinstance(assets, dict):
-                registry["assets"].update(assets)
+        internal_registry = {"assets": {}}
+        source_registry = internal_payload.get("registry")
+        assets = source_registry.get("assets") if isinstance(source_registry, dict) else None
+        if isinstance(assets, dict):
+            internal_registry["assets"].update(assets)
+        shot_assets = {}
         for asset in shot_payload.get("assets", []):
             if isinstance(asset, dict) and isinstance(asset.get("asset_id"), str):
-                registry["assets"][asset["asset_id"]] = {"media_id": asset.get("object_id"), "content_sha256": asset.get("digest")}
+                shot_assets[asset["asset_id"]] = {"media_id": asset.get("object_id"), "content_sha256": asset.get("digest"),
+                                                    "media_type": asset.get("media_type"), "provenance": asset.get("provenance")}
+        registries = [
+            (f"internal_timeline:{internal_id}", internal_registry["assets"]),
+            (f"shot_revision:{shot_revision_id}", shot_assets),
+            (f"parent_composition:{revision}", parent_registry["assets"]),
+        ]
         clips = internal_payload.get("clips", [])
         if not isinstance(clips, list):
             raise ConflictError("pinned shot clips are invalid")
@@ -305,6 +475,7 @@ def inspect(connection, project_id, timeline_id, options):
         track_id = raw.get("track")
         if track_id is None:
             track_id = placement.get("track")
+        occurrence_track = _track_projection(track_id, parent_track_scope, parent_tracks)
         text_bindings = shot_payload.get("text_bindings", [])
         if isinstance(text_bindings, list):
             # Keep old, unregistered descriptors readable for historical
@@ -319,14 +490,28 @@ def inspect(connection, project_id, timeline_id, options):
                     "internal_timeline_revision_id": internal_id, "internal_timeline_digest": internal["content_digest"],
                     "name": _shot_name(shot_payload, shot_id),
                     "start": _wire(start), "duration": _wire(duration), "track_id": track_id,
+                    **occurrence_track,
                     "source_offset": raw.get("source_offset", 0), "speed": raw.get("speed", 1),
                     "gain": raw.get("gain", 1), "mute": bool(raw.get("muted", raw.get("mute", False))),
                     "text_bindings": text_bindings,
                     "audio_bindings": shot_payload.get("audio_bindings", [])}
-        projected = [item for clip in clips if (item := _clip(clip, registry, identity, start, start + duration)) is not None]
+        internal_tracks = _track_catalog(internal_payload.get("tracks", []))
+        internal_track_scope = {"kind": "internal_timeline", "id": internal_id}
+        for binding_key in ("text_bindings", "audio_bindings"):
+            binding_value = identity.get(binding_key)
+            omissions = []
+            if binding_value is not None:
+                identity[binding_key] = _bounded_value(binding_value, MAX_BINDINGS_BYTES, binding_key, omissions)
+            if omissions:
+                identity.setdefault("omitted_fields", []).extend(omissions)
+        projected = [item for clip in clips if (item := _clip(clip, registries, identity, start, start + duration,
+                                                              internal_track_scope, internal_tracks)) is not None]
         children.append((identity, projected))
 
-    parent_clips = [item for raw in parent_clips_raw if (item := _parent_clip(raw, parent_registry)) is not None]
+    parent_registries = [(f"parent_composition:{revision}", parent_registry["assets"])]
+    parent_clips = [item for raw in parent_clips_raw if (item := _parent_clip(
+        raw, parent_registries, parent_track_scope, parent_tracks
+    )) is not None]
     closure_clips += len(parent_clips)
     if closure_clips > MAX_CLOSURE_CLIPS:
         raise ValidationError("timeline closure exceeds clip limit; narrow the revision")
@@ -396,7 +581,12 @@ def inspect(connection, project_id, timeline_id, options):
     if child_total_clips == 0:
         page_rows = rows
     next_cursor = _encode_cursor(scope, end_offset) if end_offset < total_clips else None
-    return {"schema": SCHEMA, "evidence_kind": "declared_inputs", "render_requested": False,
+    selected_clip_count = sum(len(row["clips"]) for row in page_rows) + len(selected_parent_page)
+    omitted_authored_fields = sum(
+        len(clip.get("omitted_fields", []))
+        for clip in [item for row in page_rows for item in row["clips"]] + selected_parent_page
+    ) + sum(len(row["occurrence"].get("omitted_fields", [])) for row in page_rows)
+    result = {"schema": SCHEMA, "evidence_kind": "declared_inputs", "render_requested": False,
             "representation": "canonical_head" if revision == head_revision else "canonical_revision",
             "authority": "runtime_parent_composition", "is_current_head": revision == head_revision,
             "source_pixels": "not_requested", "waveforms": "not_requested", "project_id": project_id,
@@ -407,5 +597,49 @@ def inspect(connection, project_id, timeline_id, options):
             "selection_status": "selected" if target_indices or selected_parent_clips else "selector_miss",
             "target_count": len(target_indices), "occurrence_count": len(children),
             "parent_clip_count": len(parent_clips), "parent_clip_target_count": len(selected_parent_clips),
-            "selected_clip_count": sum(len(row["clips"]) for row in page_rows) + len(selected_parent_page),
+            "selected_clip_count": selected_clip_count,
+            "bounds": {"max_occurrences": MAX_OCCURRENCES, "max_selected_clips_per_page": MAX_SELECTED_CLIPS,
+                       "max_closure_clips": MAX_CLOSURE_CLIPS,
+                       "max_authored_value_bytes": MAX_AUTHORED_VALUE_BYTES,
+                       "max_authored_fields_bytes_per_clip": MAX_AUTHORED_FIELDS_BYTES,
+                       "max_track_fields_bytes": MAX_TRACK_FIELDS_BYTES,
+                       "max_bindings_bytes": MAX_BINDINGS_BYTES,
+                       "max_response_bytes": MAX_RESPONSE_BYTES},
+            "page": {"offset": offset, "limit": options["limit"], "total_selected_clips": total_clips,
+                     "returned_clips": selected_clip_count, "remaining_clips": total_clips - end_offset,
+                     "has_continuation": next_cursor is not None},
+            "omission_metadata": {"authored_values_omitted": omitted_authored_fields,
+                                  "page_continuation_omits_clips": total_clips - end_offset},
             "selected": page_rows, "selected_parent_clips": selected_parent_page, "next_cursor": next_cursor}
+
+    # The transport cap is independent of per-field authored caps. If several
+    # otherwise valid clips make one page too large, shrink only at clip
+    # boundaries and advance the cursor to the exact returned count. This keeps
+    # identity/cursor metadata truthful instead of silently truncating a field
+    # or claiming that the full requested page was returned.
+    def response_size() -> int:
+        return len(canonical_json(result).encode("utf-8"))
+
+    while response_size() > MAX_RESPONSE_BYTES:
+        if result["selected_parent_clips"]:
+            result["selected_parent_clips"].pop()
+        else:
+            removed = False
+            for row in reversed(result["selected"]):
+                if row["clips"]:
+                    row["clips"].pop()
+                    removed = True
+                    if not row["clips"]:
+                        result["selected"].remove(row)
+                    break
+            if not removed:
+                raise ValidationError("timeline inspection response exceeds byte budget; narrow the revision or selectors")
+        returned = len(result["selected_parent_clips"]) + sum(len(row["clips"]) for row in result["selected"])
+        cursor_end = offset + returned
+        result["next_cursor"] = _encode_cursor(scope, cursor_end) if cursor_end < total_clips else None
+        result["page"]["returned_clips"] = returned
+        result["page"]["remaining_clips"] = total_clips - cursor_end
+        result["page"]["has_continuation"] = result["next_cursor"] is not None
+        result["omission_metadata"]["page_continuation_omits_clips"] = total_clips - cursor_end
+    result["page"]["response_bytes"] = response_size()
+    return result
