@@ -31,7 +31,9 @@ def _publication(project_id, *, expected_head=None, parent_revision_id="parent-1
         "internal_timeline_revisions": [{
             "timeline_id": "main",
             "revision_id": "timeline-rev-1",
-            "payload": {"tracks": [], "clips": [], "effects": [], "audio": [], "layout": {}, "registry": {}, "assets": []},
+            # Integrity/CAS tests need a valid admitted picture closure. Empty
+            # children are independently covered by seam rejection tests.
+            "payload": {"tracks": [], "clips": [{"id": "picture", "clipType": "media", "at": 0, "hold": 1, "track": "video-1"}], "effects": [], "audio": [], "layout": {}, "registry": {}, "assets": []},
         }],
         "shot_revisions": [{
             "shot_id": "shot-1",

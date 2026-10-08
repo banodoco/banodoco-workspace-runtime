@@ -31,6 +31,16 @@ def nonnegative(value):
     return value if value is not None and value >= 0 else None
 
 
+def transition_frames(value, fps):
+    ref = value if isinstance(value, dict) else {}
+    identity = value if isinstance(value, str) else ref.get("id", ref.get("type"))
+    if identity not in ("cross-fade", "crossfade", "fade"):
+        return None
+    frames = ref.get("durationFrames", finite(ref.get("duration"), -1) * fps if "duration" in ref else 8)
+    frames = positive(frames)
+    return js_round(frames) if frames is not None else None
+
+
 DEFAULT_SEGMENTS = [
     {"id": "astrid", "start": 0, "end": 5, "label": "00", "title": "ASTRID — through the glasses"},
     {"id": "choice", "start": 5, "end": 8, "sourceStart": 74.9347, "sourceEnd": 76.4, "speed": 0.4884, "label": "01", "title": "Two options"},
@@ -90,12 +100,33 @@ def boundary_report(context):
         if start <= frame < end:
             report["cues"].append({"frame": frame, "kind": kind, "id": identity, "path": list(path)})
 
-    kind = clip.get("clipType", (clip.get("elementRef") or {}).get("id"))
+    element = clip.get("elementRef")
+    kind = clip.get("clipType", element.get("id") if isinstance(element, dict) else None)
     try:
         if finite(fps, None) is None or fps <= 0 or not isinstance(start, int) or not isinstance(end, int) or end <= start:
             raise ValueError("invalid visible span")
         if "disclosureVersion" in params and params["disclosureVersion"] != DISCLOSURE_VERSION:
             report["opaque"].append("unsupported disclosure version")
+        if "elementRef" in clip:
+            report["opaque"].append("unverified element reference timing")
+        for phase in ("entrance", "exit"):
+            if phase not in clip:
+                continue
+            raw = clip[phase]
+            for entry in raw if isinstance(raw, list) else [raw]:
+                ref = entry if isinstance(entry, dict) else {}
+                identity = entry if isinstance(entry, str) else ref.get("id", ref.get("type"))
+                defaults = {"fade": 12, "fade-up": 18, "scale-in": 18, "slide-left": 18, "slide-up": 12, "type-on": 120}
+                duration = ref.get("durationFrames", finite(ref.get("duration"), -1) * fps if "duration" in ref else defaults.get(identity) if isinstance(identity, str) else None)
+                if nonnegative(duration) is None or identity not in defaults:
+                    report["opaque"].append(f"unsupported {phase} timing")
+                    continue
+                if duration > 0:
+                    cue(1 if phase == "entrance" else max(0, end - origin - js_round(duration) + 1), "motion-start", phase)
+        if "continuous" in clip:
+            report["opaque"].append("unsupported continuous timing")
+        if "transition" in clip and transition_frames(clip["transition"], fps) is None:
+            report["opaque"].append("unsupported transition timing")
         if kind == "end-spanning-layer":
             _, frames, _ = end_spanning_timing(clip, params, fps)
             prep, iteration, anchors = frames[:3]
@@ -189,7 +220,7 @@ def boundary_report(context):
         else:
             report["opaque"].append("unknown effect timing")
     except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
-        report["cues"] = []
+        # Keep independent known cues when a later/source adapter fails.
         report["opaque"].append(f"failed disclosure: {error}")
     report["cues"].sort(key=lambda c: (c["frame"], c["kind"], c["id"]))
     return report

@@ -14,7 +14,8 @@ from collections import defaultdict
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import canonical_json
-from .visual_boundary import VERSION, DISCLOSURE_VERSION, boundary_report, finite, js_round
+from .visual_boundary import VERSION, DISCLOSURE_VERSION, boundary_report, finite, js_round, transition_frames
+from .seam_intent import intent_context, cue_identity as portable_cue_identity
 
 MAX_METADATA_CLIPS = 20_000
 AUXILIARY = frozenset({"end-spanning-layer", "effect-layer", "frame-overlay", "text"})
@@ -173,7 +174,7 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
             clip["hold"] = duration * clip["speed"]
             clip.pop("duration_ms", None)
             clip.pop("duration", None)
-        if "from" in clip or "from_ms" in clip:
+        if "from" in clip or "from_ms" in clip or source_offset:
             clip["from"] = seconds(raw, "from") + source_offset
             clip.pop("from_ms", None)
         if "to" in clip or "to_ms" in clip:
@@ -251,6 +252,14 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
         if isinstance(source_offset, dict):
             source_offset = source_offset.get("start", 0)
         source_offset = finite(source_offset) / 1000
+        span_begin = len(spans)
+        render_begin = len(render_config["clips"]) if materialize else 0
+        if materialize:
+            known_tracks = {t.get("id") for t in render_config.get("tracks", []) if isinstance(t, dict)}
+            for t in body.get("tracks", []):
+                if isinstance(t, dict) and t.get("id") not in known_tracks:
+                    render_config.setdefault("tracks", []).append(copy.deepcopy(t))
+                    known_tracks.add(t.get("id"))
         for c in clips:
             track = c.get("track", o["track"])
             for t in body.get("tracks", []):
@@ -258,6 +267,32 @@ def normalize_closure(parent, shots, internal, *, timeline_id, materialize=False
                     continuity.add(track)
             add(c, body.get("registry", {}), path + ["clip", str(c.get("id", "?"))], offset=offset, bound=(offset, end), inherited_speed=inherited_speed,
                 inherited_track=o["track"], source_offset=source_offset, inherited_gain=o.get("gain", 1), muted=o.get("muted", o.get("mute", False)))
+        # Occurrence ownership cannot stand in for picture output. Verify the
+        # union of its child picture spans, including leading and trailing holes.
+        pictures = sorted((s for s in spans[span_begin:] if s["primary"]), key=lambda s: s["startFrame"])
+        lower, upper = js_round(offset * fps), math.ceil(end * fps - 1e-9)
+        if not pictures:
+            structural.append({"code": "boundary/empty-child-picture", "path": path, "startFrame": lower, "endFrame": upper})
+        else:
+            covered = lower
+            for picture in pictures:
+                if picture["startFrame"] > covered:
+                    pause = any(isinstance(p, dict) and p.get("kind") == "pause" and p.get("track") == o["track"]
+                                and p.get("startFrame") == covered and p.get("endFrame") == picture["startFrame"] for p in policy.get("gaps", []))
+                    if not pause:
+                        structural.append({"code": "boundary/child-picture-gap", "path": path,
+                                           "startFrame": covered, "endFrame": picture["startFrame"]})
+                covered = max(covered, picture["endFrame"])
+            if covered < upper:
+                structural.append({"code": "boundary/child-picture-gap", "path": path, "startFrame": covered, "endFrame": upper})
+        # Timeline-scoped effects are authored data too. Attach them to the
+        # occurrence's rendered children; retain existing clip-local effects.
+        if materialize and body.get("effects"):
+            for rendered in render_config["clips"][render_begin:]:
+                local_effects = rendered.get("effects", [])
+                if not isinstance(local_effects, list):
+                    raise ValidationError("clip effects must be a list")
+                rendered["effects"] = copy.deepcopy(local_effects + body["effects"])
         for i, e in enumerate(body.get("effects", [])):
             add({**e, "id": e.get("id", str(i)), "clipType": e.get("type", "unknown"), "hold": e.get("hold", end - offset), "track": e.get("track", "fx")},
                 body.get("registry", {}), path + ["effect", str(e.get("id", i))], offset=offset, bound=(offset, end), render=False)
@@ -276,12 +311,9 @@ def cue_identity(cue):
 
 
 def _transition(a, b, fps):
-    transition = b["clip"].get("transition")
-    if not isinstance(transition, dict) or not isinstance(transition.get("type"), str):
-        return False
-    duration = finite(transition.get("duration"), 0)
+    duration = transition_frames(b["clip"].get("transition"), fps)
     # Existing incoming transition owns precisely this incoming pre-roll.
-    return duration > 0 and 0 < a["endFrame"] - b["startFrame"] <= js_round(duration * fps)
+    return duration is not None and 0 < a["endFrame"] - b["startFrame"] <= duration <= min(a["endFrame"] - a["startFrame"], b["endFrame"] - b["startFrame"])
 
 
 def analyze_normalized(metadata):
@@ -343,13 +375,34 @@ def analyze_normalized(metadata):
         # fingerprinting until there is known behavior to acknowledge.
         context = "sha256:" + hashlib.sha256((DISCLOSURE_VERSION + "|" + str(fps) + "|" + str(frame) + "|"
                   + "|".join(fingerprint(s) for _, s in sorted(relevant.items()))).encode()).hexdigest() if nearby else None
+        # Portable witnesses use the actual child clips at the occurrence seam,
+        # rather than the transport occurrence record or mutable projection IDs.
+        portable_owners = {p: s for p, s in relevant.items() if "disclosure" in s}
+        for owner in owners:
+            if "disclosure" not in owner:
+                for s in spans:
+                    if s["primary"] and s["path"][:4] == owner["path"] and s["startFrame"] <= frame + 2 and s["endFrame"] >= frame - 2:
+                        portable_owners[tuple(s["path"])] = s
+        portable_context = intent_context(fps, frame, portable_owners.values())
         intent = (policy.get("intents") or {}).get(str(frame))
         valid = isinstance(intent, dict) and intent.get("frame") == frame and intent.get("context") == context and intent.get("kind") in ("hard-cut", "transition", "synchronized")
-        acknowledged = set(intent.get("participants", [])) if valid and intent["kind"] == "synchronized" else set()
+        canonical_intent = intent.get("canonical", intent) if isinstance(intent, dict) else None
+        if isinstance(intent, dict) and "canonical" in intent:
+            valid = False  # Never downgrade a new record to a legacy grant.
+        portable_ids = {portable_cue_identity(c) for c in nearby}
+        portable_valid = (isinstance(canonical_intent, dict) and canonical_intent.get("contextVersion") == DISCLOSURE_VERSION
+                          and canonical_intent.get("frame") == frame and canonical_intent.get("context") == portable_context
+                          and canonical_intent.get("kind") in ("hard-cut", "transition", "synchronized")
+                          and canonical_intent.get("kind") == intent.get("kind") and canonical_intent.get("frame") == intent.get("frame")
+                          and isinstance(canonical_intent.get("participants"), list)
+                          and all(isinstance(p, str) and p in portable_ids for p in canonical_intent["participants"]))
+        acknowledged = set(intent.get("participants", [])) if valid and intent["kind"] == "synchronized" and isinstance(intent.get("participants"), list) else set()
+        portable_ack = set(canonical_intent["participants"]) if portable_valid and canonical_intent["kind"] == "synchronized" else set()
         risky = [c for c in nearby if c["kind"] in ("activation", "motion-start", "phase-change", "source-reset", "source-change", "rate-change")]
-        uncovered = [c for c in risky if cue_identity(c) not in acknowledged]
+        uncovered = [c for c in risky if cue_identity(c) not in acknowledged and portable_cue_identity(c) not in portable_ack]
         boundaries.append({"frame": frame, "context": context, "ownerPaths": [list(p) for p in sorted({tuple(s["path"]) for s in owners})],
                            "cues": nearby, "opaquePaths": [list(p) for p in sorted(live_opaque)], "requiresIntent": bool(uncovered),
+                           "canonicalContext": portable_context, "canonicalCueIds": sorted(portable_ids),
                            "unacknowledgedCues": [cue_identity(c) for c in uncovered]})
     return {"version": VERSION, "disclosureVersion": DISCLOSURE_VERSION, "fps": fps, "guardFrames": 2,
             "spans": [{k: v for k, v in s.items() if k not in ("clip", "disclosure")} for s in spans], "cues": cues,
