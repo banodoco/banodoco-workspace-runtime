@@ -22,6 +22,7 @@ from .errors import CapabilityUnavailableError, ConflictError, InvalidRequestErr
 from .canonical_schema import CANONICAL_FORMAT_ID, CANONICAL_SCHEMA_SQL
 from .dirfd import remove_tree_at
 from .util import canonical_json, new_id, now
+from .visual_seam import load_closure, admit_closure
 
 try:
     import fcntl
@@ -1363,6 +1364,8 @@ class RealmStore:
             (project_id, row["id"]),
         ).fetchone()
         parent = None
+        seam_report = None
+        seam_metadata = None
         dependency_digests = []
         occurrences = []
         if head is not None and head["revision_id"] is not None:
@@ -1380,8 +1383,8 @@ class RealmStore:
             occurrences = payload.get("occurrences")
             if not isinstance(occurrences, list):
                 raise ValidationError("canonical parent occurrences must be a list")
-            if occurrences:
-                raise ValidationError("canonical occurrence render requires the existing pinned child projection route")
+            closure_parent, closure_shots, closure_internal = load_closure(self.conn, project_id, row["id"], parent)
+            seam_report, seam_metadata = admit_closure(closure_parent, closure_shots, closure_internal, timeline_id=row["id"], materialize=True)
             content = {**content, "config": copy.deepcopy(payload.get("config")), "registry": copy.deepcopy(payload.get("registry"))}
             config_clips = content["config"].get("clips", []) if isinstance(content["config"], dict) else None
             parent_clips = payload.get("clips", [])
@@ -1432,6 +1435,9 @@ class RealmStore:
             )
         expanded_config = copy.deepcopy(config)
         expanded_registry = copy.deepcopy(registry)
+        if seam_metadata is not None and occurrences:
+            expanded_config = seam_metadata["render_config"]
+            expanded_registry = seam_metadata["render_registry"]
 
         expanded_assets = expanded_registry.get("assets", {})
         if not isinstance(expanded_assets, dict):
@@ -1520,6 +1526,7 @@ class RealmStore:
                 "snapshot_digest": "sha256:" + hashlib.sha256(canonical_json({"config": expanded_config, "registry": expanded_registry}).encode()).hexdigest(),
                 "input_object_ids": list(ordered_input_ids),
                 "scene_objects": scene_objects,
+                "visual_seam_report": seam_report,
             })
         frozen["timeline_snapshot"] = {"config": expanded_config, "registry": expanded_registry}
         inputs["timeline_ref"] = timeline_ref
