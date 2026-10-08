@@ -453,6 +453,60 @@ def test_authored_aliases_track_scopes_and_media_provenance_are_explicit(tmp_pat
         service.close()
 
 
+def test_authored_asset_and_track_omissions_merge_for_child_parent_and_occurrence(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = publication["parent_composition"]["occurrences"][:1]
+        publication["parent_composition"]["occurrences"][0]["track"] = "parent-large"
+        publication["parent_composition"]["config"]["tracks"] = [
+            {"id": "parent-large", "kind": "visual", "label": "p" * 3000},
+        ]
+        publication["parent_composition"]["registry"] = {"assets": {
+            "parent-key": {"media_id": "parent-object", "type": "image",
+                           "provenance": {"source": "p" * 5000}},
+        }}
+        publication["parent_composition"]["clips"] = [{
+            "id": "parent-omissions", "clipType": "media", "track": "parent-large",
+            "at_ms": 0, "duration_ms": 1000, "asset": "parent-key",
+            "params": {"payload": "p" * 5000},
+        }]
+
+        internal = publication["internal_timeline_revisions"][0]["payload"]
+        internal["tracks"] = [{"id": "child-large", "kind": "visual", "label": "c" * 3000}]
+        internal["registry"] = {"assets": {
+            "child-key": {"media_id": "child-object", "type": "image",
+                          "provenance": {"source": "c" * 5000}},
+        }}
+        internal["clips"] = [{
+            "id": "child-omissions", "clipType": "media", "track": "child-large",
+            "at_ms": 0, "duration_ms": 500, "asset": "child-key",
+            "params": {"payload": "c" * 5000},
+        }]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-merged-omissions")
+
+        result = service.inspect_timeline(project, "main", {"limit": 10})
+        child = result["selected"][0]["clips"][0]
+        parent = result["selected_parent_clips"][0]
+        expected_paths = {"parameters", "source_provenance", "track"}
+        for clip, scope, scope_id, track_id in (
+            (child, "internal_timeline", "internal-1", "child-large"),
+            (parent, "parent_composition", "parent-1", "parent-large"),
+        ):
+            assert {item["path"] for item in clip["omitted_fields"]} == expected_paths
+            assert {item["path"] for item in clip["track_omitted_fields"]} == {"track"}
+            assert clip["track_ref"] == {"scope": scope, "scope_id": scope_id, "track_id": track_id}
+
+        occurrence = result["selected"][0]["occurrence"]
+        assert occurrence["track_ref"] == {
+            "scope": "parent_composition", "scope_id": "parent-1", "track_id": "parent-large",
+        }
+        assert [item["path"] for item in occurrence["omitted_fields"]] == ["track"]
+        assert result["omission_metadata"]["authored_values_omitted"] == 7
+    finally:
+        service.close()
+
+
 def test_oversize_authored_values_are_omitted_with_byte_evidence(tmp_path):
     service, project, _ = _service(tmp_path)
     try:
@@ -523,6 +577,71 @@ def test_response_budget_pages_at_clip_boundaries_with_truthful_cursor(tmp_path)
         ) + sum(len(row["occurrence"].get("omitted_fields", [])) for row in second["selected"])
         assert second["page"]["response_bytes"] == len(canonical_json(second).encode("utf-8"))
         assert second["page"]["offset"] == first["page"]["returned_clips"]
+    finally:
+        service.close()
+
+
+def test_response_budget_shrinks_mixed_parent_child_sequence_without_cursor_gaps(tmp_path, monkeypatch):
+    import runtime_protocol.timeline_inspection as timeline_inspection
+
+    # Force the normal byte-budget shrink path with a modest fixture. A page
+    # starts with parent clips, followed by child clips in occurrence order.
+    monkeypatch.setattr(timeline_inspection, "MAX_RESPONSE_BYTES", 22_000)
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = publication["parent_composition"]["occurrences"][:1]
+        publication["parent_composition"]["occurrences"][0]["track"] = "V1"
+        publication["parent_composition"]["config"]["tracks"] = [
+            {"id": "V1", "kind": "visual", "label": "p" * 3000},
+        ]
+        publication["parent_composition"]["clips"] = [
+            {**_parent_clip(f"parent-{index}", track="V1", at_ms=index * 5, duration_ms=5),
+             "params": {"payload": "p" * 3000}}
+            for index in range(2)
+        ]
+        _with_clips(publication, [
+            {**_clip(f"child-{index}", at_ms=index * 5, duration_ms=5),
+             "params": {"payload": "c" * 3000}}
+            for index in range(5)
+        ])
+        publication["internal_timeline_revisions"][0]["payload"]["tracks"] = [
+            {"id": "picture", "kind": "visual", "label": "c" * 3000},
+        ]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-mixed-budget")
+
+        expected = ["parent-0", "parent-1", *(f"child-{index}" for index in range(5))]
+        seen = []
+        cursor = None
+        pages = []
+        while True:
+            page = service.inspect_timeline(project, "main", {"limit": 20, **({"cursor": cursor} if cursor else {})})
+            current = [clip["clip_id"] for clip in page["selected_parent_clips"]]
+            current.extend(clip["clip_id"] for row in page["selected"] for clip in row["clips"])
+            assert current == expected[len(seen):len(seen) + len(current)]
+            assert page["page"]["offset"] == len(seen)
+            assert page["page"]["returned_clips"] == page["selected_clip_count"] == len(current)
+            assert page["page"]["remaining_clips"] == len(expected) - len(seen) - len(current)
+            assert page["page"]["response_bytes"] <= timeline_inspection.MAX_RESPONSE_BYTES
+            assert page["page"]["response_bytes"] == len(canonical_json(page).encode("utf-8"))
+            returned_clips = page["selected_parent_clips"] + [
+                clip for row in page["selected"] for clip in row["clips"]
+            ]
+            assert page["omission_metadata"]["authored_values_omitted"] == sum(
+                len(clip.get("omitted_fields", [])) for clip in returned_clips
+            ) + sum(
+                len(row["occurrence"].get("omitted_fields", [])) for row in page["selected"]
+            )
+            seen.extend(current)
+            pages.append(page)
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+
+        assert pages[0]["page"]["returned_clips"] < pages[0]["page"]["limit"]
+        assert [clip["clip_id"] for clip in pages[0]["selected_parent_clips"]] == ["parent-0", "parent-1"]
+        assert seen == expected
+        assert len(seen) == len(set(seen))
     finally:
         service.close()
 

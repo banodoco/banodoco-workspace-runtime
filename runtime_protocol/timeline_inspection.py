@@ -143,6 +143,34 @@ def _bounded_value(value, limit, path, omissions):
     return None
 
 
+def _merged_omissions(*collections):
+    """Return each distinct bounded-value omission once across projection sources."""
+    merged = []
+    seen = set()
+    for omissions in collections:
+        if not isinstance(omissions, list):
+            continue
+        for omission in omissions:
+            if not isinstance(omission, dict):
+                continue
+            identity = canonical_json(omission)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            merged.append(omission)
+    return merged
+
+
+def _projection_omissions(value):
+    """Read merged and legacy omission buckets without double-counting them."""
+    if not isinstance(value, dict):
+        return []
+    return _merged_omissions(
+        value.get("omitted_fields"), value.get("authored_omitted_fields"),
+        value.get("asset_omitted_fields"), value.get("track_omitted_fields"),
+    )
+
+
 def _authored_projection(raw):
     """Expose authored values while keeping each clip's optional data bounded."""
     omissions = []
@@ -336,6 +364,7 @@ def _clip(raw, registries, occurrence, start, end, track_scope, tracks):
     clip_end = absolute + duration
     asset = _asset(raw, registries)
     authored = _authored_projection(raw)
+    track = _track_projection(raw.get("track"), track_scope, tracks)
     result = {"occurrence_id": occurrence["occurrence_id"], "shot_id": occurrence["shot_id"],
             "clip_id": cid, "track_id": raw.get("track"), "clip_type": raw.get("clipType", raw.get("clip_type", raw.get("type", "media"))),
             "start": _wire(visible_start), "duration": _wire(visible_end - visible_start), "source_from": raw.get("from_ms", raw.get("from")),
@@ -345,7 +374,13 @@ def _clip(raw, registries, occurrence, start, end, track_scope, tracks):
                             "declared_start": _wire(absolute), "declared_end": _wire(clip_end),
                             "start_clipped_to_occurrence": visible_start > absolute,
                             "end_clipped_to_occurrence": visible_end < clip_end},
-            **_track_projection(raw.get("track"), track_scope, tracks), **authored, **asset}
+            **track, **authored, **asset}
+    omissions = _merged_omissions(
+        authored.get("omitted_fields"), asset.get("omitted_fields"),
+        track.get("track_omitted_fields"),
+    )
+    if omissions:
+        result["omitted_fields"] = omissions
     if isinstance(result.get("text"), (str, dict, list)):
         omissions = result.setdefault("omitted_fields", [])
         bounded_text = _bounded_value(result["text"], 2000, "text", omissions)
@@ -393,6 +428,7 @@ def _parent_clip(raw, registries, track_scope, tracks):
         return None
     asset = _asset(raw, registries)
     authored = _authored_projection(raw)
+    track = _track_projection(raw.get("track"), track_scope, tracks)
     result = {
         "target_kind": "parent_clip", "clip_id": cid, "track_id": raw.get("track"),
         "clip_type": raw.get("clipType", raw.get("clip_type", raw.get("type", "media"))),
@@ -402,8 +438,14 @@ def _parent_clip(raw, registries, track_scope, tracks):
         "mute": bool(raw.get("mute", False)), "text": raw.get("text", ""),
         "time_bounds": {"timeline_start": _wire(start), "timeline_end": _wire(start + duration),
                         "declared_end": _wire(start + duration), "end_clipped_to_occurrence": False},
-        **_track_projection(raw.get("track"), track_scope, tracks), **authored, **asset,
+        **track, **authored, **asset,
     }
+    omissions = _merged_omissions(
+        authored.get("omitted_fields"), asset.get("omitted_fields"),
+        track.get("track_omitted_fields"),
+    )
+    if omissions:
+        result["omitted_fields"] = omissions
     if isinstance(result.get("text"), (str, dict, list)):
         omissions = result.setdefault("omitted_fields", [])
         bounded_text = _bounded_value(result["text"], 2000, "text", omissions)
@@ -599,6 +641,11 @@ def inspect(connection, project_id, timeline_id, options):
                     "gain": raw.get("gain", 1), "mute": bool(raw.get("muted", raw.get("mute", False))),
                     "text_bindings": text_bindings,
                     "audio_bindings": shot_payload.get("audio_bindings", [])}
+        occurrence_omissions = _merged_omissions(
+            identity.get("omitted_fields"), occurrence_track.get("track_omitted_fields"),
+        )
+        if occurrence_omissions:
+            identity["omitted_fields"] = occurrence_omissions
         internal_tracks = _track_catalog(internal_payload.get("tracks", []))
         internal_track_scope = {"kind": "internal_timeline", "id": internal_id}
         for binding_key in ("text_bindings", "audio_bindings"):
@@ -698,9 +745,9 @@ def inspect(connection, project_id, timeline_id, options):
     next_cursor = _encode_cursor(scope, end_offset) if end_offset < total_clips else None
     selected_clip_count = sum(len(row["clips"]) for row in page_rows) + len(selected_parent_page)
     omitted_authored_fields = sum(
-        len(clip.get("omitted_fields", []))
+        len(_projection_omissions(clip))
         for clip in [item for row in page_rows for item in row["clips"]] + selected_parent_page
-    ) + sum(len(row["occurrence"].get("omitted_fields", [])) for row in page_rows)
+    ) + sum(len(_projection_omissions(row["occurrence"])) for row in page_rows)
     result = {"schema": SCHEMA, "evidence_kind": "declared_inputs", "render_requested": False,
             "representation": "canonical_head" if revision == head_revision else "canonical_revision",
             "authority": "runtime_parent_composition", "is_current_head": revision == head_revision,
@@ -740,14 +787,14 @@ def inspect(connection, project_id, timeline_id, options):
         )
         cursor_end = offset + returned
         omitted = sum(
-            len(clip.get("omitted_fields", []))
+            len(_projection_omissions(clip))
             for clip in [
                 item
                 for row in result["selected"]
                 for item in row["clips"]
             ] + result["selected_parent_clips"]
         ) + sum(
-            len(row["occurrence"].get("omitted_fields", []))
+            len(_projection_omissions(row["occurrence"]))
             for row in result["selected"]
         )
         result["selected_clip_count"] = returned
@@ -774,19 +821,22 @@ def inspect(connection, project_id, timeline_id, options):
     refresh_surviving_page_metadata()
 
     while response_size() > MAX_RESPONSE_BYTES:
-        if result["selected_parent_clips"]:
+        # The cursor sequence is parent clips followed by child clips. Remove
+        # exactly its tail so a shortened page remains a prefix of that
+        # sequence and cursor offset + returned count stays gap-free.
+        removed = False
+        for row in reversed(result["selected"]):
+            if row["clips"]:
+                row["clips"].pop()
+                removed = True
+                if not row["clips"]:
+                    result["selected"].remove(row)
+                break
+        if not removed and result["selected_parent_clips"]:
             result["selected_parent_clips"].pop()
-        else:
-            removed = False
-            for row in reversed(result["selected"]):
-                if row["clips"]:
-                    row["clips"].pop()
-                    removed = True
-                    if not row["clips"]:
-                        result["selected"].remove(row)
-                    break
-            if not removed:
-                raise ValidationError("timeline inspection response exceeds byte budget; narrow the revision or selectors")
+            removed = True
+        if not removed:
+            raise ValidationError("timeline inspection response exceeds byte budget; narrow the revision or selectors")
         refresh_surviving_page_metadata()
     # One final fixed-point measurement confirms the returned field describes
     # these exact serialized bytes and remains inside the declared transport cap.
