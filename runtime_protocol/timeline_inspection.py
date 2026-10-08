@@ -432,7 +432,17 @@ def _timing_record(raw, timing_id):
     result = {key: raw[key] for key in ("at", "hold", "from", "to", "speed", "track", "clipType", "transition", "elementRef")
               if key in raw}
     result["id"] = timing_id
-    return result
+    # Scheduling needs identity/duration only, never the transition's opaque
+    # component parameters or extension bytes. Keep original authored values
+    # under their existing independent omission contract.
+    if isinstance(result.get("transition"), dict):
+        result["transition"] = {key: result["transition"][key]
+                                for key in ("id", "type", "durationFrames", "duration")
+                                if key in result["transition"]}
+    if isinstance(result.get("elementRef"), dict):
+        result["elementRef"] = {key: result["elementRef"][key]
+                                for key in ("id", "kind", "revision") if key in result["elementRef"]}
+    return result if len(_value_bytes(result)) <= MAX_AUTHORED_VALUE_BYTES else None
 
 
 def _attach_render_timing(projected, raw_clips, occurrence, registry):
@@ -460,6 +470,9 @@ def _attach_render_timing(projected, raw_clips, occurrence, registry):
             else:
                 row["render_timing"] = _timing_record(
                     expanded_clip, canonical_json([occurrence["occurrence_id"], row["clip_id"]]))
+                if row["render_timing"] is None:
+                    row["render_timing_unknown"] = "managed render timing fields exceed 4096-byte bound"
+                    continue
                 row["render_timing"]["target"] = {"occurrence_id": occurrence["occurrence_id"],
                     "clip_id": row["clip_id"], "shot_id": occurrence["shot_id"],
                     "internal_timeline_revision_id": occurrence["internal_timeline_revision_id"]}
@@ -470,17 +483,25 @@ def _attach_render_timing(projected, raw_clips, occurrence, registry):
 
 def _render_timing_context(config, parent_tracks, parent_clips, children, *, transition_free):
     """Bounded complete scheduling input; absence never implies absent siblings."""
-    output = config.get("output", {})
-    visual = config.get("theme_overrides", {}).get("visual", {}).get("canvas", {})
-    fps = output.get("fps", visual.get("fps", 30))
+    output = config.get("output") if isinstance(config.get("output"), dict) else {}
+    overrides = config.get("theme_overrides") if isinstance(config.get("theme_overrides"), dict) else {}
+    visual = overrides.get("visual") if isinstance(overrides.get("visual"), dict) else {}
+    canvas = visual.get("canvas") if isinstance(visual.get("canvas"), dict) else {}
+    fps = output.get("fps", canvas.get("fps", 30))
+    tracks = [{"id": row.get("id"), "kind": row.get("kind")} for row in
+              (parent_tracks if isinstance(parent_tracks, list) else []) if isinstance(row, dict)]
+    # A transition-free page can still use ordinary per-clip duration helpers
+    # when its actual compositor track is proven; no full sibling list needed.
+    bounded_tracks = tracks if len(_value_bytes(tracks)) <= MAX_AUTHORED_VALUE_BYTES else []
+    fallback = {"status": "unavailable", "fps": fps, "transition_free": transition_free,
+                "tracks": bounded_tracks}
     all_clips = parent_clips + [clip for _, clips in children for clip in clips]
     if any(not isinstance(clip.get("render_timing"), dict) for clip in all_clips):
-        return {"status": "unavailable", "reason": "one or more closure clips lack managed render timing", "fps": fps, "transition_free": transition_free}
+        return {**fallback, "reason": "one or more closure clips lack managed render timing"}
     context = {"status": "complete", "fps": fps, "transition_free": transition_free,
-               "tracks": [{"id": row.get("id"), "kind": row.get("kind")} for row in parent_tracks if isinstance(row, dict)],
-               "clips": [clip["render_timing"] for clip in all_clips]}
+               "tracks": tracks, "clips": [clip["render_timing"] for clip in all_clips]}
     if len(_value_bytes(context)) > 32768:
-        return {"status": "unavailable", "reason": "complete render scheduling context exceeds 32768-byte bound", "fps": fps, "transition_free": transition_free}
+        return {**fallback, "reason": "complete render scheduling context exceeds 32768-byte bound"}
     return context
 
 def inspect(connection, project_id, timeline_id, options):
@@ -597,6 +618,9 @@ def inspect(connection, project_id, timeline_id, options):
     for row in parent_clips:
         row["render_timing"] = _timing_record(_render_timing_clip(raw_parent_by_id[row["clip_id"]]),
                                                canonical_json(["parent", row["clip_id"]]))
+        if row["render_timing"] is None:
+            row["render_timing_unknown"] = "managed render timing fields exceed 4096-byte bound"
+            continue
         row["render_timing"]["target"] = {"target_kind": "parent_clip", "clip_id": row["clip_id"],
                                           "revision_id": revision}
     render_timing_context = _render_timing_context(config, parent_tracks_raw, parent_clips, children, transition_free=not has_render_transitions)
