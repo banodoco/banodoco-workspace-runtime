@@ -51,6 +51,34 @@ PLACEMENT_LOSS_EVIDENCE_MAX_AGE_SECONDS = 15 * 60
 REBOOT_COMMAND_ALLOWLIST = frozenset({"reboot", "resume"})
 PAGE_DEFAULT_LIMIT = 50
 PAGE_MAX_LIMIT = 200
+CHILD_LIMITS = {
+    "max_children": 64,
+    "max_active_children": 64,
+    "max_derived_objects": 256,
+    "max_derived_bytes": 256 * 1024 * 1024,
+    "max_child_inputs": 256,
+    "max_child_bytes": 256 * 1024 * 1024,
+    "max_recoverable_snapshots": 64,
+    "max_recoverable_bytes": 64 * 1024 * 1024,
+    "max_snapshot_bytes": 1024 * 1024,
+}
+CHILD_LIMIT_CEILINGS = CHILD_LIMITS | {
+    "max_children": 4096,
+    "max_derived_objects": 1024,
+    "max_derived_bytes": 4 * 1024 * 1024 * 1024,
+    "max_recoverable_snapshots": 1024,
+    "max_recoverable_bytes": 4 * 1024 * 1024 * 1024,
+    "max_snapshot_bytes": OBJECT_MAX_BYTES,
+}
+# Fail-closed prototype caps; these are not certified discovery workload sizes.
+DISCOVERY_GRANT_CEILINGS = {
+    "max_discovery_rows": 750,
+    "max_discovery_metadata_bytes": 64 * 1024 * 1024,
+    "max_selected_output_objects": 2,
+    "max_selected_output_bytes": 16 * 1024 * 1024,
+    "max_child_media_bindings": 1,
+    "max_child_media_bytes": 16 * 1024 * 1024,
+}
 IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$")
 MANAGED_COVERAGE_MODES = frozenset({"interval", "clips", "cuts", "shots"})
 MANAGED_COVERAGE_REASONS = frozenset({"interval", "before_cut", "after_cut", "clip_first", "shot_midpoint"})
@@ -656,7 +684,7 @@ class RuntimeService:
     def _remote_activation_history(self, task_id, activation_id=None):
         rows = self.store.conn.execute(
             "SELECT id, kind, payload_json FROM events WHERE task_id=? "
-            "AND kind IN ('task.remote_activation_qualified', 'task.remote_activation_revoked') "
+            "AND kind IN ('task.remote_activation_qualified', 'task.remote_activation_accepted', 'task.remote_activation_revoked') "
             "ORDER BY id", (str(task_id),),
         ).fetchall()
         history = []
@@ -682,6 +710,9 @@ class RuntimeService:
         return json.loads(row["payload_json"])
 
     def _task_requires_remote_activation(self, task_id):
+        if any(kind == "task.remote_activation_qualified"
+               for kind, _ in self._remote_activation_history(task_id)):
+            return True
         row = self.store.conn.execute(
             "SELECT capability, execution_request_json, spec_json FROM tasks WHERE id=?",
             (str(task_id),),
@@ -695,7 +726,7 @@ class RuntimeService:
         if (row["capability"] == QUALIFIED_REMOTE_CAPABILITY
                 and isinstance(request, dict)
                 and isinstance(request.get("target"), dict)
-                and request["target"].get("kind") == "runpod"):
+                and request["target"].get("kind") in {"runpod", "machine"}):
             return True
         try:
             spec = json.loads(row["spec_json"] or "{}")
@@ -799,6 +830,9 @@ class RuntimeService:
             return False
         if supplied != recorded or identity.get("actor") != recorded.get("credential_actor"):
             return False
+        if not any(kind == "task.remote_activation_accepted"
+                   for kind, _ in self._remote_activation_history(owner_id, recorded.get("activation_id"))):
+            return False
         if recorded.get("runtime_session_id") != self.runtime_session_id:
             return False
         if recorded.get("runtime_epoch") != self.store._current_runtime_epoch():
@@ -825,9 +859,56 @@ class RuntimeService:
             return False
         return recorded.get("binding_digest") == binding.digest()
 
+    def assert_remote_activation_admissible(self, task_id, qualification):
+        """Allow ordinary queued tasks or the exact quiescent recovery receipt."""
+        from .remote_worker_deployment import deployment_binding_from_task
+        task = self._task_resource(self.store.get_task(task_id))
+        binding = deployment_binding_from_task(task)
+        if (qualification.get("task_id") != str(task_id)
+                or qualification.get("run_id") != binding.admission_identity.run_id
+                or qualification.get("binding_digest") != binding.digest()
+                or qualification.get("effective_target") != binding.placement.effective_target):
+            raise ConflictError("remote activation is foreign to the current binding")
+        if task["state"] == "queued":
+            return
+        recovery = self.store.placement_recovery(task_id)
+        replacement = recovery.get("qualification") if isinstance(recovery, dict) else None
+        placement = {
+            "actual": qualification.get("effective_target"),
+            "verification": {"evidence_digest": qualification.get("evidence_digest")},
+            "executor_incarnation": qualification.get("executor_incarnation"),
+        }
+        if (task["state"] not in {"failed", "cancelled"}
+                or not isinstance(recovery, dict)
+                or not isinstance(replacement, dict)
+                or binding.placement.effective_target.get("kind") != "runpod"
+                or binding.placement.placement_version <= 0
+                or recovery.get("task_id") != str(task_id)
+                or recovery.get("run_id") != task["run_id"]
+                or recovery.get("task_version") != task["version"]
+                or recovery.get("placement_version") != binding.placement.placement_version
+                or recovery.get("decision_digest") != binding.placement.recovery_decision_digest
+                or recovery.get("original_target") != binding.placement.original_target
+                or recovery.get("replacement_target") != binding.placement.effective_target
+                or replacement.get("verified") is not True
+                or replacement.get("target") != binding.placement.effective_target
+                or qualification.get("authorized_child_lineage", {}).get("placement_version")
+                != binding.placement.placement_version
+                or not self._placement_recovery_qualification_matches(task_id, placement)):
+            raise ConflictError("remote activation requires a queued task or exact recovered placement")
+        row = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        current = self._assert_placement_recovery_quiescent(row, self._delegated_children(str(task_id)))
+        if current["status"] != "prepared":
+            raise ConflictError("recovered activation has no prepared replacement binding")
+
     @_durable_mutation
     def record_remote_activation(self, task_id, qualification, *, identity=None):
-        """Commit a privately acknowledged, independently observed activation."""
+        """Commit owner-observed acceptance before the private final ACK.
+
+        The existing record RPC is the callback transport: qualification and its
+        acceptance receipt are durable in one transaction, with no new wire
+        fields or worker authority. Exact replay returns that same receipt.
+        """
         actor = self._require_placement_recovery_owner(identity)
         if actor != "owner":
             raise AuthorizationError("remote activation requires the Runtime owner actor")
@@ -877,29 +958,42 @@ class RuntimeService:
         if history:
             if any(kind == "task.remote_activation_revoked" for kind, _payload in history):
                 raise ConflictError("remote activation generation is permanently revoked")
-            if any(kind == "task.remote_activation_qualified" and payload == qualification for kind, payload in history):
+            if (any(kind == "task.remote_activation_qualified" and payload == qualification for kind, payload in history)
+                    and any(kind == "task.remote_activation_accepted" for kind, _ in history)):
                 return qualification
             raise ConflictError("remote activation generation was already used")
         if latest is not None:
             raise ConflictError("another remote activation is already qualified")
+        self.assert_remote_activation_admissible(task_id, qualification)
         self.store._append_event(
             task["run_id"], str(task_id), "task.remote_activation_qualified", qualification
+        )
+        self.store._append_event(
+            task["run_id"], str(task_id), "task.remote_activation_accepted",
+            {"activation_id": qualification["activation_id"]},
         )
         return qualification
 
     @_durable_mutation
-    def revoke_remote_activation(self, task_id, activation_id, *, identity=None):
+    def revoke_remote_activation(self, task_id, activation_id, *, identity=None, qualification=None):
         actor = self._require_placement_recovery_owner(identity)
         if actor != "owner":
             raise AuthorizationError("remote activation revocation requires the Runtime owner actor")
         latest = self._latest_remote_activation(task_id)
-        if latest is None or latest.get("activation_id") != activation_id:
+        unaccepted = (
+            latest is None and isinstance(qualification, dict)
+            and qualification.get("task_id") == str(task_id)
+            and qualification.get("activation_id") == activation_id
+            and not self._remote_activation_history(task_id, activation_id)
+        )
+        if not unaccepted and (latest is None or latest.get("activation_id") != activation_id):
             raise ConflictError("remote activation is no longer current")
         task = self.store.get_task(task_id)
         self.store._append_event(
             task["run"]["id"], str(task_id), "task.remote_activation_revoked",
             {"activation_id": activation_id, "revoked_at": now()},
         )
+        self.store.contain_delegated_children(task_id, reason="parent_authority_revoked")
 
     def _assert_attempt_identity(self, row, identity):
         if not row:
@@ -4604,7 +4698,7 @@ class RuntimeService:
     @staticmethod
     def _child_policy(value):
         required = {"capabilities", "targets", "input_object_ids"}
-        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"stages", "final_publication"}:
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"stages", "final_publication", "limits", "recoverable_outputs", "discovery_grant"}:
             raise ValidationError("child_delegation requires capabilities, targets, and input_object_ids")
         capabilities = value["capabilities"]
         if not isinstance(capabilities, list) or not capabilities or len(capabilities) > 32:
@@ -4626,6 +4720,40 @@ class RuntimeService:
         if len({canonical_json(item) for item in normalized_targets}) != len(normalized_targets) or len(set(inputs)) != len(inputs) or len({item["capability_id"] for item in normalized_caps}) != len(normalized_caps):
             raise ValidationError("child_delegation entries must be unique")
         policy = {"capabilities": normalized_caps, "targets": normalized_targets, "input_object_ids": inputs}
+        limits = value.get("limits", {})
+        if (not isinstance(limits, dict) or set(limits) - CHILD_LIMIT_CEILINGS.keys()
+                or any(type(n) is not int or n < 1 or n > CHILD_LIMIT_CEILINGS[key] for key, n in limits.items())):
+            raise ValidationError("child_delegation.limits must fit the finite Runtime ceilings")
+        # Freeze effective defaults in the admitted policy. Reading an existing
+        # full policy preserves its bounds after future default changes.
+        policy["limits"] = CHILD_LIMITS | limits
+        if "discovery_grant" in value:
+            grant = value["discovery_grant"]
+            identities = {"project_id", "run_id", "task_id", "attempt_id", "capability_id"}
+            if (not isinstance(grant, dict) or set(grant) != identities | {"capability_digest", "limits"}
+                    or any(not isinstance(grant[key], str) or not grant[key] or "*" in grant[key]
+                           for key in identities)
+                    or not isinstance(grant["capability_digest"], str)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", grant["capability_digest"])):
+                raise ValidationError("discovery_grant requires one exact project/run/task/attempt and root capability")
+            bounds = grant["limits"]
+            if (not isinstance(bounds, dict) or set(bounds) != DISCOVERY_GRANT_CEILINGS.keys()
+                    or any(type(n) is not int or n < 1 or n > DISCOVERY_GRANT_CEILINGS[key]
+                           for key, n in bounds.items())):
+                raise ValidationError("discovery_grant.limits requires every finite prototype bound")
+            policy["discovery_grant"] = {**grant, "limits": dict(bounds)}
+        if "recoverable_outputs" in value:
+            grants = value["recoverable_outputs"]
+            if not isinstance(grants, list) or len(grants) != 1:
+                raise ValidationError("recoverable_outputs requires one exact pinned Human Review grant")
+            grant = grants[0]
+            if (not isinstance(grant, dict)
+                    or set(grant) != {"capability_id", "capability_digest", "output_ports"}
+                    or grant.get("capability_id") != "editorial.human_review"
+                    or grant.get("output_ports") != ["state_result"]
+                    or {key: grant.get(key) for key in ("capability_id", "capability_digest")} not in normalized_caps):
+                raise ValidationError("recoverable_outputs must pin editorial.human_review/state_result in capabilities")
+            policy["recoverable_outputs"] = [dict(grant)]
         if "stages" in value:
             stages = value["stages"]
             if not isinstance(stages, list) or not stages or len(stages) > 16:
@@ -4684,8 +4812,26 @@ class RuntimeService:
             policy["final_publication"] = dict(final)
         return policy
 
+    def _validate_discovery_grant_binding(self, policy, project, capability, digest):
+        grant = policy.get("discovery_grant")
+        if grant is None:
+            return
+        if (project is None or grant["project_id"] != project
+                or grant["capability_id"] != capability or grant["capability_digest"] != digest):
+            raise AuthorizationError("discovery grant does not match parent project or root capability")
+        # The selected attempt is historical and explicit. Never fall back to
+        # a current attempt or expand this tuple through ancestry.
+        selected = self.store.conn.execute(
+            "SELECT 1 FROM runs r JOIN tasks t ON t.run_id=r.id "
+            "JOIN attempts a ON a.task_id=t.id "
+            "WHERE r.project_id=? AND r.id=? AND t.id=? AND a.id=?",
+            (project, grant["run_id"], grant["task_id"], grant["attempt_id"]),
+        ).fetchone()
+        if selected is None:
+            raise AuthorizationError("discovery grant selected project/run/task/attempt association does not match")
+
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None):
+    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None, _recoverable_outputs=None):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
         capability = body.get("capability_id")
@@ -4696,8 +4842,8 @@ class RuntimeService:
         task_spec_value = body.get("spec", {})
         if not isinstance(task_spec_value, dict):
             raise ValidationError("task spec must be an object")
-        reserved = {"child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs"}
-        if set(task_spec_value) & {"child_delegation", "delegated_parent"} or set(body) & (reserved - {"child_delegation"}):
+        reserved = {"child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs", "derived_input_registry", "delegation_closed_attempt_id", "delegated_recoverable_outputs", "discovery_grant"}
+        if set(task_spec_value) & reserved or set(body) & (reserved - {"child_delegation"}):
             raise ValidationError("delegation fields must use Runtime admission authority")
         if _delegated_lineage is not None and "child_delegation" in body:
             raise ValidationError("delegated children cannot delegate further")
@@ -4722,6 +4868,13 @@ class RuntimeService:
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
         if "child_delegation" in body:
             task_spec["child_delegation"] = self._child_policy(body["child_delegation"])
+            if any(object_id not in task_spec["input_object_ids"] for object_id in task_spec["child_delegation"]["input_object_ids"]):
+                raise AuthorizationError("child policy root inputs must be admitted parent inputs")
+            if "discovery_grant" in task_spec["child_delegation"]:
+                project = self.store.get_project(body.get("project")) if body.get("project") else None
+                self._validate_discovery_grant_binding(
+                    task_spec["child_delegation"], project["id"] if project else None, capability, digest,
+                )
             final = task_spec["child_delegation"].get("final_publication")
             if final is not None:
                 project = self.store.get_project(body.get("project")) if body.get("project") else None
@@ -4730,8 +4883,11 @@ class RuntimeService:
                 self.store._validate_settlement_effect(final["effect"], project_id=project["id"])
         if _delegated_lineage is not None:
             task_spec["delegated_parent"] = dict(_delegated_lineage)
+        if _recoverable_outputs is not None:
+            task_spec["delegated_recoverable_outputs"] = _recoverable_outputs
         if _delegated_stage is not None:
             task_spec["delegated_stage"] = _delegated_stage
+        if _delegated_inputs is not None:
             task_spec["delegated_inputs"] = list(_delegated_inputs or [])
         if _verified_publication_source is not None:
             task_spec["verified_publication_source"] = dict(_verified_publication_source)
@@ -4753,13 +4909,23 @@ class RuntimeService:
         self._assert_attempt_identity(row, identity)
         self._validate_attempt_lease(row, lease, self.store._current_runtime_epoch())
         task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
-        if not task or task["status"] != "running" or task["attempt_id"] != attempt_id or task["lease_token"] != row["lease_id"] or int(task["lease_fence"]) != int(row["fence"]):
+        if (not task or task["status"] != "running" or task["attempt_id"] != attempt_id
+                or task["lease_token"] != row["lease_id"] or int(task["lease_fence"]) != int(row["fence"])
+                or task["executor_id"] != row["executor_id"] or int(task["runtime_epoch"] or 0) != int(row["runtime_epoch"])):
             raise LeaseError("parent attempt is no longer live")
+        if identity is not None and (self._task_requires_remote_activation(task["id"]) or isinstance(identity.get("qualified_activation"), dict)):
+            if not self._remote_activation_matches(task["id"], identity, self._trusted_execution_placement(identity), require_fresh=True):
+                raise AuthorizationError("parent activation is missing, expired, revoked, or foreign")
+        if json.loads(task["spec_json"]).get("delegated_parent") is not None:
+            raise AuthorizationError("delegated children cannot delegate further")
         policy = json.loads(task["spec_json"]).get("child_delegation")
+        if json.loads(task["spec_json"]).get("delegation_closed_attempt_id") == attempt_id:
+            raise AuthorizationError("parent child authority has ended")
         if policy is None:
             raise AuthorizationError("parent task has no child delegation policy")
         policy = self._child_policy(policy)
         project = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0]
+        self._validate_discovery_grant_binding(policy, project, task["capability"], task["capability_digest"])
         return row, task, project, policy
 
     def _child_identity_digest(self, identity):
@@ -4770,9 +4936,9 @@ class RuntimeService:
             "placement": self._trusted_execution_placement(identity),
         }).encode())
 
-    @_verified_mutation
+    @_durable_mutation
     def issue_child_authority(self, attempt_id, body, *, identity):
-        body = _wire_object(body, required=("lease_id", "fence", "runtime_epoch"), allowed=("lease_id", "fence", "runtime_epoch"))
+        body = _wire_object(body, required=("lease_id", "fence", "runtime_epoch"), allowed=("lease_id", "fence", "runtime_epoch", "child", "derived_inputs"))
         _wire_string(body, "lease_id")
         _wire_integer(body, "fence")
         _wire_integer(body, "runtime_epoch", positive=True)
@@ -4790,12 +4956,114 @@ class RuntimeService:
             "effective_target": effective_target,
             "placement_version": int(recovery.get("placement_version", 0)) if recovery else 0,
         }
+        if "derived_inputs" in body or "child" in body:
+            child = _wire_object(body.get("child"), required=("child_id", "capability_id", "capability_digest"), allowed=("child_id", "capability_id", "capability_digest"))
+            require_idempotency_key(child["child_id"])
+            capability = {key: child[key] for key in ("capability_id", "capability_digest")}
+            if capability not in policy["capabilities"] or "stages" in policy:
+                raise AuthorizationError("derived input child must match an unstaged declared capability")
+            payload["child"] = dict(child)
+            payload["derived_inputs"] = self._register_derived_inputs(
+                body.get("derived_inputs", []), row, task, project, policy, body,
+            )
         encoded = base64.urlsafe_b64encode(canonical_json(payload).encode()).decode().rstrip("=")
         signature = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
-        return {"authority": encoded + "." + signature, "expires_at": row["lease_expires_at"], "parent_task_id": task["id"], "parent_attempt_id": attempt_id}
+        return {"authority": encoded + "." + signature, "expires_at": row["lease_expires_at"], "parent_task_id": task["id"], "parent_attempt_id": attempt_id, **({"child": payload["child"], "derived_inputs": payload["derived_inputs"]} if "child" in payload else {})}
+
+    def _verify_derived_association(self, ref, parent, attempt, project):
+        association = self.store.get_managed_output(ref["association_id"])
+        provenance = association["provenance"]
+        if (association["task_id"] != parent["id"] or association["attempt_id"] != attempt["id"]
+                or association["project_id"] != project or association["role"] != "derived_input"
+                or association["object_id"] != ref["object_id"] or association["size"] != ref["size"]
+                or association["media_type"] != ref["media_type"] or association["filename"] != ref["filename"]
+                or association["output_port"] != ref["output_port"] or association["durability"] != "durable"
+                or association["lifecycle"]["state"] not in {"available", "promoted"}
+                or provenance.get("task_id") != parent["id"] or provenance.get("attempt_id") != attempt["id"]
+                or provenance.get("executor_id") != attempt["executor_id"]
+                or provenance.get("fence") != int(attempt["fence"])
+                or provenance.get("runtime_epoch") != int(attempt["runtime_epoch"])):
+            raise AuthorizationError("derived input managed association no longer matches its receipt")
+        digest = ref["object_id"].removeprefix("sha256:")
+        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+        if (obj is None or int(obj["size"]) != ref["size"] or obj["media_type"] != ref["media_type"]
+                or not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project, digest)).fetchone()):
+            raise ConflictError("derived input object metadata or project association changed")
+        self._verify_child_object_bytes(digest, ref["size"], label="derived input CAS object")
+
+    def _verify_child_object_bytes(self, digest, size, *, label):
+        try:
+            root_fd, prefix_fd = self._cas_prefix_fds(digest, create=False)
+        except OSError as exc:
+            raise ConflictError(f"{label} is unavailable") from exc
+        try:
+            self._verify_file_at(prefix_fd, digest[2:], digest, size, label=label)
+        finally:
+            os.close(prefix_fd)
+            os.close(root_fd)
+
+    def _register_derived_inputs(self, inputs, attempt, parent, project, policy, lease):
+        limits = policy["limits"]
+        if not isinstance(inputs, list) or len(inputs) > limits["max_child_inputs"]:
+            raise ValidationError("derived_inputs exceeds the child input count limit")
+        if inputs and project is None:
+            raise ValidationError("derived inputs require a project-scoped parent")
+        spec = json.loads(parent["spec_json"])
+        registry = {key: ref for key, ref in spec.get("derived_input_registry", {}).items() if ref.get("parent_attempt_id") == attempt["id"]}
+        normalized = []
+        for item in inputs:
+            item = _wire_object(item, required=("name", "output_port", "filename", "object_id", "size", "media_type"), allowed=("name", "output_port", "filename", "object_id", "size", "media_type"))
+            for key in ("name", "output_port", "media_type"):
+                _wire_string(item, key)
+                if len(item[key]) > 255 or any(ord(c) < 32 for c in item[key]):
+                    raise ValidationError("derived input metadata is invalid")
+            _canonical_execution_input_filename(item["filename"], "derived input filename")
+            _wire_integer(item, "size")
+            if item["size"] < 0 or item["size"] > OBJECT_MAX_BYTES or not isinstance(item["object_id"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", item["object_id"]):
+                raise ValidationError("derived input identity or size is invalid")
+            normalized.append(dict(item))
+        if len({item["object_id"] for item in normalized}) != len(normalized) or len({item["name"] for item in normalized}) != len(normalized):
+            raise ValidationError("derived input identities and names must be unique")
+        if sum(item["size"] for item in normalized) > limits["max_child_bytes"]:
+            raise ValidationError("child input byte limit exceeded")
+        # Budget the union before checking bytes or associating anything.
+        candidate = dict(registry)
+        for item in normalized:
+            candidate.setdefault(item["object_id"], item)
+        if len(candidate) > limits["max_derived_objects"] or sum(item["size"] for item in candidate.values()) > limits["max_derived_bytes"]:
+            raise ValidationError("derived input attempt count or byte limit exceeded")
+        refs = []
+        for item in normalized:
+            digest = item["object_id"].removeprefix("sha256:")
+            if not self._is_authorized_generic_output(
+                digest, item["size"], item["media_type"], name=item["name"], output_port=item["output_port"],
+                filename=item["filename"], recorded_filename=item["filename"], attempt_row=attempt,
+                task_row=parent, project_id=project, lease_body=lease,
+            ):
+                raise AuthorizationError("derived input requires this live attempt's authenticated upload receipt")
+            previous = registry.get(item["object_id"])
+            if previous is not None:
+                if any(previous.get(key) != value for key, value in item.items()):
+                    raise ConflictError("derived input was already registered with another descriptor")
+                ref = previous
+            else:
+                obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+                if obj is None or int(obj["size"]) != item["size"] or obj["media_type"] != item["media_type"]:
+                    raise ConflictError("derived input object metadata does not match upload")
+                self._verify_child_object_bytes(digest, item["size"], label="derived input CAS object")
+                self.store.conn.execute("INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)", (project, digest, now()))
+                output = {**item, "digest": item["object_id"], "kind": "object", "role": "derived_input", "group_key": "derived-input-" + attempt["id"], "variant_key": digest}
+                association = self.store._associate_managed_outputs({"outputs": [output]}, task_id=parent["id"], attempt_id=attempt["id"], project_id=project)[0]
+                ref = {**item, "association_id": association["association_id"], "parent_attempt_id": attempt["id"]}
+                registry[item["object_id"]] = ref
+            self._verify_derived_association(ref, parent, attempt, project)
+            refs.append(ref)
+        spec["derived_input_registry"] = registry
+        self.store.conn.execute("UPDATE tasks SET spec_json=? WHERE id=?", (canonical_json(spec), parent["id"]))
+        return refs
 
     def _decode_child_authority(self, token):
-        if not isinstance(token, str) or len(token) > 8192 or token.count(".") != 1:
+        if not isinstance(token, str) or len(token) > 1024 * 1024 or token.count(".") != 1:
             raise AuthorizationError("invalid child authority")
         encoded, supplied = token.split(".", 1)
         expected = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
@@ -4851,6 +5119,7 @@ class RuntimeService:
                 association = self.store.get_managed_output(ref["association_id"])
                 if (association["task_id"] != producer["id"] or association["attempt_id"] != producer["attempt_id"]
                         or association["project_id"] != project or association["output_port"] != expected["output_port"]
+                        or association["role"] == "recoverable_snapshot"
                         or association["durability"] != "durable" or association["lifecycle"]["state"] not in {"available", "promoted"}):
                     raise AuthorizationError("managed output does not match the declared live lineage and port")
                 attempt = self.store.conn.execute("SELECT settled, runtime_epoch FROM attempts WHERE id=? AND task_id=?", (association["attempt_id"], producer["id"])).fetchone()
@@ -4894,6 +5163,18 @@ class RuntimeService:
             raise AuthorizationError("child capability is outside parent policy")
         idempotency_key = require_idempotency_key(idempotency_key)
         stages = policy.get("stages")
+        exact_child = payload.get("child")
+        derived_refs = payload.get("derived_inputs", [])
+        if exact_child is not None and (exact_child["child_id"] != idempotency_key
+                or any(exact_child[key] != task[key] for key in ("capability_id", "capability_digest"))):
+            raise AuthorizationError("derived input receipt is bound to another exact child")
+        limits = policy["limits"]
+        accounting = self.store.delegated_child_accounting(parent["id"], row["id"], idempotency_key=idempotency_key)
+        if not accounting["replay"]:
+            if accounting["lifetime"] >= limits["max_children"]:
+                raise ValidationError("parent child count limit exceeded")
+            if accounting["active"] >= limits["max_active_children"]:
+                raise ValidationError("parent active child count limit exceeded")
         stage_name = task.get("stage")
         request = task.get("execution_request")
         if request is not None and not isinstance(request, dict):
@@ -4903,9 +5184,21 @@ class RuntimeService:
         if stages is None:
             if stage_name is not None or "input_refs" in task:
                 raise ValidationError("parent policy does not declare child stages")
-            inputs = task.get("input_object_ids")
-            if not isinstance(inputs, list) or any(item not in policy["input_object_ids"] for item in inputs):
+            inputs = task.get("input_object_ids", [])
+            authorized_ids = list(policy["input_object_ids"]) + [ref["object_id"] for ref in derived_refs]
+            if not isinstance(inputs, list) or any(item not in authorized_ids for item in inputs):
                 raise AuthorizationError("child inputs are outside parent policy")
+            if len(inputs) > limits["max_child_inputs"]:
+                raise ValidationError("child input count limit exceeded")
+            if derived_refs:
+                if [item for item in inputs if item in {ref["object_id"] for ref in derived_refs}] != [ref["object_id"] for ref in derived_refs]:
+                    raise AuthorizationError("child inputs must consume the exact derived receipt")
+                registry = json.loads(parent["spec_json"]).get("derived_input_registry", {})
+                for ref in derived_refs:
+                    if registry.get(ref["object_id"]) != ref:
+                        raise AuthorizationError("derived input receipt is not registered to the parent")
+                    self._verify_derived_association(ref, parent, row, project)
+                resolved_inputs = derived_refs
         else:
             if "input_object_ids" in task or not isinstance(stage_name, str):
                 raise ValidationError("staged child requires stage and input_refs, not bare input_object_ids")
@@ -4928,10 +5221,24 @@ class RuntimeService:
             if any(item["name"] not in siblings or siblings[item["name"]]["status"] != "completed" for item in stages[:index]):
                 raise ConflictError("delegated stages must be admitted once and completed in order")
             inputs, resolved_inputs = self._resolve_delegated_stage_inputs(stage["inputs"], task.get("input_refs"), siblings=siblings, project=project, lineage=lineage_keys)
+            if len(inputs) > limits["max_child_inputs"]:
+                raise ValidationError("child input count limit exceeded")
             final = policy.get("final_publication")
             if final is not None and stage_name == final["stage"]:
                 verified_source = next(ref for ref in resolved_inputs if ref.get("producer_stage") == final["verify_stage"] and ref.get("output_port") == final["verify_output_port"])
         target = _normalize_execution_target(request.get("target")) if isinstance(request, dict) else {"kind": "default"}
+        derived_object_ids = {ref["object_id"] for ref in (resolved_inputs or []) if "association_id" in ref}
+        total_input_bytes = 0
+        for object_id in inputs:
+            if not isinstance(object_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", object_id):
+                raise ValidationError("delegated input object identity is invalid")
+            obj = self.store.conn.execute("SELECT size FROM objects WHERE digest=?", (object_id[7:],)).fetchone()
+            if obj is None:
+                raise ConflictError("delegated input object is unavailable")
+            if object_id in derived_object_ids:
+                total_input_bytes += int(obj["size"])
+        if total_input_bytes > limits["max_child_bytes"]:
+            raise ValidationError("child input byte limit exceeded")
         if target not in policy["targets"] and target != effective_target:
             raise AuthorizationError("child target is outside parent policy")
         if stages is not None and request is not None:
@@ -4984,11 +5291,26 @@ class RuntimeService:
             request["inputs"] = canonical_inputs
         if request is not None:
             request = dict(request)
-            request["target"] = effective_target
+            request["target"] = effective_target or {"kind": "default"}
+        elif effective_target is not None:
+            request = {"schema_version": 1, "target": effective_target}
+        if derived_refs:
+            if request is None:
+                request = {"schema_version": 1, "target": {"kind": "default"}}
+            descriptors = request.get("inputs")
+            if not isinstance(descriptors, list):
+                raise ValidationError("derived input child requires execution_request.inputs descriptors")
+            for ref in derived_refs:
+                matches = [item for item in descriptors if isinstance(item, dict) and item.get("object_id") == ref["object_id"]]
+                if (len(matches) != 1 or matches[0].get("name") != ref["name"]
+                        or matches[0].get("filename") != ref["filename"]
+                        or matches[0].get("digest", ref["object_id"]) != ref["object_id"]):
+                    raise AuthorizationError("derived execution input descriptor disagrees with its receipt")
         child_spec = task.get("spec", {})
         if not isinstance(child_spec, dict) or "runtime_dependencies" in child_spec:
             raise ValidationError("delegated child spec cannot use runtime_dependencies")
         lineage = {"parent_task_id": parent["id"], "parent_attempt_id": row["id"], "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]), "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"], "parent_placement": self._trusted_execution_placement(identity), "parent_effective_target": effective_target, "parent_placement_version": placement_version, "project_id": project}
+        lineage["policy_digest"] = payload["policy_digest"]
         admitted = dict(task)
         admitted.pop("stage", None)
         admitted.pop("input_refs", None)
@@ -4999,7 +5321,120 @@ class RuntimeService:
             admitted["settlement_effect"] = policy["final_publication"]["effect"]
         admitted["project"] = project
         admitted["idempotency_key"] = idempotency_key
-        return self.create_task(admitted, enforce_readiness=True, _delegated_lineage=lineage, _delegated_stage=stage_name, _delegated_inputs=resolved_inputs, _verified_publication_source=verified_source)
+        recoverable = self._recoverable_child_grant(policy, task, lineage)
+        return self.create_task(admitted, enforce_readiness=True, _delegated_lineage=lineage, _delegated_stage=stage_name, _delegated_inputs=resolved_inputs, _verified_publication_source=verified_source, _recoverable_outputs=recoverable)
+
+    @staticmethod
+    def _recoverable_child_grant(policy, task, lineage):
+        grant = next((item for item in policy.get("recoverable_outputs", [])
+                      if all(item[key] == task[key] for key in ("capability_id", "capability_digest"))), None)
+        if grant is None:
+            return None
+        return {**grant, "limits": {key: policy["limits"][key] for key in (
+            "max_recoverable_snapshots", "max_recoverable_bytes", "max_snapshot_bytes")},
+            "parent_attempt_id": lineage["parent_attempt_id"], "policy_digest": lineage["policy_digest"]}
+
+    @_durable_mutation
+    def publish_recoverable_snapshot(self, attempt_id, body, *, idempotency_key, identity):
+        """Commit an opaque child draft; this never settles either attempt."""
+        body = _wire_object(body, required=("lease_id", "fence", "runtime_epoch", "revision", "output"),
+                            allowed=("lease_id", "fence", "runtime_epoch", "revision", "output"))
+        _wire_string(body, "lease_id")
+        for key in ("fence", "runtime_epoch", "revision"):
+            _wire_integer(body, key, positive=True)
+        if body["revision"] > 9007199254740991:
+            raise ValidationError("snapshot revision exceeds the portable integer bound")
+        item = _wire_object(body["output"], required=("name", "output_port", "filename", "object_id", "size", "media_type"),
+                            allowed=("name", "output_port", "filename", "object_id", "size", "media_type"))
+        for key in ("name", "output_port", "media_type"):
+            _wire_string(item, key)
+            if len(item[key]) > 255 or any(ord(c) < 32 for c in item[key]):
+                raise ValidationError("snapshot metadata is invalid")
+        _canonical_execution_input_filename(item["filename"], "snapshot filename")
+        _wire_integer(item, "size")
+        if (item["size"] < 0 or item["size"] > OBJECT_MAX_BYTES
+                or not isinstance(item["object_id"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", item["object_id"])):
+            raise ValidationError("snapshot object identity or size is invalid")
+        idempotency_key = require_idempotency_key(idempotency_key)
+        if identity is None:
+            raise AuthorizationError("authenticated snapshot worker identity is required")
+        attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        self._assert_attempt_identity(attempt, identity)
+        # Historical fence facts remain necessary for receipt recovery, but a
+        # replay does not require that the old lease or epoch is still live.
+        if (not attempt or attempt["lease_id"] != body["lease_id"]
+                or int(attempt["fence"]) != body["fence"] or int(attempt["runtime_epoch"]) != body["runtime_epoch"]):
+            raise LeaseError("snapshot attempt fence does not match")
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (attempt["task_id"],)).fetchone()
+        spec = json.loads(task["spec_json"])
+        project = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0]
+        kind = "attempt.recoverable_snapshot.publish"
+        request_hash = sha256_bytes(canonical_json(body).encode())
+        alias_kind = "attempt.recoverable_snapshot.replay"
+        alias = self._command_replay(alias_kind, attempt_id, idempotency_key, request_hash, with_receipt=False)
+        if alias is not None:
+            return alias
+        replay = self._command_replay(kind, attempt_id, idempotency_key, request_hash, project_id=project)
+        if replay is not None:
+            return replay
+        prior = self.store.recoverable_snapshots(attempt_id=attempt_id, output_port=item["output_port"])
+        same = next((a for a in prior if a["provenance"]["revision"] == body["revision"]), None)
+        if same is not None:
+            original_key = same["provenance"]["idempotency_key"]
+            original = self._command_replay(kind, attempt_id, original_key, request_hash, project_id=project)
+            # Bind an alternate replay key without another publication receipt,
+            # event, association or quota charge, even after authority closes.
+            return self._command_record(alias_kind, attempt_id, idempotency_key, request_hash, original, with_receipt=False)
+        self._validate_attempt_lease(attempt, body, self.store._current_runtime_epoch())
+        if (task["status"] != "running" or task["attempt_id"] != attempt_id
+                or task["lease_token"] != body["lease_id"] or int(task["lease_fence"]) != body["fence"]
+                or task["executor_id"] != attempt["executor_id"] or int(task["runtime_epoch"]) != body["runtime_epoch"]):
+            raise LeaseError("snapshot producing child is no longer live")
+        lineage = spec.get("delegated_parent")
+        frozen = spec.get("delegated_recoverable_outputs")
+        if not isinstance(lineage, dict) or not isinstance(frozen, dict) or project is None:
+            raise AuthorizationError("child has no admitted recoverable output grant")
+        parent_attempt, parent, parent_project, policy = self._live_delegating_parent(
+            lineage["parent_attempt_id"], {"lease_id": lineage["parent_lease_id"],
+            "fence": lineage["parent_fence"], "runtime_epoch": lineage["runtime_epoch"]}, identity=None)
+        recovery = self.store.placement_recovery(parent["id"])
+        if (parent["id"] != lineage["parent_task_id"] or parent_project != project or lineage["project_id"] != project
+                or parent_attempt["executor_id"] != lineage["executor_id"]
+                or self.store.effective_execution_target(parent["id"]) != lineage["parent_effective_target"]
+                or int(recovery.get("placement_version", 0) if recovery else 0) != lineage["parent_placement_version"]
+                or sha256_bytes(canonical_json(policy).encode()) != lineage["policy_digest"]
+                or frozen != self._recoverable_child_grant(policy, {"capability_id": task["capability"],
+                    "capability_digest": spec["capability_digest"]}, lineage)
+                or item["output_port"] not in frozen["output_ports"]):
+            raise AuthorizationError("snapshot grant or parent lineage does not match")
+        if prior and body["revision"] <= max(a["provenance"]["revision"] for a in prior):
+            raise ConflictError("snapshot revision is stale")
+        limits = frozen["limits"]
+        committed = self.store.recoverable_snapshots(parent_attempt_id=lineage["parent_attempt_id"])
+        if (item["size"] > limits["max_snapshot_bytes"]
+                or len(committed) >= limits["max_recoverable_snapshots"]
+                or sum(a["size"] for a in committed) + item["size"] > limits["max_recoverable_bytes"]):
+            raise ValidationError("recoverable snapshot count or byte limit exceeded")
+        digest = item["object_id"][7:]
+        if not self._is_authorized_generic_output(digest, item["size"], item["media_type"], name=item["name"],
+                output_port=item["output_port"], filename=item["filename"], recorded_filename=item["filename"],
+                attempt_row=attempt, task_row=task, project_id=project, lease_body=body):
+            raise AuthorizationError("snapshot requires the producing child's authenticated upload receipt")
+        obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+        if obj is None or int(obj["size"]) != item["size"] or obj["media_type"] != item["media_type"]:
+            raise ConflictError("snapshot object metadata does not match upload")
+        self._verify_child_object_bytes(digest, item["size"], label="snapshot CAS object")
+        self.store.conn.execute("INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)", (project, digest, now()))
+        output = {**item, "digest": item["object_id"], "kind": "object", "role": "recoverable_snapshot",
+                  "group_key": "recoverable-" + attempt_id, "variant_key": str(body["revision"]),
+                  "provenance": {"parent_attempt_id": lineage["parent_attempt_id"],
+                    "revision": body["revision"], "idempotency_key": idempotency_key}}
+        association = self.store._associate_managed_outputs({"outputs": [output]}, task_id=task["id"],
+                        attempt_id=attempt_id, project_id=project)[0]
+        event = self.store._append_event(task["run_id"], task["id"], "attempt.recoverable_snapshot_published",
+                        {"association_id": association["association_id"], "revision": body["revision"]})
+        return self._command_record(kind, attempt_id, idempotency_key, request_hash, association,
+                                    project_id=project, event_ids=(event,))
 
     def task(self, task_id):
         return self.store.get_task(task_id)
@@ -5720,6 +6155,7 @@ class RuntimeService:
                 raise ConflictError("stale task version", details={"expected": expected, "actual": version})
             with self.store._transaction():
                 timestamp = now()
+                self.store.assert_delegated_retry_capacity(task_id)
                 self.store._release_reservations(task_id, current["task"].get("lease_token"))
                 # A retry is a new queue admission attempt for the same
                 # immutable task/request.  Keep the task id, spec, and input
@@ -6087,6 +6523,26 @@ class RuntimeService:
             if effect is not None:
                 self.store._validate_settlement_effect(effect)
             admitted_spec = json.loads(task["spec_json"])
+            if admitted_spec.get("delegation_closed_attempt_id") == attempt_id:
+                raise AuthorizationError("parent attempt child authority has ended")
+            lineage = admitted_spec.get("delegated_parent")
+            if lineage is not None:
+                self._live_delegating_parent(lineage["parent_attempt_id"], {
+                    "lease_id": lineage["parent_lease_id"], "fence": lineage["parent_fence"],
+                    "runtime_epoch": lineage["runtime_epoch"],
+                }, identity=None)
+            self.store.assert_delegated_children_completed(task["id"], attempt_id)
+            for child in self.store.delegated_children(task["id"], attempt_id):
+                for association in self.store.list_managed_outputs(child["id"]):
+                    if association["role"] == "recoverable_snapshot":
+                        continue
+                    digest = association["object_id"].removeprefix("sha256:")
+                    obj = self.store.conn.execute("SELECT size, media_type FROM objects WHERE digest=?", (digest,)).fetchone()
+                    if (obj is None or int(obj["size"]) != association["size"] or obj["media_type"] != association["media_type"]
+                            or association["project_id"] != project_id
+                            or (project_id is not None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone())):
+                        raise ConflictError("accepted child managed output metadata changed")
+                    self._verify_child_object_bytes(digest, association["size"], label="accepted child output CAS object")
             verified_source = admitted_spec.get("verified_publication_source")
             if verified_source is not None:
                 lineage = admitted_spec["delegated_parent"]
@@ -6397,6 +6853,8 @@ class RuntimeService:
         stage_dir.chmod(0o700)
         staged = []
         seen = set()
+        content_metadata = {}
+        non_object_digests = set()
         try:
             for index, output in enumerate(outputs):
                 if not isinstance(output, dict):
@@ -6410,18 +6868,21 @@ class RuntimeService:
                 unknown = sorted(set(output) - allowed)
                 if unknown:
                     raise ValidationError("output contains unsupported fields", details={"fields": unknown})
+                if output.get("role") == "recoverable_snapshot":
+                    raise ValidationError("recoverable_snapshot is a Runtime-reserved output role")
                 digest_value = output.get("digest")
                 if not isinstance(digest_value, str) or not digest_value.startswith("sha256:"):
                     raise ValidationError("each output requires a sha256 digest")
                 digest = digest_value.removeprefix("sha256:")
                 if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
                     raise ValidationError("each output requires a valid SHA-256 digest")
-                if digest in seen:
-                    raise ValidationError("outputs must not contain duplicate digests")
-                seen.add(digest)
                 kind = output.get("kind", "object")
                 if not isinstance(kind, str) or kind not in {"object", "document", "value"}:
                     raise ValidationError("output kind is invalid")
+                if digest in non_object_digests or (kind != "object" and digest in content_metadata):
+                    raise ValidationError("outputs must not contain duplicate digests")
+                if kind != "object":
+                    non_object_digests.add(digest)
                 name = output.get("name", "output")
                 if not isinstance(name, str) or not name or len(name) > 512:
                     raise ValidationError("output name must be a non-empty string")
@@ -6488,6 +6949,10 @@ class RuntimeService:
                             os.close(root_fd)
                     if declared_size is not None and declared_size != size:
                         raise ValidationError("output size does not match CAS bytes")
+                metadata = (size, media_type)
+                if digest in content_metadata and content_metadata[digest] != metadata:
+                    raise ConflictError("output metadata does not match existing object", details={"digest": digest_value})
+                content_metadata[digest] = metadata
                 ordinal = output.get("ordinal")
                 if ordinal is not None and (isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0):
                     raise ValidationError("output ordinal must be a non-negative integer")
@@ -6522,6 +6987,13 @@ class RuntimeService:
                 variant_key = output.get("variant_key", str(ordinal if ordinal is not None else 0))
                 if not isinstance(variant_key, str) or len(variant_key) > 255 or any(ord(char) < 32 for char in variant_key):
                     raise ValidationError("output variant_key is invalid")
+                # Content identity is shared by CAS objects; association
+                # identity follows the existing port/group/variant/ordinal key.
+                association_key = (output_port, group_key, variant_key, ordinal if ordinal is not None else 0)
+                if kind == "object":
+                    if association_key in seen:
+                        raise ValidationError("outputs must not contain duplicate associations")
+                    seen.add(association_key)
                 generation_id = output.get("generation_id")
                 if generation_id is not None and (not isinstance(generation_id, str) or not generation_id or len(generation_id) > 255):
                     raise ValidationError("output generation_id is invalid")
@@ -6548,19 +7020,22 @@ class RuntimeService:
                         has_project_owner = self.store.conn.execute(
                             "SELECT 1 FROM project_objects WHERE digest=? LIMIT 1", (digest,)
                         ).fetchone()
-                        if has_project_owner or not self._is_authorized_generic_output(
+                        # The CAS row retains the first ingest's filename.
+                        # Each association still needs its own exact receipt;
+                        # retain the recorded filename for legacy normalization.
+                        if has_project_owner or not any(self._is_authorized_generic_output(
                             digest,
                             size,
                             media_type,
                             name=name,
                             output_port=output_port,
                             filename=filename,
-                            recorded_filename=existing["original_name"],
+                            recorded_filename=recorded_filename,
                             attempt_row=attempt_row,
                             task_row=task_row,
                             project_id=project_id,
                             lease_body=lease_body,
-                        ):
+                        ) for recorded_filename in (output.get("filename", name), existing["original_name"])):
                             raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
                 elif project_id and stage_path is None and not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
                     raise ConflictError("output object is outside the task project", details={"project_id": project_id, "digest": digest_value})
@@ -6796,6 +7271,8 @@ class RuntimeService:
 
             for item in staged["items"]:
                 digest = item["digest"]
+                if digest in cas_handles:
+                    continue
                 root_fd, prefix_fd = self._cas_prefix_fds(digest, create=True)
                 cas_handles[digest] = (root_fd, prefix_fd)
                 destination_name = digest[2:]

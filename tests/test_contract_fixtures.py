@@ -14,7 +14,16 @@ def test_shared_fixtures_are_canonical_json_and_product_neutral() -> None:
     for path in sorted(FIXTURES.glob("*.json")):
         raw = path.read_bytes()
         value = json.loads(raw)
-        assert raw == json.dumps(value, separators=(",", ":"), sort_keys=True).encode() or path.name in {"handshake.json", "project.json", "managed-object.json", "task.json", "event.json", "settlement.json"}
+        assert raw == json.dumps(value, separators=(",", ":"), sort_keys=True).encode() or path.name in {
+            "handshake.json",
+            "project.json",
+            "managed-object.json",
+            "task.json",
+            "event.json",
+            "settlement.json",
+            "canonical-timeline-parity.json",
+            "shot-composition-compatibility.json",
+        }
         assert not forbidden.search(raw.decode()), path
         assert value.get("protocol", "workspace.v1") == "workspace.v1"
 

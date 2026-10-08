@@ -813,6 +813,10 @@ class RealmStore:
                     "FROM tasks WHERE status IN ('running', 'cancel_requested') ORDER BY rowid"
                 ).fetchall()
                 for task in interrupted:
+                    latest = self.conn.execute("SELECT status FROM tasks WHERE id=?", (task["id"],)).fetchone()
+                    if latest["status"] not in {"running", "cancel_requested"}:
+                        continue
+                    self.contain_delegated_children(task["id"], attempt_id=task["attempt_id"], reason="parent_runtime_epoch_ended")
                     binding = self.execution_binding(task["id"])
                     unresolved_external = bool(
                         binding
@@ -827,7 +831,7 @@ class RealmStore:
                         # require checkpoint-authorized reconciliation.
                         next_status = (
                             "cancel_requested"
-                            if task["status"] == "cancel_requested"
+                            if latest["status"] == "cancel_requested"
                             else "queued"
                         )
                         self.conn.execute(
@@ -2216,6 +2220,7 @@ class RealmStore:
         """
         if not attempt_id:
             return None
+        self.contain_delegated_children(task_id, attempt_id=attempt_id, reason="parent_attempt_reconciled")
         updated = self.conn.execute(
             "UPDATE attempts SET settled=1 WHERE id=? AND task_id=? AND settled=0",
             (str(attempt_id), str(task_id)),
@@ -2380,12 +2385,120 @@ class RealmStore:
         else:
             self.conn.execute("UPDATE reservations SET released_at=? WHERE task_id=? AND lease_token=? AND released_at IS NULL", (timestamp, task_id, lease_token))
 
+    def delegated_children(self, parent_task_id, parent_attempt_id=None):
+        query = ("SELECT t.*, r.idempotency_key FROM tasks t JOIN runs r ON r.id=t.run_id "
+                 "WHERE json_extract(t.spec_json, '$.delegated_parent.parent_task_id')=?")
+        params = [str(parent_task_id)]
+        if parent_attempt_id is not None:
+            query += " AND json_extract(t.spec_json, '$.delegated_parent.parent_attempt_id')=?"
+            params.append(str(parent_attempt_id))
+        return self.conn.execute(query + " ORDER BY t.created_at, t.id", params).fetchall()
+
+    def delegated_child_accounting(self, parent_task_id, parent_attempt_id, *, idempotency_key=None):
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS lifetime, "
+            "COALESCE(SUM(CASE WHEN t.status NOT IN ('completed', 'failed', 'cancelled') "
+            "OR t.waiting_reason='provider_state_unknown' THEN 1 ELSE 0 END), 0) AS active, "
+            "COALESCE(MAX(CASE WHEN r.idempotency_key=? THEN 1 ELSE 0 END), 0) AS replay "
+            "FROM tasks t JOIN runs r ON r.id=t.run_id "
+            "WHERE json_extract(t.spec_json, '$.delegated_parent.parent_task_id')=? "
+            "AND json_extract(t.spec_json, '$.delegated_parent.parent_attempt_id')=?",
+            (idempotency_key, str(parent_task_id), str(parent_attempt_id)),
+        ).fetchone()
+        return {"lifetime": int(row["lifetime"]), "active": int(row["active"]), "replay": bool(row["replay"])}
+
+    def assert_delegated_retry_capacity(self, task_id):
+        """A same-task retry reuses lifetime identity but must regain active capacity."""
+        task = self.conn.execute("SELECT spec_json FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+        lineage = json.loads(task["spec_json"]).get("delegated_parent") if task else None
+        if lineage is None:
+            return
+        parent = self.conn.execute("SELECT * FROM tasks WHERE id=?", (lineage["parent_task_id"],)).fetchone()
+        spec = json.loads(parent["spec_json"]) if parent else {}
+        if (not parent or parent["status"] != "running" or parent["attempt_id"] != lineage["parent_attempt_id"]
+                or parent["lease_token"] != lineage["parent_lease_id"] or int(parent["lease_fence"] or 0) != lineage["parent_fence"]
+                or int(parent["runtime_epoch"] or 0) != self._current_runtime_epoch()
+                or spec.get("delegation_closed_attempt_id") == lineage["parent_attempt_id"]):
+            raise LeaseError("delegated child parent authority has ended")
+        try:
+            if not parent["lease_expires_at"] or datetime.fromisoformat(parent["lease_expires_at"]) <= datetime.now(timezone.utc):
+                raise LeaseError("delegated child parent lease has expired")
+        except (TypeError, ValueError) as exc:
+            raise LeaseError("delegated child parent lease is invalid") from exc
+        limit = spec["child_delegation"].get("limits", {}).get("max_active_children", 64)
+        accounting = self.delegated_child_accounting(parent["id"], parent["attempt_id"])
+        if accounting["active"] >= limit:
+            raise ValidationError("parent active child count limit exceeded")
+
+    def contain_delegated_children(self, parent_task_id, *, attempt_id=None, reason):
+        """Fence descendants with the existing cancellation/unknown-provider semantics."""
+        parent = self.conn.execute("SELECT attempt_id, spec_json FROM tasks WHERE id=?", (str(parent_task_id),)).fetchone()
+        if parent:
+            spec = json.loads(parent["spec_json"])
+            if "child_delegation" in spec and (attempt_id is None or parent["attempt_id"] == attempt_id):
+                spec["delegation_closed_attempt_id"] = attempt_id or parent["attempt_id"]
+                self.conn.execute("UPDATE tasks SET spec_json=? WHERE id=?", (canonical_json(spec), str(parent_task_id)))
+        for child in self.delegated_children(parent_task_id, attempt_id):
+            if child["status"] not in {"completed", "failed", "cancelled", "cancel_requested"}:
+                value = self.cancel_task(child["id"])
+                self._append_event(child["run_id"], child["id"], "task.parent_contained", {
+                    "parent_task_id": str(parent_task_id), "parent_attempt_id": attempt_id,
+                    "reason": reason, "status": value["task"]["status"],
+                    "remote_stop_confirmed": False, "billing_stop_confirmed": False,
+                })
+
+    def _contain_orphaned_delegations(self):
+        rows = self.conn.execute("SELECT id, spec_json FROM tasks WHERE status NOT IN ('completed', 'failed', 'cancelled') AND json_extract(spec_json, '$.delegated_parent') IS NOT NULL").fetchall()
+        for child in rows:
+            lineage = json.loads(child["spec_json"])["delegated_parent"]
+            parent = self.conn.execute("SELECT * FROM tasks WHERE id=?", (lineage["parent_task_id"],)).fetchone()
+            parent_spec = json.loads(parent["spec_json"]) if parent else {}
+            parent_attempt = self.conn.execute("SELECT * FROM attempts WHERE id=?", (lineage["parent_attempt_id"],)).fetchone()
+            parent_project = self.conn.execute("SELECT project_id FROM runs WHERE id=?", (parent["run_id"],)).fetchone()[0] if parent else None
+            live = bool(parent and parent["status"] == "running"
+                        and parent["attempt_id"] == lineage["parent_attempt_id"]
+                        and parent["lease_token"] == lineage["parent_lease_id"]
+                        and int(parent["lease_fence"] or 0) == lineage["parent_fence"]
+                        and int(parent["runtime_epoch"] or 0) == self._current_runtime_epoch() == lineage["runtime_epoch"]
+                        and parent_spec.get("delegation_closed_attempt_id") != lineage["parent_attempt_id"]
+                        and parent_project == lineage["project_id"]
+                        and parent["executor_id"] == lineage["executor_id"]
+                        and parent_attempt and not parent_attempt["settled"]
+                        and parent_attempt["lease_id"] == lineage["parent_lease_id"]
+                        and int(parent_attempt["fence"]) == lineage["parent_fence"]
+                        and int(parent_attempt["runtime_epoch"]) == lineage["runtime_epoch"]
+                        and parent_attempt["executor_id"] == lineage["executor_id"]
+                        and ("policy_digest" not in lineage or hashlib.sha256(canonical_json(parent_spec.get("child_delegation")).encode()).hexdigest() == lineage["policy_digest"]))
+            try:
+                live = live and bool(parent["lease_expires_at"]) and datetime.fromisoformat(parent["lease_expires_at"]) > datetime.now(timezone.utc)
+            except (TypeError, ValueError):
+                live = False
+            if not live:
+                self.contain_delegated_children(lineage["parent_task_id"], attempt_id=lineage["parent_attempt_id"], reason="parent_authority_ended")
+
+    def assert_delegated_children_completed(self, task_id, attempt_id):
+        for child in self.delegated_children(task_id, attempt_id):
+            if child["status"] != "completed":
+                raise ConflictError("parent success requires every accepted child to complete", details={"child_task_id": child["id"], "status": child["status"]})
+            settled_attempt = self.conn.execute("SELECT settled FROM attempts WHERE id=? AND task_id=?", (child["attempt_id"], child["id"])).fetchone()
+            if settled_attempt is None or not settled_attempt["settled"]:
+                raise ConflictError("accepted child attempt is not settled")
+            outputs = json.loads(child["result_json"] or "{}").get("outputs", [])
+            associations = [a for a in self.list_managed_outputs(child["id"]) if a["role"] != "recoverable_snapshot"]
+            for output in outputs:
+                if output.get("kind", "object") != "object":
+                    continue
+                matches = [a for a in associations if a["object_id"] == output["digest"] and a["output_port"] == output.get("output_port", output.get("name", "output")) and a["attempt_id"] == child["attempt_id"]]
+                if not matches or any(a["durability"] != "durable" or a["lifecycle"]["state"] not in {"available", "promoted"} or a["size"] != output["size"] or a["media_type"] != output["media_type"] for a in matches):
+                    raise ConflictError("accepted child output is not a verified durable managed output")
+
     def _reap_expired_leases(self):
         """Return expired attempts to the queue and release their resources.
 
         Called inside the caller's transaction; expiry only affects attempts
         that carry the v2 lease deadline.
         """
+        self._contain_orphaned_delegations()
         current = datetime.now(timezone.utc)
         rows = self.conn.execute(
             "SELECT id, run_id, attempt_id, lease_token, lease_expires_at FROM tasks "
@@ -2398,11 +2511,15 @@ class RealmStore:
                 expired = True
             if not expired:
                 continue
+            latest = self.conn.execute("SELECT status FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            if latest["status"] not in {"running", "cancel_requested"}:
+                continue
+            self.contain_delegated_children(row["id"], attempt_id=row["attempt_id"], reason="parent_lease_expired")
             timestamp = now()
             binding = self.execution_binding(row["id"])
             unresolved_external = bool(
                 binding
-                and binding.get("status") == "claimed"
+                and binding.get("status") in {"claimed", "stale"}
                 and binding.get("actual_target")
                 and (binding.get("verification") or {}).get("verified") is True
             )
@@ -4183,6 +4300,18 @@ class RealmStore:
             associations.append(self._managed_output_value(row))
         return associations
 
+    def recoverable_snapshots(self, *, parent_attempt_id=None, attempt_id=None, output_port=None):
+        """Read committed revisions; cancellation never removes quota history."""
+        clauses = ["a.role='recoverable_snapshot'"]
+        args = []
+        for key, value in (("json_extract(a.provenance_json, '$.parent_attempt_id')", parent_attempt_id),
+                           ("a.attempt_id", attempt_id), ("a.output_port", output_port)):
+            if value is not None:
+                clauses.append(key + "=?")
+                args.append(value)
+        rows = self.conn.execute(self._managed_output_select() + "WHERE " + " AND ".join(clauses), args).fetchall()
+        return [self._managed_output_value(row) for row in rows]
+
     def list_managed_outputs(self, task_id):
         with self._mutex:
             rows = self.conn.execute(
@@ -4330,6 +4459,7 @@ class RealmStore:
                 # The service stages output bytes before entering this fenced
                 # transaction.  Publication and object/project metadata are
                 # performed only after all lease/effect checks succeeded.
+                self.assert_delegated_children_completed(task_id, attempt_id)
                 if effect is not None:
                     self._validate_settlement_effect(
                         effect,
@@ -4443,6 +4573,7 @@ class RealmStore:
                     record(value)
                 return value
             with self._transaction():
+                self.contain_delegated_children(task_id, reason="parent_cancelled")
                 binding = self.execution_binding(task_id)
                 unresolved_external = bool(
                     binding
@@ -4513,6 +4644,7 @@ class RealmStore:
                 for task in children:
                     if task["status"] in {"completed", "failed", "cancelled"}:
                         continue
+                    self.contain_delegated_children(task["id"], reason="parent_run_cancelled")
                     binding = self.execution_binding(task["id"])
                     unresolved_external = bool(
                         binding
@@ -4594,6 +4726,7 @@ class RealmStore:
                     raise ConflictError("run has no eligible failed children", details={"selected_task_ids": selected or []})
                 retried = []
                 for task in eligible:
+                    self.assert_delegated_retry_capacity(task["id"])
                     self._release_reservations(task["id"], task["lease_token"])
                     self.reset_execution_attempt(task["id"])
                     # A retry starts a fresh bounded queue wait while
@@ -4625,6 +4758,7 @@ class RealmStore:
                 except ValueError as exc:
                     raise LeaseError("attempt lease deadline is invalid") from exc
             with self._transaction():
+                self.contain_delegated_children(task_id, attempt_id=attempt_id, reason="parent_failed")
                 timestamp = now()
                 result = {"error": failure}
                 self.conn.execute("UPDATE tasks SET status='failed', result_json=?, lease_expires_at=NULL, waiting_reason=NULL, updated_at=? WHERE id=?", (canonical_json(result), timestamp, task_id))
@@ -5144,14 +5278,24 @@ class RealmStore:
                         elif paired_manifests:
                             expected.extend(paired_manifests[0][1])
                 # The publication canonicalizes each dependency family, but
-                # older migrated parents may retain the same valid closure in
-                # a different family order. Compare the complete multiset so
-                # extra, missing, or duplicate rows remain actionable while
-                # preserving compatibility with those durable revisions.
+                # older durable parents may retain valid declared media beyond
+                # what can be rediscovered by walking the payload (for example,
+                # media explicitly declared by a legacy caller). The row-level
+                # checks above still require every media pin to name an owned
+                # CAS object with the matching digest. Require the complete
+                # payload-derived closure as a subset, while keeping child
+                # revision pins exact so unrelated shots/timelines cannot be
+                # smuggled into a parent graph.
                 expected = list(dict.fromkeys(expected))
                 actual_rows = self.conn.execute("SELECT dependency_kind, dependency_id, content_digest, ordinal FROM composition_revision_dependencies WHERE parent_revision_id=? ORDER BY ordinal", (parent_id,)).fetchall()
                 actual = [(row["dependency_kind"], row["dependency_id"], row["content_digest"]) for row in actual_rows]
-                if sorted(actual) != sorted(expected) or [int(row["ordinal"]) for row in actual_rows] != list(range(len(actual_rows))):
+                expected_set = set(expected)
+                actual_set = set(actual)
+                missing = expected_set - actual_set
+                extra = actual_set - expected_set
+                invalid_extra = {item for item in extra if item[0] != "media"}
+                duplicate_dependencies = len(actual) != len(actual_set)
+                if missing or invalid_extra or duplicate_dependencies or [int(row["ordinal"]) for row in actual_rows] != list(range(len(actual_rows))):
                     revision_issue("composition_revision_dependencies", parent_id, "dependency_graph_mismatch", expected=expected, actual=actual, actual_ordinals=[int(row["ordinal"]) for row in actual_rows])
         if realm_identity["ok"] and {"realm", "realm_lifecycle"}.issubset(actual_tables):
             lifecycle_rows = self.conn.execute(

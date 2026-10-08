@@ -235,6 +235,163 @@ def test_existing_realm_missing_required_column_fails_admission_with_schema_deta
 
 
 @pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("owned_declared_media_superset", None),
+        ("missing_payload_media", "dependency_graph_mismatch"),
+        ("unrelated_child_revision", "dependency_graph_mismatch"),
+        ("unowned_extra_media", "dependency_closure"),
+        ("wrong_extra_media_digest", "dependency_closure"),
+        ("duplicate_dependency", "dependency_graph_mismatch"),
+        ("noncontiguous_ordinals", "dependency_graph_mismatch"),
+    ],
+    ids=[
+        "owned_declared_media_superset",
+        "missing_payload_media",
+        "unrelated_child_revision",
+        "unowned_extra_media",
+        "wrong_extra_media_digest",
+        "duplicate_dependency",
+        "noncontiguous_ordinals",
+    ],
+)
+def test_revision_admission_legacy_declared_media_boundaries(tmp_path, case, expected_reason):
+    root = tmp_path / "realm"
+    service = _new_service(root)
+    try:
+        project = service.create_project({"slug": "legacy-media", "name": "Legacy media", "metadata": {}})
+        project_id = project["id"]
+        service.create_timeline(project_id, "main", idempotency_key="timeline")
+        referenced = service.ingest_object(b"referenced-media", idempotency_key="referenced-media")["data"]["digest"]
+        legacy_extra = service.ingest_object(b"legacy-declared-media", idempotency_key="legacy-extra")["data"]["digest"]
+        for digest in (referenced, legacy_extra):
+            service.store.conn.execute(
+                "INSERT INTO project_objects(project_id,digest,relation,created_at) VALUES (?, ?, 'managed', datetime('now'))",
+                (project_id, digest.removeprefix("sha256:")),
+            )
+        service.publish_parent_composition(
+            project_id,
+            "main",
+            {
+                "project_id": project_id,
+                "timeline_id": "main",
+                "expected_head": None,
+                "parent_revision_id": "legacy-parent",
+                "parent_composition": {
+                    "config": {}, "clips": [], "occurrences": [],
+                    "registry": {"assets": {"tone": {"media_id": referenced}}},
+                },
+                "dependency_manifest": {"media": [referenced]},
+            },
+            idempotency_key="legacy-parent-publication",
+        )
+        if case == "unrelated_child_revision":
+            # Publish a separate valid same-project child graph through the
+            # ordinary API, so its ownership and digest are independently valid.
+            service.create_timeline(project_id, "other", idempotency_key="other-timeline")
+            service.publish_parent_composition(
+                project_id,
+                "other",
+                {
+                    "project_id": project_id, "timeline_id": "other",
+                    "expected_head": None, "parent_revision_id": "other-parent",
+                    "internal_timeline_revisions": [{
+                        "timeline_id": "other", "revision_id": "other-internal",
+                        "payload": {"tracks": [], "clips": [], "effects": [], "audio": [], "layout": {}, "registry": {}, "assets": []},
+                    }],
+                    "shot_revisions": [{
+                        "shot_id": "other-shot", "revision_id": "other-shot-revision",
+                        "internal_timeline_revision_id": "other-internal",
+                        "payload": {"metadata": {}, "items": [], "pools": [], "selected_variants": {}, "provenance": {}, "generation_inputs": {}, "audio_bindings": [], "text_bindings": []},
+                    }],
+                    "parent_composition": {
+                        "config": {}, "registry": {}, "clips": [],
+                        "occurrences": [{
+                            "occurrence_id": "other-occurrence", "shot_id": "other-shot",
+                            "shot_revision_id": "other-shot-revision",
+                            "placement": {"start_ms": 0}, "source_offset": 0,
+                            "duration_ms": 1000, "speed": 1, "track": "video-1",
+                            "transform": {}, "gain": 1, "mute": False, "provenance": {},
+                        }],
+                    },
+                },
+                idempotency_key="other-parent-publication",
+            )
+        assert service.store.integrity_report()["ok"] is True
+        service.store.conn.execute(
+            "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'media', ?, ?, 1)",
+            ("legacy-parent", legacy_extra, legacy_extra),
+        )
+        if case == "missing_payload_media":
+            service.store.conn.execute(
+                "DELETE FROM composition_revision_dependencies WHERE parent_revision_id=? AND dependency_kind='media' AND dependency_id=?",
+                ("legacy-parent", referenced),
+            )
+            # Preserve contiguous ordinals: this case must fail for missing
+            # payload closure rather than an incidental ordinal gap.
+            service.store.conn.execute(
+                "UPDATE composition_revision_dependencies SET ordinal=0 WHERE parent_revision_id=?",
+                ("legacy-parent",),
+            )
+        elif case == "unrelated_child_revision":
+            child = service.store.conn.execute(
+                "SELECT content_digest FROM shot_revisions WHERE id=?", ("other-shot-revision",),
+            ).fetchone()
+            service.store.conn.execute(
+                "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'shot_revision', ?, ?, 2)",
+                ("legacy-parent", "other-shot-revision", child["content_digest"]),
+            )
+        elif case == "unowned_extra_media":
+            service.store.conn.execute(
+                "DELETE FROM project_objects WHERE project_id=? AND digest=?",
+                (project_id, legacy_extra.removeprefix("sha256:")),
+            )
+        elif case == "wrong_extra_media_digest":
+            service.store.conn.execute(
+                "UPDATE composition_revision_dependencies SET content_digest=? WHERE parent_revision_id=? AND dependency_id=?",
+                (referenced, "legacy-parent", legacy_extra),
+            )
+        elif case == "duplicate_dependency":
+            # The canonical primary key includes ordinal, so a duplicate
+            # dependency triple at another ordinal is representable.
+            service.store.conn.execute(
+                "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'media', ?, ?, 2)",
+                ("legacy-parent", legacy_extra, legacy_extra),
+            )
+        elif case == "noncontiguous_ordinals":
+            service.store.conn.execute(
+                "UPDATE composition_revision_dependencies SET ordinal=2 WHERE parent_revision_id=? AND dependency_id=?",
+                ("legacy-parent", legacy_extra),
+            )
+    finally:
+        service.close()
+
+    before = _tree_bytes(root)
+    report = RealmStore.inspect_realm(root)
+    assert _tree_bytes(root) == before
+    assert report["checks"]["sqlite_integrity"]["ok"] is True
+    assert report["checks"]["schema"]["ok"] is True
+    revisions = report["checks"]["revisions"]
+    if expected_reason is None:
+        assert report["ok"] is True, report
+        assert revisions["ok"] is True
+    else:
+        assert report["ok"] is False
+        assert revisions["ok"] is False
+        errors = revisions["errors"]
+        assert any(
+            error["table"] == "composition_revision_dependencies"
+            and str(error["identity"]).startswith("legacy-parent")
+            and error["reason"] == expected_reason
+            for error in errors
+        ), errors
+        # Non-media, missing, duplicate and ordinal cases have valid row-level
+        # references; their rejection must come from graph reconciliation.
+        if expected_reason == "dependency_graph_mismatch":
+            assert not any(error["reason"] == "dependency_closure" for error in errors), errors
+
+
+@pytest.mark.parametrize(
     ("mutation", "reason"),
     [
         ("missing", "realm_identity_missing"),

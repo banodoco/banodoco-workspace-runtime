@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from runtime_protocol.auth import CredentialStore
-from runtime_protocol.errors import AuthorizationError, ConflictError, ValidationError
+from runtime_protocol.errors import AuthorizationError, ConflictError
 from runtime_protocol.remote_worker_activation import QualifiedRemoteWorkerLauncher, _digest
 from runtime_protocol.remote_worker_deployment import ArtifactReference, DeploymentReference, deployment_binding_from_task
 from runtime_protocol.service import RuntimeService
@@ -21,10 +21,11 @@ CAPABILITY = "h3_av.transform"
 CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(CAPABILITY.encode()).hexdigest()
 OLD = {"kind": "runpod", "pod_id": "pod-old", "provider_account_ref": "account-a"}
 NEW = {"kind": "runpod", "pod_id": "pod-new", "provider_account_ref": "account-a"}
+MACHINE = {"kind": "machine", "id": "machine-a"}
 OWNER = {"actor": "owner", "scopes": ["admin"]}
 
 
-def _service(tmp_path: Path, *, child_delegation: bool = False):
+def _service(tmp_path: Path, *, child_delegation: bool = False, target=OLD):
     root = tmp_path / "realm"
     RealmStore.initialize(root).close()
     service = RuntimeService(root)
@@ -53,7 +54,7 @@ def _service(tmp_path: Path, *, child_delegation: bool = False):
         "spec": {"inputs": {"source": input_digest}},
         "execution_request": {
             "schema_version": 1,
-            "target": OLD,
+            "target": target,
             "inputs": [{"name": "source", "object_id": input_digest}],
         },
         "idempotency_key": "same-canonical-admission",
@@ -61,7 +62,7 @@ def _service(tmp_path: Path, *, child_delegation: bool = False):
     if child_delegation:
         admission["child_delegation"] = {
             "capabilities": [{"capability_id": CAPABILITY, "capability_digest": CAPABILITY_DIGEST}],
-            "targets": [OLD],
+            "targets": [target],
             "input_object_ids": [],
         }
     admitted = service.create_task(admission, enforce_readiness=True)
@@ -77,8 +78,8 @@ def _reference(tmp_path: Path, service: RuntimeService, task_id: str) -> Deploym
     return DeploymentReference(
         deployment_id="deployment-1", revision="revision-1",
         task_id=task_id, run_id=binding.admission_identity.run_id,
-        target_ref="runpod:" + binding.placement.original_target["pod_id"],
-        effective_target_ref="runpod:" + target["pod_id"],
+        target_ref=target["kind"] + ":" + binding.placement.original_target.get("pod_id", binding.placement.original_target.get("id", "")),
+        effective_target_ref=target["kind"] + ":" + target.get("pod_id", target.get("id", "")),
         executable=executable, dependency_closure=(executable,),
         source_closure_digest="sha256:" + "3" * 64,
         data_root=tmp_path / "data", support_root=tmp_path / "data" / "runtime",
@@ -104,9 +105,8 @@ def _reference(tmp_path: Path, service: RuntimeService, task_id: str) -> Deploym
 
 
 def _observation(ref: DeploymentReference, service: RuntimeService):
-    return {
+    value = {
         "target": dict(ref.effective_target),
-        "provider_identity": {"account_ref": ref.effective_target["provider_account_ref"], "pod_id": ref.effective_target["pod_id"]},
         "process": {"pid": 12345, "birth_id": "birth-1", "pgid": 12345, "sid": 12345},
         "child": {"attached": True, "birth_id": "child-birth-1", "lanes": ["orchestration", "executor"]},
         "runtime_instance_id": ref.runtime_instance_id,
@@ -122,6 +122,14 @@ def _observation(ref: DeploymentReference, service: RuntimeService):
         "capacity": 2, "model_inventory_digest": "sha256:" + "8" * 64,
         "session_config_digest": ref.session_config_digest,
     }
+    if ref.effective_target["kind"] == "runpod":
+        value["provider_identity"] = {"account_ref": ref.effective_target["provider_account_ref"],
+                                      "pod_id": ref.effective_target["pod_id"]}
+    else:
+        value.pop("child")
+        value["machine_identity"] = {"id": ref.effective_target["id"], "uid": 501}
+        value["process"].update(uid=501, executable=str(ref.executable.path), artifact_digest=ref.executable.digest)
+    return value
 
 
 class Preparer:
@@ -133,7 +141,8 @@ class Preparer:
         self.calls.append("prepare")
         return object()
 
-    def acknowledge(self, handle, grant):
+    def acknowledge(self, handle, grant, *, accept):
+        accept(dict(grant), {"pid": 12345, "birth_id": "birth-1"})
         self.calls.append("private_ack")
         return {"activation_id": "wrong" if self.bad_ack else grant["activation_id"],
                 "executor_incarnation": grant["executor_incarnation"],
@@ -163,64 +172,6 @@ def _fixture(tmp_path):
         runtime=service, credentials=credentials, preparer=preparer, inspector=inspector,
     )
     return service, task_id, reference, credentials, preparer, inspector, launcher
-
-
-def test_resident_credential_control_lifecycle_uses_callback_without_local_store(tmp_path):
-    service, task_id, ref, credentials, preparer, inspector, _launcher = _fixture(tmp_path)
-    calls = []
-
-    def control(control_task, value):
-        assert control_task == task_id
-        action = value["action"]
-        calls.append(action)
-        if action == "provision":
-            _token, path = credentials.provision(
-                "host", ["worker:execute"], rotate=True, enabled=False,
-                metadata={"execution_binding": value["placement"],
-                          "qualified_activation": value["qualification"]},
-            )
-            return {"credential_actor": "host", "credential_file": str(path)}
-        if action == "enable":
-            credentials.enable_actor("host")
-            return {"enabled": True}
-        if action == "verify":
-            return {"fresh": credentials.actor_metadata("host") is not None}
-        if action == "revoke":
-            credentials.revoke("host")
-            return {"revoked": True}
-        pytest.fail(f"unexpected resident control: {action}")
-
-    launcher = QualifiedRemoteWorkerLauncher(
-        runtime=service, credentials=None, credential_control=control,
-        preparer=preparer, inspector=inspector,
-    )
-    try:
-        parked = launcher.park(ref, target=OLD)
-        task = service._task_resource(service.store.get_task(task_id))
-        qualification = launcher.activate(task, ref, parked)
-        assert launcher.activation_state == "active"
-        assert calls == ["provision", "enable"]
-        launcher.assert_fresh(service._task_resource(service.store.get_task(task_id)), ref, parked, qualification)
-        assert calls[-1] == "verify"
-        credentials.revoke("host")
-        with pytest.raises(ConflictError, match="revoked or expired"):
-            launcher.assert_fresh(service._task_resource(service.store.get_task(task_id)), ref, parked, qualification)
-    finally:
-        service.close()
-
-
-@pytest.mark.parametrize("both", [False, True])
-def test_resident_credential_control_requires_exactly_one_authority(tmp_path, both):
-    service, _task_id, _ref, credentials, preparer, inspector, _launcher = _fixture(tmp_path)
-    try:
-        with pytest.raises(ValidationError, match="exactly one"):
-            QualifiedRemoteWorkerLauncher(
-                runtime=service, credentials=credentials if both else None,
-                credential_control=(lambda *_args: {}) if both else None,
-                preparer=preparer, inspector=inspector,
-            )
-    finally:
-        service.close()
 
 
 def _claim(service, target, identity, key):
@@ -255,13 +206,86 @@ def test_parked_host_remains_unclaimable_until_private_ack_and_owner_activation(
         task = service._task_resource(service.store.get_task(task_id))
         qualification = launcher.activate(task, ref, parked)
         assert preparer.calls == ["prepare", "private_ack"]
-        assert inspector.calls == 4
+        assert inspector.calls == 5
         assert credentials.actor_metadata("host")["qualified_activation"] == qualification
         launcher.assert_fresh(task, ref, parked, qualification)
         claimed = _claim(service, OLD, _identity(credentials), "qualified-claim")
         assert claimed["task_id"] == task_id
         assert claimed["execution_binding"]["executor_incarnation"] == parked.executor_incarnation
         assert claimed["execution_binding"]["actual_target"] == OLD
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("failure", [None, "grant", "process", "missing", "duplicate", "lost_reply", "cleanup"])
+def test_acceptance_callback_commits_before_ack_and_keeps_credential_disabled(tmp_path, failure):
+    service, task_id, ref, credentials, preparer, inspector, launcher = _fixture(tmp_path)
+    try:
+        parked = launcher.park(ref, target=OLD)
+        deliveries = []
+
+        def acknowledge(handle, grant, *, accept):
+            deliveries.append(handle)
+            token = Path(grant["credential_file"]).read_text().strip()
+            assert service._latest_remote_activation(task_id) is None
+            with pytest.raises(AuthorizationError):
+                credentials.require(token, "worker:execute")
+            received = dict(grant)
+            process = {"pid": 12345, "birth_id": "birth-1"}
+            if failure == "grant":
+                received["activation_id"] = "foreign"
+            if failure == "process":
+                process["birth_id"] = "foreign"
+            if failure != "missing":
+                accept(received, process)
+                assert [kind for kind, _ in service._remote_activation_history(task_id)] == [
+                    "task.remote_activation_qualified", "task.remote_activation_accepted",
+                ]
+                with pytest.raises(AuthorizationError):
+                    credentials.require(token, "worker:execute")
+            if failure == "duplicate":
+                accept(received, process)
+            if failure == "lost_reply":
+                raise EOFError("final reply lost after resident commit")
+            if failure == "cleanup":
+                raise ConflictError("bad final acknowledgement")
+            return {key: grant[key] for key in ("activation_id", "executor_incarnation", "evidence_digest")}
+
+        preparer.acknowledge = acknowledge
+        if failure == "cleanup":
+            def abort(_handle):
+                raise OSError("cleanup uncertain")
+            preparer.abort = abort
+        task = service._task_resource(service.store.get_task(task_id))
+        if failure in {None, "lost_reply"}:
+            launcher.activate(task, ref, parked)
+            assert launcher.activation_state == "active"
+            assert credentials.require(credentials.path_for("host").read_text().strip(), "worker:execute")
+        else:
+            with pytest.raises(ConflictError):
+                launcher.activate(task, ref, parked)
+            assert credentials.actor_metadata("host") is None
+            assert service._latest_remote_activation(task_id) is None
+            assert launcher.activation_state == ("unknown" if failure == "cleanup" else "inactive")
+        assert deliveries == [parked.handle]
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("target,field,change", [
+    (OLD, "provider_identity", {"account_ref": "account-a", "pod_id": "foreign-pod"}),
+    (OLD, "child", {"attached": False}),
+    (MACHINE, "machine_identity", {"id": "foreign-machine", "uid": 501}),
+    (MACHINE, "machine_identity", {"id": "machine-a", "uid": 502}),
+])
+def test_placement_witness_cannot_substitute_provider_machine_or_child(tmp_path, target, field, change):
+    service, task_id = _service(tmp_path, target=target)
+    try:
+        ref = _reference(tmp_path, service, task_id)
+        observation = _observation(ref, service)
+        observation[field] = change
+        with pytest.raises(ConflictError):
+            QualifiedRemoteWorkerLauncher._validate_observation(observation, target)
     finally:
         service.close()
 
@@ -415,8 +439,10 @@ def test_expired_qualification_remains_authoritative_for_bound_attempt(tmp_path,
         service.close()
 
 
-def test_qualified_credential_is_scoped_to_authorized_child_lineage(tmp_path):
-    service, task_id = _service(tmp_path, child_delegation=True)
+@pytest.mark.parametrize("target", [OLD, MACHINE])
+@pytest.mark.parametrize("finish", [False, True])
+def test_qualified_credential_is_scoped_to_authorized_child_lineage(tmp_path, target, finish):
+    service, task_id = _service(tmp_path, child_delegation=True, target=target)
     try:
         ref = _reference(tmp_path, service, task_id)
         credentials = CredentialStore(tmp_path / "credentials")
@@ -424,11 +450,11 @@ def test_qualified_credential_is_scoped_to_authorized_child_lineage(tmp_path):
             runtime=service, credentials=credentials, preparer=Preparer(),
             inspector=Inspector(_observation(ref, service)),
         )
-        parked = launcher.park(ref, target=OLD)
+        parked = launcher.park(ref, target=target)
         task = service._task_resource(service.store.get_task(task_id))
         launcher.activate(task, ref, parked)
         identity = _identity(credentials)
-        parent = _claim(service, OLD, identity, "qualified-parent")
+        parent = _claim(service, target, identity, "qualified-parent")
         authority = service.issue_child_authority(
             parent["attempt_id"], {
                 "lease_id": parent["lease_id"], "fence": parent["fence"],
@@ -442,12 +468,12 @@ def test_qualified_credential_is_scoped_to_authorized_child_lineage(tmp_path):
                 "capability_digest": CAPABILITY_DIGEST,
                 "input_object_ids": [],
                 "spec": {"params": {"child": "authorized"}},
-                "execution_request": {"schema_version": 1, "target": OLD, "inputs": []},
+                "execution_request": {"schema_version": 1, "target": target, "inputs": []},
             },
         }, idempotency_key="authorized-child", identity=identity)
-        claimed_child = _claim(service, OLD, identity, "authorized-child-claim")
+        claimed_child = _claim(service, target, identity, "authorized-child-claim")
         assert claimed_child["task_id"] == child["task"]["id"]
-        replayed_child = _claim(service, OLD, identity, "authorized-child-claim")
+        replayed_child = _claim(service, target, identity, "authorized-child-claim")
         assert replayed_child["attempt_id"] == claimed_child["attempt_id"]
         heartbeat = service.heartbeat_attempt(
             claimed_child["attempt_id"], {
@@ -457,6 +483,33 @@ def test_qualified_credential_is_scoped_to_authorized_child_lineage(tmp_path):
             }, idempotency_key="authorized-child-heartbeat", identity=identity,
         )
         assert heartbeat["data"]["attempt_id"] == claimed_child["attempt_id"]
+        # Two actual resident attempts make progress while the parent's lease
+        # remains live. Machine evidence carries no invented remote child.
+        assert service.store.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE executor_id='host' AND settled=0"
+        ).fetchone()[0] == 2
+        parent_lease = {key: parent[key] for key in ("lease_id", "fence", "runtime_epoch")}
+        progress = service.heartbeat_attempt(
+            parent["attempt_id"], {**parent_lease, "progress": {"phase": "child-running"}},
+            idempotency_key="parent-with-live-child", identity=identity,
+        )
+        assert progress["data"]["attempt_id"] == parent["attempt_id"]
+        if finish:
+            child_lease = {key: claimed_child[key] for key in ("lease_id", "fence", "runtime_epoch")}
+            service.settle_attempt(
+                claimed_child["attempt_id"], {**child_lease, "outputs": []},
+                idempotency_key="child-progress-completed", identity=identity,
+            )
+            service.heartbeat_attempt(
+                parent["attempt_id"], {**parent_lease, "progress": {"phase": "child-completed"}},
+                idempotency_key="parent-after-child-completed", identity=identity,
+            )
+            service.settle_attempt(
+                parent["attempt_id"], {**parent_lease, "outputs": []},
+                idempotency_key="parent-progress-completed", identity=identity,
+            )
+            assert service.task(child["task"]["id"])["task"]["status"] == "completed"
+            assert service.task(task_id)["task"]["status"] == "completed"
         service.revoke_remote_activation(
             task_id, identity["qualified_activation"]["activation_id"], identity=OWNER,
         )
@@ -508,6 +561,8 @@ def test_recovered_placement_requires_matching_new_qualification(tmp_path):
             "lease_id": claimed["lease_id"], "fence": claimed["fence"],
             "runtime_epoch": claimed["runtime_epoch"], "error": {"code": "old-pod-lost"},
         }, idempotency_key="old-fail", identity=old_identity)
+        with pytest.raises(ConflictError, match="queued task or exact recovered"):
+            service.assert_remote_activation_admissible(task_id, old_activation)
         new_ref = replace(ref, effective_target=NEW, execution_target=NEW,
                           effective_target_ref="runpod:pod-new")
         new_inspector = Inspector(_observation(new_ref, service))
@@ -530,6 +585,31 @@ def test_recovered_placement_requires_matching_new_qualification(tmp_path):
         assert service._latest_remote_activation(task_id) is None
         fresh = service._task_resource(service.store.get_task(task_id))
         recovered_ref = _reference(tmp_path, service, task_id)
+        candidate = {**old_activation, "binding_digest": recovered_ref.deployment_binding.digest(),
+                     "effective_target": NEW, "evidence_digest": new_parked.evidence_digest,
+                     "executor_incarnation": new_parked.executor_incarnation,
+                     "authorized_child_lineage": {**old_activation["authorized_child_lineage"],
+                                                  "effective_target": NEW, "placement_version": 1}}
+        service.assert_remote_activation_admissible(task_id, candidate)
+        for field, bad in (("binding_digest", old_activation["binding_digest"]),
+                           ("effective_target", OLD), ("evidence_digest", "sha256:" + "0" * 64),
+                           ("executor_incarnation", "foreign"),
+                           ("authorized_child_lineage", {**candidate["authorized_child_lineage"], "placement_version": 0})):
+            with pytest.raises(ConflictError):
+                service.assert_remote_activation_admissible(task_id, {**candidate, field: bad})
+        service.store.conn.execute("UPDATE attempts SET settled=0 WHERE id=?", (claimed["attempt_id"],))
+        with pytest.raises(ConflictError, match="unknown active work"):
+            service.assert_remote_activation_admissible(task_id, candidate)
+        service.store.conn.execute("UPDATE attempts SET settled=1 WHERE id=?", (claimed["attempt_id"],))
+        service.store.conn.execute(
+            "INSERT INTO reservations(task_id,resource_key,lease_token,created_at,released_at,executor_id,fence,lease_expires_at,runtime_epoch) "
+            "VALUES (?, 'recovery-test', ?, ?, NULL, 'host', ?, ?, ?)",
+            (task_id, claimed["lease_id"], datetime.now(timezone.utc).isoformat(), claimed["fence"],
+             datetime.now(timezone.utc).isoformat(), claimed["runtime_epoch"]),
+        )
+        with pytest.raises(ConflictError, match="active reservation"):
+            service.assert_remote_activation_admissible(task_id, candidate)
+        service.store.conn.execute("DELETE FROM reservations WHERE task_id=? AND resource_key='recovery-test'", (task_id,))
         new_activation = new_launcher.activate(fresh, recovered_ref, new_parked)
         assert new_activation["binding_digest"] != old_activation["binding_digest"]
         assert fresh["run_id"] == task["run_id"]

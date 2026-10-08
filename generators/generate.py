@@ -89,6 +89,28 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
 def render_typescript_client() -> str:
     """Render the source-frame thumbnail operations into the typed TS client."""
     source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
+    child_authority_types = (
+        'export interface ChildAuthorityChild { child_id: string; capability_id: string; capability_digest: string }\n'
+        'export interface DerivedInputDescriptor { name: string; output_port: string; filename: string; object_id: string; size: number; media_type: string }\n'
+        'export interface ChildAuthorityRequest { lease_id: string; fence: number; runtime_epoch: number; child?: ChildAuthorityChild; derived_inputs?: DerivedInputDescriptor[] }'
+    )
+    if "export interface ChildAuthorityRequest " not in source:
+        anchor = "export interface ObjectLocation"
+        if anchor not in source:
+            raise SystemExit("TypeScript client is missing the child-authority type insertion point")
+        source = source.replace(anchor, child_authority_types + "\n" + anchor, 1)
+    old_child_authority_method = '  async issueChildAuthority(attemptId: string, body: { lease_id: string; fence: number; runtime_epoch: number }): Promise<Record<string, unknown>>'
+    new_child_authority_method = '  async issueChildAuthority(attemptId: string, body: ChildAuthorityRequest): Promise<Record<string, unknown>>'
+    if new_child_authority_method not in source:
+        if old_child_authority_method not in source:
+            raise SystemExit("TypeScript child-authority client projection is partially present")
+        source = source.replace(old_child_authority_method, new_child_authority_method, 1)
+    snapshot_type = 'export interface RecoverableSnapshotRequest { lease_id: string; fence: number; runtime_epoch: number; revision: number; output: DerivedInputDescriptor }'
+    if "export interface RecoverableSnapshotRequest " not in source:
+        source = source.replace("export interface ObjectLocation", snapshot_type + "\nexport interface ObjectLocation", 1)
+    snapshot_method = '  async publishRecoverableSnapshot(attemptId: string, body: RecoverableSnapshotRequest, idempotencyKey: string): Promise<MutationResult<ManagedOutput>> { return this.mutation<ManagedOutput>((await this.request("POST", `/v1/attempts/${encodeURIComponent(attemptId)}/recoverable-snapshots`, new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body) }'
+    if "  async publishRecoverableSnapshot(" not in source:
+        source = source.replace("  async issueChildAuthority(", snapshot_method + "\n  async issueChildAuthority(", 1)
     source = source.replace(
         'export interface GenerationVariant { variant_id: string; generation_id: string; object_id?: string | null; variant_type: string; metadata: Record<string, unknown>; thumbnail?: { object_id: string; source_object_id: string; recipe_version: number } | null; viewed_at?: string | null; created_at: string }',
         'export interface ThumbnailDescriptor { object_id: string; source_object_id: string; recipe_version: number; selection?: { kind: "variant" | "source_frame"; source_time_seconds?: number } }\nexport interface GenerationVariant { variant_id: string; generation_id: string; object_id?: string | null; variant_type: string; metadata: Record<string, unknown>; thumbnail?: ThumbnailDescriptor | null; viewed_at?: string | null; created_at: string }',

@@ -141,7 +141,7 @@ paths:
   /v1/projects/{project_id}/media-imports:
     post:
       operationId: importProjectMedia
-      description: Authenticated Runtime-host image/video/audio ingest and atomic Generation plus original primary Variant settlement. Audio imports accept duration but must omit visual dimensions. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
+      description: Authenticated Runtime-host image/video ingest and atomic Generation plus original primary Variant settlement. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
       parameters:
         - { $ref: '#/components/parameters/ProjectId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -156,7 +156,6 @@ paths:
           application/octet-stream: { schema: { type: string, format: binary, maxLength: 67108864 } }
           image/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
           video/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
-          audio/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
       responses:
         '201': { description: Completed Runtime media import with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
         '409': { $ref: '#/components/responses/Conflict' }
@@ -531,7 +530,7 @@ paths:
         - { name: source_time_seconds, in: query, required: true, schema: { type: number, minimum: 0, maximum: 4000000000, multipleOf: 0.000001 } }
         - { name: recipe_version, in: query, required: false, schema: { type: integer, const: 1, default: 1 } }
       responses:
-        '200': { description: Matching source-frame thumbnail or no match, content: { application/json: { schema: { type: object, required: [thumbnail], properties: { thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] } } } } }
+        '200': { description: Matching source-frame thumbnail or no match, content: { application/json: { schema: { type: object, required: [thumbnail], properties: { thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] } } } } }}
     post:
       operationId: ensureSourceFrameThumbnail
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
@@ -722,6 +721,13 @@ paths:
       parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Settlement' } } } }
       responses: { '200': { description: Settled with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/attempts/{attempt_id}/recoverable-snapshots:
+    post:
+      operationId: publishRecoverableSnapshot
+      description: Publish one opaque recoverable state_result revision under the producing Human Review child's frozen parent-policy grant. A durable receipt acknowledges the save; publication does not settle either attempt. Exact committed replay may recover its receipt after closure.
+      parameters: [ { $ref: '#/components/parameters/AttemptId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/RecoverableSnapshotRequest' } } } }
+      responses: { '200': { description: Durable recoverable managed-output association and committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/RecoverableSnapshotPublication' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/attempts/{attempt_id}/child-authority:
     post:
       operationId: issueChildAuthority
@@ -967,6 +973,7 @@ components:
         schema_version: { type: string, minLength: 1 }
         input_object_ids: { type: array, items: { type: string, description: Canonical sha256 object ID already associated with the task project. }, uniqueItems: true }
         required_facts: { $ref: './schemas/task.json#/definitions/RequiredFacts' }
+        execution_request: { $ref: './schemas/task.json#/definitions/ExecutionRequest', description: Caller-provided execution request; Runtime supplies execution_binding on claim and task readback. }
         project: { type: string, description: Project selector whose managed-object associations authorize input_object_ids and output settlement. }
         spec: { type: object, additionalProperties: true }
         generation_intent: { type: object, additionalProperties: true, description: Opaque producer intent; GEN owns its semantics. }
@@ -1272,6 +1279,13 @@ components:
           additionalProperties: false
           required: [receipt_id, command_kind, idempotency_key, request_hash, project_id, project_seq, event_ids, result, created_at]
           properties: { receipt_id: { type: string }, command_kind: { type: string }, idempotency_key: { type: string }, request_hash: { type: string }, project_id: { type: string }, project_seq: { type: array, minItems: 2, maxItems: 2, items: { type: integer, minimum: 1 } }, event_ids: { type: array, items: { type: string } }, result: {}, created_at: { type: string } }
+    RecoverableSnapshotPublication:
+      type: object
+      additionalProperties: false
+      required: [data, receipt]
+      properties:
+        data: { $ref: './schemas/managed-output.json' }
+        receipt: { $ref: '#/components/schemas/CommittedMutation/properties/receipt' }
     ProjectObjectMutation:
       type: object
       additionalProperties: false

@@ -657,6 +657,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 4 and path[:2] == ["v1", "attempts"] and method == "POST":
             identity = self._identity("worker:execute")
             action = path[3]
+            if action == "recoverable-snapshots":
+                key = self._idempotency_key()
+                return self._send(200, self.runtime.publish_recoverable_snapshot(path[2], self._project_mutation_body(), idempotency_key=key, identity=identity))
             if action == "child-authority":
                 return self._send(200, self.runtime.issue_child_authority(path[2], self._project_mutation_body(), identity=identity))
             if action == "prepare-reboot":

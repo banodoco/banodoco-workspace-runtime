@@ -39,11 +39,54 @@
         "input_object_ids": {
           "type": "array", "maxItems": 256, "items": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "uniqueItems": true
         },
+        "discovery_grant": { "$ref": "#/definitions/DiscoveryGrant" },
+        "recoverable_outputs": {
+          "type": "array", "minItems": 1, "maxItems": 1, "uniqueItems": true,
+          "items": { "$ref": "#/definitions/RecoverableOutputGrant" }
+        },
+        "limits": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "max_children": { "type": "integer", "minimum": 1, "maximum": 4096, "default": 64 },
+            "max_active_children": { "type": "integer", "minimum": 1, "maximum": 64, "default": 64 },
+            "max_derived_objects": { "type": "integer", "minimum": 1, "maximum": 1024, "default": 256 },
+            "max_derived_bytes": { "type": "integer", "minimum": 1, "maximum": 4294967296, "default": 268435456 },
+            "max_child_inputs": { "type": "integer", "minimum": 1, "maximum": 256, "default": 256 },
+            "max_child_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456, "default": 268435456 },
+            "max_recoverable_snapshots": { "type": "integer", "minimum": 1, "maximum": 1024, "default": 64 },
+            "max_recoverable_bytes": { "type": "integer", "minimum": 1, "maximum": 4294967296, "default": 67108864 },
+            "max_snapshot_bytes": { "type": "integer", "minimum": 1, "maximum": 67108864, "default": 1048576 }
+          }
+        },
         "stages": {
           "type": "array", "minItems": 1, "maxItems": 16,
           "items": { "type": "object", "additionalProperties": true }
         },
         "final_publication": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "DiscoveryGrant": {
+      "type": "object", "additionalProperties": false,
+      "required": ["project_id", "run_id", "task_id", "attempt_id", "capability_id", "capability_digest", "limits"],
+      "properties": {
+        "project_id": { "type": "string", "minLength": 1, "pattern": "^[^*]+$" },
+        "run_id": { "type": "string", "minLength": 1, "pattern": "^[^*]+$" },
+        "task_id": { "type": "string", "minLength": 1, "pattern": "^[^*]+$" },
+        "attempt_id": { "type": "string", "minLength": 1, "pattern": "^[^*]+$" },
+        "capability_id": { "type": "string", "minLength": 1, "pattern": "^[^*]+$" },
+        "capability_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "limits": {
+          "type": "object", "additionalProperties": false,
+          "required": ["max_discovery_rows", "max_discovery_metadata_bytes", "max_selected_output_objects", "max_selected_output_bytes", "max_child_media_bindings", "max_child_media_bytes"],
+          "properties": {
+            "max_discovery_rows": { "type": "integer", "minimum": 1, "maximum": 750 },
+            "max_discovery_metadata_bytes": { "type": "integer", "minimum": 1, "maximum": 67108864 },
+            "max_selected_output_objects": { "type": "integer", "minimum": 1, "maximum": 2 },
+            "max_selected_output_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+            "max_child_media_bindings": { "type": "integer", "minimum": 1, "maximum": 1 },
+            "max_child_media_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+          }
+        }
       }
     },
     "Executor": {
@@ -105,6 +148,8 @@
         "lease_expires_at": { "type": "string", "format": "date-time" },
         "runtime_epoch": { "type": "integer", "minimum": 1 },
         "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "execution_request": { "$ref": "task.json#/definitions/ExecutionRequest" },
+        "execution_binding": { "$ref": "task.json#/definitions/ExecutionBinding" },
         "spec": { "type": "object", "additionalProperties": true },
         "generation_intent": { "type": "object", "additionalProperties": true },
         "expected_effect": { "$ref": "#/definitions/Effect" },
@@ -127,13 +172,56 @@
         "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts", "waiting_for_dependencies", "dependency_failed", "dependency_cancelled", "execution_binding_missing", "execution_binding_mismatch", "provider_state_unknown", "remote_activation_missing", "execution_qualification_mismatch"] }
       }
     },
+    "RecoverableOutputGrant": {
+      "type": "object", "additionalProperties": false,
+      "required": ["capability_id", "capability_digest", "output_ports"],
+      "properties": {
+        "capability_id": { "const": "editorial.human_review" },
+        "capability_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "output_ports": { "const": ["state_result"] }
+      }
+    },
+    "RecoverableSnapshotRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["lease_id", "fence", "runtime_epoch", "revision", "output"],
+      "properties": {
+        "lease_id": { "type": "string", "minLength": 1 },
+        "fence": { "type": "integer", "minimum": 1 },
+        "runtime_epoch": { "type": "integer", "minimum": 1 },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "output": { "$ref": "#/definitions/DerivedInputDescriptor" }
+      }
+    },
+    "ChildAuthorityChild": {
+      "type": "object", "additionalProperties": false,
+      "required": ["child_id", "capability_id", "capability_digest"],
+      "properties": {
+        "child_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$" },
+        "capability_id": { "type": "string", "minLength": 1 },
+        "capability_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "DerivedInputDescriptor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "output_port", "filename", "object_id", "size", "media_type"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^\\u0000-\\u001F]+$" },
+        "output_port": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^\\u0000-\\u001F]+$" },
+        "filename": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^(?!\\.{1,2}$)[^/\\\\\\u0000-\\u001F]+$" },
+        "object_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "size": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "media_type": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^\\u0000-\\u001F]+$" }
+      }
+    },
     "ChildAuthorityRequest": {
       "type": "object", "additionalProperties": false,
       "required": ["lease_id", "fence", "runtime_epoch"],
       "properties": {
         "lease_id": { "type": "string", "minLength": 1 },
         "fence": { "type": "integer", "minimum": 1 },
-        "runtime_epoch": { "type": "integer", "minimum": 1 }
+        "runtime_epoch": { "type": "integer", "minimum": 1 },
+        "child": { "$ref": "#/definitions/ChildAuthorityChild" },
+        "derived_inputs": { "type": "array", "maxItems": 256, "items": { "$ref": "#/definitions/DerivedInputDescriptor" } }
       }
     },
     "ChildAuthority": {
