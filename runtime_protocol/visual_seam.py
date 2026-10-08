@@ -354,7 +354,7 @@ def analyze_normalized(metadata):
     frames = [c["frame"] for c in cues]
     opaque = sorted((s for s in spans if s["disclosure"]["opaque"]), key=lambda s: s["startFrame"])
     live_opaque, cursor, boundaries = {}, 0, []
-    span_by_path = {tuple(s["path"]): s for s in spans}
+    portable_boundaries = boundary_intent_owners(spans)
     fingerprints = {}
     def fingerprint(s):
         path = tuple(s["path"])
@@ -378,7 +378,7 @@ def analyze_normalized(metadata):
                   + "|".join(fingerprint(s) for _, s in sorted(relevant.items()))).encode()).hexdigest() if nearby else None
         # Portable witnesses use the actual child clips at the occurrence seam,
         # rather than the transport occurrence record or mutable projection IDs.
-        portable_boundary = boundary_intent_owners(spans, frame)
+        portable_boundary = portable_boundaries.get(frame, [])
         portable_relevant = relevant_intent_owners(spans, portable_boundary, nearby)
         portable_owners = {tuple(s["path"]): s for s in portable_relevant}
         portable_context = intent_context(fps, frame, portable_owners.values())
