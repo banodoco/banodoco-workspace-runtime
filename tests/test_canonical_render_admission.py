@@ -242,8 +242,9 @@ def test_canonical_conflicting_populated_clip_lists_fail_closed(canonical_scene)
     f = canonical_scene
     publication = _publication(f)
     publication["parent_composition"]["config"]["clips"] = [{"id": "different", "clipType": "text", "at": 0, "hold": 1}]
-    f["service"].publish_parent_composition(f["project"], "main", publication, idempotency_key="conflicting-clips")
-    _assert_rejected(f, _request(f), ConflictError, "clips")
+    with pytest.raises(ConflictError, match="clips"):
+        f["service"].publish_parent_composition(f["project"], "main", publication, idempotency_key="conflicting-clips")
+    assert f["service"].store.conn.execute("SELECT COUNT(*) FROM parent_composition_revisions").fetchone()[0] == 0
 
 
 def test_canonical_admission_holds_sqlite_write_fence_during_snapshot_freeze(canonical_scene, monkeypatch):

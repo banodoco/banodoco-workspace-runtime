@@ -37,6 +37,7 @@ from .dirfd import close_pinned as _close_pinned, mkdir_chain_at as _mkdir_chain
 from .shot_dependencies import analyze_invalidation
 from .timeline_inspection import inspect as inspect_timeline_closure
 from .timeline_view import markdown as render_timeline_markdown, png as render_timeline_png
+from .visual_seam import admit_closure
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
@@ -2740,6 +2741,13 @@ class RuntimeService:
         }
         if any(isinstance(item, dict) and item.get("dependency_kind") in {"composition", "parent_composition", "nested"} for item in manifest_source.get("timelines", [])):
             raise ValidationError("one-level composition cannot depend on another composition")
+        # Complete immutable bytes, inside the publication transaction and after
+        # durable replay/CAS. No caller-supplied report can grant admission.
+        seam_report, _ = admit_closure(
+            parent_payload, resolved_shots,
+            {v["revision_id"]: v for v in resolved_internal.values()},
+            timeline_id=timeline_id,
+        )
         timestamp = now()
         if timeline is None:
             self.store.conn.execute("INSERT INTO timelines(id, project_id, version, created_at, archived_at) VALUES (?, ?, 1, ?, NULL)", (timeline_id, project["id"], timestamp))
@@ -2817,6 +2825,7 @@ class RuntimeService:
         event_id = self.store._append_timeline_event(timeline_id, "parent.composition.published", event_payload)
         event_seq = self.store.conn.execute("SELECT COUNT(*) FROM timeline_events WHERE timeline_id=?", (timeline_id,)).fetchone()[0]
         result = {"project_id": project["id"], "timeline_id": timeline_id, "revision_id": parent_revision_id, "parent_revision_id": parent_revision_id, "content_digest": parent_digest, "payload": parent_payload, "old_head": expected_head, "new_head": parent_revision_id, "dependency_manifest": manifest, "content_digests": {"parent": parent_digest, **{item["revision_id"]: item["content_digest"] for item in manifest["shots"] + manifest["internal_timelines"]}, **{item["media_id"]: item["content_digest"] for item in manifest["media"]}}, "event_id": event_id, "created_at": timestamp}
+        result["visual_seam_report"] = seam_report
         return self._command_record("parent_composition.publish", timeline_id, idempotency_key, request_hash, result, project_id=project["id"], event_ids=(event_id,), primary_stream_id=timeline_id, resulting_stream_seq=event_seq)
 
     def _project_shot_resource(self, row):
