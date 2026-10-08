@@ -13,6 +13,7 @@ from fractions import Fraction
 
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import canonical_json
+from .managed_render_snapshot import ShotExpansionError, expand_shot_clips
 
 SCHEMA = "runtime.timeline.declared_inputs/v1"
 MAX_OCCURRENCES = 500
@@ -34,7 +35,7 @@ _PRESENTATION_KEYS = (
 _TIMING_KEYS = ("at", "at_ms", "duration", "duration_ms", "hold", "from", "from_ms", "to", "to_ms", "speed")
 
 
-def _fraction(value, label, *, milliseconds=False):
+def _fraction(value, label, *, milliseconds=False, nonnegative=True):
     try:
         if isinstance(value, bool) or value is None:
             raise ValueError
@@ -57,7 +58,7 @@ def _fraction(value, label, *, milliseconds=False):
             if abs(result - bounded) > Fraction(1, 1_000_000_000):
                 raise ValueError
             result = bounded
-        if result < 0 or result.denominator > 1_000_000:
+        if (nonnegative and result < 0) or result.denominator > 1_000_000:
             raise ValueError
         return result
     except (ValueError, TypeError, ZeroDivisionError, OverflowError) as exc:
@@ -228,7 +229,12 @@ def _decode_cursor(cursor):
 
 
 def _asset(clip, registries):
-    """Resolve a media alias while retaining the identity and owner evidence."""
+    """Resolve a media alias in its nearest pinned owner scope.
+
+    Internal timeline registries are passed before the shot and parent
+    registries. A repeated local key is therefore resolved from the first
+    scope that owns it instead of being joined globally by its alias.
+    """
     key = clip.get("asset", clip.get("asset_id", clip.get("assetId")))
     candidates = []
     omissions = []
@@ -236,52 +242,51 @@ def _asset(clip, registries):
         for scope, assets in registries:
             if isinstance(assets, dict) and key in assets and isinstance(assets[key], dict):
                 metadata = assets[key]
+                media_name = next((metadata.get(name) for name in (
+                    "media_name", "friendly_name", "display_name", "name", "title",
+                    "original_name", "filename",
+                ) if isinstance(metadata.get(name), str) and metadata.get(name).strip()), None)
+                if media_name is None and isinstance(metadata.get("file"), str) and metadata["file"].strip():
+                    media_name = metadata["file"].replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
                 candidates.append({
                     "scope": scope,
                     "source_object_id": metadata.get("source_object_id") or metadata.get("media_id") or metadata.get("object_id"),
                     "content_digest": next((metadata.get(name) for name in ("content_sha256", "digest", "sha256", "hash") if metadata.get(name) is not None), None),
                     "media_type": metadata.get("media_type") or metadata.get("type"),
+                    "media_name": media_name,
                     "source_provenance": metadata.get("provenance"),
                 })
-    identities = {}
-    for item in candidates:
-        identity = canonical_json([item["source_object_id"], item["content_digest"], item["media_type"]])
-        identities.setdefault(identity, item)
+    # This list is ordered from the clip's immediate pinned owner outwards.
+    # Use the first matching registry entry even when another scope happens
+    # to reuse its local key; the alias is not a global media identifier.
+    resolved = candidates[0] if candidates else None
     direct_object = next((clip.get(name) for name in ("source_object_id", "source_media_id", "media_id", "object_id") if isinstance(clip.get(name), str)), None)
     direct_digest = next((clip.get(name) for name in ("content_sha256", "content_digest", "digest", "sha256", "hash") if isinstance(clip.get(name), str)), None)
-    if len(identities) == 1:
-        resolved = next(iter(identities.values()))
+    if resolved is not None:
         source_object_id, content_digest, media_type = resolved["source_object_id"], resolved["content_digest"], resolved["media_type"]
+        media_name = resolved["media_name"]
         provenance = {"resolution": "registry", "registry_key": key,
-                      "registry_scopes": [item["scope"] for item in candidates],
-                      "candidate_count": len(candidates)}
+                      "registry_scope": resolved["scope"],
+                      "registry_scopes": [resolved["scope"]], "candidate_count": 1}
         source_provenance = resolved["source_provenance"]
-    elif len(identities) > 1:
-        source_object_id = direct_object
-        content_digest = direct_digest
-        media_type = clip.get("media_type") or clip.get("type")
-        projected_candidates = []
-        for index, item in enumerate(candidates):
-            source_provenance = _bounded_value(item.pop("source_provenance"), MAX_AUTHORED_VALUE_BYTES,
-                                                f"media_provenance.candidates[{index}].source_provenance", omissions)
-            projected_candidates.append({**item, "source_provenance": source_provenance})
-        provenance = {"resolution": "ambiguous_registry_key", "registry_key": key,
-                      "candidate_count": len(candidates), "candidates": projected_candidates}
-        source_provenance = clip.get("provenance")
     else:
         source_object_id = direct_object
         content_digest = direct_digest
         media_type = clip.get("media_type") or clip.get("type")
+        media_name = next((clip.get(name) for name in ("media_name", "filename", "original_name")
+                           if isinstance(clip.get(name), str) and clip.get(name).strip()), None)
         provenance = {"resolution": "clip_fields" if direct_object or direct_digest else "unresolved",
                       "source_fields": [name for name in ("source_object_id", "source_media_id", "media_id", "object_id") if name in clip]}
         source_provenance = clip.get("provenance")
     bounded = {}
     for name, value in (("asset_id", key), ("source_object_id", source_object_id),
                         ("content_digest", content_digest), ("media_type", media_type),
+                        ("media_name", media_name),
                         ("source_provenance", source_provenance), ("source_uuid", clip.get("source_uuid"))):
         bounded[name] = _bounded_value(value, MAX_AUTHORED_VALUE_BYTES, name, omissions) if value is not None else None
     result = {"asset_id": bounded["asset_id"], "source_object_id": bounded["source_object_id"],
-              "content_digest": bounded["content_digest"], "kind": bounded["media_type"],
+              "content_digest": bounded["content_digest"], "media_name": bounded["media_name"],
+              "kind": bounded["media_type"],
               "media_type": bounded["media_type"], "media_provenance": provenance,
               "source_provenance": bounded["source_provenance"], "source_uuid": bounded["source_uuid"]}
     if omissions:
@@ -310,7 +315,7 @@ def _clip(raw, registries, occurrence, start, end, track_scope, tracks):
     cid = raw.get("id")
     if not isinstance(cid, str) or not cid:
         raise ConflictError("pinned internal clip has no identity")
-    relative = _fraction(raw.get("at_ms", raw.get("at", 0)), "clip start", milliseconds="at_ms" in raw)
+    relative = _fraction(raw.get("at_ms", raw.get("at", 0)), "clip start", milliseconds="at_ms" in raw, nonnegative=False)
     absolute = start + relative
     speed = _fraction(raw.get("speed", 1), "clip speed")
     if speed <= 0:
@@ -324,19 +329,22 @@ def _clip(raw, registries, occurrence, start, end, track_scope, tracks):
     else:
         source_duration = _fraction(raw.get("to", 0), "clip to") - _fraction(raw.get("from", 0), "clip from")
     duration = source_duration / speed
+    visible_start = max(absolute, start)
     visible_end = min(absolute + duration, end)
-    if duration < 0 or visible_end <= absolute or absolute >= end:
+    if duration < 0 or visible_end <= visible_start or absolute >= end:
         return None
     clip_end = absolute + duration
     asset = _asset(raw, registries)
     authored = _authored_projection(raw)
     result = {"occurrence_id": occurrence["occurrence_id"], "shot_id": occurrence["shot_id"],
             "clip_id": cid, "track_id": raw.get("track"), "clip_type": raw.get("clipType", raw.get("clip_type", raw.get("type", "media"))),
-            "start": _wire(absolute), "duration": _wire(visible_end - absolute), "source_from": raw.get("from_ms", raw.get("from")),
+            "start": _wire(visible_start), "duration": _wire(visible_end - visible_start), "source_from": raw.get("from_ms", raw.get("from")),
             "source_to": raw.get("to_ms", raw.get("to")), "speed": _wire(speed), "gain": raw.get("volume", 1),
             "mute": bool(raw.get("mute", False)), "text": raw.get("text", ""),
-            "time_bounds": {"timeline_start": _wire(absolute), "timeline_end": _wire(visible_end),
-                            "declared_end": _wire(clip_end), "end_clipped_to_occurrence": visible_end < clip_end},
+            "time_bounds": {"timeline_start": _wire(visible_start), "timeline_end": _wire(visible_end),
+                            "declared_start": _wire(absolute), "declared_end": _wire(clip_end),
+                            "start_clipped_to_occurrence": visible_start > absolute,
+                            "end_clipped_to_occurrence": visible_end < clip_end},
             **_track_projection(raw.get("track"), track_scope, tracks), **authored, **asset}
     if isinstance(result.get("text"), (str, dict, list)):
         omissions = result.setdefault("omitted_fields", [])
@@ -405,6 +413,76 @@ def _parent_clip(raw, registries, track_scope, tracks):
     return result
 
 
+
+def _render_timing_clip(raw):
+    """Normalize existing millisecond wire aliases for managed shot expansion."""
+    clip = dict(raw)
+    for seconds, milliseconds in (("at", "at_ms"), ("from", "from_ms"), ("to", "to_ms")):
+        if milliseconds in raw:
+            clip[seconds] = float(_fraction(raw[milliseconds], milliseconds, milliseconds=True,
+                                           nonnegative=seconds != "at"))
+    clip.setdefault("at", 0)
+    if "hold" not in clip and "duration_ms" in raw:
+        clip["hold"] = float(_fraction(raw["duration_ms"], "duration_ms", milliseconds=True))
+    clip.setdefault("clipType", raw.get("clip_type", raw.get("type", "media")))
+    return clip
+
+
+def _timing_record(raw, timing_id):
+    result = {key: raw[key] for key in ("at", "hold", "from", "to", "speed", "track", "clipType", "transition", "elementRef")
+              if key in raw}
+    result["id"] = timing_id
+    return result
+
+
+def _attach_render_timing(projected, raw_clips, occurrence, registry):
+    """Use the same shot clipping producer as managed rendering, before selection."""
+    reason = None
+    if occurrence.get("speed", 1) != 1 or occurrence.get("source_offset", 0) != 0:
+        reason = "managed shot expansion does not apply occurrence speed/source_offset"
+    try:
+        if reason:
+            raise ShotExpansionError(reason)
+        child = {"clips": [_render_timing_clip(raw) for raw in raw_clips]}
+        parent = {"clips": [{"id": "inspection-shot", "clipType": "shot",
+                            "at": float(Fraction(*occurrence["start"])),
+                            "hold": float(Fraction(*occurrence["duration"])),
+                            "track": occurrence.get("track_id"),
+                            "params": {"shot_id": occurrence["shot_id"], "timeline_document_id": "pinned"}}]}
+        expanded, _ = expand_shot_clips(parent, {"assets": {}},
+                                       load_timeline=lambda _: (child, registry))
+        by_source = {row["app"]["astrid_shot_composition"]["source_clip_id"]: row
+                     for row in expanded["clips"]}
+        for row in projected:
+            expanded_clip = by_source.get(row["clip_id"])
+            if expanded_clip is None:
+                row["render_timing_unknown"] = "clip absent from managed shot expansion"
+            else:
+                row["render_timing"] = _timing_record(
+                    expanded_clip, canonical_json([occurrence["occurrence_id"], row["clip_id"]]))
+                row["render_timing"]["target"] = {"occurrence_id": occurrence["occurrence_id"],
+                    "clip_id": row["clip_id"], "shot_id": occurrence["shot_id"],
+                    "internal_timeline_revision_id": occurrence["internal_timeline_revision_id"]}
+    except (ShotExpansionError, ValidationError, TypeError, ValueError) as exc:
+        for row in projected:
+            row["render_timing_unknown"] = "managed shot expansion unavailable: " + str(exc)
+
+
+def _render_timing_context(config, parent_tracks, parent_clips, children, *, transition_free):
+    """Bounded complete scheduling input; absence never implies absent siblings."""
+    output = config.get("output", {})
+    visual = config.get("theme_overrides", {}).get("visual", {}).get("canvas", {})
+    fps = output.get("fps", visual.get("fps", 30))
+    all_clips = parent_clips + [clip for _, clips in children for clip in clips]
+    if any(not isinstance(clip.get("render_timing"), dict) for clip in all_clips):
+        return {"status": "unavailable", "reason": "one or more closure clips lack managed render timing", "fps": fps, "transition_free": transition_free}
+    context = {"status": "complete", "fps": fps, "transition_free": transition_free,
+               "tracks": [{"id": row.get("id"), "kind": row.get("kind")} for row in parent_tracks if isinstance(row, dict)],
+               "clips": [clip["render_timing"] for clip in all_clips]}
+    if len(_value_bytes(context)) > 32768:
+        return {"status": "unavailable", "reason": "complete render scheduling context exceeds 32768-byte bound", "fps": fps, "transition_free": transition_free}
+    return context
+
 def inspect(connection, project_id, timeline_id, options):
     """Freeze one parent head and its pinned children under the caller's lock."""
     options = normalize_options(options)
@@ -436,6 +514,7 @@ def inspect(connection, project_id, timeline_id, options):
     parent_track_scope = {"kind": "parent_composition", "id": revision}
     seen = set()
     closure_clips = 0
+    has_render_transitions = any(raw.get("transition") for raw in parent_clips_raw)
     for ordinal, raw in enumerate(occurrences):
         if not isinstance(raw, dict):
             raise ConflictError("pinned parent occurrence is invalid")
@@ -469,6 +548,7 @@ def inspect(connection, project_id, timeline_id, options):
         clips = internal_payload.get("clips", [])
         if not isinstance(clips, list):
             raise ConflictError("pinned shot clips are invalid")
+        has_render_transitions = has_render_transitions or any(raw.get("transition") for raw in clips if isinstance(raw, dict))
         closure_clips += len(clips)
         if closure_clips > MAX_CLOSURE_CLIPS:
             raise ValidationError("timeline closure exceeds clip limit; narrow the revision")
@@ -506,12 +586,20 @@ def inspect(connection, project_id, timeline_id, options):
                 identity.setdefault("omitted_fields", []).extend(omissions)
         projected = [item for clip in clips if (item := _clip(clip, registries, identity, start, start + duration,
                                                               internal_track_scope, internal_tracks)) is not None]
+        _attach_render_timing(projected, clips, identity, {"assets": {**parent_registry["assets"], **shot_assets, **internal_registry["assets"]}})
         children.append((identity, projected))
 
     parent_registries = [(f"parent_composition:{revision}", parent_registry["assets"])]
     parent_clips = [item for raw in parent_clips_raw if (item := _parent_clip(
         raw, parent_registries, parent_track_scope, parent_tracks
     )) is not None]
+    raw_parent_by_id = {raw["id"]: raw for raw in parent_clips_raw}
+    for row in parent_clips:
+        row["render_timing"] = _timing_record(_render_timing_clip(raw_parent_by_id[row["clip_id"]]),
+                                               canonical_json(["parent", row["clip_id"]]))
+        row["render_timing"]["target"] = {"target_kind": "parent_clip", "clip_id": row["clip_id"],
+                                          "revision_id": revision}
+    render_timing_context = _render_timing_context(config, parent_tracks_raw, parent_clips, children, transition_free=not has_render_transitions)
     closure_clips += len(parent_clips)
     if closure_clips > MAX_CLOSURE_CLIPS:
         raise ValidationError("timeline closure exceeds clip limit; narrow the revision")
@@ -607,18 +695,56 @@ def inspect(connection, project_id, timeline_id, options):
                        "max_response_bytes": MAX_RESPONSE_BYTES},
             "page": {"offset": offset, "limit": options["limit"], "total_selected_clips": total_clips,
                      "returned_clips": selected_clip_count, "remaining_clips": total_clips - end_offset,
-                     "has_continuation": next_cursor is not None},
+                     "has_continuation": next_cursor is not None, "response_bytes": 0},
             "omission_metadata": {"authored_values_omitted": omitted_authored_fields,
                                   "page_continuation_omits_clips": total_clips - end_offset},
-            "selected": page_rows, "selected_parent_clips": selected_parent_page, "next_cursor": next_cursor}
+            "selected": page_rows, "selected_parent_clips": selected_parent_page, "next_cursor": next_cursor,
+            "render_timing_context": render_timing_context}
 
     # The transport cap is independent of per-field authored caps. If several
     # otherwise valid clips make one page too large, shrink only at clip
     # boundaries and advance the cursor to the exact returned count. This keeps
     # identity/cursor metadata truthful instead of silently truncating a field
     # or claiming that the full requested page was returned.
+    def refresh_surviving_page_metadata() -> int:
+        """Recompute all page-scoped counts after any clip-boundary shrink."""
+        returned = len(result["selected_parent_clips"]) + sum(
+            len(row["clips"]) for row in result["selected"]
+        )
+        cursor_end = offset + returned
+        omitted = sum(
+            len(clip.get("omitted_fields", []))
+            for clip in [
+                item
+                for row in result["selected"]
+                for item in row["clips"]
+            ] + result["selected_parent_clips"]
+        ) + sum(
+            len(row["occurrence"].get("omitted_fields", []))
+            for row in result["selected"]
+        )
+        result["selected_clip_count"] = returned
+        result["page"]["returned_clips"] = returned
+        result["page"]["remaining_clips"] = total_clips - cursor_end
+        result["page"]["has_continuation"] = cursor_end < total_clips
+        result["omission_metadata"]["authored_values_omitted"] = omitted
+        result["omission_metadata"]["page_continuation_omits_clips"] = total_clips - cursor_end
+        result["next_cursor"] = _encode_cursor(scope, cursor_end) if cursor_end < total_clips else None
+        return returned
+
     def response_size() -> int:
-        return len(canonical_json(result).encode("utf-8"))
+        """Measure the final serialized result, including its byte-count field."""
+        # The reported value changes its own JSON size at digit boundaries.
+        # Iterate to a fixed point so the public field equals the final byte
+        # count rather than the response size before metadata was appended.
+        for _ in range(10):
+            measured = len(canonical_json(result).encode("utf-8"))
+            if result["page"]["response_bytes"] == measured:
+                return measured
+            result["page"]["response_bytes"] = measured
+        raise ValidationError("timeline inspection response byte count did not stabilize")
+
+    refresh_surviving_page_metadata()
 
     while response_size() > MAX_RESPONSE_BYTES:
         if result["selected_parent_clips"]:
@@ -634,12 +760,9 @@ def inspect(connection, project_id, timeline_id, options):
                     break
             if not removed:
                 raise ValidationError("timeline inspection response exceeds byte budget; narrow the revision or selectors")
-        returned = len(result["selected_parent_clips"]) + sum(len(row["clips"]) for row in result["selected"])
-        cursor_end = offset + returned
-        result["next_cursor"] = _encode_cursor(scope, cursor_end) if cursor_end < total_clips else None
-        result["page"]["returned_clips"] = returned
-        result["page"]["remaining_clips"] = total_clips - cursor_end
-        result["page"]["has_continuation"] = result["next_cursor"] is not None
-        result["omission_metadata"]["page_continuation_omits_clips"] = total_clips - cursor_end
-    result["page"]["response_bytes"] = response_size()
+        refresh_surviving_page_metadata()
+    # One final fixed-point measurement confirms the returned field describes
+    # these exact serialized bytes and remains inside the declared transport cap.
+    if response_size() > MAX_RESPONSE_BYTES:
+        raise ValidationError("timeline inspection response exceeds byte budget; narrow the revision or selectors")
     return result

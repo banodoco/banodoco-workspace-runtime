@@ -10,6 +10,7 @@ from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 from runtime_protocol.timeline_inspection import MAX_RESPONSE_BYTES
+from runtime_protocol.util import canonical_json
 
 from banodoco_workspace_client import WorkspaceClient
 
@@ -389,7 +390,8 @@ def test_authored_aliases_track_scopes_and_media_provenance_are_explicit(tmp_pat
             {"id": "shared-track", "kind": "visual", "label": "Parent picture"},
         ]
         publication["parent_composition"]["registry"] = {"assets": {
-            "same-key": {"media_id": "parent-media", "content_sha256": "parent-digest", "type": "video"},
+            "same-key": {"media_id": "parent-media", "content_sha256": "parent-digest", "type": "video",
+                          "file": "assets/parent-room.png"},
         }}
         publication["parent_composition"]["clips"] = [{
             "id": "parent-effect", "clip_type": "effect", "track": "shared-track",
@@ -400,7 +402,8 @@ def test_authored_aliases_track_scopes_and_media_provenance_are_explicit(tmp_pat
         internal = publication["internal_timeline_revisions"][0]["payload"]
         internal["tracks"] = [{"id": "shared-track", "kind": "audio", "label": "Internal audio"}]
         internal["registry"] = {"assets": {
-            "same-key": {"media_id": "internal-media", "content_sha256": "internal-digest", "type": "audio"},
+            "same-key": {"media_id": "internal-media", "content_sha256": "internal-digest", "type": "audio",
+                          "file": "assets/internal-room.png"},
         }}
         internal["clips"] = [{
             "id": "internal-effect", "clip_type": "effect", "track": "shared-track",
@@ -412,7 +415,8 @@ def test_authored_aliases_track_scopes_and_media_provenance_are_explicit(tmp_pat
         service.publish_parent_composition(project, "main", publication, idempotency_key="publish-authored-fields")
 
         result = service.inspect_timeline(project, "main", {"limit": 10})
-        child = result["selected"][0]["clips"][0]
+        children = [clip for row in result["selected"] for clip in row["clips"]]
+        child = children[0]
         parent = result["selected_parent_clips"][0]
         assert child["parameters"] == {"opacity": 0.4}
         assert child["parameters_source"] == "params"
@@ -424,17 +428,24 @@ def test_authored_aliases_track_scopes_and_media_provenance_are_explicit(tmp_pat
         assert child["track_ref"] == {"scope": "internal_timeline", "scope_id": "internal-1", "track_id": "shared-track"}
         assert child["track_status"] == "resolved"
         assert child["track"]["label"] == "Internal audio"
-        assert child["media_provenance"]["resolution"] == "ambiguous_registry_key"
-        assert child["source_object_id"] is None
-        assert {candidate["scope"] for candidate in child["media_provenance"]["candidates"]} == {
-            "internal_timeline:internal-1", "parent_composition:parent-1",
-        }
+        assert len(children) == 3
+        assert {clip["occurrence_id"] for clip in children} == {"first", "second", "third"}
+        assert all(clip["asset_id"] == "same-key" for clip in children)
+        assert all(clip["media_name"] == "internal-room.png" for clip in children)
+        assert all(clip["source_object_id"] == "internal-media" for clip in children)
+        assert all(clip["content_digest"] == "internal-digest" for clip in children)
+        assert all(clip["media_provenance"]["resolution"] == "registry" for clip in children)
+        assert all(clip["media_provenance"]["registry_scope"] == "internal_timeline:internal-1" for clip in children)
+        assert all(clip["media_provenance"]["registry_scopes"] == ["internal_timeline:internal-1"] for clip in children)
         assert parent["parameters"] == {"glow": 0.75}
         assert parent["parameters_source"] == "props"
         assert parent["element_ref"] == "effects.glow"
         assert parent["track_ref"] == {"scope": "parent_composition", "scope_id": "parent-1", "track_id": "shared-track"}
         assert parent["track"]["label"] == "Parent picture"
         assert parent["source_object_id"] == "parent-media"
+        assert parent["asset_id"] == "same-key"
+        assert parent["content_digest"] == "parent-digest"
+        assert parent["media_name"] == "parent-room.png"
         assert parent["media_provenance"]["registry_scopes"] == ["parent_composition:parent-1"]
         assert parent["time_bounds"]["timeline_end"] == [13, 40]
         assert parent["authored_timing"]["duration_ms"] == 300
@@ -478,7 +489,9 @@ def test_response_budget_pages_at_clip_boundaries_with_truthful_cursor(tmp_path)
         publication = _publication(project)
         clips = [
             {**_clip(f"large-{index}", at_ms=index * 5, duration_ms=5),
-             "params": {"payload": "x" * 3500}}
+             "params": {"payload": "x" * 2800},
+             "extensions": {"vendor": "y" * 2800},
+             "presentation": {"note": "z" * 2800}}
             for index in range(100)
         ]
         _with_clips(publication, clips)
@@ -487,13 +500,28 @@ def test_response_budget_pages_at_clip_boundaries_with_truthful_cursor(tmp_path)
         first = service.inspect_timeline(project, "main", {"occurrence": "first", "limit": 100})
         assert first["bounds"]["max_response_bytes"] == MAX_RESPONSE_BYTES
         assert first["page"]["response_bytes"] <= MAX_RESPONSE_BYTES
+        first_clips = [clip for row in first["selected"] for clip in row["clips"]] + first["selected_parent_clips"]
+        assert first["selected_clip_count"] == first["page"]["returned_clips"] == len(first_clips)
+        assert first["omission_metadata"]["authored_values_omitted"] == sum(
+            len(clip.get("omitted_fields", [])) for clip in first_clips
+        ) + sum(len(row["occurrence"].get("omitted_fields", [])) for row in first["selected"])
+        assert first["omission_metadata"]["authored_values_omitted"] == first["page"]["returned_clips"]
+        assert first["page"]["response_bytes"] == len(canonical_json(first).encode("utf-8"))
         assert first["page"]["returned_clips"] < first["page"]["total_selected_clips"]
         assert first["next_cursor"]
+        assert first["page"]["remaining_clips"] == first["page"]["total_selected_clips"] - first["page"]["returned_clips"]
+        assert first["omission_metadata"]["page_continuation_omits_clips"] == first["page"]["remaining_clips"]
 
         second = service.inspect_timeline(project, "main", {
             "occurrence": "first", "limit": 100, "cursor": first["next_cursor"]
         })
         assert second["page"]["response_bytes"] <= MAX_RESPONSE_BYTES
+        second_clips = [clip for row in second["selected"] for clip in row["clips"]] + second["selected_parent_clips"]
+        assert second["selected_clip_count"] == second["page"]["returned_clips"] == len(second_clips)
+        assert second["omission_metadata"]["authored_values_omitted"] == sum(
+            len(clip.get("omitted_fields", [])) for clip in second_clips
+        ) + sum(len(row["occurrence"].get("omitted_fields", [])) for row in second["selected"])
+        assert second["page"]["response_bytes"] == len(canonical_json(second).encode("utf-8"))
         assert second["page"]["offset"] == first["page"]["returned_clips"]
     finally:
         service.close()
@@ -628,3 +656,65 @@ def test_canonical_head_names_and_parent_targets_are_distinct_from_occurrences(t
         assert [clip["clip_id"] for clip in view["inspection"]["selected_parent_clips"]] == ["effect-code-only"]
     finally:
         service.close()
+
+
+def test_inspection_timing_context_keeps_off_page_transition_siblings(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication['parent_composition']['config'] = {'output': {'fps': 30}, 'tracks': [{'id': 'picture', 'kind': 'visual'}]}
+        publication['internal_timeline_revisions'][0]['payload']['clips'] = [
+            {'id': 'a', 'clipType': 'media', 'track': 'picture', 'at': 0, 'hold': .6,
+             'transition': {'id': 'cross-fade', 'durationFrames': 6}},
+            {'id': 'b', 'clipType': 'media', 'track': 'picture', 'at': .5, 'hold': .6},
+        ]
+        service.publish_parent_composition(project, 'main', publication, idempotency_key='timing-context')
+        result = service.inspect_timeline(project, 'main', {'limit': 1})
+        assert result['selected_clip_count'] == 1
+        context = result['render_timing_context']
+        assert context['status'] == 'complete' and context['fps'] == 30 and not context['transition_free']
+        assert len(context['clips']) == 6
+        first = result['selected'][0]['clips'][0]
+        assert first['render_timing']['id'] == '["first","a"]'
+        sibling = next(row for row in context['clips'] if row['id'] == '["first","b"]')
+        assert sibling['at'] == .5 and sibling['hold'] == .5
+        assert sibling['target']['occurrence_id'] == 'first'
+        assert sibling['target']['internal_timeline_revision_id'] == 'internal-1'
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize('at, hold, speed, expected_at, expected_hold, expected_from, expected_to', [
+    (-.5, 4, 2, 10., 2., 8., 10.),
+    (.75, 2, 1, 10.75, .25, 7., 7.25),
+    (.025, .55, 2, 10.025, .55, 7., 7.55),
+])
+def test_shot_inspection_uses_existing_expansion_for_left_right_hold_speed_clipping(
+        at, hold, speed, expected_at, expected_hold, expected_from, expected_to):
+    from runtime_protocol.timeline_inspection import _attach_render_timing
+    occurrence = {'occurrence_id': 'repeat-2', 'shot_id': 'shot', 'internal_timeline_revision_id': 'pinned',
+                  'start': [10, 1], 'duration': [1, 1], 'speed': 1, 'source_offset': 0, 'track_id': 'picture'}
+    raw = {'id': 'clip', 'clipType': 'media', 'track': 'picture', 'at': at, 'hold': hold,
+           'speed': speed, 'from': 7, 'to': 99,
+           'params': {'sourceSegments': [{'at': 0, 'sourceStart': 500, 'speed': 3}]}}
+    projected = [{'clip_id': 'clip'}]
+    _attach_render_timing(projected, [raw], occurrence, {'assets': {}})
+    timing = projected[0]['render_timing']
+    assert timing['at'] == pytest.approx(expected_at)
+    assert timing['hold'] == pytest.approx(expected_hold)
+    assert timing['from'] == pytest.approx(expected_from)
+    assert timing['to'] == pytest.approx(expected_to)
+    assert timing['speed'] == speed
+    assert 'sourceSegments' not in timing
+    assert raw['params']['sourceSegments'][0]['sourceStart'] == 500
+
+
+def test_occurrence_speed_discrepancy_keeps_authored_values_and_marks_missing_producer():
+    from runtime_protocol.timeline_inspection import _attach_render_timing
+    projected = [{'clip_id': 'clip', 'authored_fields': {'hold': 2, 'params': {'keyframes': [{'at': 0}]}}}]
+    occurrence = {'occurrence_id': 'repeat', 'shot_id': 'shot', 'start': [10, 1], 'duration': [1, 1],
+                  'speed': 2, 'source_offset': 0}
+    _attach_render_timing(projected, [{'id': 'clip', 'at': 0, 'hold': 2}], occurrence, {'assets': {}})
+    assert 'render_timing' not in projected[0]
+    assert 'does not apply occurrence speed/source_offset' in projected[0]['render_timing_unknown']
+    assert projected[0]['authored_fields']['hold'] == 2
