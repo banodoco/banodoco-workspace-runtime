@@ -184,6 +184,166 @@ def test_spanning_cue_free_secondary_picture_is_not_an_intent_owner():
     assert _normalized(clips, policy, tracks=tracks)["blocked"]
 
 
+def test_two_occurrence_portable_context_ignores_spanning_secondary_child():
+    tracks = [{"id": "v", "kind": "visual"}, {"id": "secondary", "kind": "visual"}]
+    parent = {
+        "config": {"output": {"fps": 30}, "tracks": tracks}, "registry": {}, "clips": [],
+        "occurrences": [
+            {"occurrence_id": "outgoing", "shot_id": "s1", "shot_revision_id": "r1",
+             "placement": {"start_ms": 0}, "source_offset": 0, "duration_ms": 1000,
+             "speed": 1, "track": "v", "transform": {}, "gain": 1, "mute": False},
+            {"occurrence_id": "incoming", "shot_id": "s2", "shot_revision_id": "r2",
+             "placement": {"start_ms": 1000}, "source_offset": 0, "duration_ms": 1000,
+             "speed": 1, "track": "v", "transform": {}, "gain": 1, "mute": False},
+        ],
+    }
+    shots = {
+        ("s1", "r1"): {"internal_timeline_revision_id": "i1"},
+        ("s2", "r2"): {"internal_timeline_revision_id": "i2"},
+    }
+    internals = {
+        "i1": {"payload": {"tracks": tracks, "clips": [
+            {"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+            {"id": "spanning", "clipType": "media", "track": "secondary", "at": 0, "hold": 1},
+        ], "registry": {}}},
+        "i2": {"payload": {"tracks": tracks, "clips": [
+            {"id": "b", "clipType": "media", "track": "v", "at": 0, "hold": 1, "entrance": "fade"},
+        ], "registry": {}}},
+    }
+    baseline, _ = evaluate_closure(parent, shots, internals, timeline_id="main")
+    boundary = next(b for b in baseline["boundaries"] if b["frame"] == 30)
+    assert [owner["path"] for owner in boundary["canonicalContext"]["owners"]] == [
+        ["occurrence", "incoming", "clip", "b"], ["occurrence", "outgoing", "clip", "a"]]
+    policy = {"intents": {"30": {"contextVersion": "visual-seam/v1", "frame": 30,
+                                  "kind": "synchronized", "context": boundary["canonicalContext"],
+                                  "participants": boundary["canonicalCueIds"]}}}
+    parent["config"]["app"] = {"visualSeamContract": policy}
+    acknowledged, _ = evaluate_closure(parent, shots, internals, timeline_id="main")
+    assert not acknowledged["blocked"]
+
+    internals["i1"]["payload"]["clips"][1]["opacity"] = 0.5
+    unchanged_secondary, _ = evaluate_closure(parent, shots, internals, timeline_id="main")
+    assert not unchanged_secondary["blocked"]
+    internals["i2"]["payload"]["clips"][0]["entrance"] = {"type": "fade", "duration": 0.7}
+    changed_picture, _ = evaluate_closure(parent, shots, internals, timeline_id="main")
+    assert changed_picture["blocked"]
+
+
+@pytest.mark.parametrize("mode", ["cue-free", "cue-contributor", "lane-boundary"])
+def test_occurrence_context_binds_lane_boundary_children_and_independent_cues(mode):
+    tracks = [{"id": "v", "kind": "visual"}, {"id": "secondary", "kind": "visual"}]
+    outgoing = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+                {"id": "spanning", "clipType": "media", "track": "secondary", "at": 0, "hold": 1}]
+    incoming = [{"id": "b", "clipType": "media", "track": "v", "at": 0, "hold": 1,
+                 "entrance": {"type": "fade", "duration": 0.5}}]
+    if mode == "cue-contributor":
+        outgoing[1]["exit"] = {"type": "fade", "durationFrames": 2}
+    if mode == "lane-boundary":
+        incoming.append({"id": "secondary-in", "clipType": "media", "track": "secondary", "at": 0, "hold": 1})
+    parent = {"config": {"output": {"fps": 30}, "tracks": tracks}, "clips": [], "registry": {},
+              "occurrences": [{"occurrence_id": f"o-{i}", "shot_id": f"s-{i}", "shot_revision_id": f"sr-{i}",
+                               "placement": {"start_ms": i * 1000}, "track": "v", "duration_ms": 1000}
+                              for i in range(2)]}
+    shots = {(f"s-{i}", f"sr-{i}"): {"internal_timeline_revision_id": f"ir-{i}"} for i in range(2)}
+    internal = {f"ir-{i}": {"payload": {"clips": clips}} for i, clips in enumerate([outgoing, incoming])}
+    baseline, _ = evaluate_closure(parent, shots, internal, timeline_id="main")
+    assert baseline["blocked"]
+    boundary = next(b for b in baseline["boundaries"] if b["frame"] == 30)
+    expected_paths = [["occurrence", "o-0", "clip", "a"]]
+    if mode != "cue-free":
+        expected_paths.append(["occurrence", "o-0", "clip", "spanning"])
+    expected_paths.append(["occurrence", "o-1", "clip", "b"])
+    if mode == "lane-boundary":
+        expected_paths.append(["occurrence", "o-1", "clip", "secondary-in"])
+    assert [o["path"] for o in boundary["canonicalContext"]["owners"]] == expected_paths
+    # Owner selection must leave full child geometry/coverage available.
+    assert len(baseline["spans"]) == len(outgoing) + len(incoming)
+    assert not baseline["structuralIssues"]
+    parent["config"]["app"] = {"visualSeamContract": _portable_policy(baseline, 30)}
+    admitted, _ = admit_closure(parent, shots, internal, timeline_id="main")
+    assert not admitted["blocked"]
+    if mode == "cue-free":
+        outgoing[1]["opacity"] = 0.5
+        unrelated, _ = admit_closure(parent, shots, internal, timeline_id="main")
+        assert unrelated["boundaries"][0]["canonicalContext"] == boundary["canonicalContext"]
+    # Every selected picture or cue contributor remains bound, including the
+    # secondary lane when it contributes a cue or its own adjacent pair.
+    for path in expected_paths:
+        clips = outgoing if path[1] == "o-0" else incoming
+        clip = next(c for c in clips if c["id"] == path[-1])
+        original = copy.deepcopy(clip)
+        clip["opacity"] = 0.25
+        changed, _ = evaluate_closure(parent, shots, internal, timeline_id="main")
+        assert changed["boundaries"][0]["canonicalContext"] != boundary["canonicalContext"]
+        assert changed["blocked"]
+        with pytest.raises(ValidationError, match="visual seam admission blocked"):
+            admit_closure(parent, shots, internal, timeline_id="main")
+        clip.clear()
+        clip.update(original)
+    incoming[0]["entrance"] = {"type": "fade", "duration": 0.7}
+    assert evaluate_closure(parent, shots, internal, timeline_id="main")[0]["blocked"]
+
+
+@pytest.mark.parametrize("mode", ["cue-free", "cue-contributor", "secondary-cut", "independent-effect"])
+def test_occurrence_seam_binds_lane_boundary_owners_and_independent_cue_contributors(mode):
+    tracks = [{"id": "v", "kind": "visual"}, {"id": "secondary", "kind": "visual"}]
+    outgoing = [{"id": "a", "clipType": "media", "track": "v", "at": 0, "hold": 1},
+                {"id": "spanning", "clipType": "media", "track": "secondary", "at": 0, "hold": 1}]
+    incoming = [{"id": "b", "clipType": "media", "track": "v", "at": 0, "hold": 1,
+                 "entrance": {"type": "fade", "duration": 0.5}}]
+    if mode == "cue-contributor":
+        outgoing[1]["exit"] = {"type": "fade", "durationFrames": 2}
+    if mode == "secondary-cut":
+        incoming.append({"id": "secondary-in", "clipType": "media", "track": "secondary", "at": 0, "hold": 1})
+    if mode == "independent-effect":
+        outgoing[1]["effects"] = [{"id": "nested", "type": "animated-media-transform",
+                                    "params": {"keyframes": [
+                                        {**_motion_keys()[0], "at": 28 / 30},
+                                        {**_motion_keys()[1], "at": 29 / 30}]}}]
+    parent = {"config": {"output": {"fps": 30}, "tracks": tracks}, "clips": [], "registry": {},
+              "occurrences": [{"occurrence_id": f"o-{i}", "shot_id": f"s-{i}", "shot_revision_id": f"sr-{i}",
+                               "placement": {"start_ms": i * 1000}, "track": "v", "duration_ms": 1000}
+                              for i in range(2)]}
+    shots = {(f"s-{i}", f"sr-{i}"): {"internal_timeline_revision_id": f"ir-{i}"} for i in range(2)}
+    internal = {f"ir-{i}": {"payload": {"tracks": tracks, "clips": clips}}
+                for i, clips in enumerate((outgoing, incoming))}
+    baseline, metadata = evaluate_closure(parent, shots, internal, timeline_id="main")
+    boundary = next(b for b in baseline["boundaries"] if b["frame"] == 30)
+    expected_paths = [["occurrence", "o-0", "clip", "a"]]
+    if mode in ("cue-contributor", "secondary-cut"):
+        expected_paths.append(["occurrence", "o-0", "clip", "spanning"])
+    if mode == "independent-effect":
+        expected_paths.append(["occurrence", "o-0", "clip", "spanning", "effect", "nested"])
+    expected_paths.append(["occurrence", "o-1", "clip", "b"])
+    if mode == "secondary-cut":
+        expected_paths.append(["occurrence", "o-1", "clip", "secondary-in"])
+    assert [o["path"] for o in boundary["canonicalContext"]["owners"]] == expected_paths
+    # Omission from the portable witness never removes child disclosure or coverage.
+    assert any(s["path"][-1] == "spanning" for s in metadata["spans"])
+    assert not baseline["structuralIssues"]
+    assert baseline["blocked"]
+    parent["config"]["app"] = {"visualSeamContract": _portable_policy(baseline, 30)}
+    assert not admit_closure(parent, shots, internal, timeline_id="main")[0]["blocked"]
+    if mode == "cue-free":
+        outgoing[1]["opacity"] = 0.5
+        assert not admit_closure(parent, shots, internal, timeline_id="main")[0]["blocked"]
+        outgoing[1]["exit"] = {"type": "fade", "durationFrames": 2}
+    elif mode == "independent-effect":
+        outgoing[1]["effects"][0]["params"]["keyframes"][1]["x"] = 20
+    else:
+        outgoing[1]["opacity"] = 0.5
+    with pytest.raises(ValidationError) as error:
+        admit_closure(parent, shots, internal, timeline_id="main")
+    assert error.value.details["code"] == "visual_seam_admission_blocked"
+    # Reauthor, then a relevant incoming fade edit must independently invalidate.
+    current = evaluate_closure(parent, shots, internal, timeline_id="main")[0]
+    parent["config"]["app"] = {"visualSeamContract": _portable_policy(current, 30)}
+    assert not admit_closure(parent, shots, internal, timeline_id="main")[0]["blocked"]
+    incoming[0]["entrance"]["duration"] = 0.7
+    with pytest.raises(ValidationError):
+        admit_closure(parent, shots, internal, timeline_id="main")
+
+
 @pytest.mark.parametrize("pause", [
     {"kind": "pause", "track": "v", "startFrame": 29, "endFrame": 60},
     {"kind": "pause", "track": "v", "startFrame": 30, "endFrame": 61},

@@ -23,6 +23,31 @@ def relevant_intent_owners(owners, boundary_owners, cues):
     return [o for o in owners if tuple(o["path"]) in paths]
 
 
+def boundary_intent_owners(owners, frame):
+    """Select adjacent/furthest picture owners for one seam frame.
+
+    This mirrors Astrid's portable boundary-owner rule. An owner on another
+    lane participates only when that lane has its own cut at this frame; a
+    spanning owner is not pulled in merely because it overlaps the guard
+    window around an occurrence seam.
+    """
+    groups = {}
+    for owner in owners:
+        if not owner["primary"]:
+            continue
+        groups.setdefault(str(owner["track"]), []).append(owner)
+    selected = []
+    for rows in groups.values():
+        rows.sort(key=lambda owner: (owner["startFrame"], owner["endFrame"]))
+        furthest = None
+        for row in rows:
+            if furthest is not None and row["startFrame"] == frame:
+                selected.extend((furthest, row))
+            if furthest is None or row["endFrame"] > furthest["endFrame"]:
+                furthest = row
+    return selected
+
+
 def opaque_activation_cues(owners, frames):
     return [{"frame": o["startFrame"], "kind": "activation", "id": "owner-activation", "path": o["path"]}
             for o in owners if not o["primary"] and o["disclosure"]["opaque"]

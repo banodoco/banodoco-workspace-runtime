@@ -15,7 +15,8 @@ from collections import defaultdict
 from .errors import ConflictError, NotFoundError, ValidationError
 from .util import canonical_json
 from .visual_boundary import VERSION, DISCLOSURE_VERSION, boundary_report, finite, js_round, transition_frames
-from .seam_intent import intent_context, cue_identity as portable_cue_identity, pause_covers, relevant_intent_owners, opaque_activation_cues
+from .seam_intent import (boundary_intent_owners, intent_context, cue_identity as portable_cue_identity,
+                          pause_covers, relevant_intent_owners, opaque_activation_cues)
 
 MAX_METADATA_CLIPS = 20_000
 AUXILIARY = frozenset({"end-spanning-layer", "effect-layer", "frame-overlay", "text"})
@@ -377,12 +378,9 @@ def analyze_normalized(metadata):
                   + "|".join(fingerprint(s) for _, s in sorted(relevant.items()))).encode()).hexdigest() if nearby else None
         # Portable witnesses use the actual child clips at the occurrence seam,
         # rather than the transport occurrence record or mutable projection IDs.
-        portable_owners = {p: s for p, s in relevant.items() if "disclosure" in s}
-        for owner in owners:
-            if "disclosure" not in owner:
-                for s in spans:
-                    if s["primary"] and s["path"][:4] == owner["path"] and s["startFrame"] <= frame + 2 and s["endFrame"] >= frame - 2:
-                        portable_owners[tuple(s["path"])] = s
+        portable_boundary = boundary_intent_owners(spans, frame)
+        portable_relevant = relevant_intent_owners(spans, portable_boundary, nearby)
+        portable_owners = {tuple(s["path"]): s for s in portable_relevant}
         portable_context = intent_context(fps, frame, portable_owners.values())
         intent = (policy.get("intents") or {}).get(str(frame))
         valid = isinstance(intent, dict) and intent.get("frame") == frame and intent.get("context") == context and intent.get("kind") in ("hard-cut", "transition", "synchronized")
