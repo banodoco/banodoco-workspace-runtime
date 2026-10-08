@@ -429,7 +429,7 @@ def _render_timing_clip(raw):
 
 
 def _timing_record(raw, timing_id):
-    result = {key: raw[key] for key in ("at", "hold", "from", "to", "speed", "track", "clipType", "transition", "elementRef")
+    result = {key: raw[key] for key in ("at", "hold", "from", "to", "speed", "track", "clipType", "transition", "elementRef", "volume", "opacity")
               if key in raw}
     result["id"] = timing_id
     # Scheduling needs identity/duration only, never the transition's opaque
@@ -488,7 +488,10 @@ def _render_timing_context(config, parent_tracks, parent_clips, children, *, tra
     visual = overrides.get("visual") if isinstance(overrides.get("visual"), dict) else {}
     canvas = visual.get("canvas") if isinstance(visual.get("canvas"), dict) else {}
     fps = output.get("fps", canvas.get("fps", 30))
-    tracks = [{"id": row.get("id"), "kind": row.get("kind")} for row in
+    # These are compositor parent dispatch facts, separate from each child's
+    # authored scoped track. Keep only the fields consumed by the pinned
+    # AudioTrack/VisualClip/visual-track inheritance contracts.
+    tracks = [{key: row[key] for key in ("id", "kind", "muted", "volume", "opacity", "blendMode") if key in row} for row in
               (parent_tracks if isinstance(parent_tracks, list) else []) if isinstance(row, dict)]
     # A transition-free page can still use ordinary per-clip duration helpers
     # when its actual compositor track is proven; no full sibling list needed.
