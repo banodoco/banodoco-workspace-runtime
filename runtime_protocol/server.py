@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
@@ -149,6 +148,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             scope = str(body.get("scope") or "")
             if not actor or not token or scope != "astrid":
                 raise ProtocolError("actor_id, credential, and astrid scope are required")
+            from .daemon import WORKER_ACTOR
+            if actor == WORKER_ACTOR:
+                raise ConflictError("the shared Worker actor requires exact owner credential control")
             scopes = ["handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write"]
             self.server.credentials.provision_static(actor, token, scopes)  # type: ignore[attr-defined]
             return self._send(201, {"actor_id": actor, "scope": scope})
@@ -718,24 +720,45 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if not key:
                 raise ProtocolError("Idempotency-Key header is required")
             return self._send(201, self.runtime.register_executor(self._body(), idempotency_key=key, identity=identity))
+        if len(path) == 3 and path[:2] == ["v1", "executors"] and method == "GET":
+            identity = self._identity("admin")
+            if identity.get("actor") != "owner":
+                raise AuthorizationError("exact executor observation requires the Runtime owner")
+            return self._send(200, self.runtime.executor_observation(path[2], identity=identity))
         if len(path) == 3 and path[:2] == ["v1", "runs"] and method == "GET":
             self._identity("tasks:read")
             return self._send(200, self.runtime.run(path[2]))
         raise NotFoundError("route not found")
 
     def _is_local_worker_control(self):
-        return getattr(self, "command", None) == "POST" and urlsplit(getattr(self, "path", "")).path == "/v1/control/local-worker/start"
+        path = urlsplit(getattr(self, "path", "")).path
+        method = getattr(self, "command", None)
+        return (method == "POST" and path in {
+            "/v1/control/local-worker/start", "/v1/control/local-worker/relinquish",
+        }) or (method == "GET" and path == "/v1/control/local-worker/generation")
+
+    def _is_remote_credential_control(self):
+        path = [unquote(x) for x in urlsplit(getattr(self, "path", "")).path.split("/") if x]
+        return getattr(self, "command", None) == "POST" and len(path) == 4 and path[:2] == ["v1", "tasks"] and path[3] == "remote-credential"
 
     def _local_worker_control(self):
         identity = self._identity("admin")
         if identity.get("actor") != "owner":
             raise ForbiddenError("local worker launch requires the Runtime owner actor")
-        body = self._body()
-        if not isinstance(body, dict) or set(body) != {"profile_id", "expected_workspace_uuid"}:
-            raise ProtocolError("profile_id and expected_workspace_uuid are the only accepted launch fields")
         daemon = getattr(self.server, "daemon_runtime", None)
         if daemon is None:
             raise ConflictError("local worker launch requires daemon ownership")
+        if self.command == "GET":
+            return self._send(200, daemon.local_worker_generation(identity=identity))
+        body = self._body()
+        if urlsplit(self.path).path.endswith("/relinquish"):
+            if not isinstance(body, dict) or set(body) != {"executor_incarnation", "evidence_digest"}:
+                raise ProtocolError("exact local Worker generation fields are required")
+            return self._send(200, daemon.relinquish_local_worker(
+                body["executor_incarnation"], body["evidence_digest"], identity=identity,
+            ))
+        if not isinstance(body, dict) or set(body) != {"profile_id", "expected_workspace_uuid"}:
+            raise ProtocolError("profile_id and expected_workspace_uuid are the only accepted launch fields")
         return self._send(200, daemon.start_local_worker(body["profile_id"], body["expected_workspace_uuid"]))
 
     def _dispatch(self):
@@ -758,6 +781,10 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # outside the SQLite mutex. Credential authentication and
                     # publication use CredentialStore's short internal lock.
                     self._local_worker_control()
+                elif self._is_remote_credential_control():
+                    # Daemon takes actor then short store sections. Never
+                    # acquire the store lock before actor ownership.
+                    self._route()
                 else:
                     with self.runtime.store._mutex:
                         self._route()

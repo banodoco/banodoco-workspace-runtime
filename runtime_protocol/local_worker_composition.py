@@ -22,18 +22,17 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .catalog import process_birth_identity
 from .errors import ConflictError, ValidationError
 from .local_worker import (
-    ACTIVATION_VERSION,
     LocalWorkerObservation,
     LocalWorkerPreparer,
     LocalWorkerProfile,
     ProcessIdentity,
-    PREPARATION_VERSION,
     _engine_endpoint,
 )
 
@@ -317,6 +316,71 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
                 self._active = None
         if failure is not None:
             raise failure
+
+    def stop_owned(self, receipt: Mapping[str, Any], handle: _PreparedWorker | None = None) -> bool:
+        """Stop only PIDs whose current birth marker matches the exact receipt.
+
+        This works after a daemon restart when the private control handle is
+        gone. A missing or reused PID is already absent from this generation;
+        an unobservable PID leaves the handover unresolved.
+        """
+        names = ("engine_listener", "engine", "host", "worker")
+        processes = []
+        for name in names:
+            item = receipt.get(name)
+            if not isinstance(item, Mapping) or not isinstance(item.get("pid"), int) or not isinstance(item.get("birth_id"), str):
+                raise ConflictError("local Worker relinquish receipt has invalid process identity")
+            processes.append((item["pid"], item["birth_id"]))
+        if handle is not None and (handle.worker.pid, handle.birth_id) != processes[-1]:
+            raise ConflictError("local Worker handle does not match relinquish receipt")
+
+        def live() -> list[int]:
+            remaining = []
+            for pid, birth in processes:
+                if handle is not None and pid == handle.worker.pid:
+                    # Popen.poll reaps an exited child; an unreaped zombie
+                    # still has the same birth marker in /proc or ps.
+                    handle.worker.poll()
+                current = process_birth_identity(pid)
+                if current == birth:
+                    remaining.append(pid)
+                elif current is None:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        continue
+                    except PermissionError as exc:
+                        raise ConflictError("receipt-owned process state is unobservable") from exc
+                    raise ConflictError("receipt-owned process birth is unobservable")
+            return remaining
+
+        for pid in live():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + max(1.0, self.cleanup_timeout_seconds)
+        while time.monotonic() < deadline and live():
+            time.sleep(0.02)
+        for pid in live():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + max(1.0, self.cleanup_timeout_seconds)
+        while time.monotonic() < deadline and live():
+            time.sleep(0.02)
+        if live():
+            raise ConflictError("receipt-owned local Worker processes remain alive")
+        if handle is not None:
+            try:
+                handle.control.close()
+            except OSError:
+                pass
+            handle.closed = True
+            if self._active is handle:
+                self._active = None
+        return True
 
     def control_alive(self, handle: _PreparedWorker) -> bool:
         if not isinstance(handle, _PreparedWorker) or handle.closed or handle.worker.poll() is not None:

@@ -25,6 +25,7 @@
     "required_facts": { "$ref": "#/definitions/RequiredFacts" },
     "spec": { "type": "object", "additionalProperties": true },
     "generation_intent": { "type": "object", "additionalProperties": true },
+    "expected_effect": { "type": "object", "additionalProperties": true },
     "storage_estimate": {
       "type": "object", "additionalProperties": false,
       "required": ["scratch_bytes", "output_bytes"],
@@ -58,6 +59,7 @@
       "properties": {
         "schema_version": { "type": "integer", "const": 1 },
         "target": { "$ref": "#/definitions/ExecutionTarget" },
+        "remote_activation_required": { "type": "boolean" },
         "inputs": { "type": "array", "items": { "type": "object" } },
         "workflow": { "type": "object" }, "execution": { "type": "object" },
         "retry_policy": { "type": "object" }, "lifecycle": { "type": "object" },

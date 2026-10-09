@@ -5,13 +5,14 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .auth import CredentialStore
 from .catalog import LiveDiscovery, RealmCatalog, process_birth_identity
 from .backup import restore_backup, verify_backup, verify_restore_candidate
 from .dirfd import capture_parent, close_pinned, validate_parent
-from .errors import ConflictError, ProtocolError
+from .errors import ConflictError, NotFoundError, ProtocolError
 from .server import RuntimeHTTPServer, RuntimeHandler
 from .service import RuntimeService
 from .util import atomic_json_write, now
@@ -88,6 +89,11 @@ class RuntimeDaemon:
         self.local_worker_preparer = local_worker_preparer
         self.local_worker_inspector = local_worker_inspector
         self.local_worker_launcher = None
+        self._local_worker_deferred = False
+        # Local launch and remote credential control share one actor. Keep
+        # their ownership transitions mutually exclusive without adding a
+        # second actor or credential ledger.
+        self._worker_actor_lock = threading.RLock()
         if bool(self.local_worker_profiles) != bool(local_worker_preparer) or bool(self.local_worker_profiles) != bool(local_worker_inspector):
             raise ValueError("local worker profiles, preparer, and inspector must be configured together")
 
@@ -108,11 +114,19 @@ class RuntimeDaemon:
 
     def _provision_credentials(self, *, rotate=False):
         self.credentials = CredentialStore(_authority_path(self.support_root / "credentials", "credential root"))
+        self._local_worker_deferred = False
         owner_scopes = ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"]
         self.token, self.credential_path = self.credentials.provision("owner", owner_scopes, rotate=rotate)
         if self.local_worker_profiles:
-            # The two-phase owner path issues this actor only after independent
-            # process verification. I-06b supplies the parked Worker adapter.
+            if self._remote_worker_custody_unresolved() or self._local_relinquish_pending():
+                # Keep the owner and exact remote cleanup route available. Do
+                # not construct LocalWorkerLauncher here: its restart recovery
+                # intentionally reconciles local receipts and could otherwise
+                # revoke an exact remote generation as an invalid local one.
+                self.credentials.disable_actor(WORKER_ACTOR)
+                self._local_worker_deferred = True
+            # The two-phase local path issues this shared actor only after
+            # independent process verification.
             self.worker_token = None
             self.worker_credential_path = self.credentials.path_for(WORKER_ACTOR)
         else:
@@ -121,14 +135,31 @@ class RuntimeDaemon:
             # before HTTP starts; fixture-mode credentials retain their
             # historical behavior for in-process tests.
             existing_worker = self.credentials.actor_metadata(WORKER_ACTOR)
-            rotate_worker = (
-                rotate
-                or bool(self.production_worker_credentials and existing_worker)
-                or self.credentials.has_legacy_generation(WORKER_ACTOR)
-            )
-            self.worker_token, self.worker_credential_path = self.credentials.provision(
-                WORKER_ACTOR, list(WORKER_SCOPES), rotate=rotate_worker
-            )
+            if isinstance(existing_worker, dict) and isinstance(existing_worker.get("qualified_activation"), dict):
+                # Preserve exact remote custody across daemon restart. The old
+                # session/epoch cannot execute; only exact owner cleanup may
+                # retire it before a freshly observed generation is installed.
+                self.credentials.disable_actor(WORKER_ACTOR)
+                self.worker_token = None
+                self.worker_credential_path = self.credentials.path_for(WORKER_ACTOR)
+            else:
+                legacy = self.credentials._legacy_pair(WORKER_ACTOR)
+                if (existing_worker is None and any(path.exists() or path.is_symlink() for path in self.credentials._paths(WORKER_ACTOR))
+                        and (legacy is None or isinstance(legacy[1].get("qualified_activation"), dict))):
+                    # Keep owner reconciliation reachable after interrupted
+                    # credential cleanup; never rotate unresolved file bytes.
+                    self.credentials.disable_actor(WORKER_ACTOR)
+                    self.worker_token = None
+                    self.worker_credential_path = self.credentials.path_for(WORKER_ACTOR)
+                else:
+                    rotate_worker = (
+                        rotate
+                        or bool(self.production_worker_credentials and existing_worker)
+                        or self.credentials.has_legacy_generation(WORKER_ACTOR)
+                    )
+                    self.worker_token, self.worker_credential_path = self.credentials.provision(
+                        WORKER_ACTOR, list(WORKER_SCOPES), rotate=rotate_worker
+                    )
         if not self.production_worker_credentials and not self.local_worker_profiles:
             # Test-only in-process convenience.  The production CLI never
             # selects this branch; its pack host receives WORKER_ACTOR's
@@ -189,21 +220,8 @@ class RuntimeDaemon:
         self.service.set_readiness_callback(self._revoke_readiness)
         self.catalog.bind_owner(self._catalog_owner_valid)
         self._provision_credentials(rotate=rotate_credentials)
-        if self.local_worker_profiles:
-            from .local_worker import LocalWorkerLauncher
-
-            self.local_worker_launcher = LocalWorkerLauncher(
-                credentials=self.credentials,
-                profiles=self.local_worker_profiles,
-                preparer=self.local_worker_preparer,
-                inspector=self.local_worker_inspector,
-                workspace_uuid=self.service.realm["id"],
-                realm_root=self.root,
-                support_root=self.support_root,
-                runtime_pid=os.getpid(),
-                actor=WORKER_ACTOR,
-                scopes=WORKER_SCOPES,
-            )
+        if self.local_worker_profiles and not self._local_worker_deferred:
+            self._create_local_worker_launcher()
         self.httpd = RuntimeHTTPServer((self.host, self.port), RuntimeHandler)
         self.httpd.runtime = self.service
         self.httpd.daemon_runtime = self
@@ -221,21 +239,346 @@ class RuntimeDaemon:
         self.thread.start()
         return self
 
+    def _create_local_worker_launcher(self):
+        from .local_worker import LocalWorkerLauncher
+
+        self.local_worker_launcher = LocalWorkerLauncher(
+            credentials=self.credentials,
+            profiles=self.local_worker_profiles,
+            preparer=self.local_worker_preparer,
+            inspector=self.local_worker_inspector,
+            workspace_uuid=self.service.realm["id"],
+            realm_root=self.root,
+            support_root=self.support_root,
+            runtime_pid=os.getpid(),
+            actor=WORKER_ACTOR,
+            scopes=WORKER_SCOPES,
+        )
+        self._local_worker_deferred = False
+        return self.local_worker_launcher
+
+    def _has_unrevoked_remote_activation(self):
+        rows = self.service.store.conn.execute(
+            "SELECT task_id, kind, payload_json FROM events "
+            "WHERE kind IN ('task.remote_activation_qualified', 'task.remote_activation_revoked') "
+            "ORDER BY id"
+        ).fetchall()
+        active = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                # Corrupt identity history cannot prove the shared actor free.
+                return True
+            activation_id = payload.get("activation_id") if isinstance(payload, dict) else None
+            if not isinstance(activation_id, str):
+                return True
+            key = (str(row["task_id"]), activation_id)
+            if row["kind"] == "task.remote_activation_qualified":
+                active.add(key)
+            else:
+                active.discard(key)
+        return bool(active)
+
+    def _remote_worker_custody_unresolved(self):
+        """Whether the shared actor still has remote or ambiguous custody."""
+        metadata = self.credentials.actor_metadata(WORKER_ACTOR)
+        paths = self.credentials._paths(WORKER_ACTOR)
+        files_exist = any(path.exists() or path.is_symlink() for path in paths)
+        if self._has_unrevoked_remote_activation():
+            return True
+        if isinstance(metadata, dict) and isinstance(metadata.get("qualified_activation"), dict):
+            return True
+        if files_exist and not (
+            isinstance(metadata, dict)
+            and isinstance(metadata.get("local_launch_receipt"), dict)
+        ):
+            # Partial, corrupt, legacy, or otherwise unclassified bytes are
+            # not evidence that a local process may take over the actor.
+            return True
+        return False
+
+    def _local_relinquish_path(self):
+        return self.support_root / "local-worker-relinquish.json"
+
+    def _local_relinquish_state(self):
+        path = self._local_relinquish_path()
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ConflictError("local Worker relinquish checkpoint is unreadable") from exc
+        if (not isinstance(value, dict) or value.get("version") != 1
+                or value.get("state") not in {"fencing", "fenced", "stop_unknown", "stopped", "complete"}
+                or not isinstance(value.get("receipt"), dict)):
+            raise ConflictError("local Worker relinquish checkpoint is invalid")
+        return value
+
+    def _local_relinquish_pending(self):
+        state = self._local_relinquish_state()
+        return state is not None and state["state"] != "complete"
+
+    def _write_local_relinquish(self, state):
+        atomic_json_write(self._local_relinquish_path(), state)
+
+    def _assert_worker_actor_has_no_work(self):
+        """Called under the claim/store mutex before disabling the bearer."""
+        queries = (
+            ("tasks", "SELECT 1 FROM tasks WHERE executor_id=? AND status IN ('running', 'cancel_requested') LIMIT 1"),
+            ("attempts", "SELECT 1 FROM attempts WHERE executor_id=? AND settled=0 LIMIT 1"),
+            ("reservations", "SELECT 1 FROM reservations WHERE executor_id=? AND released_at IS NULL LIMIT 1"),
+            ("execution bindings", "SELECT 1 FROM execution_bindings WHERE executor_id=? AND status='claimed' LIMIT 1"),
+        )
+        for label, query in queries:
+            if self.service.store.conn.execute(query, (WORKER_ACTOR,)).fetchone():
+                raise ConflictError(f"local Worker has outstanding {label}")
+
+    def _assert_local_relinquish_receipt(self, receipt, metadata):
+        from .local_worker import RECEIPT_VERSION
+
+        profile = self.local_worker_profiles.get(receipt.get("profile_id")) if isinstance(receipt, dict) else None
+        if (profile is None or receipt.get("version") != RECEIPT_VERSION
+                or receipt.get("workspace_uuid") != self.service.realm["id"]
+                or not isinstance(receipt.get("executor_incarnation"), str)
+                or not receipt["executor_incarnation"]
+                or not isinstance(receipt.get("evidence_digest"), str)
+                or not receipt["evidence_digest"]
+                or receipt.get("profile_digest") != profile.profile_digest
+                or receipt.get("release_digest") != profile.release_digest
+                or receipt.get("machine_id") != profile.machine_id):
+            raise ConflictError("local Worker relinquish receipt does not match this Runtime")
+        for name in ("worker", "host", "engine", "engine_listener"):
+            process = receipt.get(name)
+            if (not isinstance(process, dict) or not isinstance(process.get("pid"), int)
+                    or process["pid"] <= 0 or not isinstance(process.get("birth_id"), str)
+                    or not process["birth_id"]):
+                raise ConflictError("local Worker relinquish process receipt is invalid")
+        if metadata is not None:
+            binding = metadata.get("execution_binding")
+            verification = binding.get("verification") if isinstance(binding, dict) else None
+            if (metadata.get("local_launch_receipt") != receipt
+                    or not isinstance(binding, dict)
+                    or binding.get("executor_incarnation") != receipt.get("executor_incarnation")
+                    or not isinstance(verification, dict)
+                    or verification.get("verified") is not True
+                    or verification.get("evidence_digest") != receipt.get("evidence_digest")):
+                raise ConflictError("local Worker relinquish credential binding changed")
+
+    def relinquish_local_worker(self, executor_incarnation, evidence_digest, *, identity):
+        """Fence, stop, and retire one exact local shared-actor generation.
+
+        The checkpoint is intentionally kept through process and credential
+        cleanup so an interrupted owner can replay this exact request. No
+        process wait runs while the SQLite claim mutex is held.
+        """
+        if not isinstance(executor_incarnation, str) or not executor_incarnation or not isinstance(evidence_digest, str) or not evidence_digest:
+            raise ProtocolError("exact local Worker generation is required")
+        if not self.local_worker_profiles or self.service is None:
+            raise ConflictError("local Worker relinquish requires a configured Runtime owner")
+        with self._worker_actor_lock:
+            with self.service.store._mutex:
+                self.service._assert_mutation_admitted()
+                if self.service._require_placement_recovery_owner(identity) != "owner":
+                    raise ConflictError("local Worker relinquish requires the Runtime owner")
+                self._assert_worker_actor_has_no_work()
+                checkpoint = self._local_relinquish_state()
+                metadata = self.credentials.actor_metadata(WORKER_ACTOR)
+                receipt = metadata.get("local_launch_receipt") if isinstance(metadata, dict) else None
+                if checkpoint is not None and checkpoint["state"] != "complete":
+                    saved = checkpoint["receipt"]
+                    if (saved.get("executor_incarnation") != executor_incarnation
+                            or saved.get("evidence_digest") != evidence_digest):
+                        raise ConflictError("another local Worker generation is pending relinquish")
+                    if receipt is not None and receipt != saved:
+                        raise ConflictError("local Worker credential generation changed")
+                    receipt = saved
+                    self._assert_local_relinquish_receipt(receipt, metadata)
+                else:
+                    if (not isinstance(receipt, dict)
+                            or receipt.get("executor_incarnation") != executor_incarnation
+                            or receipt.get("evidence_digest") != evidence_digest):
+                        if checkpoint is not None and checkpoint["state"] == "complete" and (
+                            checkpoint["receipt"].get("executor_incarnation") == executor_incarnation
+                            and checkpoint["receipt"].get("evidence_digest") == evidence_digest
+                        ):
+                            return {"state": "relinquished", "executor_incarnation": executor_incarnation}
+                        raise ConflictError("local Worker credential generation changed")
+                    if self.local_worker_launcher is not None and self.local_worker_launcher._operation_lock.locked():
+                        raise ConflictError("local Worker launch is in progress")
+                    self._assert_local_relinquish_receipt(receipt, metadata)
+                    self.credentials._read_actor(WORKER_ACTOR)
+                    file_digests = {
+                        path.name: self.credentials._sha256(path.read_bytes())
+                        for path in self.credentials._paths(WORKER_ACTOR)
+                    }
+                    checkpoint = {"version": 1, "state": "fencing", "receipt": dict(receipt), "file_digests": file_digests}
+                    self._write_local_relinquish(checkpoint)
+                self.credentials.disable_actor(WORKER_ACTOR)
+                if (not isinstance(checkpoint.get("file_digests"), dict)
+                        or set(checkpoint["file_digests"]) != {path.name for path in self.credentials._paths(WORKER_ACTOR)}):
+                    raise ConflictError("local Worker relinquish file proof is incomplete")
+                checkpoint["state"] = "fenced" if checkpoint["state"] == "fencing" else checkpoint["state"]
+                self._write_local_relinquish(checkpoint)
+
+            # The actor lock excludes local start and remote provision. The
+            # SQLite mutex is free while the OS stop may wait or be retried.
+            handle = None
+            if self.local_worker_launcher is not None:
+                handle = self.local_worker_launcher.relinquish_handle(receipt)
+            stop_owned = getattr(self.local_worker_preparer, "stop_owned", None)
+            if not callable(stop_owned):
+                checkpoint["state"] = "stop_unknown"
+                self._write_local_relinquish(checkpoint)
+                raise ConflictError("local Worker preparer cannot attest exact process stop")
+            try:
+                if stop_owned(receipt, handle=handle) is not True:
+                    raise ConflictError("receipt-owned local Worker stop is unconfirmed")
+            except BaseException:
+                checkpoint["state"] = "stop_unknown"
+                self._write_local_relinquish(checkpoint)
+                raise
+            checkpoint["state"] = "stopped"
+            self._write_local_relinquish(checkpoint)
+            with self.service.store._mutex:
+                self._assert_worker_actor_has_no_work()
+                current = self.credentials.actor_metadata(WORKER_ACTOR)
+                if current is not None and current.get("local_launch_receipt") != receipt:
+                    raise ConflictError("local Worker credential generation changed during cleanup")
+                for path in self.credentials._paths(WORKER_ACTOR):
+                    if path.exists():
+                        self.credentials._safe_file(path, "local Worker relinquish file")
+                        if self.credentials._sha256(path.read_bytes()) != checkpoint["file_digests"].get(path.name):
+                            raise ConflictError("local Worker credential bytes changed during cleanup")
+                self.credentials.revoke(WORKER_ACTOR)
+                checkpoint["state"] = "complete"
+                self._write_local_relinquish(checkpoint)
+                self.local_worker_launcher = None
+                self._local_worker_deferred = False
+            return {"state": "relinquished", "executor_incarnation": executor_incarnation}
+
+    def local_worker_generation(self, *, identity):
+        """Read the exact local generation held by this owner, including a pending stop."""
+        with self._worker_actor_lock:
+            with self.service.store._mutex:
+                if self.service._require_placement_recovery_owner(identity) != "owner":
+                    raise ConflictError("local Worker generation requires the Runtime owner")
+                checkpoint = self._local_relinquish_state()
+                if checkpoint is not None and checkpoint["state"] != "complete":
+                    receipt = checkpoint["receipt"]
+                    state = checkpoint["state"]
+                else:
+                    metadata = self.credentials.actor_metadata(WORKER_ACTOR)
+                    receipt = metadata.get("local_launch_receipt") if isinstance(metadata, dict) else None
+                    state = "active"
+                if not isinstance(receipt, dict):
+                    raise NotFoundError("local Worker generation is unavailable")
+                self._assert_local_relinquish_receipt(receipt, None)
+                return {
+                    "executor_incarnation": receipt["executor_incarnation"],
+                    "evidence_digest": receipt["evidence_digest"],
+                    "profile_id": receipt["profile_id"],
+                    "workspace_uuid": receipt["workspace_uuid"],
+                    "state": state,
+                }
+
     def start_local_worker(self, profile_id, expected_workspace_uuid):
-        if self.local_worker_launcher is None:
+        if not self.local_worker_profiles:
             raise ConflictError(
                 "No local Worker profile is configured; set worker_profile in the Astrid source profile and restart the Runtime"
             )
-        bind_runtime = getattr(self.local_worker_preparer, "bind_runtime", None)
-        if bind_runtime is not None:
-            bind_runtime(
-                endpoint=self.endpoint,
-                runtime_instance_id=self.instance_id,
-                credential_file=self.worker_credential_path,
-            )
-        return self.local_worker_launcher.start(profile_id, expected_workspace_uuid)
+        if self.service is None or self.httpd is None:
+            raise ConflictError("local Worker start requires a running Runtime owner")
+        with self._worker_actor_lock:
+            if self._remote_worker_custody_unresolved() or self._local_relinquish_pending():
+                raise ConflictError(
+                    "remote or unresolved Worker credential custody must be reconciled before local launch"
+                )
+            if self.local_worker_launcher is None:
+                self._create_local_worker_launcher()
+            bind_runtime = getattr(self.local_worker_preparer, "bind_runtime", None)
+            if bind_runtime is not None:
+                bind_runtime(
+                    endpoint=self.endpoint,
+                    runtime_instance_id=self.instance_id,
+                    credential_file=self.worker_credential_path,
+                )
+            return self.local_worker_launcher.start(profile_id, expected_workspace_uuid)
+
+    def _cleanup_exact_remote_credential(self, task_id, activation_id):
+        """Reconcile interrupted file deletion using committed, secret-free hashes.
+
+        Called only inside the Runtime owner mutex after exact revocation.
+        A foreign or changed byte is unresolved, never an orphan we may erase.
+        """
+        actor = WORKER_ACTOR
+        paths = self.credentials._paths(actor)
+        existing = [path for path in paths if path.exists() or path.is_symlink()]
+        if not existing:
+            return
+        rows = self.service.store.conn.execute(
+            "SELECT payload_json FROM events WHERE task_id=? "
+            "AND kind='task.remote_credential_cleanup_started' ORDER BY id DESC",
+            (str(task_id),),
+        ).fetchall()
+        intent = next((value for row in rows if (value := json.loads(row["payload_json"]))
+                       .get("activation_id") == activation_id), None)
+        if intent is None:
+            metadata = self.credentials.actor_metadata(actor)
+            qualification = metadata.get("qualified_activation") if isinstance(metadata, dict) else None
+            if (not isinstance(qualification, dict) or qualification.get("task_id") != task_id
+                    or qualification.get("activation_id") != activation_id):
+                raise ConflictError("exact remote credential cleanup is unresolved")
+            self.credentials._read_actor(actor)
+            intent = {"activation_id": activation_id, "credential_actor": actor,
+                      "file_digests": {path.name: self.credentials._sha256(path.read_bytes()) for path in paths}}
+            task = self.service.store.get_task(task_id)
+            with self.service.store._transaction():
+                self.service.store._append_event(task["run"]["id"], str(task_id),
+                                                "task.remote_credential_cleanup_started", intent)
+        if intent.get("credential_actor") != actor:
+            raise ConflictError("remote credential cleanup actor changed")
+        for path in existing:
+            self.credentials._safe_file(path, "remote credential cleanup file")
+            if self.credentials._sha256(path.read_bytes()) != intent["file_digests"].get(path.name):
+                raise ConflictError("remote credential cleanup bytes changed")
+        self.credentials.revoke(actor)
 
     def remote_credential_control(self, task_id, body, *, identity):
+        # Metadata compare and every token side effect share claim/admission's
+        # owner mutex. Credential files retain their own durable generation
+        # commit; a failed Runtime commit leaves exact metadata to reconcile.
+        with self._worker_actor_lock:
+            with self.service.store._mutex:
+                self.service._assert_mutation_admitted()
+                if self.service._require_placement_recovery_owner(identity) != "owner":
+                    raise ConflictError("remote credential control requires the Runtime owner")
+                if self.local_worker_launcher is not None and not self.local_worker_launcher.is_idle():
+                    raise ConflictError("the local Worker owns the shared executor actor")
+                if isinstance(body, dict) and body.get("action") in {"provision", "enable"} and self._local_relinquish_pending():
+                    raise ConflictError("local Worker relinquish is unresolved")
+                return self._remote_credential_control(task_id, body, identity=identity)
+
+    def _remote_credential_binding_matches(self, task_id, binding, qualification, placement):
+        """Validate provision/startup against the same resident task binding."""
+        return bool(
+            isinstance(qualification, dict) and isinstance(placement, dict)
+            and qualification.get("task_id") == task_id
+            and qualification.get("run_id") == binding.admission_identity.run_id
+            and qualification.get("credential_actor") == WORKER_ACTOR
+            and qualification.get("binding_digest") == binding.digest()
+            and qualification.get("effective_target") == binding.placement.effective_target
+            and qualification.get("runtime_session_id") == self.service.runtime_session_id
+            and qualification.get("runtime_epoch") == self.service.store._current_runtime_epoch()
+            and placement.get("actual") == binding.placement.effective_target
+            and placement.get("executor_incarnation") == qualification.get("executor_incarnation")
+            and isinstance(placement.get("verification"), dict)
+            and placement["verification"].get("method") == "credential_claim"
+            and placement["verification"].get("verified") is True
+            and placement["verification"].get("evidence_digest") == qualification.get("evidence_digest")
+        )
+
+    def _remote_credential_control(self, task_id, body, *, identity):
         """Keep the remote Worker's credential generation in the resident owner.
 
         The caller must already have authenticated as the exact daemon owner.
@@ -243,33 +586,81 @@ class RuntimeDaemon:
         """
         from .remote_worker_deployment import deployment_binding_from_task
 
-        if not isinstance(body, dict) or body.get("action") not in {"provision", "enable", "verify", "revoke"}:
+        if not isinstance(body, dict) or body.get("action") not in {"provision", "enable", "verify", "revoke", "revoke-uncommitted", "begin-drain", "finish-drain"}:
             raise ProtocolError("remote credential action is invalid")
-        if self.local_worker_launcher is not None:
-            raise ConflictError("the local Worker owns the shared executor actor")
         task = self.service._task_resource(self.service.store.get_task(task_id))
         binding = deployment_binding_from_task(task)
         actor = WORKER_ACTOR
+        if body["action"] == "revoke-uncommitted":
+            if set(body) != {"action", "qualification", "placement"}:
+                raise ProtocolError("uncommitted remote cleanup requires exact qualification and placement")
+            qualification, placement = body["qualification"], body["placement"]
+            if not self._remote_credential_binding_matches(task_id, binding, qualification, placement):
+                raise ConflictError("uncommitted remote cleanup does not match Runtime task binding")
+            activation_id = qualification.get("activation_id")
+            if not isinstance(activation_id, str) or not activation_id:
+                raise ProtocolError("uncommitted remote cleanup activation_id is required")
+            history = self.service._remote_activation_history(task_id, activation_id)
+            if (self.service._latest_remote_activation(task_id) is not None
+                    or any(kind == "task.remote_activation_qualified" for kind, _ in history)
+                    or any(kind == "task.remote_activation_revoked" and payload.get("unqualified") is not True
+                           for kind, payload in history)):
+                raise ConflictError("remote activation may have admitted work; reconcile before cleanup")
+            metadata = self.credentials.actor_metadata(actor)
+            if metadata is not None and (
+                    metadata.get("qualified_activation") != qualification
+                    or metadata.get("execution_binding") != placement):
+                raise ConflictError("remote credential generation changed before uncommitted cleanup")
+            if not any(kind == "task.remote_activation_revoked" for kind, _ in history):
+                with self.service.store._transaction():
+                    self.service.store._append_event(
+                        binding.admission_identity.run_id, task_id,
+                        "task.remote_activation_revoked",
+                        {"activation_id": activation_id, "unqualified": True},
+                    )
+            self._cleanup_exact_remote_credential(task_id, activation_id)
+            return {"revoked": True}
+        if body["action"] in {"begin-drain", "finish-drain"}:
+            if set(body) != {"action", "qualification"}:
+                raise ProtocolError("remote drain requires exact qualification")
+            metadata = self.credentials.actor_metadata(actor)
+            qualification = body["qualification"]
+            if metadata is not None and metadata.get("qualified_activation") != qualification:
+                if body["action"] == "finish-drain":
+                    # An old successful finish may lose its reply before a new
+                    # generation is installed. Reconcile only its Runtime
+                    # marker/tombstone; never touch the current actor token.
+                    return self.service.finish_remote_drain(task_id, qualification, identity=identity)
+                raise ConflictError("remote drain credential generation changed")
+            if body["action"] == "begin-drain":
+                if metadata is None:
+                    raise ConflictError("remote drain credential generation is unavailable")
+                return self.service.begin_remote_drain(task_id, qualification, identity=identity)
+            result = self.service.finish_remote_drain(task_id, qualification, identity=identity)
+            if result["state"] == "drained":
+                self._cleanup_exact_remote_credential(task_id, qualification["activation_id"])
+            return result
         if body["action"] == "provision":
             if set(body) != {"action", "qualification", "placement"}:
                 raise ProtocolError("remote credential provision has invalid fields")
             qualification, placement = body["qualification"], body["placement"]
             if not isinstance(qualification, dict) or not isinstance(placement, dict):
                 raise ProtocolError("remote credential proof is missing")
-            if (qualification.get("task_id") != task_id
-                    or qualification.get("run_id") != binding.admission_identity.run_id
-                    or qualification.get("credential_actor") != actor
-                    or qualification.get("binding_digest") != binding.digest()
-                    or qualification.get("effective_target") != binding.placement.effective_target
-                    or qualification.get("runtime_session_id") != self.service.runtime_session_id
-                    or qualification.get("runtime_epoch") != self.service.store._current_runtime_epoch()
-                    or placement.get("actual") != binding.placement.effective_target
-                    or placement.get("executor_incarnation") != qualification.get("executor_incarnation")
-                    or not isinstance(placement.get("verification"), dict)
-                    or placement["verification"].get("method") != "credential_claim"
-                    or placement["verification"].get("verified") is not True
-                    or placement["verification"].get("evidence_digest") != qualification.get("evidence_digest")):
+            if not self._remote_credential_binding_matches(task_id, binding, qualification, placement):
                 raise ConflictError("remote credential proof does not match Runtime task binding")
+            history = self.service._remote_activation_history(task_id, qualification.get("activation_id"))
+            if any(kind == "task.remote_activation_revoked" for kind, _ in history):
+                raise ConflictError("remote credential generation is permanently revoked")
+            existing = self.credentials.actor_metadata(actor)
+            previous = existing.get("qualified_activation") if isinstance(existing, dict) else None
+            if existing is None and any(path.exists() for path in self.credentials._paths(actor)):
+                raise ConflictError("remote credential generation is unresolved")
+            if previous is not None:
+                if previous != qualification or existing.get("execution_binding") != placement:
+                    raise ConflictError("another remote credential generation is live or unresolved")
+                # A lost provision response must not rotate or disable a token
+                # already enabled for this exact activation.
+                return {"credential_file": str(self.credentials.path_for(actor)), "credential_actor": actor}
             _, path = self.credentials.provision(
                 actor, list(WORKER_SCOPES), rotate=True, enabled=False,
                 metadata={"execution_binding": placement, "qualified_activation": qualification},
@@ -282,17 +673,37 @@ class RuntimeDaemon:
         if body["action"] == "revoke" and qualification is None:
             history = self.service._remote_activation_history(task_id, body["activation_id"])
             if any(kind == "task.remote_activation_revoked" for kind, _ in history):
+                self._cleanup_exact_remote_credential(task_id, body["activation_id"])
                 return {"revoked": True}
             raise ConflictError("remote credential generation is unavailable")
-        if not isinstance(qualification, dict) or qualification.get("activation_id") != body["activation_id"]:
+        if (not isinstance(qualification, dict) or qualification.get("task_id") != task_id
+                or qualification.get("activation_id") != body["activation_id"]):
             raise ConflictError("remote credential generation changed")
         placement = metadata.get("execution_binding")
         matched = self.service._remote_activation_matches(
             task_id, {"actor": actor, "qualified_activation": qualification}, placement
         )
         if body["action"] == "enable":
-            if not matched:
-                raise ConflictError("remote activation was not recorded by Runtime")
+            # Startup authentication precedes the final activation commit.
+            # Only the exact current provision may bootstrap; claim/admission
+            # still require _remote_activation_matches and verify stays false.
+            startup = False
+            if not matched and self._remote_credential_binding_matches(task_id, binding, qualification, placement):
+                try:
+                    expiry = datetime.fromisoformat(qualification["expires_at"].replace("Z", "+00:00"))
+                    startup = bool(
+                        expiry.tzinfo is not None and expiry > datetime.now(timezone.utc)
+                        and all(isinstance(qualification.get(field), str) and qualification[field]
+                                for field in ("activation_id", "executor_incarnation"))
+                        and metadata.get("actor") == actor
+                        and metadata.get("scopes") == sorted(WORKER_SCOPES)
+                        and self.service._latest_remote_activation(task_id) is None
+                        and not self.service._remote_activation_history(task_id, qualification["activation_id"])
+                    )
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    pass
+            if not matched and not startup:
+                raise ConflictError("remote credential generation is not current for startup or activation")
             self.credentials.enable_actor(actor)
             return {"enabled": True}
         if body["action"] == "verify":
@@ -303,7 +714,17 @@ class RuntimeDaemon:
                 raise ConflictError("remote activation generation changed before revocation")
             if latest == qualification:
                 self.service.revoke_remote_activation(task_id, body["activation_id"], identity=identity)
-        self.credentials.revoke(actor)
+            elif not any(kind == "task.remote_activation_revoked" for kind, _ in
+                         self.service._remote_activation_history(task_id, body["activation_id"])):
+                # A startup generation can fail before activation commits.
+                # Tombstone its exact identity before deleting files so a lost
+                # cleanup reply is reconcilable without blind reprovision.
+                with self.service.store._transaction():
+                    self.service.store._append_event(
+                        binding.admission_identity.run_id, task_id,
+                        "task.remote_activation_revoked", {"activation_id": body["activation_id"], "unqualified": True},
+                    )
+        self._cleanup_exact_remote_credential(task_id, body["activation_id"])
         return {"revoked": True}
 
     def _replacement_state_path(self):

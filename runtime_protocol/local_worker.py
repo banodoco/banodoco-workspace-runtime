@@ -468,6 +468,53 @@ class LocalWorkerLauncher:
     def _control_alive(self, handle: object) -> bool:
         return bool(self.preparer.control_alive(handle))
 
+    def is_idle(self) -> bool:
+        """Whether remote credential control may use the shared Worker actor."""
+        existing = self.credentials.actor_metadata(self.actor)
+        restart_receipt_pending = (
+            isinstance(existing, Mapping)
+            and isinstance(existing.get("local_launch_receipt"), Mapping)
+        )
+        with self._state_lock:
+            watcher_alive = bool(
+                self._watch_thread is not None
+                and self._watch_thread.is_alive()
+                and not self._watch_stop.is_set()
+            )
+            return bool(
+                not self._operation_lock.locked()
+                and self._active_handle is None
+                and self._preparing_handle is None
+                and not watcher_alive
+                and not restart_receipt_pending
+            )
+
+    def relinquish_handle(self, receipt: Mapping[str, Any]) -> object | None:
+        """Fence this launcher's exact generation before owner-directed stop.
+
+        The daemon has already disabled the bearer under the claim mutex.
+        A surviving preparer handle is only usable when it belongs to the
+        receipt being relinquished; restart reconciliation may have no handle.
+        """
+        if not self._operation_lock.acquire(blocking=False):
+            raise ConflictError("a local Worker launch operation is in progress")
+        try:
+            with self._state_lock:
+                if self._active_receipt is not None and self._active_receipt != dict(receipt):
+                    raise ConflictError("local Worker generation changed")
+                handle = self._active_handle
+                if handle is None:
+                    handle = self.preparer.current_handle()
+                self._shutdown.set()
+                self._watch_stop.set()
+                self._active_handle = None
+                self._active_profile = None
+                self._active_identity = None
+                self._active_receipt = None
+                return handle
+        finally:
+            self._operation_lock.release()
+
     def _install_active(
         self,
         handle: object,

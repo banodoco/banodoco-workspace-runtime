@@ -398,8 +398,11 @@ class DeploymentReference:
         if isinstance(self.runtime_epoch, bool) or not isinstance(self.runtime_epoch, int) or self.runtime_epoch <= 0:
             raise DeploymentReferenceError("runtime_epoch must be a positive integer")
         object.__setattr__(self, "runtime_schema_digest", _digest(self.runtime_schema_digest, "runtime_schema_digest"))
-        if isinstance(self.capacity, bool) or not isinstance(self.capacity, int) or self.capacity != 2:
-            raise DeploymentReferenceError("capacity must be the canonical two-lane value 2")
+        # GenericPackHost drives one synchronous claim/execute loop. Its
+        # advertised max-concurrency does not create another polling worker;
+        # the local orchestration caller consumes no remote host capacity.
+        if isinstance(self.capacity, bool) or not isinstance(self.capacity, int) or self.capacity != 1:
+            raise DeploymentReferenceError("capacity must match the single GenericPackHost worker loop (1)")
         object.__setattr__(self, "session_config_digest", _digest(self.session_config_digest, "session_config_digest"))
         object.__setattr__(self, "credential_ref", _secret_free_reference(self.credential_ref, "credential_ref"))
         object.__setattr__(self, "boot_manifest_hash", _digest(self.boot_manifest_hash, "boot_manifest_hash"))
@@ -449,7 +452,7 @@ class DeploymentReference:
         readiness_profile_hash: str,
         source_closure_digest: str | None = None,
         executor_id: str = "astrid-pack-host",
-        capacity: int = 2,
+        capacity: int = 1,
         source_checkout: Path | None = None,
         source_checkout_digest: str | None = None,
         pack_roots: tuple[Path, ...] = (),

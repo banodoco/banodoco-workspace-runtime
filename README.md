@@ -72,3 +72,49 @@ The HTTP binding in this slice is the canonical Stage 1 runtime transport
 boundary used by the daemon and product integrations. OpenAPI and generated
 product bindings consume this same protocol contract in the
 protocol/conformance lane. No runtime module imports a product checkout.
+
+Remote worker preparation currently supports one remote worker credential
+generation per Runtime, using the shared `astrid-pack-host` actor. A local
+worker must not use that actor concurrently. Configured local profiles leave
+the actor available while their launcher is idle, so Runtime can start and
+reconcile an exact remote generation without changing profiles. If remote
+credential custody is live or unresolved at startup, local launcher creation is
+deferred and the credential remains disabled. Explicit local start stays
+refused until exact remote drain or revocation cleanup finishes; remote
+credential control is refused while the local launcher is preparing or active.
+The owner-only
+`control_remote_credential(task_id, body)` seam provisions an exact disabled
+generation, enables it after Runtime qualification, and reconciles exact
+cleanup. Repeating an identical provision never rotates its token; foreign or
+unresolved generations must be explicitly reconciled first. On daemon restart,
+persisted remote metadata and its token remain retained and disabled. Fresh
+Runtime session/epoch and process observations are required before reactivation.
+
+For explicit machine release, pass the exact recorded qualification with
+`action: "begin-drain"`, then `action: "finish-drain"` through the same owner
+control seam. Begin pins a running parent's attempt, lease, fence and epoch. It
+blocks fresh parent claims, retries and checkpoint resumes, while preserving
+existing attempt settlement and required child continuations under that exact
+parent lineage. Qualification expiry does not strand those pinned
+continuations; current session, epoch, binding and incarnation still must
+match. Finish computes parent/child terminal state, attempt settlement,
+reservations and binding status inside Runtime's serialized transaction. It
+returns `pending` while any work is unresolved, otherwise revokes that exact
+activation and removes only its credential generation. These responses are
+observations, not portable cleanup permits: a machine owner must call Runtime
+immediately before its independently verified process/provider cleanup.
+
+After restart, an already-persisted drain can finish only when the same binding
+remains authoritative and all work is proven quiescent. A live interrupted
+attempt stays unsettled with `provider_state_unknown`; release stays pending.
+An old successful finish retry never deletes a replacement generation. The
+credential file returned by provision is local to the resident Runtime owner;
+a remote SSH preparer must privately deliver the exact token into its owned
+restricted target file before acknowledging a grant. Runtime responses and
+preparation receipts never carry bearer bytes.
+
+Interrupted credential deletion retains a Runtime cleanup intent containing
+only committed credential-file hashes. Owner reconciliation removes surviving
+files only if their bytes still match that exact intent; changed or unrelated
+bytes remain unresolved. The daemon starts with such an actor disabled so the
+owner can reconcile it without replacing its credential generation.

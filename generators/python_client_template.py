@@ -320,10 +320,11 @@ class Task:
     execution_binding: Mapping[str, Any] | None = None
     storage_estimate: Mapping[str, int] | None = None
     required_facts: Mapping[str, Any] | None = None
+    expected_effect: Mapping[str, Any] | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Task":
-        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), generation_intent=dict(value["generation_intent"]) if value.get("generation_intent") is not None else None, project_id=value.get("project_id"), attempt_id=value.get("attempt_id"), runtime_epoch=int(value["runtime_epoch"]), result=value.get("result"), execution_request=dict(value["execution_request"]) if value.get("execution_request") is not None else None, execution_binding=dict(value["execution_binding"]) if value.get("execution_binding") is not None else None, storage_estimate=dict(value["storage_estimate"]) if value.get("storage_estimate") is not None else None, required_facts=dict(value["required_facts"]) if value.get("required_facts") is not None else None)
+        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), generation_intent=dict(value["generation_intent"]) if value.get("generation_intent") is not None else None, project_id=value.get("project_id"), attempt_id=value.get("attempt_id"), runtime_epoch=int(value["runtime_epoch"]), result=value.get("result"), execution_request=dict(value["execution_request"]) if value.get("execution_request") is not None else None, execution_binding=dict(value["execution_binding"]) if value.get("execution_binding") is not None else None, storage_estimate=dict(value["storage_estimate"]) if value.get("storage_estimate") is not None else None, required_facts=dict(value["required_facts"]) if value.get("required_facts") is not None else None, expected_effect=dict(value["expected_effect"]) if value.get("expected_effect") is not None else None)
 
 
 @dataclass(frozen=True)
@@ -482,10 +483,14 @@ class Executor:
     dependency_digest: str | None = None
     source_epoch: str | None = None
     verified_facts: Mapping[str, Any] | None = None
+    readiness: str | None = None
+    readiness_reason: str | None = None
+    last_seen_at: str | None = None
+    runtime_session_id: str | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Executor":
-        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"], runtime_epoch=int(value["runtime_epoch"]) if value.get("runtime_epoch") is not None else None, source_digest=value.get("source_digest"), dependency_digest=value.get("dependency_digest"), source_epoch=value.get("source_epoch"), verified_facts=dict(value["verified_facts"]) if value.get("verified_facts") is not None else None)
+        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"], runtime_epoch=int(value["runtime_epoch"]) if value.get("runtime_epoch") is not None else None, source_digest=value.get("source_digest"), dependency_digest=value.get("dependency_digest"), source_epoch=value.get("source_epoch"), verified_facts=dict(value["verified_facts"]) if value.get("verified_facts") is not None else None, readiness=value.get("readiness"), readiness_reason=value.get("readiness_reason"), last_seen_at=value.get("last_seen_at"), runtime_session_id=value.get("runtime_session_id"))
 
 
 def _decode_error(status: int, body: bytes, *, request_id: str = "") -> ApiError:
@@ -1246,6 +1251,24 @@ class WorkspaceClient:
     def register_executor(self, executor: Mapping[str, Any], *, idempotency_key: str) -> Executor:
         _, _, body = self._request("POST", "/v1/executors", body=json.dumps(dict(executor), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
         return Executor.from_json(self._json(body))
+
+    def get_executor(self, executor_id: str) -> Executor:
+        _, _, body = self._request("GET", f"/v1/executors/{_path_part(executor_id)}")
+        return Executor.from_json(self._json(body))
+
+    def get_local_worker_generation(self) -> Mapping[str, Any]:
+        _, _, body = self._request("GET", "/v1/control/local-worker/generation")
+        return self._json(body)
+
+    def start_local_worker(self, profile_id: str, expected_workspace_uuid: str) -> Mapping[str, Any]:
+        payload = {"profile_id": profile_id, "expected_workspace_uuid": expected_workspace_uuid}
+        _, _, body = self._request("POST", "/v1/control/local-worker/start", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
+        return self._json(body)
+
+    def relinquish_local_worker(self, executor_incarnation: str, evidence_digest: str) -> Mapping[str, Any]:
+        payload = {"executor_incarnation": executor_incarnation, "evidence_digest": evidence_digest}
+        _, _, body = self._request("POST", "/v1/control/local-worker/relinquish", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})
+        return self._json(body)
 
     def list_capabilities(self, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Capability], str | None]:
         query = (f"?limit={int(limit)}" if cursor or int(limit) != 50 else "") + (f"&cursor={_path_part(cursor)}" if cursor else "")

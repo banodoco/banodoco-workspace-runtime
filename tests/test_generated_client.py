@@ -76,6 +76,85 @@ def test_connected_register_executor_response_uses_generated_capability_parser(t
         daemon.stop()
 
 
+def test_owner_get_executor_observes_exact_readiness_and_session(tmp_path: Path) -> None:
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support", production_worker_credentials=True).start()
+    try:
+        owner = WorkspaceClient(daemon.endpoint, daemon.token)
+        owner.register_executor({
+            "executor_id": "exact-worker", "max_concurrency": 1,
+            "resource_keys": [], "capabilities": ["render.basic"],
+            "protocol": "workspace.v1", "source_digest": "sha256:" + "a" * 64,
+        }, idempotency_key="exact-worker-register")
+        observed = owner.get_executor("exact-worker")
+        assert observed.executor_id == "exact-worker"
+        assert observed.readiness == "ready"
+        assert observed.runtime_epoch == daemon.service.store._current_runtime_epoch()
+        assert observed.runtime_session_id == daemon.service.runtime_session_id
+        assert observed.source_digest == "sha256:" + "a" * 64
+        assert observed.last_seen_at
+        daemon.service.store.set_executor_readiness(
+            "exact-worker", ready=False, reason="observer_probe",
+            runtime_epoch=observed.runtime_epoch,
+        )
+        not_ready = owner.get_executor("exact-worker")
+        assert not_ready.readiness == "not_ready"
+        assert not_ready.readiness_reason == "observer_probe"
+        with pytest.raises(ApiError) as missing:
+            owner.get_executor("foreign-worker")
+        assert missing.value.status == 404
+        with pytest.raises(ApiError) as denied:
+            WorkspaceClient(daemon.endpoint, daemon.worker_token).get_executor("exact-worker")
+        assert denied.value.status in {401, 403}
+    finally:
+        daemon.stop()
+
+
+def test_generated_owner_local_generation_readback() -> None:
+    def transport(method, path, _headers, body):
+        if (method, path) == ("GET", "/v1/control/local-worker/generation"):
+            return 200, {}, json.dumps({
+                "executor_incarnation": "incarnation-1",
+                "evidence_digest": "sha256:" + "a" * 64,
+                "profile_id": "astrid", "workspace_uuid": "realm-1",
+                "state": "stop_unknown",
+            }).encode()
+        assert (method, path) == ("POST", "/v1/control/local-worker/relinquish")
+        assert json.loads(body) == {
+            "executor_incarnation": "incarnation-1",
+            "evidence_digest": "sha256:" + "a" * 64,
+        }
+        return 200, {}, b'{"state":"relinquished","executor_incarnation":"incarnation-1"}'
+
+    client = WorkspaceClient("http://runtime", "owner-token", transport=transport)
+    observed = client.get_local_worker_generation()
+    assert observed["executor_incarnation"] == "incarnation-1"
+    assert observed["state"] == "stop_unknown"
+    assert client.relinquish_local_worker(
+        observed["executor_incarnation"], observed["evidence_digest"]
+    )["state"] == "relinquished"
+
+
+def test_generated_owner_local_worker_restart():
+    expected = {
+        "state": "active", "operation_id": "operation-1", "profile_id": "astrid",
+        "workspace_uuid": "realm-1", "machine_id": "machine-1",
+        "executor_incarnation": "incarnation-2",
+        "evidence_digest": "sha256:" + "b" * 64,
+    }
+
+    def transport(method, path, _headers, body):
+        assert (method, path) == ("POST", "/v1/control/local-worker/start")
+        assert json.loads(body) == {
+            "profile_id": "astrid", "expected_workspace_uuid": "realm-1",
+        }
+        return 200, {}, json.dumps(expected).encode()
+
+    client = WorkspaceClient("http://runtime", "owner-token", transport=transport)
+    assert client.start_local_worker("astrid", "realm-1") == expected
+
+
 def test_generation_intent_round_trips_through_admission_claim_and_terminal_readback(tmp_path: Path) -> None:
     realm = tmp_path / "realm"
     RealmStore.initialize(realm).close()
@@ -169,6 +248,60 @@ def test_generation_intent_round_trips_through_admission_claim_and_terminal_read
         )
         assert "generation_intent" not in generic
         assert client.get_task(generic["task_id"]).generation_intent is None
+    finally:
+        daemon.stop()
+
+
+def test_expected_effect_round_trips_through_public_task_read(tmp_path: Path) -> None:
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support").start()
+    effect_payload = {
+        "version": 1,
+        "modality": "video",
+        "generation_type": "vibecomfy.run",
+        "metadata": {"h3_av": {"request_digest": "sha256:" + "a" * 64}},
+        "partial_success_policy": "reject",
+        "groups": [{
+            "group_key": "main",
+            "selectors": [{
+                "selector": "video",
+                "ordinal": 0,
+                "variant_key": "original",
+                "output_port": "vibecomfy_run",
+            }],
+        }],
+    }
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project(
+            "H3 receipt projection",
+            idempotency_key="effect-projection-project",
+            slug="h3-receipt-projection",
+        )
+        effect = {
+            "effect_type": "generation.publish_v1",
+            "target_id": project.project_id,
+            "payload": effect_payload,
+        }
+        admitted = client.admit_task(
+            capability_id="vibecomfy.run",
+            capability_digest="sha256:" + hashlib.sha256(b"vibecomfy.run").hexdigest(),
+            input_object_ids=[],
+            idempotency_key="effect-projection-task",
+            project_id=project.project_id,
+            settlement_effect=effect,
+            generation_intent={
+                "version": 1,
+                "modality": "video",
+                "partial_success_policy": "reject",
+                "metadata": effect_payload["metadata"],
+                "groups": effect_payload["groups"],
+            },
+        )
+
+        task = client.get_task(admitted["task_id"])
+        assert task.expected_effect == effect
     finally:
         daemon.stop()
 

@@ -600,7 +600,7 @@ paths:
   /v1/tasks/{task_id}/remote-credential:
     post:
       operationId: controlRemoteCredential
-      description: Owner-only resident credential generation, enablement, verification, or revocation for an already admitted remote task.
+      description: Owner-only resident credential generation, enablement, verification, exact uncommitted cleanup, and drain for an already admitted remote task.
       parameters: [ { $ref: '#/components/parameters/TaskId' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RemoteCredentialControl' } } } }
       responses: { '200': { description: Credential control result, content: { application/json: { schema: { type: object } } } }, '409': { $ref: '#/components/responses/Conflict' } }
@@ -644,6 +644,25 @@ paths:
       parameters: [ { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }
       responses: { '201': { description: Registered executor, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } } }
+  /v1/executors/{executor_id}:
+    get:
+      operationId: getExecutor
+      parameters: [ { name: executor_id, in: path, required: true, schema: { type: string, minLength: 1 } } ]
+      responses: { '200': { description: Exact owner-observed executor, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/Executor' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/local-worker/generation:
+    get:
+      operationId: getLocalWorkerGeneration
+      responses: { '200': { description: Current or pending owner-held local Worker generation, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerGeneration' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/control/local-worker/start:
+    post:
+      operationId: startLocalWorker
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerStartRequest' } } } }
+      responses: { '200': { description: Exact restarted local Worker generation, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerStartResult' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/control/local-worker/relinquish:
+    post:
+      operationId: relinquishLocalWorker
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerRelinquishRequest' } } } }
+      responses: { '200': { description: Exact local generation relinquished, content: { application/json: { schema: { $ref: './schemas/worker.json#/definitions/LocalWorkerRelinquishResult' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/capabilities:
     get:
       operationId: listCapabilities
@@ -904,7 +923,7 @@ components:
       additionalProperties: false
       required: [action]
       properties:
-        action: { type: string, enum: [provision, enable, verify, revoke] }
+        action: { type: string, enum: [provision, enable, verify, revoke, revoke-uncommitted, begin-drain, finish-drain] }
         activation_id: { type: string, minLength: 1 }
         qualification: { $ref: '#/components/schemas/RemoteActivationQualification' }
         placement: { type: object }
