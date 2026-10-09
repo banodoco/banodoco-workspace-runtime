@@ -1,0 +1,52 @@
+sha256	path	evidence_basis
+a41070d182913425edbcef85615bc0f0a4c18b758862e4ea072b675cfc6ee98a	banodoco_local/__init__.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+02e473edb8e71a99c6b2abbd6fdb011b8aab3955f43c98a4f35abda7668e41f6	banodoco_local/bootstrap.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+f616df25914079f89b0cc0063a6a513c724c2e149f5cf795195bb62182ca7727	banodoco_local/cli.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+f6a8a2a390dea263ef1ebceca0f5a883a323429f576f821eb9ee9305760ed9e2	banodoco_local/operator_upgrade.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+2bbe4d6a2654a6680fb58b9f971a2dbdf60d7276aaf425308be9076f8b460754	banodoco_local/runtime_boundary.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+4ce47bf936f1f619e9892f9dafb8b66b3b43d1dcd7de306e40ef33c5eaa4e647	banodoco_local/workspace.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+7eeb6622eb5597182df86f775388740b8a2a2c3bb9a91e2be11baec83f4d72e8	clients/typescript/contract-metadata.ts	I-09 successor reconciliation/source-integration round3 + I-11 sealed Runtime tuple
+12fc73ff54b89024d5d02b65abecbddb25e0b76114d73e7146789377d62c28b1	clients/typescript/generated.ts	I-09 successor reconciliation/source-integration round3 + I-11 sealed Runtime tuple
+259f06fa225aec0cb0e0cfc593fa89db4578fc26db9664e2b7632ce2f4fec234	conformance/fixtures/handshake.json	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+fcae767eaba85e406658ac3b14f3c3447e11073dffcb5e1256e223bdb84f51f4	contract/component-manifest.json	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+d2b2c2c3ef2d88bdc7d3e766d68de7beb6ed1040ab16a2b5d389af5592e101a5	contract/openapi/workspace-v1.yaml	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+2d5b35b754a0d56d969b1fb7f2ab9177ed0003f8ce74c68f2a8c2c51c01fda7e	contract/schemas/handshake-response.json	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+a887c25fb641f7ff7cc53101b96fa32edc5446b67371029e4afd2908cc58aa8b	contract/schemas/health.json	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+f4ba5d862baa1cc49a2eaef35588d117d63c5a296388eee0ddbe4525e529c6ac	contract/schemas/task.json	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+8e875fc1252ecc72dd3234f4702f4e58b8035620d02b9c9393b3e9408559e587	contract/schemas/worker.json	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+8d25d7a097b3391357f331c071cc231eda18bc9e432a205080696c95036e9dee	generators/generate.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+075d1fad14e9befb2f09ebb0043faf74a73570836544c728febb989aaf8cf264	generators/python_client_template.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+9c01d2a6c1cdcd47a090bf63f0e00a948710c3a76118fcfa9131d6a342baf950	packages/python/banodoco_workspace_client/contract_metadata.py	I-09 successor reconciliation/source-integration round3 + I-11 sealed Runtime tuple
+d6206ad8528e56d680c031d5eaa7ba67bcce85f64ec29953dab100e85ce55838	packages/python/banodoco_workspace_client/generated.py	I-09 successor reconciliation/source-integration round3 + I-11 sealed Runtime tuple
+8a35dde9d775bd32b711963b53736cb4a514201bb02b015dbbe91e69ce85c2b7	packages/typescript/src/contract-metadata.ts	I-09 successor reconciliation/source-integration round3 + I-11 sealed Runtime tuple
+21335d420323c98c21a0a12b3785d451244a789605a4209554929c7bcd5625c7	packages/typescript/src/generated.ts	I-09 successor reconciliation/source-integration round3 + I-11 sealed Runtime tuple
+1b3067589cd574ffe61684749892db8bad0f1f5c139df23bd1b3da19618b8261	pyproject.toml	runtime foundation + I-11 sealed packaging input
+6a91245a06f050e89fc43300704e6eae547522c04b6c4f15304a74e8f877c785	runtime_protocol/auth.py	I-06 implementation/source-integration round3 + I-11 sealed Runtime tuple
+405746e4def5210c569d40e1a2681f4c71507cde8874265ef869af1181b765e4	runtime_protocol/canonical_schema.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+8bd81cec980c37fab7137c99f63af0e2f3b0c752d542df66e88f509d261d9af2	runtime_protocol/catalog.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+9c01d2a6c1cdcd47a090bf63f0e00a948710c3a76118fcfa9131d6a342baf950	runtime_protocol/contract_metadata.py	I-09 successor reconciliation/source-integration round3 + I-11 sealed Runtime tuple
+c273dda27825051aed0983553c4206cb3f2df91685e2034ad5873aec35deca08	runtime_protocol/daemon.py	I-06 implementation/source-integration round3 + I-11 sealed Runtime tuple
+6329c44bfc195f865f39fdb527810407cff9e617433a63e6a68f68191249425a	runtime_protocol/lifecycle.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+309cb6a41a8c94d55612c9399dc3ae1300f3436ca3cf5cd9912b6e2e2cf70f2c	runtime_protocol/local_worker.py	I-06 implementation/source-integration round3 + I-11 sealed Runtime tuple
+630a900f7d333d8eeed89fea9ad4f062dc9af293cd3387a2ac6cf9608551fe13	runtime_protocol/server.py	I-06 implementation/source-integration round3 + I-11 sealed Runtime tuple
+c0bfc55332334cf8f944bf4ef5493c5e33e5dd46755d90df25ee5394eecd5e83	runtime_protocol/service.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+edebe606884fc3a0bc8d388e2f0006ea2fb67f2eff4ca43b4eaa5cf4b4740c21	runtime_protocol/store.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+8f1505fdc1085a344f9cab4dc06df7665a4a932dd00196b2d897f18c67b7219e	runtime_protocol/upgrade.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+3d1f4118d508d795a571f069863d1b70f43b50416c44a7ac81b14ff150d75615	tests/test_bootstrap.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+343af0f0d7aeb723c376ce163b92eb0524a2f31ad1310294f2b3bfbd14f9fb7b	tests/test_client_parity.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+4f19a6687d9f6aa379f8473ff625a8cba1ae49af90589bf498914d27e2e77841	tests/test_execution_binding_contract.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+95e1f2cb6f838fcdab763b370a612363290d36db5d4214fc2610be826d16408f	tests/test_generated_client.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+235eb2e41075c9231c2b7ff2fb2d97899386ed6f2162804bde03ab2cb16e8dae	tests/test_i06_composed_proof.py	I-06 implementation/source-integration round3 + I-11 sealed Runtime tuple
+4a1fedd336503405b9ad13d346a9ddcda83d94a58d1d3c9058170d1f190eeddd	tests/test_local_worker_placement.py	I-06 implementation/source-integration round3 + I-11 sealed Runtime tuple
+0c3b3996e13b87fbb4abcd318b0355f665d7b62302252d8cec2a01939a90ebdc	tests/test_operator_lifecycle_sol_closures.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+6c09a22bda69bfc4d67ef65ad309cb3cdd51248934f6ed8497af5e2826b02843	tests/test_operator_upgrade.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+9adf33a825c827722ee4fb4a5688e24064fb2f07e0fdad706b0d8ec04d2a3af7	tests/test_production_worker_credentials_luna.py	I-06 implementation/source-integration round3 + I-11 sealed Runtime tuple
+92e09e6bdf18b5efe96de767ace902a8f691bab40dc760622a22c2f49d593e70	tests/test_real_bootstrap.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+776b2f0937b679be9a8ebd65612f73174c1b83da28fa94dc3b8c1d860c85f61d	tests/test_realm_admission_hardening.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+f4e2f6286a72fb8b64f908bdba4f89b1ae68d20424ce9b045be39ba721c3699a	tests/test_relocation_real_e2e.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+219188bb057be89a7ec6084a3563e137f9fe4ac085d7691f9244db8a52c8d3f2	tests/test_runtime_boundary.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+ebeddf16d334136837896e79785a1766f1eceec0b7747840d41826e4aa3c62fa	tests/test_runtime_lifecycle.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+10bcdb57a1b631576bd828be27c3503e7f3afc55b28cc18e358d5e41973ebf1c	tests/test_runtime_upgrade.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+bfc97844d827d89619dbb10bb8eafcca6dfc25f573e77ebbf0a62a58c0281944	tests/test_schema_validation.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+f0471ca740c971c12b6585808347355456caf7ee5b792ea2023b539333c02adb	tests/test_stage1_runtime_contract_completion.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
+90d80a1fec939325fe10f983fb58c62c92b09d5ba3dae0a88423518f74375599	tests/test_workspace_lifecycle.py	runtime-foundation-review-round3 + I-11 sealed Runtime tuple
