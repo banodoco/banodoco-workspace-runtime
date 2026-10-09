@@ -28,6 +28,26 @@ def test_core_fixtures_validate_against_closed_schemas() -> None:
     validate("worker.json", "settlement.json", definition="Settlement")
 
 
+def test_health_schema_has_exact_closed_runtime_identity_contract() -> None:
+    schema = json.loads((ROOT / "contract/schemas/health.json").read_text())
+    fields = ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id"]
+    assert schema["additionalProperties"] is False
+    assert list(schema["required"]) == fields
+    assert list(schema["properties"]) == fields
+
+    value = {
+        "status": "ok",
+        "protocol": "workspace.v1",
+        "schema_digest": "sha256:" + "a" * 64,
+        "runtime_epoch": 1,
+        "runtime_session_id": "runtime-session-1",
+        "runtime_instance_id": "runtime-instance-1",
+    }
+    assert not list(Draft202012Validator(schema).iter_errors(value))
+    assert list(Draft202012Validator(schema).iter_errors({**value, "extra": True}))
+    assert list(Draft202012Validator(schema).iter_errors({key: item for key, item in value.items() if key != "runtime_instance_id"}))
+
+
 def test_closed_schemas_reject_unknown_fields() -> None:
     schema = json.loads((ROOT / "contract/schemas/project.json").read_text())
     instance = json.loads((ROOT / "conformance/fixtures/project.json").read_text())

@@ -1,0 +1,9 @@
+check	repository/path	expected	observed	result
+generated Python byte parity	Runtime packages/python/banodoco_workspace_client/generated.py ↔ Astrid banodoco_workspace_client/generated.py	d6206ad8528e56d680c031d5eaa7ba67bcce85f64ec29953dab100e85ce55838	d6206ad8528e56d680c031d5eaa7ba67bcce85f64ec29953dab100e85ce55838	PASS
+metadata tuple	Runtime packages/python/banodoco_workspace_client/contract_metadata.py ↔ Astrid banodoco_workspace_client/contract_metadata.py	PROTOCOL/SCHEMA_DIGEST/OPERATIONS equal	PROTOCOL workspace.v1; schema sha256:510b40ce55d488347001656014cd07e19c35d1a9e1f810dfc8f5c9fd1a26eae0; operations equal	PASS
+successor operation	Runtime generated Python and Astrid vendored Python	replaceParentCompositionMedia / replace_parent_composition_media present	present in both	PASS
+attempt identity	Runtime generated Python, Astrid vendored Python, app TypeScript	AttemptFence.run_id / run_id: string present	present in all three consumers	PASS
+app schema binding	reigh-app src/integrations/runtime/contract-metadata.ts	Runtime schema sha256:510b40ce55d488347001656014cd07e19c35d1a9e1f810dfc8f5c9fd1a26eae0	sha256:510b40ce55d488347001656014cd07e19c35d1a9e1f810dfc8f5c9fd1a26eae0	PASS
+app component binding	reigh-app src/integrations/runtime/contract-metadata.ts	Runtime component sha256:fcae767eaba85e406658ac3b14f3c3447e11073dffcb5e1256e223bdb84f51f4	sha256:fcae767eaba85e406658ac3b14f3c3447e11073dffcb5e1256e223bdb84f51f4	PASS
+frozen C1 raw identity	reigh-app config/contracts/astrid-plan-a-c1.json	b5036e16eab503afd15a4ec5b11cb178a01c6e895016b0545493e93314404783	b5036e16eab503afd15a4ec5b11cb178a01c6e895016b0545493e93314404783	PASS / unchanged
+frozen C2 raw identity	reigh-app config/contracts/astrid-plan-a-c2.json	1f8b9d99854150bf5a34afcff56758eb40af70adecef5be30933bb40def115ef	1f8b9d99854150bf5a34afcff56758eb40af70adecef5be30933bb40def115ef	PASS / unchanged

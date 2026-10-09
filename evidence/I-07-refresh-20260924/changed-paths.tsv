@@ -1,0 +1,7 @@
+scope	path	disposition
+product	<none>	No product source changed; the existing I-07 merge was retained and I-08/I-09/I-10-owned choices remain held.
+evidence	evidence/I-07-refresh-20260924/I-07-refresh-result.md	new continuation result
+evidence	evidence/I-07-refresh-20260924/collision-dispositions.tsv	new six-collision source identity and disposition manifest
+evidence	evidence/I-07-refresh-20260924/source-hashes.tsv	new client/contract/source identity manifest
+evidence	evidence/I-07-refresh-20260924/primary-fingerprints.tsv	new pre/post primary preservation proof
+evidence	evidence/I-07-refresh-20260924/commands.log	new deterministic command receipt

@@ -1,0 +1,7 @@
+sha256	path	custody
+86543cb6914ba50260453e0fd9d3cdb6ef171e954c0ea98f7e249ecaedb66e20	reigh-worker/source/runtime/supervisor.py	I-06 product change; Worker delivery worktree
+d399f66785fcf6cccbebd3ff7b3fe0e52c50ddca59988a6b49f222d233dc9654	reigh-worker/tests/test_worker_composition.py	I-06 deterministic test; Worker delivery worktree
+328316b28e3e3ddbb55469474a6d92203c045c98108cd2586020fc34a54be363	Astrid/astrid/core/execution/generic_host.py	I-06 product change; pre-existing dirty Astrid delivery worktree preserved
+eb8ac77f5de601db8dc6c54da8066bbcc92ad5429bf362a8b281ad132d922cda	Astrid/tests/core/execution/test_generic_host_contract.py	I-06 deterministic test; pre-existing untracked Astrid delivery worktree file preserved
+9c1886376a85ebfb7f1c0516b83b596e31cfebdd4579d6ae53a2a7eec14c94a8	banodoco-workspace-runtime/runtime_protocol/auth.py	I-06 correction; credential metadata-aware reuse/replacement in Runtime delivery worktree
+9adf33a825c827722ee4fb4a5688e24064fb2f07e0fdad706b0d8ec04d2a3af7	banodoco-workspace-runtime/tests/test_production_worker_credentials_luna.py	I-06 correction deterministic credential reuse/replacement test in Runtime delivery worktree

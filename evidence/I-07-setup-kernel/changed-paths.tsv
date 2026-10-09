@@ -1,0 +1,12 @@
+sha256	path	custody
+15c9f950cb159fcf14b4ad4320cd7f40b95bdf083540bb698e6f9945f08cbf4e	Astrid/astrid/core/gateway/__init__.py	I-07 product change; Astrid delivery worktree
+2827f11f50b4391228c2eabd0b149e378895ff51e7e1d01787614bd72d47e88c	Astrid/astrid/core/gateway/dispatch.py	I-07 product change; Astrid delivery worktree
+0e9d1ccffba7cf69513cd127c81891f1ba8f5d7c3df50d022887524378b89dd1	Astrid/astrid/core/gateway/help.py	I-07 product change; Astrid delivery worktree
+1f3f1ff1a93df030ffec0fb990a249ff97e2fd4af2a4b73aec8944b297f33ea6	Astrid/astrid/setup.py	I-07 product change; integrated setup/lifecycle owner
+2aab447dcd76be026b566d002bdb20e56e0b192a274bbd12f70464863cabb131	Astrid/astrid/runtime_cli.py	I-07 product change; new thin Runtime facade
+d1869917dd76d03e40019cd41dc98a4c11bf58c7fc9545d0544102354e83f2ae	Astrid/astrid/skills/__init__.py	I-07 product change; retained skill composition
+1588cd6e652520274f0afc02846796625bea0113f3dacc917bea7c9f21d3e21a	Astrid/astrid/skills/state.py	I-07 product change; retained setup-selection state
+e0cef8380ec04c4648439e45e749e788b5cce61f8bb69ee81f0db8882fc18e51	Astrid/tests/sdk/test_rrp_launcher_boundary.py	I-07 regression coverage; launcher boundary
+775ded89c7fa6c835b8088e26e6147579b20129324ef3b63d454491b6c3610e3	Astrid/tests/test_pipeline_dispatch_aliases.py	I-07 regression coverage; reserved route dispatch
+6304da807dce4519a063cc146196eea9c3867435e7123a6334b48efe911cd383	Astrid/tests/test_skills_package_data.py	I-07 regression coverage; skill selection composition
+d43e5d1aef1281e9fa7ab4212cd39b0667ffb4db3ffac2fc60c33adc81478e9c	Astrid/tests/test_setup_lifecycle_kernel.py	I-07 regression coverage; setup/observer/kernel acceptance

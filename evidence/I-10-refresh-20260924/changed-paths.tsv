@@ -1,0 +1,7 @@
+scope	path	disposition
+product	<none>	no product source changed; all I-10-owned collisions remain explicitly deferred
+evidence	evidence/I-10-refresh-20260924/I-10-refresh-result.md	new bounded disposition result
+evidence	evidence/I-10-refresh-20260924/disposition.tsv	new group disposition map
+evidence	evidence/I-10-refresh-20260924/source-hashes.tsv	new input identity manifest
+evidence	evidence/I-10-refresh-20260924/primary-fingerprints.tsv	new primary preservation proof
+evidence	evidence/I-10-refresh-20260924/commands.log	new command receipt

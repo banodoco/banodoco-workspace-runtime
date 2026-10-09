@@ -70,6 +70,9 @@ def test_product_clients_match_canonical_contract_projection() -> None:
     assert "getProjectTimeline" in typescript_methods
     assert {"publishParentComposition", "getProjectShotRevision", "getProjectTimelineRevision"}.issubset(typescript_methods)
     assert {"publish_parent_composition", "get_project_shot_revision", "get_project_timeline_revision"}.issubset(_python_methods())
+    assert "actual_target?: ExecutionTarget" in typescript_source
+    assert "executor_incarnation?: string" in typescript_source
+    assert "provider_state_unknown" in typescript_source
 
     component_digest = "sha256:" + hashlib.sha256((ROOT / "contract" / "component-manifest.json").read_bytes()).hexdigest()
     from generators.generate import contract_digest

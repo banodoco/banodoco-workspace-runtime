@@ -7,7 +7,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit, parse_qs
 
-from .errors import RuntimeErrorBase, AuthorizationError, NotFoundError, ProtocolError, InvalidRequestError
+from .errors import RuntimeErrorBase, AuthorizationError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError
 from .service import validate_idempotency_key
 
 
@@ -653,6 +653,21 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             return self._send(200, self.runtime.run(path[2]))
         raise NotFoundError("route not found")
 
+    def _is_local_worker_control(self):
+        return self.command == "POST" and urlsplit(self.path).path == "/v1/control/local-worker/start"
+
+    def _local_worker_control(self):
+        identity = self._identity("admin")
+        if identity.get("actor") != "owner":
+            raise ForbiddenError("local worker launch requires the Runtime owner actor")
+        body = self._body()
+        if not isinstance(body, dict) or set(body) != {"profile_id", "expected_workspace_uuid"}:
+            raise ProtocolError("profile_id and expected_workspace_uuid are the only accepted launch fields")
+        daemon = getattr(self.server, "daemon_runtime", None)
+        if daemon is None:
+            raise ConflictError("local worker launch requires daemon ownership")
+        return self._send(200, daemon.start_local_worker(body["profile_id"], body["expected_workspace_uuid"]))
+
     def _dispatch(self):
         """Serialize handlers that share the daemon's SQLite connection.
 
@@ -668,8 +683,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             self._pending_response = None
             self._defer_response = True
             try:
-                with self.runtime.store._mutex:
-                    self._route()
+                if self._is_local_worker_control():
+                    # Process preparation and OS observation are deliberately
+                    # outside the SQLite mutex. Credential authentication and
+                    # publication use CredentialStore's short internal lock.
+                    self._local_worker_control()
+                else:
+                    with self.runtime.store._mutex:
+                        self._route()
             finally:
                 self._defer_response = False
             if self._pending_response is not None:

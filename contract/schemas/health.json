@@ -3,11 +3,13 @@
   "$id": "https://banodoco.dev/workspace/v1/schemas/health.json",
   "title": "Health response",
   "type": "object", "additionalProperties": false,
-  "required": ["status", "protocol", "schema_digest", "runtime_epoch"],
+  "required": ["status", "protocol", "schema_digest", "runtime_epoch", "runtime_session_id", "runtime_instance_id"],
   "properties": {
     "status": { "type": "string", "enum": ["ok", "degraded"] },
     "protocol": { "type": "string", "const": "workspace.v1" },
     "schema_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
-    "runtime_epoch": { "type": "integer", "minimum": 1 }
+    "runtime_epoch": { "type": "integer", "minimum": 1 },
+    "runtime_session_id": { "type": "string", "minLength": 1 },
+    "runtime_instance_id": { "type": "string", "minLength": 1 }
   }
 }

@@ -21,6 +21,7 @@ MANIFEST = ROOT / "contract" / "manifest.json"
 COMPONENT_MANIFEST = ROOT / "contract" / "component-manifest.json"
 PYTHON_CLIENT_TEMPLATE = ROOT / "generators" / "python_client_template.py"
 PYTHON_CLIENT_OUTPUT = ROOT / "packages" / "python" / "banodoco_workspace_client" / "generated.py"
+TYPESCRIPT_CLIENT_OUTPUT = ROOT / "packages" / "typescript" / "src" / "generated.ts"
 
 
 def _regular(path: Path, label: str) -> bytes:
@@ -85,6 +86,41 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
     return rendered
 
 
+def validate_typescript_client(manifest_path: Path = MANIFEST) -> None:
+    """Fail closed when the typed product projection drifts from OpenAPI.
+
+    The TypeScript client remains a typed repository source rather than a
+    Python-template copy.  This check still binds every public method to the
+    canonical operation projection and asserts the execution binding fields
+    whose types cannot be inferred by the small metadata renderer.
+    """
+    source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
+    methods = set(re.findall(r"^  async (\w+)\(", source, re.MULTILINE))
+    expected = set(operation_index(manifest_path)) | {"updateTimelineDocument"}
+    if methods != expected:
+        missing = sorted(expected - methods)
+        extra = sorted(methods - expected)
+        raise SystemExit(
+            "TypeScript client operation projection drifted"
+            + (f"; missing={missing}" if missing else "")
+            + (f"; extra={extra}" if extra else "")
+        )
+    required_fragments = (
+        "actual_target?: ExecutionTarget",
+        "verification?: ExecutionBindingVerification",
+        "executor_incarnation?: string",
+        "run_id: string; project_id: string | null; lease_id: string",
+        "lease_expires_at: string; runtime_epoch: number",
+        "provider_state_unknown",
+    )
+    missing_fragments = [value for value in required_fragments if value not in source]
+    if missing_fragments:
+        raise SystemExit(
+            "TypeScript execution contract projection is stale: "
+            + ", ".join(missing_fragments)
+        )
+
+
 def render(manifest_path: Path = MANIFEST, component_path: Path = COMPONENT_MANIFEST) -> dict[str, str]:
     component_bytes, component = _component(component_path)
     digest = contract_digest(manifest_path)
@@ -124,6 +160,7 @@ def main() -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
             print(relative)
+    validate_typescript_client()
     return 0
 
 

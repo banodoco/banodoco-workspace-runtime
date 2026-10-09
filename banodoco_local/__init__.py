@@ -17,11 +17,13 @@ from .bootstrap import (
     UnsupportedRealmError,
     bootstrap,
     connect,
+    down,
     doctor,
     restart,
 )
 from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
+from .workspace import configure_workspace, inspect_workspace
 
 __all__ = [
     "BootstrapConfig",
@@ -38,8 +40,11 @@ __all__ = [
     "UnsupportedRealmError",
     "bootstrap",
     "connect",
+    "down",
     "doctor",
     "restart",
+    "configure_workspace",
+    "inspect_workspace",
 ]
 
 __version__ = "0.1.0"

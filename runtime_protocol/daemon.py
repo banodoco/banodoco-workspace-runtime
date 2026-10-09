@@ -48,7 +48,7 @@ def _authority_path(value, label):
 class RuntimeDaemon:
     """Loopback-only daemon owning one realm and its storage."""
 
-    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, production_worker_credentials=False, admission_timeout=None):
+    def __init__(self, root, *, support_root=None, export_root=None, display_name="Workspace", host="127.0.0.1", port=0, realm_id=None, owner_lock=None, bootstrap_token_file=None, reboot_executor=None, reboot_allowlist=None, production_worker_credentials=False, admission_timeout=None, local_worker_profiles=None, local_worker_preparer=None, local_worker_inspector=None):
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("runtime daemon only binds to loopback")
         self.root = _authority_path(root, "realm root").resolve()
@@ -84,6 +84,12 @@ class RuntimeDaemon:
         self.worker_token = None
         self.credential_path = None
         self.worker_credential_path = None
+        self.local_worker_profiles = dict(local_worker_profiles or {})
+        self.local_worker_preparer = local_worker_preparer
+        self.local_worker_inspector = local_worker_inspector
+        self.local_worker_launcher = None
+        if bool(self.local_worker_profiles) != bool(local_worker_preparer) or bool(self.local_worker_profiles) != bool(local_worker_inspector):
+            raise ValueError("local worker profiles, preparer, and inspector must be configured together")
 
     @property
     def endpoint(self):
@@ -104,8 +110,14 @@ class RuntimeDaemon:
         self.credentials = CredentialStore(_authority_path(self.support_root / "credentials", "credential root"))
         owner_scopes = ["admin", "handshake", "projects:read", "projects:write", "objects:read", "objects:write", "tasks:read", "tasks:write", "worker:execute", "worker:register", "credentials:provision"]
         self.token, self.credential_path = self.credentials.provision("owner", owner_scopes, rotate=rotate)
-        self.worker_token, self.worker_credential_path = self.credentials.provision(WORKER_ACTOR, list(WORKER_SCOPES), rotate=rotate)
-        if not self.production_worker_credentials:
+        if self.local_worker_profiles:
+            # The two-phase owner path issues this actor only after independent
+            # process verification. I-06b supplies the parked Worker adapter.
+            self.worker_token = None
+            self.worker_credential_path = self.credentials.path_for(WORKER_ACTOR)
+        else:
+            self.worker_token, self.worker_credential_path = self.credentials.provision(WORKER_ACTOR, list(WORKER_SCOPES), rotate=rotate)
+        if not self.production_worker_credentials and not self.local_worker_profiles:
             # Test-only in-process convenience.  The production CLI never
             # selects this branch; its pack host receives WORKER_ACTOR's
             # scoped token and cannot call admin/project routes.
@@ -165,6 +177,21 @@ class RuntimeDaemon:
         self.service.set_readiness_callback(self._revoke_readiness)
         self.catalog.bind_owner(self._catalog_owner_valid)
         self._provision_credentials(rotate=rotate_credentials)
+        if self.local_worker_profiles:
+            from .local_worker import LocalWorkerLauncher
+
+            self.local_worker_launcher = LocalWorkerLauncher(
+                credentials=self.credentials,
+                profiles=self.local_worker_profiles,
+                preparer=self.local_worker_preparer,
+                inspector=self.local_worker_inspector,
+                workspace_uuid=self.service.realm["id"],
+                realm_root=self.root,
+                support_root=self.support_root,
+                runtime_pid=os.getpid(),
+                actor=WORKER_ACTOR,
+                scopes=WORKER_SCOPES,
+            )
         self.httpd = RuntimeHTTPServer((self.host, self.port), RuntimeHandler)
         self.httpd.runtime = self.service
         self.httpd.daemon_runtime = self
@@ -176,11 +203,18 @@ class RuntimeDaemon:
         self.catalog.register(realm_id=self.service.realm["id"], display_name=self.service.realm["display_name"], data_root=str(self.root), owner=owner, runtime_epoch=owner["runtime_epoch"], runtime_instance_id=self.instance_id, readiness="ready")
         birth_id = process_birth_identity()
         if self.owner_lock:
-            atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"]})
-        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES))
+            atomic_json_write(self.owner_lock, {"pid": os.getpid(), "process_birth_id": birth_id, "runtime_instance_id": self.instance_id, "realm_id": self.service.realm["id"], "realm_root": str(self.root)})
+        self.discovery.publish(version=1, endpoint=self.endpoint, pid=os.getpid(), process_birth_id=birth_id, runtime_instance_id=self.instance_id, active_realm=self.service.realm["id"], realm_root=str(self.root), protocol_version="workspace.v1", schema_version="workspace-schema-v1", coordinator_epoch=self.instance_id, credential_file=str(self.credential_path), worker_credential_file=str(self.worker_credential_path), worker_actor=WORKER_ACTOR, worker_scopes=list(WORKER_SCOPES))
         self.thread = threading.Thread(target=self.httpd.serve_forever, name="banodoco-runtime", daemon=True)
         self.thread.start()
         return self
+
+    def start_local_worker(self, profile_id, expected_workspace_uuid):
+        if self.local_worker_launcher is None:
+            raise ConflictError(
+                "local Worker preparation is not installed; install the I-06b parked-host adapter"
+            )
+        return self.local_worker_launcher.start(profile_id, expected_workspace_uuid)
 
     def _replacement_state_path(self):
         return self.support_root / "replacement-state.json"

@@ -163,6 +163,28 @@ def test_malformed_doctor_is_structured_bounded_and_non_mutating(tmp_path, capsy
     assert _tree_bytes(root) == before
 
 
+@pytest.mark.parametrize("configured_timeout, expected_timeout", [(None, 5.0), (37.0, 37.0)])
+def test_doctor_uses_configured_admission_timeout(tmp_path, monkeypatch, configured_timeout, expected_timeout):
+    root = tmp_path / "realm"
+    RealmStore.initialize(root).close()
+    kwargs = {} if configured_timeout is None else {"admission_timeout": configured_timeout}
+    store = RealmStore(root, **kwargs)
+    observed = {}
+
+    def fake_integrity_report(self, *, catalog_path=None, timeout_seconds=None):
+        observed["catalog_path"] = catalog_path
+        observed["timeout_seconds"] = timeout_seconds
+        return {"ok": True, "state": "healthy"}
+
+    monkeypatch.setattr(RealmStore, "integrity_report", fake_integrity_report)
+    try:
+        assert store.doctor() == {"ok": True, "state": "healthy"}
+    finally:
+        store.close()
+
+    assert observed == {"catalog_path": None, "timeout_seconds": expected_timeout}
+
+
 def test_existing_realm_missing_attempts_table_fails_admission(tmp_path):
     root = tmp_path / "realm"
     RealmStore.initialize(root).close()

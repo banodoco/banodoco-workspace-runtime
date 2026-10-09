@@ -65,10 +65,11 @@
     },
     "AttemptFence": {
       "type": "object", "additionalProperties": false,
-      "required": ["attempt_id", "task_id", "project_id", "lease_id", "fence", "lease_expires_at", "runtime_epoch", "input_object_ids"],
+      "required": ["attempt_id", "task_id", "run_id", "project_id", "lease_id", "fence", "lease_expires_at", "runtime_epoch", "input_object_ids"],
       "properties": {
         "attempt_id": { "type": "string", "minLength": 1 },
         "task_id": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 },
         "project_id": { "type": ["string", "null"], "minLength": 1 },
         "lease_id": { "type": "string", "minLength": 1 },
         "fence": { "type": "integer", "minimum": 1 },
@@ -94,7 +95,7 @@
       "required": ["task", "waiting_reason"],
       "properties": {
         "task": { "$ref": "./task.json" },
-        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts", "waiting_for_dependencies", "dependency_failed", "dependency_cancelled"] }
+        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts", "waiting_for_dependencies", "dependency_failed", "dependency_cancelled", "execution_binding_missing", "execution_binding_mismatch", "provider_state_unknown"] }
       }
     },
     "Settlement": {

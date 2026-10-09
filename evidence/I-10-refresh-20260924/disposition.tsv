@@ -1,0 +1,4 @@
+owner_group	unresolved_rows	disposition	authority	next_action
+I-10 H3/RunPod	18	preserve-deferred	current-main and delivery bytes remain side-by-side; exact row identities in I-02 replay-operations.tsv	defer H3/resource/provider decision to later Plan B owner; no live validation in Plan A
+I-10 timeline/local-evaluation	14	preserve-deferred	current-main and delivery bytes remain side-by-side; deleted local-loop/adapter choices remain unresolved	defer timeline owner decision; do not accept deletion or rewrite implementation here
+I-07/I-09 paired H3 tests	4	preserve-held	I-02 unresolved-paths.tsv and I-07 refresh result	choose paired test/product bytes only during I-09/I-10 source reconciliation

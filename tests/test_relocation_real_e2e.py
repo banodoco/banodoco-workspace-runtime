@@ -10,7 +10,7 @@ import pytest
 from banodoco_local.bootstrap import BootstrapConfig, SourceProfile, bootstrap
 from banodoco_local.relocation import RelocationError, relocate
 from banodoco_local.runtime_boundary import LocalRuntimeBoundary
-from banodoco_local import RuntimePaths
+from banodoco_local import RuntimePaths, configure_workspace
 
 
 def _config(repo: Path) -> BootstrapConfig:
@@ -36,6 +36,7 @@ def test_real_runtime_daemon_cutover_starts_from_new_support_root(tmp_path):
     config = _config(repo)
 
     try:
+        configure_workspace(paths, boundary, config, mode="create", realm_root=paths.realms_dir / "explicit-realm", realm_id="explicit-realm")
         first = bootstrap(paths, boundary, config)
         assert first.ready
         marker = old_support / "auxiliary-preserved.txt"
@@ -71,6 +72,7 @@ def test_real_runtime_cutover_failure_rolls_back_tree_and_metadata(tmp_path, mon
     boundary = LocalRuntimeBoundary(wait_seconds=8)
     config = _config(repo)
     try:
+        configure_workspace(paths, boundary, config, mode="create", realm_root=paths.realms_dir / "explicit-realm", realm_id="explicit-realm")
         first = bootstrap(paths, boundary, config)
         before = paths.catalog_path.read_bytes()
         original_start = boundary.start
