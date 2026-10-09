@@ -14,7 +14,10 @@ from .errors import RuntimeErrorBase
 from .store import RealmStore
 from .upgrade import (
     DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION,
     migrate_historical_managed_outputs,
+    migrate_canonical_v24_to_v25,
+    repair_generic_media_types,
     upgrade_realm,
 )
 
@@ -41,17 +44,28 @@ def _parser():
     doctor.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     doctor.add_argument("--json", action="store_true")
     doctor.add_argument("--support-root")
-    upgrade = sub.add_parser("upgrade", help="offline upgrade one stopped v23 realm to the canonical format")
+    upgrade = sub.add_parser("upgrade", help="offline upgrade one stopped legacy realm to the canonical format")
     upgrade.add_argument("--root", required=True)
     upgrade.add_argument("--archive-root")
     upgrade.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     upgrade.add_argument("--confirm", required=True)
+    variant_state = sub.add_parser("migrate-variant-state", help="offline migrate one stopped canonical v24 realm to v25")
+    variant_state.add_argument("--root", required=True)
+    variant_state.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    variant_state.add_argument("--confirm", required=True)
     reconcile = sub.add_parser("migrate-managed-outputs", help="materialize verified associations for historical settled render outputs")
     reconcile.add_argument("--root", required=True)
     reconcile.add_argument("--project-id")
     reconcile.add_argument("--task-id")
     reconcile.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
     reconcile.add_argument("--confirm", required=True)
+    repair = sub.add_parser("repair-media-types", help="repair generic published MIME values from managed filenames")
+    repair.add_argument("--root", required=True)
+    repair.add_argument("--project-id")
+    repair.add_argument("--task-id")
+    repair.add_argument("--generation-id")
+    repair.add_argument("--timeout", type=float, default=DEFAULT_UPGRADE_TIMEOUT_SECONDS)
+    repair.add_argument("--confirm", required=True)
     backup = sub.add_parser("backup", help="create a verified self-contained realm backup")
     backup.add_argument("--root", default=os.environ.get("BANODOCO_RUNTIME_ROOT", ".runtime"))
     backup.add_argument("--support-root")
@@ -131,12 +145,39 @@ def main(argv=None):
             return 1
         print(json.dumps(result, sort_keys=True))
         return 0
+    if args.command == "migrate-variant-state":
+        try:
+            result = migrate_canonical_v24_to_v25(
+                args.root,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if args.command == "migrate-managed-outputs":
         try:
             result = migrate_historical_managed_outputs(
                 args.root,
                 project_id=args.project_id,
                 task_id=args.task_id,
+                timeout_seconds=args.timeout,
+                confirmation=args.confirm,
+            )
+        except RuntimeErrorBase as exc:
+            print(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True))
+            return 1
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if args.command == "repair-media-types":
+        try:
+            result = repair_generic_media_types(
+                args.root,
+                project_id=args.project_id,
+                task_id=args.task_id,
+                generation_id=args.generation_id,
                 timeout_seconds=args.timeout,
                 confirmation=args.confirm,
             )

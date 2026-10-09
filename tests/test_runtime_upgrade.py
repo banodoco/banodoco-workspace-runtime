@@ -10,7 +10,7 @@ import pytest
 
 from runtime_protocol.errors import OwnerBusyError, ValidationError
 from runtime_protocol.store import RealmStore
-from runtime_protocol.upgrade import upgrade_realm
+from runtime_protocol.upgrade import migrate_canonical_v24_to_v25, repair_generic_media_types, upgrade_realm
 
 
 def _legacy_realm(root, *, register_indexes=True):
@@ -97,7 +97,7 @@ def test_upgrade_archives_legacy_state_and_preserves_canonical_rows(tmp_path):
     archive = tmp_path / "realm" / "realm-upgrade-backups" / result["archive"].split("/")[-1]
     manifest = json.loads((archive / "manifest.json").read_text())
     assert manifest["source_schema_version"] == 23
-    assert manifest["target_schema_version"] == 24
+    assert manifest["target_schema_version"] == 25
     assert manifest["historical_managed_outputs"]["migrated"] == 1
     assert set(manifest["legacy_tables"]) >= {"schema_migrations", "lost_and_found"}
     assert (archive / "realm.sqlite3").is_file()
@@ -110,7 +110,7 @@ def test_upgrade_archives_legacy_state_and_preserves_canonical_rows(tmp_path):
     reopened = RealmStore(root)
     try:
         row = reopened.conn.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
-        assert tuple(row) == ("astrid-runtime-sqlite-v1", 24)
+        assert tuple(row) == ("astrid-runtime-sqlite-v1", 25)
         assert reopened.conn.execute("SELECT id FROM realm").fetchone()[0] == realm_id
         assert reopened.conn.execute("SELECT id FROM generations").fetchone()[0] == "generation-1"
         migrated_output = reopened.list_managed_outputs("task-1")
@@ -120,6 +120,67 @@ def test_upgrade_archives_legacy_state_and_preserves_canonical_rows(tmp_path):
         assert {"managed_output_associations", "managed_output_lifecycle"}.issubset(tables)
     finally:
         reopened.close()
+
+
+def test_canonical_v24_variant_state_migration_is_additive_and_refuses_repeat(tmp_path):
+    root = tmp_path / "realm"
+    store = RealmStore.initialize(root, realm_id="realm-v24")
+    project = store.create_project("v24", "V24", idempotency_key="project-v24")
+    timestamp = "2026-09-22T00:00:00Z"
+    store.conn.execute(
+        "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, version, created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, 1, ?, ?)",
+        ("generation-v24", project["id"], "video", "succeeded", "{}", timestamp, timestamp),
+    )
+    store.conn.execute(
+        "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("variant-v24", "generation-v24", None, "original", "{}", timestamp),
+    )
+    store.conn.commit()
+    store.close()
+
+    connection = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("ALTER TABLE generation_variants RENAME TO generation_variants_v25")
+        connection.execute(
+            """
+            CREATE TABLE generation_variants (
+                id TEXT PRIMARY KEY,
+                generation_id TEXT NOT NULL REFERENCES generations(id),
+                object_id TEXT REFERENCES objects(digest),
+                variant_type TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) SELECT id, generation_id, object_id, variant_type, metadata_json, created_at FROM generation_variants_v25"
+        )
+        connection.execute("DROP TABLE generation_variants_v25")
+        connection.execute("UPDATE runtime_schema SET version=24 WHERE id=1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = migrate_canonical_v24_to_v25(
+        root,
+        confirmation="MIGRATE VARIANT STATE realm-v24",
+    )
+    assert result["target_schema_version"] == 25
+    reopened = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        assert reopened.execute("SELECT version FROM runtime_schema WHERE id=1").fetchone()[0] == 25
+        columns = {row[1] for row in reopened.execute("PRAGMA table_info(generation_variants)")}
+        assert {"thumbnail_object_id", "thumbnail_source_object_id", "thumbnail_recipe_version", "viewed_at"} <= columns
+        foreign_keys = {row[3] for row in reopened.execute("PRAGMA foreign_key_list(generation_variants)")}
+        assert {"thumbnail_object_id", "thumbnail_source_object_id"} <= foreign_keys
+        assert reopened.execute("SELECT viewed_at FROM generation_variants WHERE id='variant-v24'").fetchone()[0] is None
+    finally:
+        reopened.close()
+
+    with pytest.raises(ValidationError, match="canonical schema v24"):
+        migrate_canonical_v24_to_v25(root, confirmation="MIGRATE VARIANT STATE realm-v24")
 
 
 def test_upgrade_refuses_unknown_shape_without_touching_source(tmp_path):
@@ -160,6 +221,88 @@ def test_upgrade_repairs_missing_historical_object_indexes(tmp_path):
         assert reopened.conn.execute(
             "SELECT relation FROM project_objects WHERE project_id='project-1' AND digest=?", (digest,)
         ).fetchone()[0] == "managed"
+    finally:
+        reopened.close()
+
+
+def test_repair_generic_media_types_updates_object_association_and_variant(tmp_path):
+    root = tmp_path / "realm"
+    store = RealmStore.initialize(root, realm_id="realm-repair")
+    store.close()
+    timestamp = "2026-09-22T00:00:00Z"
+    payload = b"not-a-real-video-but-a-digest-checked-fixture"
+    digest = hashlib.sha256(payload).hexdigest()
+    cas = root / "cas" / "sha256" / digest[:2]
+    cas.mkdir(parents=True, exist_ok=True)
+    (cas / digest[2:]).write_bytes(payload)
+
+    connection = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        connection.execute(
+            "INSERT INTO projects(id, realm_id, slug, name, metadata_json, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("project-repair", "realm-repair", "repair", "Repair", "{}", 1, timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO runs(id, project_id, capability, spec_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("run-repair", "project-repair", "vibecomfy.run", "{}", "completed", timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO tasks(id, run_id, capability, spec_json, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("task-repair", "run-repair", "vibecomfy.run", "{}", "completed", timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("attempt-repair", "task-repair", "lease-repair", 1, "fixture", timestamp, 1, 1),
+        )
+        connection.execute(
+            "INSERT INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+            (digest, len(payload), "application/octet-stream", "vibecomfy_run", timestamp),
+        )
+        connection.execute(
+            "INSERT INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, ?, ?)",
+            ("project-repair", digest, "managed", timestamp),
+        )
+        connection.execute(
+            "INSERT INTO generations(id, project_id, source_task_id, type, status, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("generation-repair", "project-repair", "task-repair", "vibecomfy.run", "completed", "{}", timestamp, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "variant-repair",
+                "generation-repair",
+                digest,
+                "original",
+                json.dumps({"filename": "render.mp4", "media_type": "application/octet-stream"}),
+                timestamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO managed_output_associations(association_id, task_id, attempt_id, project_id, output_port, group_key, generation_id, variant_key, object_digest, size, filename, media_type, ordinal, role, producer_json, provenance_json, durability, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "association-repair", "task-repair", "attempt-repair", "project-repair",
+                "vibecomfy_run", "main", "generation-repair", "original", digest,
+                len(payload), "render.mp4", "application/octet-stream", 0, "result", "{}", "{}", "durable", timestamp,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = repair_generic_media_types(
+        root,
+        task_id="task-repair",
+        confirmation="REPAIR GENERIC MEDIA TYPES realm-repair",
+    )
+    assert result["repaired"] == {"objects": 1, "associations": 1, "variants": 1}
+    assert result["skipped_count"] == 0
+
+    reopened = sqlite3.connect(root / "realm.sqlite3")
+    try:
+        assert reopened.execute("SELECT media_type FROM objects WHERE digest=?", (digest,)).fetchone()[0] == "video/mp4"
+        assert reopened.execute("SELECT media_type FROM managed_output_associations WHERE association_id='association-repair'").fetchone()[0] == "video/mp4"
+        metadata = json.loads(reopened.execute("SELECT metadata_json FROM generation_variants WHERE id='variant-repair'").fetchone()[0])
+        assert metadata["media_type"] == "video/mp4"
     finally:
         reopened.close()
 

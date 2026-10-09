@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - supported beta host is POSIX
     fcntl = None
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 LEASE_SECONDS = 30
 EXECUTOR_LIVENESS_SECONDS = 90
 REALM_ADMISSION_TIMEOUT_SECONDS = 5.0
@@ -62,7 +62,7 @@ REQUIRED_SCHEMA_COLUMNS = {
     "continuation_admissions": frozenset("continuation_task_id dependency_snapshot_json admitted_at".split()),
     "events": frozenset("id run_id task_id kind payload_json previous_hash event_hash created_at".split()),
     "executors": frozenset("id max_concurrency resource_keys_json capabilities_json protocol created_at runtime_epoch readiness readiness_reason last_seen_at source_digest dependency_digest source_epoch".split()),
-    "generation_variants": frozenset("id generation_id object_id variant_type metadata_json created_at".split()),
+    "generation_variants": frozenset("id generation_id object_id variant_type metadata_json thumbnail_object_id thumbnail_source_object_id thumbnail_recipe_version viewed_at created_at".split()),
     "generations": frozenset("id project_id source_task_id type status metadata_json version created_at updated_at".split()),
     "media_references": frozenset("id reference_id media_id role ordinal is_primary metadata_json created_at".split()),
     "media_relations": frozenset("project_id from_digest to_digest kind ordinal metadata_json created_at".split()),
@@ -2417,6 +2417,17 @@ class RealmStore:
         }
 
     @staticmethod
+    def _variant_thumbnail_columns(descriptor):
+        """Return the durable variant poster columns for a validated descriptor."""
+        if descriptor is None:
+            return (None, None, None)
+        return (
+            descriptor["object_id"].removeprefix("sha256:"),
+            descriptor["source_object_id"].removeprefix("sha256:"),
+            descriptor["recipe_version"],
+        )
+
+    @staticmethod
     def _validate_existing_generation_thumbnail(value, *, generation_id):
         if value is None:
             return
@@ -2674,11 +2685,17 @@ class RealmStore:
             if not group["selected"]:
                 group["primary_output"] = None
                 group["thumbnail"] = None
+                group["thumbnails"] = {}
                 continue
             primary_output = self._selected_primary_publish_output(
                 group["selected"], effect_type="generation.publish_v1"
             )
             group["primary_output"] = primary_output
+            group["thumbnails"] = {
+                output["digest"]: thumbnails_by_source[output["digest"]]
+                for _key, _declaration, output in group["selected"]
+                if output["digest"] in thumbnails_by_source
+            }
             group["thumbnail"] = thumbnails_by_source.get(primary_output["digest"])
         return plan
 
@@ -2918,6 +2935,7 @@ class RealmStore:
             "creative_output": selected,
             "primary_source_object_id": primary_source_object_id,
             "thumbnail": thumbnails.get(primary_source_object_id),
+            "variant_thumbnail": thumbnails.get(selected["digest"]),
         }
 
     def _validate_generation_thumbnail_attach_effect(
@@ -3133,14 +3151,23 @@ class RealmStore:
                         "regeneration": output.get("regeneration"),
                         "coverage": output.get("coverage"),
                     }
+                    thumbnail_descriptor = group.get("thumbnails", {}).get(output["digest"])
+                    thumbnail = (
+                        self._thumbnail_metadata_descriptor(thumbnail_descriptor, output["digest"])
+                        if thumbnail_descriptor is not None else None
+                    )
+                    thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version = self._variant_thumbnail_columns(thumbnail)
                     self.conn.execute(
-                        "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version, viewed_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
                         (
                             variant_id,
                             generation_id,
                             output_digest,
                             declaration["variant_key"],
                             canonical_json(variant_metadata),
+                            thumbnail_object_id,
+                            thumbnail_source_object_id,
+                            thumbnail_recipe_version,
                             timestamp,
                         ),
                     )
@@ -3250,14 +3277,22 @@ class RealmStore:
                 "media_type": output.get("media_type"),
                 "size": output.get("size"),
             }
+            thumbnail = (
+                self._thumbnail_metadata_descriptor(plan["thumbnail"], output["digest"])
+                if plan["thumbnail"] is not None else None
+            )
+            thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version = self._variant_thumbnail_columns(thumbnail)
             self.conn.execute(
-                "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version, viewed_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
                 (
                     variant_id,
                     generation_id,
                     output_digest,
                     payload["variant_type"],
                     canonical_json(variant_metadata),
+                    thumbnail_object_id,
+                    thumbnail_source_object_id,
+                    thumbnail_recipe_version,
                     timestamp,
                 ),
             )
@@ -3356,10 +3391,19 @@ class RealmStore:
                 "output_ordinal": payload["output_ordinal"],
                 "primary_policy": payload["primary_policy"],
             }
+            thumbnail = (
+                self._thumbnail_metadata_descriptor(plan["variant_thumbnail"], output["digest"])
+                if plan["variant_thumbnail"] is not None else None
+            )
+            thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version = self._variant_thumbnail_columns(thumbnail)
             try:
                 self.conn.execute(
-                    "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (variant_id, str(effect["target_id"]), output_digest, payload["variant_type"], canonical_json(metadata), timestamp),
+                    "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version, viewed_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                    (
+                        variant_id, str(effect["target_id"]), output_digest, payload["variant_type"],
+                        canonical_json(metadata), thumbnail_object_id,
+                        thumbnail_source_object_id, thumbnail_recipe_version, timestamp,
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ConflictError(

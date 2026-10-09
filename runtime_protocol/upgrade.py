@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import re
 import shutil
@@ -50,11 +51,19 @@ REVISION_TABLES = frozenset({
     "composition_revision_dependencies",
 })
 DEFAULT_UPGRADE_TIMEOUT_SECONDS = 120.0
+CANONICAL_PREVIOUS_SCHEMA_VERSION = 24
 HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION = "MIGRATE MANAGED OUTPUTS"
+GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION = "REPAIR GENERIC MEDIA TYPES"
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".webm", ".mkv"})
 _VIDEO_MEDIA_TYPES = frozenset({
     "video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "clip/visual",
 })
+_VIDEO_SUFFIX_MEDIA_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+}
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _HISTORICAL_ASSOCIATION_COLUMNS = (
     "association_id", "task_id", "attempt_id", "project_id", "output_port", "group_key",
@@ -212,6 +221,77 @@ def _open_readonly(db: Path) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only=ON")
     return connection
+
+
+def migrate_canonical_v24_to_v25(
+    root: str | Path,
+    *,
+    timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    confirmation: str | None = None,
+) -> dict:
+    """Add variant poster/read-state columns to a stopped canonical v24 realm."""
+    root = Path(root).expanduser().resolve()
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        raise RealmAdmissionError("realm root is missing or invalid")
+    if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+        raise ValidationError("timeout_seconds must be positive")
+    with _owner_fence(root):
+        db = root / "realm.sqlite3"
+        _regular(db, "realm database")
+        connection = sqlite3.connect(db)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            schema = connection.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
+            if not schema or schema[0] != CANONICAL_FORMAT_ID or int(schema[1]) != CANONICAL_PREVIOUS_SCHEMA_VERSION:
+                raise ValidationError(
+                    f"variant state migration requires canonical schema v{CANONICAL_PREVIOUS_SCHEMA_VERSION}"
+                )
+            realm_id = str(connection.execute("SELECT id FROM realm LIMIT 1").fetchone()[0])
+            expected_confirmation = f"MIGRATE VARIANT STATE {realm_id}"
+            if confirmation != expected_confirmation:
+                raise ValidationError(f"migration requires confirmation exactly '{expected_confirmation}'")
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(generation_variants)")}
+            required = {"id", "generation_id", "object_id", "variant_type", "metadata_json", "created_at"}
+            if not required.issubset(columns):
+                raise ValidationError("v24 generation_variants shape is not recognized")
+            unexpected = columns - required
+            if unexpected:
+                raise ValidationError("v24 generation_variants already has unsupported state columns")
+            started = time.monotonic()
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "ALTER TABLE generation_variants ADD COLUMN thumbnail_object_id TEXT REFERENCES objects(digest)"
+            )
+            connection.execute(
+                "ALTER TABLE generation_variants ADD COLUMN thumbnail_source_object_id TEXT REFERENCES objects(digest)"
+            )
+            connection.execute("ALTER TABLE generation_variants ADD COLUMN thumbnail_recipe_version INTEGER")
+            connection.execute("ALTER TABLE generation_variants ADD COLUMN viewed_at TEXT")
+            connection.execute(
+                "UPDATE runtime_schema SET version=? WHERE id=1",
+                (SCHEMA_VERSION,),
+            )
+            connection.commit()
+            elapsed = time.monotonic() - started
+            return {
+                "ok": True,
+                "realm_id": realm_id,
+                "source_schema_version": CANONICAL_PREVIOUS_SCHEMA_VERSION,
+                "target_schema_version": SCHEMA_VERSION,
+                "added_columns": [
+                    "thumbnail_object_id",
+                    "thumbnail_source_object_id",
+                    "thumbnail_recipe_version",
+                    "viewed_at",
+                ],
+                "elapsed_seconds": elapsed,
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 def _source_shape(connection: sqlite3.Connection) -> tuple[set[str], dict[str, list[str]], str]:
@@ -552,6 +632,251 @@ def _verified_cas_object(root: Path, digest: str, expected_size: int, deadline: 
         raise ValidationError(f"historical output CAS verification failed for {digest}")
 
 
+def _media_type_from_filename(filename: object) -> str | None:
+    """Infer a display MIME only from a safe direct output filename."""
+    if not isinstance(filename, str) or not filename or Path(filename).name != filename:
+        return None
+    media_type = _VIDEO_SUFFIX_MEDIA_TYPES.get(Path(filename).suffix.lower())
+    if media_type is not None:
+        return media_type
+    media_type = mimetypes.guess_type(filename)[0]
+    if not media_type or media_type.lower() == "application/octet-stream":
+        return None
+    return media_type
+
+
+def repair_generic_media_types(
+    root: str | Path,
+    *,
+    project_id: str | None = None,
+    task_id: str | None = None,
+    generation_id: str | None = None,
+    timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
+    confirmation: str | None = None,
+) -> dict:
+    """Repair generic published MIME values using the managed filename contract.
+
+    This is an explicit, stopped-runtime migration for rows published before
+    producers consistently supplied MIME types. It changes metadata only when
+    every reference to an object agrees with the filename-derived type and the
+    CAS bytes still verify against the stored digest and size.
+    """
+    root = Path(root).expanduser().resolve()
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        raise RealmAdmissionError("realm root is missing or invalid")
+    if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+        raise ValidationError("timeout_seconds must be positive")
+    with _owner_fence(root):
+        db = root / "realm.sqlite3"
+        _regular(db, "realm database")
+        connection = sqlite3.connect(db)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            schema = connection.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
+            if not schema or schema[0] != CANONICAL_FORMAT_ID or int(schema[1]) != SCHEMA_VERSION:
+                raise ValidationError(f"generic MIME repair requires canonical schema v{SCHEMA_VERSION}")
+            realm_id = str(connection.execute("SELECT id FROM realm LIMIT 1").fetchone()[0])
+            expected_confirmation = f"{GENERIC_MEDIA_TYPE_REPAIR_CONFIRMATION} {realm_id}"
+            if confirmation != expected_confirmation:
+                raise ValidationError(f"repair requires confirmation exactly '{expected_confirmation}'")
+
+            filters: list[str] = []
+            association_params: list[object] = ["application/octet-stream"]
+            variant_params: list[object] = ["application/octet-stream"]
+            if project_id:
+                filters.append("project_id=?")
+                association_params.append(project_id)
+            if task_id:
+                filters.append("task_id=?")
+                association_params.append(task_id)
+            if generation_id:
+                filters.append("generation_id=?")
+                association_params.append(generation_id)
+            association_where = " AND ".join(["media_type=?", *filters])
+            associations = connection.execute(
+                f"SELECT * FROM managed_output_associations WHERE {association_where} ORDER BY association_id",
+                tuple(association_params),
+            ).fetchall()
+
+            variant_filters: list[str] = ["json_extract(gv.metadata_json, '$.media_type')=?"]
+            if project_id:
+                variant_filters.append("g.project_id=?")
+                variant_params.append(project_id)
+            if task_id:
+                variant_filters.append("g.source_task_id=?")
+                variant_params.append(task_id)
+            if generation_id:
+                variant_filters.append("gv.generation_id=?")
+                variant_params.append(generation_id)
+            variants = connection.execute(
+                "SELECT gv.*, g.project_id, g.source_task_id FROM generation_variants gv "
+                "JOIN generations g ON g.id=gv.generation_id WHERE "
+                + " AND ".join(variant_filters)
+                + " ORDER BY gv.id",
+                tuple(variant_params),
+            ).fetchall()
+
+            skipped: list[dict[str, object]] = []
+            association_plan: list[tuple[str, str, str]] = []
+            variant_plan: list[tuple[str, str, str]] = []
+            digest_targets: dict[str, set[str]] = {}
+
+            for row in associations:
+                media_type = _media_type_from_filename(row["filename"])
+                if media_type is None:
+                    skipped.append({"kind": "association", "id": row["association_id"], "reason": "filename_has_no_supported_mime"})
+                    continue
+                digest_targets.setdefault(str(row["object_digest"]), set()).add(media_type)
+                association_plan.append((str(row["association_id"]), str(row["object_digest"]), media_type))
+
+            for row in variants:
+                try:
+                    metadata = json.loads(row["metadata_json"])
+                except (TypeError, json.JSONDecodeError):
+                    skipped.append({"kind": "variant", "id": row["id"], "reason": "malformed_metadata"})
+                    continue
+                media_type = _media_type_from_filename(metadata.get("filename"))
+                if media_type is None or not row["object_id"]:
+                    skipped.append({"kind": "variant", "id": row["id"], "reason": "filename_has_no_supported_mime"})
+                    continue
+                digest = str(row["object_id"])
+                digest_targets.setdefault(digest, set()).add(media_type)
+                variant_plan.append((str(row["id"]), digest, media_type))
+
+            target_by_digest: dict[str, str] = {}
+            for digest, targets in digest_targets.items():
+                if len(targets) != 1:
+                    skipped.append({"kind": "object", "id": digest, "reason": "conflicting_filename_mimes"})
+                    continue
+                target_by_digest[digest] = next(iter(targets))
+
+            deadline = time.monotonic() + float(timeout_seconds)
+            for digest, target in list(target_by_digest.items()):
+                object_row = connection.execute(
+                    "SELECT size, media_type FROM objects WHERE digest=?", (digest,)
+                ).fetchone()
+                if object_row is None:
+                    skipped.append({"kind": "object", "id": digest, "reason": "object_missing"})
+                    target_by_digest.pop(digest)
+                    continue
+                _verified_cas_object(root, digest, int(object_row["size"]), deadline)
+                existing_object_type = str(object_row["media_type"] or "").strip().lower()
+                if existing_object_type not in {"", "application/octet-stream", target}:
+                    skipped.append({"kind": "object", "id": digest, "reason": "object_media_type_conflict"})
+                    target_by_digest.pop(digest)
+                    continue
+                for reference in connection.execute(
+                    "SELECT media_type, filename FROM managed_output_associations WHERE object_digest=?",
+                    (digest,),
+                ):
+                    reference_type = str(reference["media_type"] or "").strip().lower()
+                    inferred = _media_type_from_filename(reference["filename"])
+                    resolved = inferred if reference_type in {"", "application/octet-stream", "clip/visual"} else reference_type
+                    if resolved != target:
+                        skipped.append({"kind": "object", "id": digest, "reason": "association_media_type_conflict"})
+                        target_by_digest.pop(digest)
+                        break
+                if digest not in target_by_digest:
+                    continue
+                for reference in connection.execute(
+                    "SELECT metadata_json FROM generation_variants WHERE object_id=?",
+                    (digest,),
+                ):
+                    try:
+                        metadata = json.loads(reference["metadata_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        resolved = None
+                    else:
+                        reference_type = str(metadata.get("media_type") or "").strip().lower()
+                        inferred = _media_type_from_filename(metadata.get("filename"))
+                        resolved = inferred if reference_type in {"", "application/octet-stream", "clip/visual"} else reference_type
+                    if resolved != target:
+                        skipped.append({"kind": "object", "id": digest, "reason": "variant_media_type_conflict"})
+                        target_by_digest.pop(digest)
+                        break
+
+            # An object can be shared by several settled attempts. Once the
+            # object-level type is proven, repair every generic reference to
+            # it, including references outside the optional scope filters, so
+            # Runtime's object and association contracts remain consistent.
+            for digest, target in target_by_digest.items():
+                for reference in connection.execute(
+                    "SELECT association_id, media_type, filename FROM managed_output_associations WHERE object_digest=?",
+                    (digest,),
+                ):
+                    if str(reference["media_type"] or "").strip().lower() != "application/octet-stream":
+                        continue
+                    if _media_type_from_filename(reference["filename"]) == target:
+                        association_plan.append((str(reference["association_id"]), digest, target))
+                for reference in connection.execute(
+                    "SELECT id, metadata_json FROM generation_variants WHERE object_id=?",
+                    (digest,),
+                ):
+                    try:
+                        metadata = json.loads(reference["metadata_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if str(metadata.get("media_type") or "").strip().lower() != "application/octet-stream":
+                        continue
+                    if _media_type_from_filename(metadata.get("filename")) == target:
+                        variant_plan.append((str(reference["id"]), digest, target))
+
+            association_plan = list(dict.fromkeys(association_plan))
+            variant_plan = list(dict.fromkeys(variant_plan))
+            connection.execute("BEGIN")
+            repaired_objects = 0
+            repaired_associations = 0
+            repaired_variants = 0
+            for digest, target in target_by_digest.items():
+                cursor = connection.execute(
+                    "UPDATE objects SET media_type=? WHERE digest=? AND media_type=?",
+                    (target, digest, "application/octet-stream"),
+                )
+                repaired_objects += cursor.rowcount
+            for association_id, digest, target in association_plan:
+                if digest not in target_by_digest:
+                    continue
+                cursor = connection.execute(
+                    "UPDATE managed_output_associations SET media_type=? WHERE association_id=? AND media_type=?",
+                    (target, association_id, "application/octet-stream"),
+                )
+                repaired_associations += cursor.rowcount
+            for variant_id, digest, target in variant_plan:
+                if digest not in target_by_digest:
+                    continue
+                row = connection.execute("SELECT metadata_json FROM generation_variants WHERE id=?", (variant_id,)).fetchone()
+                if row is None:
+                    continue
+                metadata = json.loads(row["metadata_json"])
+                metadata["media_type"] = target
+                connection.execute(
+                    "UPDATE generation_variants SET metadata_json=? WHERE id=?",
+                    (canonical_json(metadata), variant_id),
+                )
+                repaired_variants += 1
+            connection.commit()
+            return {
+                "ok": True,
+                "realm_id": realm_id,
+                "project_id": project_id,
+                "task_id": task_id,
+                "generation_id": generation_id,
+                "repaired": {
+                    "objects": repaired_objects,
+                    "associations": repaired_associations,
+                    "variants": repaired_variants,
+                },
+                "skipped": skipped,
+                "skipped_count": len(skipped),
+            }
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
 def _file_digest_until(path: Path, deadline: float) -> tuple[int, str]:
     digest = hashlib.sha256()
     size = 0
@@ -746,7 +1071,7 @@ def migrate_historical_managed_outputs(
     timeout_seconds: float = DEFAULT_UPGRADE_TIMEOUT_SECONDS,
     confirmation: str | None = None,
 ) -> dict:
-    """Materialize verified v24 associations for old settled video outputs.
+    """Materialize verified historical associations for old settled video outputs.
 
     This is an explicit, stopped-runtime migration. It reads only task result
     JSON, the task's own output name, project ownership, and the Runtime CAS;
@@ -766,7 +1091,7 @@ def migrate_historical_managed_outputs(
         try:
             schema = connection.execute("SELECT format_id, version FROM runtime_schema WHERE id=1").fetchone()
             if not schema or schema[0] != CANONICAL_FORMAT_ID or int(schema[1]) != SCHEMA_VERSION:
-                raise ValidationError("historical output migration requires canonical schema v24")
+                raise ValidationError(f"historical output migration requires canonical schema v{SCHEMA_VERSION}")
             realm_id = str(connection.execute("SELECT id FROM realm LIMIT 1").fetchone()[0])
             expected_confirmation = f"{HISTORICAL_OUTPUT_MIGRATION_CONFIRMATION} {realm_id}"
             if confirmation != expected_confirmation:

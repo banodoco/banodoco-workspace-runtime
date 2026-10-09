@@ -85,7 +85,7 @@ def test_operator_upgrade_current_realm_is_single_idempotent_workflow(tmp_path, 
     )
     result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
     assert result["ok"] is True
-    assert result["schema_before"] == "v24"
+    assert result["schema_before"] == "v25"
     assert boundary.calls[1][0] == "stop"
     assert boundary.calls[1][1]["require_health"] is False
     assert started == [paths.app_support]
@@ -153,7 +153,7 @@ def test_operator_upgrade_restarts_a_real_current_runtime(tmp_path):
         first = bootstrap(paths, boundary, BootstrapConfig(source_profile=profile))
         result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
         assert first.ready and result["ok"]
-        assert result["schema_before"] == "v24"
+        assert result["schema_before"] == "v25"
         assert result["verification"]["health"] is True
         assert result["verification"]["integrity"]["ok"] is True
     finally:

@@ -107,7 +107,12 @@ CREATE TABLE generations (
 CREATE TABLE generation_variants (
     id TEXT PRIMARY KEY, generation_id TEXT NOT NULL REFERENCES generations(id),
     object_id TEXT REFERENCES objects(digest), variant_type TEXT NOT NULL DEFAULT 'original',
-    metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    thumbnail_object_id TEXT REFERENCES objects(digest),
+    thumbnail_source_object_id TEXT REFERENCES objects(digest),
+    thumbnail_recipe_version INTEGER,
+    viewed_at TEXT,
+    created_at TEXT NOT NULL,
     UNIQUE(generation_id, id)
 );
 CREATE TABLE timeline_revisions (

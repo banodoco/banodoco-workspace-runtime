@@ -1576,6 +1576,11 @@ class RuntimeService:
     def _normalize_occurrence(self, occurrence, *, shot_lookup):
         if not isinstance(occurrence, dict):
             raise ValidationError("occurrences must be objects")
+        # Occurrences are authored records, not a transport DTO.  Start from
+        # the submitted object so forward-compatible/opaque placement fields
+        # survive immutable publication.  The known fields below are then
+        # validated and written back in their canonical spellings.
+        result = copy.deepcopy(occurrence)
         occurrence_id = occurrence.get("occurrence_id")
         if not isinstance(occurrence_id, str) or not occurrence_id:
             raise ValidationError("occurrence_id is required")
@@ -1620,7 +1625,25 @@ class RuntimeService:
         provenance = occurrence.get("provenance", {})
         if not isinstance(provenance, dict):
             raise ValidationError("occurrence provenance must be an object")
-        return {"occurrence_id": occurrence_id, "shot_id": shot_id, "shot_revision_id": shot_revision_id, "placement": placement, "source_offset": source_offset, "duration_ms": int(duration), "speed": speed, "track": track, "transform": transform, "gain": gain, "muted": muted, "provenance": provenance}
+        result.update({
+            "occurrence_id": occurrence_id,
+            "shot_id": shot_id,
+            "shot_revision_id": shot_revision_id,
+            "placement": copy.deepcopy(placement),
+            "source_offset": copy.deepcopy(source_offset),
+            "duration_ms": int(duration),
+            "speed": copy.deepcopy(speed),
+            "track": track,
+            "transform": copy.deepcopy(transform),
+            "gain": gain,
+            "muted": muted,
+            "provenance": copy.deepcopy(provenance),
+        })
+        # These accepted aliases are known/derived rather than opaque fields.
+        result.pop("duration", None)
+        result.pop("source_offset_ms", None)
+        result.pop("mute", None)
+        return result
 
     def _validate_media_dependencies(self, project_id, manifest):
         media = manifest.get("media", []) if isinstance(manifest, dict) else []
@@ -2922,7 +2945,10 @@ class RuntimeService:
         if replay is not None:
             return replay
         try:
-            self.store.conn.execute("INSERT INTO generation_variants VALUES (?, ?, ?, ?, ?, ?)", (variant_id, generation_id, object_id, variant_type, canonical_json(metadata), now()))
+            self.store.conn.execute(
+                "INSERT INTO generation_variants(id, generation_id, object_id, variant_type, metadata_json, thumbnail_object_id, thumbnail_source_object_id, thumbnail_recipe_version, viewed_at, created_at) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)",
+                (variant_id, generation_id, object_id, variant_type, canonical_json(metadata), now()),
+            )
         except sqlite3.IntegrityError as exc:
             raise ConflictError("generation variant already exists", details={"variant_id": variant_id}) from exc
         result = self._variant_resource(self.store.conn.execute("SELECT * FROM generation_variants WHERE id=?", (variant_id,)).fetchone())
@@ -2935,6 +2961,17 @@ class RuntimeService:
         value["metadata"] = json.loads(value.pop("metadata_json"))
         if value.get("object_id"):
             value["object_id"] = "sha256:" + value["object_id"]
+        thumbnail_object_id = value.pop("thumbnail_object_id", None)
+        thumbnail_source_object_id = value.pop("thumbnail_source_object_id", None)
+        thumbnail_recipe_version = value.pop("thumbnail_recipe_version", None)
+        if thumbnail_object_id and thumbnail_source_object_id and thumbnail_recipe_version is not None:
+            value["thumbnail"] = {
+                "object_id": "sha256:" + str(thumbnail_object_id),
+                "source_object_id": "sha256:" + str(thumbnail_source_object_id),
+                "recipe_version": int(thumbnail_recipe_version),
+            }
+        else:
+            value["thumbnail"] = None
         return value
 
     def list_variants(self, generation_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
@@ -2949,6 +2986,138 @@ class RuntimeService:
         if not row:
             raise NotFoundError("generation variant not found")
         return self._variant_resource(row)
+
+    @_durable_mutation
+    def attach_variant_thumbnail(self, variant_id, body, *, idempotency_key=None):
+        """Attach a source-verified managed JPEG poster to one variant."""
+        if not idempotency_key:
+            raise InvalidRequestError("Idempotency-Key is required for state mutations")
+        self._require_object_body(body)
+        if set(body) != {"thumbnail_object_id", "source_object_id", "recipe_version"}:
+            raise ValidationError(
+                "variant thumbnail requires thumbnail_object_id, source_object_id, and recipe_version"
+            )
+        thumbnail_object_id = body["thumbnail_object_id"]
+        source_object_id = body["source_object_id"]
+        recipe_version = body["recipe_version"]
+        for field, value in (("thumbnail_object_id", thumbnail_object_id), ("source_object_id", source_object_id)):
+            if not isinstance(value, str) or not OBJECT_ID_RE.fullmatch(value) or not value.startswith("sha256:"):
+                raise ValidationError(f"{field} must be a canonical sha256 object id")
+        if isinstance(recipe_version, bool) or recipe_version != 1:
+            raise ValidationError("recipe_version must be 1")
+        row = self.store.conn.execute(
+            "SELECT gv.*, g.project_id FROM generation_variants gv JOIN generations g ON g.id=gv.generation_id WHERE gv.id=?",
+            (variant_id,),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("generation variant not found")
+        source_digest = source_object_id.removeprefix("sha256:")
+        thumbnail_digest = thumbnail_object_id.removeprefix("sha256:")
+        if row["object_id"] != source_digest:
+            raise ConflictError(
+                "variant source changed before thumbnail attachment",
+                details={"variant_id": str(variant_id), "expected_source_object_id": "sha256:" + str(row["object_id"]), "actual_source_object_id": source_object_id},
+            )
+        project_id = str(row["project_id"])
+        thumbnail_row = self.store.conn.execute(
+            "SELECT media_type FROM objects WHERE digest=?", (thumbnail_digest,)
+        ).fetchone()
+        if not thumbnail_row:
+            raise NotFoundError("thumbnail object not found")
+        if str(thumbnail_row["media_type"]).lower() != "image/jpeg":
+            raise ConflictError("variant thumbnail object must be image/jpeg")
+        if not self.store.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?",
+            (project_id, thumbnail_digest),
+        ).fetchone():
+            raise ConflictError("thumbnail object is outside the variant project")
+        request_hash = hashlib.sha256(canonical_json({"variant_id": str(variant_id), **body}).encode()).hexdigest()
+        replay = self._command_replay(
+            "variant.thumbnail.attach", str(variant_id), idempotency_key, request_hash,
+            project_id=project_id,
+        )
+        if replay is not None:
+            return replay
+        self.store.conn.execute(
+            "UPDATE generation_variants SET thumbnail_object_id=?, thumbnail_source_object_id=?, thumbnail_recipe_version=? WHERE id=? AND object_id=?",
+            (thumbnail_digest, source_digest, recipe_version, variant_id, source_digest),
+        )
+        updated = self.store.conn.execute(
+            "SELECT * FROM generation_variants WHERE id=?", (variant_id,)
+        ).fetchone()
+        return self._command_record(
+            "variant.thumbnail.attach", str(variant_id), idempotency_key,
+            request_hash, self._variant_resource(updated), project_id=project_id,
+        )
+
+    @_durable_mutation
+    def mark_variant_viewed(self, variant_id, *, idempotency_key=None):
+        """Persist the first lightbox view for one Runtime-owned variant."""
+        if not idempotency_key:
+            raise InvalidRequestError("Idempotency-Key is required for state mutations")
+        row = self.store.conn.execute(
+            "SELECT gv.*, g.project_id FROM generation_variants gv JOIN generations g ON g.id=gv.generation_id WHERE gv.id=?",
+            (variant_id,),
+        ).fetchone()
+        if not row:
+            raise NotFoundError("generation variant not found")
+        project_id = str(row["project_id"])
+        request_hash = hashlib.sha256(canonical_json({"variant_id": str(variant_id)}).encode()).hexdigest()
+        replay = self._command_replay(
+            "variant.view", str(variant_id), idempotency_key, request_hash,
+            project_id=project_id,
+        )
+        if replay is not None:
+            return replay
+        timestamp = now()
+        self.store.conn.execute(
+            "UPDATE generation_variants SET viewed_at=COALESCE(viewed_at, ?) WHERE id=?",
+            (timestamp, variant_id),
+        )
+        updated = self.store.conn.execute(
+            "SELECT gv.* FROM generation_variants gv WHERE gv.id=?", (variant_id,)
+        ).fetchone()
+        return self._command_record(
+            "variant.view", str(variant_id), idempotency_key,
+            request_hash, self._variant_resource(updated), project_id=project_id,
+        )
+
+    @_durable_mutation
+    def mark_generation_variants_viewed(self, generation_id, *, idempotency_key=None):
+        """Persist first-view timestamps for every variant in a generation."""
+        if not idempotency_key:
+            raise InvalidRequestError("Idempotency-Key is required for state mutations")
+        generation = self.store.conn.execute(
+            "SELECT id, project_id FROM generations WHERE id=?", (generation_id,)
+        ).fetchone()
+        if not generation:
+            raise NotFoundError("generation not found")
+        project_id = str(generation["project_id"])
+        request_hash = hashlib.sha256(canonical_json({"generation_id": str(generation_id)}).encode()).hexdigest()
+        replay = self._command_replay(
+            "generation.variants.view", str(generation_id), idempotency_key,
+            request_hash, project_id=project_id,
+        )
+        if replay is not None:
+            return replay
+        timestamp = now()
+        self.store.conn.execute(
+            "UPDATE generation_variants SET viewed_at=COALESCE(viewed_at, ?) WHERE generation_id=?",
+            (timestamp, generation_id),
+        )
+        rows = self.store.conn.execute(
+            "SELECT * FROM generation_variants WHERE generation_id=? ORDER BY created_at, id",
+            (generation_id,),
+        ).fetchall()
+        result = {
+            "generation_id": str(generation_id),
+            "viewed_at": timestamp,
+            "variants": [self._variant_resource(row) for row in rows],
+        }
+        return self._command_record(
+            "generation.variants.view", str(generation_id), idempotency_key,
+            request_hash, result, project_id=project_id,
+        )
 
     def get_reference(self, reference_id):
         row = self.store.conn.execute("SELECT * FROM timeline_references WHERE id=?", (reference_id,)).fetchone()

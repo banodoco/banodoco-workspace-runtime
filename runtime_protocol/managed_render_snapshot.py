@@ -176,7 +176,6 @@ def expand_shot_clips(
             visible_duration = visible_end - visible_at
             expanded = dict(child_clip)
             expanded["id"] = f"{occurrence_id}--{child_id}"
-            expanded["source_clip_id"] = child_id
             expanded["at"] = visible_at
             if "hold" in expanded or not has_source_from:
                 expanded["hold"] = visible_duration
@@ -187,6 +186,19 @@ def expand_shot_clips(
                 expanded["track"] = clip.get("track")
             expanded["shot_id"] = shot_id
             expanded["shot_occurrence_id"] = occurrence_id
+            # Keep child provenance in the extensible app namespace. The
+            # strict Remotion render contract rejects unknown top-level clip
+            # properties, while app metadata is already the canonical escape
+            # hatch used by the Astrid projection.
+            app = expanded.get("app")
+            if not isinstance(app, dict):
+                app = {}
+                expanded["app"] = app
+            shot_meta = app.get("astrid_shot_composition")
+            if not isinstance(shot_meta, dict):
+                shot_meta = {}
+                app["astrid_shot_composition"] = shot_meta
+            shot_meta["source_clip_id"] = child_id
             expanded_clips.append(expanded)
 
     expanded_config = deepcopy(dict(config))
