@@ -19,8 +19,10 @@ import json
 import sqlite3
 import base64
 import copy
+import hmac
 import os
 import re
+import secrets
 import subprocess
 import uuid
 import stat
@@ -411,6 +413,7 @@ class RuntimeService:
             self.cas = ContentAddressedStore(self.store.cas_root)
             self.realm = self.store.ensure_realm(display_name, realm_id=realm_id)
             self.runtime_session_id = new_id()
+            self._child_authority_key = secrets.token_bytes(32)
             self._runtime_state = self.store.begin_runtime_session(
                 self.runtime_session_id, epoch_floor=runtime_epoch_floor
             )
@@ -4018,8 +4021,91 @@ class RuntimeService:
                           key_fn=lambda row: (str(row["created_at"]), str(row["from_digest"]), str(row["to_digest"]), str(row["kind"]), int(row["ordinal"])),
                           resource_fn=lambda row: {"project_id": row["project_id"], "from_object_id": "sha256:" + row["from_digest"], "to_object_id": "sha256:" + row["to_digest"], "kind": row["kind"], "ordinal": int(row["ordinal"]), "metadata": json.loads(row["metadata_json"]), "created_at": row["created_at"]})
 
+    @staticmethod
+    def _child_policy(value):
+        required = {"capabilities", "targets", "input_object_ids"}
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"stages", "final_publication"}:
+            raise ValidationError("child_delegation requires capabilities, targets, and input_object_ids")
+        capabilities = value["capabilities"]
+        if not isinstance(capabilities, list) or not capabilities or len(capabilities) > 32:
+            raise ValidationError("child_delegation.capabilities must be a non-empty bounded list")
+        normalized_caps = []
+        for item in capabilities:
+            if not isinstance(item, dict) or set(item) != {"capability_id", "capability_digest"}:
+                raise ValidationError("child_delegation capability must pin id and digest")
+            if not isinstance(item["capability_id"], str) or not item["capability_id"] or not isinstance(item["capability_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", item["capability_digest"]):
+                raise ValidationError("child_delegation capability identity is invalid")
+            normalized_caps.append(dict(item))
+        targets = value["targets"]
+        if not isinstance(targets, list) or not targets or len(targets) > 32:
+            raise ValidationError("child_delegation.targets must be a non-empty bounded list")
+        normalized_targets = [_normalize_execution_target(target) for target in targets]
+        inputs = value["input_object_ids"]
+        if not isinstance(inputs, list) or len(inputs) > 256 or any(not isinstance(item, str) or not item.startswith("sha256:") or not OBJECT_ID_RE.fullmatch(item) for item in inputs):
+            raise ValidationError("child_delegation.input_object_ids must contain sha256 object IDs")
+        if len({canonical_json(item) for item in normalized_targets}) != len(normalized_targets) or len(set(inputs)) != len(inputs) or len({item["capability_id"] for item in normalized_caps}) != len(normalized_caps):
+            raise ValidationError("child_delegation entries must be unique")
+        policy = {"capabilities": normalized_caps, "targets": normalized_targets, "input_object_ids": inputs}
+        if "stages" in value:
+            stages = value["stages"]
+            if not isinstance(stages, list) or not stages or len(stages) > 16:
+                raise ValidationError("child_delegation.stages must be a non-empty bounded list")
+            normalized_stages = []
+            preceding = set()
+            for stage in stages:
+                if not isinstance(stage, dict) or set(stage) != {"name", "capability_id", "capability_digest", "target", "inputs"}:
+                    raise ValidationError("each child stage requires name, capability, target, and inputs")
+                name = stage["name"]
+                if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) or name in preceding:
+                    raise ValidationError("child stage name is invalid or repeated")
+                capability = {"capability_id": stage["capability_id"], "capability_digest": stage["capability_digest"]}
+                target = _normalize_execution_target(stage["target"])
+                if capability not in normalized_caps or target not in normalized_targets:
+                    raise ValidationError("child stage capability or target is outside policy")
+                declared_inputs = stage["inputs"]
+                if not isinstance(declared_inputs, list) or len(declared_inputs) > 256:
+                    raise ValidationError("child stage inputs must be a bounded ordered list")
+                names = set()
+                for ref in declared_inputs:
+                    if not isinstance(ref, dict) or not isinstance(ref.get("name"), str) or not ref["name"] or len(ref["name"]) > 128 or ref["name"] in names:
+                        raise ValidationError("child stage input names must be unique non-empty strings")
+                    names.add(ref["name"])
+                    if set(ref) == {"name", "root_object_id"}:
+                        if ref["root_object_id"] not in inputs:
+                            raise ValidationError("child stage root input is outside parent policy")
+                    elif set(ref) == {"name", "producer_stage", "output_port"}:
+                        if (not isinstance(ref["producer_stage"], str) or ref["producer_stage"] not in preceding
+                                or not isinstance(ref["output_port"], str) or not ref["output_port"] or len(ref["output_port"]) > 255):
+                            raise ValidationError("child stage producer must be an earlier declared stage and port")
+                    else:
+                        raise ValidationError("child stage input must name a root object or producer stage and port")
+                normalized_stages.append({**stage, "target": target, "inputs": [dict(ref) for ref in declared_inputs]})
+                preceding.add(name)
+            policy["stages"] = normalized_stages
+        if "final_publication" in value:
+            final = value["final_publication"]
+            if "stages" not in policy or not isinstance(final, dict) or set(final) != {"stage", "verify_stage", "verify_output_port", "effect"}:
+                raise ValidationError("final_publication requires a declared stage, verify source, and effect")
+            if final["stage"] != policy["stages"][-1]["name"] or final["verify_stage"] not in [stage["name"] for stage in policy["stages"][:-1]]:
+                raise ValidationError("final publication must follow its declared verify stage")
+            final_inputs = policy["stages"][-1]["inputs"]
+            matches = [ref for ref in final_inputs if ref.get("producer_stage") == final["verify_stage"] and ref.get("output_port") == final["verify_output_port"]]
+            if len(final_inputs) != 1 or len(matches) != 1:
+                raise ValidationError("final publication must consume exactly one declared verify output")
+            effect = final["effect"]
+            if not isinstance(effect, dict) or effect.get("effect_type") != "generation.publish_v1":
+                raise ValidationError("final publication requires generation.publish_v1")
+            groups = effect.get("payload", {}).get("groups") if isinstance(effect.get("payload"), dict) else None
+            selectors = [selector for group in groups for selector in group.get("selectors", [])] if isinstance(groups, list) and all(isinstance(group, dict) and isinstance(group.get("selectors"), list) for group in groups) else []
+            if any(not isinstance(selector, dict) for selector in selectors):
+                raise ValidationError("final publication effect selectors must be objects")
+            if len(selectors) != 1 or selectors[0].get("output_port") != final["verify_output_port"]:
+                raise ValidationError("final publication effect must select the verified output port")
+            policy["final_publication"] = dict(final)
+        return policy
+
     @_verified_mutation
-    def create_task(self, body, *, enforce_readiness=False, _host_owned=False):
+    def create_task(self, body, *, enforce_readiness=False, _host_owned=False, _delegated_lineage=None, _delegated_stage=None, _delegated_inputs=None, _verified_publication_source=None):
         if "capability" in body or "expected_effect" in body:
             raise ValidationError("legacy task body aliases are not supported")
         capability = body.get("capability_id")
@@ -4028,6 +4114,13 @@ class RuntimeService:
         digest = body.get("capability_digest", "sha256:" + hashlib.sha256(str(capability).encode()).hexdigest())
         execution_request = body.get("execution_request")
         task_spec_value = body.get("spec", {})
+        if not isinstance(task_spec_value, dict):
+            raise ValidationError("task spec must be an object")
+        reserved = {"child_delegation", "delegated_parent", "delegated_stage", "delegated_inputs", "verified_publication_source", "input_refs"}
+        if set(task_spec_value) & {"child_delegation", "delegated_parent"} or set(body) & (reserved - {"child_delegation"}):
+            raise ValidationError("delegation fields must use Runtime admission authority")
+        if _delegated_lineage is not None and "child_delegation" in body:
+            raise ValidationError("delegated children cannot delegate further")
         if isinstance(task_spec_value, dict) and (
             "execution_request" in task_spec_value
             or (
@@ -4047,6 +4140,21 @@ class RuntimeService:
         if isinstance(execution_request, dict) and "execution_binding" in execution_request:
             raise ValidationError("caller-supplied execution_binding is not accepted")
         task_spec = {"input_object_ids": body.get("input_object_ids", []), "schema_version": body.get("schema_version", "1"), "capability_digest": digest, "spec": body.get("spec", {})}
+        if "child_delegation" in body:
+            task_spec["child_delegation"] = self._child_policy(body["child_delegation"])
+            final = task_spec["child_delegation"].get("final_publication")
+            if final is not None:
+                project = self.store.get_project(body.get("project")) if body.get("project") else None
+                if project is None:
+                    raise ValidationError("final publication requires a project-scoped parent")
+                self.store._validate_settlement_effect(final["effect"], project_id=project["id"])
+        if _delegated_lineage is not None:
+            task_spec["delegated_parent"] = dict(_delegated_lineage)
+        if _delegated_stage is not None:
+            task_spec["delegated_stage"] = _delegated_stage
+            task_spec["delegated_inputs"] = list(_delegated_inputs or [])
+        if _verified_publication_source is not None:
+            task_spec["verified_publication_source"] = dict(_verified_publication_source)
         if "generation_intent" in body:
             if not isinstance(body["generation_intent"], dict):
                 raise ValidationError("generation_intent must be an object")
@@ -4059,6 +4167,194 @@ class RuntimeService:
             task_spec["storage_estimate"] = self.store._validate_storage_estimate(body["storage_estimate"])
         value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_request=execution_request)
         return value
+
+    def _live_delegating_parent(self, attempt_id, lease, *, identity):
+        row = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        self._assert_attempt_identity(row, identity)
+        self._validate_attempt_lease(row, lease, self.store._current_runtime_epoch())
+        task = self.store.conn.execute("SELECT * FROM tasks WHERE id=?", (row["task_id"],)).fetchone()
+        if not task or task["status"] != "running" or task["attempt_id"] != attempt_id or task["lease_token"] != row["lease_id"] or int(task["lease_fence"]) != int(row["fence"]):
+            raise LeaseError("parent attempt is no longer live")
+        policy = json.loads(task["spec_json"]).get("child_delegation")
+        if policy is None:
+            raise AuthorizationError("parent task has no child delegation policy")
+        policy = self._child_policy(policy)
+        project = self.store.conn.execute("SELECT project_id FROM runs WHERE id=?", (task["run_id"],)).fetchone()[0]
+        return row, task, project, policy
+
+    def _child_identity_digest(self, identity):
+        if identity is None:
+            raise AuthorizationError("authenticated worker identity is required")
+        return sha256_bytes(canonical_json({
+            "actor": identity.get("actor"),
+            "placement": self._trusted_execution_placement(identity),
+        }).encode())
+
+    @_verified_mutation
+    def issue_child_authority(self, attempt_id, body, *, identity):
+        body = _wire_object(body, required=("lease_id", "fence", "runtime_epoch"), allowed=("lease_id", "fence", "runtime_epoch"))
+        _wire_string(body, "lease_id")
+        _wire_integer(body, "fence")
+        _wire_integer(body, "runtime_epoch", positive=True)
+        row, task, project, policy = self._live_delegating_parent(attempt_id, body, identity=identity)
+        payload = {
+            "version": 1, "realm_id": self.realm["id"], "session_id": self.runtime_session_id,
+            "parent_task_id": task["id"], "parent_attempt_id": attempt_id,
+            "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]),
+            "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"],
+            "project_id": project, "expires_at": row["lease_expires_at"],
+            "policy_digest": sha256_bytes(canonical_json(policy).encode()),
+            "identity_digest": self._child_identity_digest(identity),
+        }
+        encoded = base64.urlsafe_b64encode(canonical_json(payload).encode()).decode().rstrip("=")
+        signature = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+        return {"authority": encoded + "." + signature, "expires_at": row["lease_expires_at"], "parent_task_id": task["id"], "parent_attempt_id": attempt_id}
+
+    def _decode_child_authority(self, token):
+        if not isinstance(token, str) or len(token) > 8192 or token.count(".") != 1:
+            raise AuthorizationError("invalid child authority")
+        encoded, supplied = token.split(".", 1)
+        expected = hmac.new(self._child_authority_key, encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(supplied, expected):
+            raise AuthorizationError("invalid child authority")
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AuthorizationError("invalid child authority") from exc
+        if not isinstance(payload, dict) or payload.get("version") != 1 or payload.get("realm_id") != self.realm["id"] or payload.get("session_id") != self.runtime_session_id:
+            raise AuthorizationError("child authority belongs to another runtime session")
+        return payload
+
+    def _delegated_stage_rows(self, project, lineage):
+        """Read the already admitted siblings under the same parent fence."""
+        rows = self.store.conn.execute(
+            "SELECT t.id, t.status, t.attempt_id, t.spec_json FROM tasks t "
+            "JOIN runs r ON r.id=t.run_id WHERE r.project_id IS ? "
+            "AND json_extract(t.spec_json, '$.delegated_parent.parent_attempt_id')=?",
+            (project, lineage["parent_attempt_id"]),
+        ).fetchall()
+        stages = {}
+        for row in rows:
+            spec = json.loads(row["spec_json"])
+            recorded = spec.get("delegated_parent")
+            if not isinstance(recorded, dict) or any(recorded.get(key) != lineage[key] for key in ("parent_task_id", "parent_attempt_id", "parent_lease_id", "parent_fence", "runtime_epoch", "executor_id", "parent_placement", "project_id")):
+                continue
+            name = spec.get("delegated_stage")
+            if name in stages:
+                raise ConflictError("delegated stage has duplicate admissions")
+            if name is not None:
+                stages[name] = row
+        return stages
+
+    def _resolve_delegated_stage_inputs(self, declared, supplied, *, siblings, project, lineage):
+        if not isinstance(supplied, list) or len(supplied) != len(declared):
+            raise ValidationError("input_refs must match the declared stage order")
+        object_ids, resolved = [], []
+        for expected, ref in zip(declared, supplied):
+            if not isinstance(ref, dict) or ref.get("name") != expected["name"]:
+                raise ValidationError("input_refs must match the declared stage order")
+            if "root_object_id" in expected:
+                if set(ref) != {"name", "root_object_id"} or ref["root_object_id"] != expected["root_object_id"]:
+                    raise AuthorizationError("root input is outside the declared stage policy")
+                object_id = expected["root_object_id"]
+                resolved.append({"name": ref["name"], "root_object_id": object_id, "object_id": object_id})
+            else:
+                if set(ref) != {"name", "producer_task_id", "association_id", "output_port"} or ref["output_port"] != expected["output_port"]:
+                    raise AuthorizationError("producer input is outside the declared stage policy")
+                producer = siblings.get(expected["producer_stage"])
+                if producer is None or producer["id"] != ref["producer_task_id"] or producer["status"] != "completed":
+                    raise ConflictError("declared producer stage is not settled")
+                association = self.store.get_managed_output(ref["association_id"])
+                if (association["task_id"] != producer["id"] or association["attempt_id"] != producer["attempt_id"]
+                        or association["project_id"] != project or association["output_port"] != expected["output_port"]
+                        or association["durability"] != "durable" or association["lifecycle"]["state"] not in {"available", "promoted"}):
+                    raise AuthorizationError("managed output does not match the declared live lineage and port")
+                attempt = self.store.conn.execute("SELECT settled, runtime_epoch FROM attempts WHERE id=? AND task_id=?", (association["attempt_id"], producer["id"])).fetchone()
+                if not attempt or not attempt["settled"] or int(attempt["runtime_epoch"]) != lineage["runtime_epoch"]:
+                    raise ConflictError("producer managed output is not settled in the parent epoch")
+                object_id = association["object_id"]
+                resolved.append({"name": ref["name"], "producer_stage": expected["producer_stage"], "producer_task_id": producer["id"], "producer_attempt_id": producer["attempt_id"], "association_id": association["association_id"], "output_port": association["output_port"], "object_id": object_id})
+            object_ids.append(object_id)
+        if len(set(object_ids)) != len(object_ids):
+            raise ValidationError("resolved delegated inputs must have unique object IDs")
+        return object_ids, resolved
+
+    @_durable_mutation
+    def admit_delegated_child(self, body, *, idempotency_key, identity):
+        body = _wire_object(body, required=("authority", "task"), allowed=("authority", "task"))
+        payload = self._decode_child_authority(body["authority"])
+        if payload.get("identity_digest") != self._child_identity_digest(identity):
+            raise AuthorizationError("child authority is bound to another worker identity")
+        lease = {"lease_id": payload.get("parent_lease_id"), "fence": payload.get("parent_fence"), "runtime_epoch": payload.get("runtime_epoch")}
+        row, parent, project, policy = self._live_delegating_parent(payload.get("parent_attempt_id"), lease, identity=identity)
+        if (payload.get("parent_task_id") != parent["id"] or payload.get("executor_id") != row["executor_id"]
+                or payload.get("project_id") != project or payload.get("expires_at") != row["lease_expires_at"]
+                or payload.get("policy_digest") != sha256_bytes(canonical_json(policy).encode())):
+            raise AuthorizationError("child authority no longer matches parent attempt")
+        task = _wire_object(body["task"], required=("capability_id", "capability_digest"), allowed=("capability_id", "capability_digest", "input_object_ids", "input_refs", "stage", "schema_version", "spec", "execution_request", "generation_intent", "required_facts", "storage_estimate"))
+        if {"capability_id": task["capability_id"], "capability_digest": task["capability_digest"]} not in policy["capabilities"]:
+            raise AuthorizationError("child capability is outside parent policy")
+        idempotency_key = require_idempotency_key(idempotency_key)
+        stages = policy.get("stages")
+        stage_name = task.get("stage")
+        request = task.get("execution_request")
+        if request is not None and not isinstance(request, dict):
+            raise ValidationError("execution_request must be an object")
+        resolved_inputs = None
+        verified_source = None
+        if stages is None:
+            if stage_name is not None or "input_refs" in task:
+                raise ValidationError("parent policy does not declare child stages")
+            inputs = task.get("input_object_ids")
+            if not isinstance(inputs, list) or any(item not in policy["input_object_ids"] for item in inputs):
+                raise AuthorizationError("child inputs are outside parent policy")
+        else:
+            if "input_object_ids" in task or not isinstance(stage_name, str):
+                raise ValidationError("staged child requires stage and input_refs, not bare input_object_ids")
+            stage_by_name = {item["name"]: (index, item) for index, item in enumerate(stages)}
+            if stage_name not in stage_by_name:
+                raise AuthorizationError("child stage is outside parent policy")
+            index, stage = stage_by_name[stage_name]
+            if {"capability_id": task["capability_id"], "capability_digest": task["capability_digest"]} != {"capability_id": stage["capability_id"], "capability_digest": stage["capability_digest"]}:
+                raise AuthorizationError("child capability does not match declared stage")
+            if (_normalize_execution_target(request.get("target")) if request is not None else {"kind": "default"}) != stage["target"]:
+                raise AuthorizationError("child target does not match declared stage")
+            lineage_keys = {"parent_task_id": parent["id"], "parent_attempt_id": row["id"], "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]), "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"], "parent_placement": self._trusted_execution_placement(identity), "project_id": project}
+            siblings = self._delegated_stage_rows(project, lineage_keys)
+            existing = siblings.get(stage_name)
+            if existing is not None:
+                old_key = self.store.conn.execute("SELECT r.idempotency_key FROM runs r JOIN tasks t ON t.run_id=r.id WHERE t.id=?", (existing["id"],)).fetchone()[0]
+                if old_key != idempotency_key:
+                    raise ConflictError("delegated stage was already admitted")
+            if any(item["name"] not in siblings or siblings[item["name"]]["status"] != "completed" for item in stages[:index]):
+                raise ConflictError("delegated stages must be admitted once and completed in order")
+            inputs, resolved_inputs = self._resolve_delegated_stage_inputs(stage["inputs"], task.get("input_refs"), siblings=siblings, project=project, lineage=lineage_keys)
+            final = policy.get("final_publication")
+            if final is not None and stage_name == final["stage"]:
+                verified_source = next(ref for ref in resolved_inputs if ref.get("producer_stage") == final["verify_stage"] and ref.get("output_port") == final["verify_output_port"])
+        target = _normalize_execution_target(request.get("target")) if isinstance(request, dict) else {"kind": "default"}
+        if target not in policy["targets"]:
+            raise AuthorizationError("child target is outside parent policy")
+        if stages is not None and request is not None:
+            if "inputs" in request:
+                raise ValidationError("staged child execution_request.inputs are resolved by Runtime")
+            request = dict(request)
+            request["inputs"] = [{"name": ref["name"], "object_id": ref["object_id"]} for ref in resolved_inputs]
+        child_spec = task.get("spec", {})
+        if not isinstance(child_spec, dict) or "runtime_dependencies" in child_spec:
+            raise ValidationError("delegated child spec cannot use runtime_dependencies")
+        lineage = {"parent_task_id": parent["id"], "parent_attempt_id": row["id"], "parent_lease_id": row["lease_id"], "parent_fence": int(row["fence"]), "runtime_epoch": int(row["runtime_epoch"]), "executor_id": row["executor_id"], "parent_placement": self._trusted_execution_placement(identity), "project_id": project}
+        admitted = dict(task)
+        admitted.pop("stage", None)
+        admitted.pop("input_refs", None)
+        admitted["input_object_ids"] = inputs
+        if request is not None:
+            admitted["execution_request"] = request
+        if verified_source is not None:
+            admitted["settlement_effect"] = policy["final_publication"]["effect"]
+        admitted["project"] = project
+        admitted["idempotency_key"] = idempotency_key
+        return self.create_task(admitted, enforce_readiness=True, _delegated_lineage=lineage, _delegated_stage=stage_name, _delegated_inputs=resolved_inputs, _verified_publication_source=verified_source)
 
     def task(self, task_id):
         return self.store.get_task(task_id)
@@ -4780,6 +5076,33 @@ class RuntimeService:
                 raise ValidationError("declared settlement effect is required")
             if effect is not None:
                 self.store._validate_settlement_effect(effect)
+            admitted_spec = json.loads(task["spec_json"])
+            verified_source = admitted_spec.get("verified_publication_source")
+            if verified_source is not None:
+                lineage = admitted_spec["delegated_parent"]
+                self._live_delegating_parent(lineage["parent_attempt_id"], {
+                    "lease_id": lineage["parent_lease_id"], "fence": lineage["parent_fence"],
+                    "runtime_epoch": lineage["runtime_epoch"],
+                }, identity=None)
+                association = self.store.get_managed_output(verified_source["association_id"])
+                producer = self.store.conn.execute("SELECT status, attempt_id FROM tasks WHERE id=?", (verified_source["producer_task_id"],)).fetchone()
+                if (association["task_id"] != verified_source["producer_task_id"]
+                        or association["attempt_id"] != verified_source["producer_attempt_id"]
+                        or association["project_id"] != project_id
+                        or association["object_id"] != verified_source["object_id"]
+                        or association["output_port"] != verified_source["output_port"]
+                        or association["durability"] != "durable"
+                        or association["lifecycle"]["state"] not in {"available", "promoted"}
+                        or producer is None or producer["status"] != "completed"
+                        or producer["attempt_id"] != verified_source["producer_attempt_id"]):
+                    raise ConflictError("verified publication source is no longer available")
+                outputs = body.get("outputs")
+                if (not isinstance(outputs, list) or len(outputs) != 1 or not isinstance(outputs[0], dict)
+                        or outputs[0].get("digest") != verified_source["object_id"]
+                        or outputs[0].get("output_port") != verified_source["output_port"]
+                        or outputs[0].get("kind", "object") != "object"
+                        or outputs[0].get("durability", "durable") != "durable"):
+                    raise AuthorizationError("final publication must use the declared verified output")
             staged = self._stage_outputs(
                 attempt_id,
                 body.get("outputs", []),
