@@ -25,6 +25,7 @@
     "required_facts": { "$ref": "#/definitions/RequiredFacts" },
     "spec": { "type": "object", "additionalProperties": true },
     "generation_intent": { "type": "object", "additionalProperties": true },
+    "expected_effect": { "type": "object", "additionalProperties": true },
     "storage_estimate": {
       "type": "object", "additionalProperties": false,
       "required": ["scratch_bytes", "output_bytes"],

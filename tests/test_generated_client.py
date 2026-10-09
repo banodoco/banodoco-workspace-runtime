@@ -173,6 +173,60 @@ def test_generation_intent_round_trips_through_admission_claim_and_terminal_read
         daemon.stop()
 
 
+def test_expected_effect_round_trips_through_public_task_read(tmp_path: Path) -> None:
+    realm = tmp_path / "realm"
+    RealmStore.initialize(realm).close()
+    daemon = RuntimeDaemon(realm, support_root=tmp_path / "support").start()
+    effect_payload = {
+        "version": 1,
+        "modality": "video",
+        "generation_type": "vibecomfy.run",
+        "metadata": {"h3_av": {"request_digest": "sha256:" + "a" * 64}},
+        "partial_success_policy": "reject",
+        "groups": [{
+            "group_key": "main",
+            "selectors": [{
+                "selector": "video",
+                "ordinal": 0,
+                "variant_key": "original",
+                "output_port": "vibecomfy_run",
+            }],
+        }],
+    }
+    try:
+        client = WorkspaceClient(daemon.endpoint, daemon.token)
+        project = client.create_project(
+            "H3 receipt projection",
+            idempotency_key="effect-projection-project",
+            slug="h3-receipt-projection",
+        )
+        effect = {
+            "effect_type": "generation.publish_v1",
+            "target_id": project.project_id,
+            "payload": effect_payload,
+        }
+        admitted = client.admit_task(
+            capability_id="vibecomfy.run",
+            capability_digest="sha256:" + hashlib.sha256(b"vibecomfy.run").hexdigest(),
+            input_object_ids=[],
+            idempotency_key="effect-projection-task",
+            project_id=project.project_id,
+            settlement_effect=effect,
+            generation_intent={
+                "version": 1,
+                "modality": "video",
+                "partial_success_policy": "reject",
+                "metadata": effect_payload["metadata"],
+                "groups": effect_payload["groups"],
+            },
+        )
+
+        task = client.get_task(admitted["task_id"])
+        assert task.expected_effect == effect
+    finally:
+        daemon.stop()
+
+
 def test_object_byte_range_etag_and_head_are_preserved() -> None:
     payload = b"0123456789"
     digest = "sha256:" + hashlib.sha256(payload).hexdigest()
