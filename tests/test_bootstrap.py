@@ -21,6 +21,7 @@ from banodoco_local.bootstrap import (
     restart,
 )
 from banodoco_local.paths import RuntimePaths
+from banodoco_local.workspace import configure_workspace
 
 
 PROFILE = SourceProfile(
@@ -59,6 +60,7 @@ class FakeBoundary:
         self.valid_owner = True
         self.next_pid = 41001
         self.restart_calls = 0
+        self.realm_ids = {}
 
     def start(self, **kwargs):
         self.calls.append("start")
@@ -85,7 +87,12 @@ class FakeBoundary:
         realm_root = kwargs["realm_root"]
         realm_root.mkdir(parents=True, exist_ok=False)
         (realm_root / "realm.sqlite3").touch()
+        self.realm_ids[str(realm_root)] = kwargs["realm_id"]
         return {"state": "created", "realm_id": kwargs["realm_id"], "root": str(realm_root)}
+
+    def inspect(self, *, realm_root):
+        realm_id = self.realm_ids.get(str(realm_root))
+        return {"ok": bool(realm_id), "state": "ready" if realm_id else "uninitialized", "checks": {"realm_identity": {"ok": bool(realm_id), "realm_id": realm_id, "row_count": 1 if realm_id else 0}}}
 
     def connect(self, **kwargs):
         self.connects.append(kwargs)
@@ -116,7 +123,15 @@ class BootstrapTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def configure_workspace(self, boundary=None):
+        configure_workspace(
+            self.paths, boundary or self.boundary, self.config, mode="create",
+            realm_root=self.paths.realms_dir / "3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+            realm_id="3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+        )
+
     def test_first_launch_writes_catalog_discovery_without_synthesizing_activation(self):
+        self.configure_workspace()
         result = bootstrap(self.paths, self.boundary, self.config)
         self.assertEqual(result.status, "started")
         self.assertEqual(result.credential_file, self.paths.credentials_dir / "astrid.json")
@@ -141,6 +156,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(source_manifest.stat().st_mode), 0o600)
 
     def test_second_launch_reconnects_same_owner_and_actor(self):
+        self.configure_workspace()
         first = bootstrap(self.paths, self.boundary, self.config)
         discovery_before = self.paths.discovery_path.read_bytes()
         updated = SourceProfile(
@@ -161,6 +177,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(catalog["source_profiles"]["astrid"], updated.as_dict())
 
     def test_stale_discovery_restarts_without_second_realm(self):
+        self.configure_workspace()
         first = bootstrap(self.paths, self.boundary, self.config)
         self.boundary.alive.clear()
         second = bootstrap(self.paths, self.boundary, self.config)
@@ -169,6 +186,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(json.loads(self.paths.catalog_path.read_text())["selected_realm_id"], first.realm_id)
 
     def test_restart_reuses_selected_realm(self):
+        self.configure_workspace()
         first = bootstrap(self.paths, self.boundary, self.config)
         self.boundary.alive.clear()
         result = restart(self.paths, self.boundary, self.config)
@@ -186,7 +204,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(self.paths.catalog_path.exists())
 
     def test_incompatible_live_owner_fails_closed_without_mutation(self):
-        self.paths.runtime_support.mkdir(parents=True)
+        self.configure_workspace()
         self.paths.discovery_path.write_text(json.dumps({
             "protocol_version": "old", "schema_version": "old", "active_realm": "realm", "pid": 99,
         }))
@@ -198,6 +216,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(self.boundary.starts), 0)
 
     def test_duplicate_owner_refuses_when_lock_validation_fails(self):
+        self.configure_workspace()
         bootstrap(self.paths, self.boundary, self.config)
         self.boundary.valid_owner = False
         with self.assertRaises(DuplicateOwnerError):
@@ -236,18 +255,19 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(boundary.calls, ["start"])
         self.assertFalse(self.paths.realms_dir.joinpath("existing-realm").exists())
 
-    def test_fresh_realm_handoff_failure_rolls_back_created_realm(self):
+    def test_failed_up_preserves_explicitly_configured_realm(self):
         class FailingHandoffBoundary(FakeBoundary):
             def start(self, **kwargs):
                 super().start(**kwargs)
                 raise RuntimeError("admission handoff failed")
 
         boundary = FailingHandoffBoundary()
+        self.configure_workspace(boundary)
         with self.assertRaisesRegex(RuntimeError, "admission handoff failed"):
             bootstrap(self.paths, boundary, self.config)
         self.assertEqual(boundary.calls[:2], ["create", "start"])
-        self.assertFalse(list(self.paths.realms_dir.iterdir()) if self.paths.realms_dir.exists() else ())
-        self.assertFalse(self.paths.catalog_path.exists())
+        self.assertTrue(list(self.paths.realms_dir.iterdir()))
+        self.assertTrue(self.paths.catalog_path.exists())
         self.assertFalse(self.paths.discovery_path.exists())
         self.assertFalse(self.paths.instance_lock_path.exists())
 

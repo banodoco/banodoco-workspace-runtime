@@ -89,7 +89,17 @@ def test_start_does_not_inject_checkout_into_child(monkeypatch, tmp_path):
     boundary = LocalRuntimeBoundary()
     monkeypatch.setattr("banodoco_local.runtime_boundary.subprocess.Popen", fake_popen)
     monkeypatch.setattr(boundary, "_wait_endpoint", lambda _support, _process: "http://127.0.0.1:1")
-    monkeypatch.setattr(boundary, "_read_discovery", lambda _support: {"process_birth_id": "birth"})
+    monkeypatch.setattr(boundary, "_read_discovery", lambda _support: {
+        "pid": 123,
+        "endpoint": "http://127.0.0.1:1",
+        "runtime_instance_id": "instance",
+        "process_birth_id": "birth",
+        "active_realm": "realm",
+        "realm_root": str((tmp_path / "realm").resolve()),
+    })
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "protocol": "workspace.v1", "status": "ok", "runtime_instance_id": "instance",
+    })
     source_checkout = tmp_path / "product-source"
     source_checkout.mkdir()
     profile = SourceProfile(
@@ -120,10 +130,12 @@ def test_wait_endpoint_does_not_adopt_incumbent_discovery(monkeypatch, tmp_path)
     observations = iter(
         [
             {"pid": 99, "endpoint": "http://127.0.0.1:43123"},
-            {"pid": 123, "endpoint": "http://127.0.0.1:43124"},
+            {"pid": 123, "endpoint": "http://127.0.0.1:43124", "runtime_instance_id": "candidate"},
         ]
     )
     monkeypatch.setattr(boundary, "_read_discovery", lambda _support: next(observations))
-    monkeypatch.setattr(boundary, "_http_health", lambda _endpoint: True)
+    monkeypatch.setattr(boundary, "_http_health_payload", lambda _endpoint: {
+        "protocol": "workspace.v1", "status": "ok", "runtime_instance_id": "candidate",
+    })
 
     assert boundary._wait_endpoint(tmp_path, Process()) == "http://127.0.0.1:43124"

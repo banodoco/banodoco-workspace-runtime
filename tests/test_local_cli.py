@@ -30,6 +30,9 @@ class _TypedClient:
 
 def test_parser_exposes_operator_lifecycle_without_legacy_verbs():
     required = {
+        "up": ["--data-root", "/tmp/support"],
+        "connect": ["--data-root", "/tmp/support"],
+        "restart": ["--data-root", "/tmp/support"],
         "backup": ["--destination", "b"],
         "restore": ["backup", "--destination", "d"],
         "checkpoint": ["--attempt-id", "a", "--lease-id", "l", "--fence", "1", "--runtime-epoch", "1", "--nonce", "n", "--authorization", "n"],
@@ -43,6 +46,10 @@ def test_parser_exposes_operator_lifecycle_without_legacy_verbs():
     upgrade = cli.parser().parse_args(["upgrade", "--profile", "astrid", "--data-root", "/tmp/astrid", "--json"])
     assert upgrade.command == "upgrade"
     assert upgrade.data_root == Path("/tmp/astrid")
+    inspect = cli.parser().parse_args(["workspace", "inspect", "--data-root", "/tmp/support", "--json"])
+    create = cli.parser().parse_args(["workspace", "create", "--data-root", "/tmp/support", "--realm-root", "/tmp/realm", "--realm-id", "3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4", "--json"])
+    attach = cli.parser().parse_args(["workspace", "attach", "--data-root", "/tmp/support", "--realm-root", "/tmp/realm", "--realm-id", "3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4", "--json"])
+    assert (inspect.workspace_command, create.workspace_command, attach.workspace_command) == ("inspect", "create", "attach")
 
 
 def test_checkpoint_requires_and_forwards_exact_epoch_nonce_and_state(monkeypatch, tmp_path, capsys):

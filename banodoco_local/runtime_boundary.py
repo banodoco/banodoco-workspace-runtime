@@ -294,6 +294,27 @@ class LocalRuntimeBoundary:
             raise BootstrapError("Runtime realm creation returned invalid metadata.")
         return created
 
+    def inspect(self, *, realm_root: Path) -> Mapping[str, Any]:
+        """Run Runtime's bounded snapshot inspection without opening authority."""
+        root = self._validate_path(Path(realm_root), "realm root")
+        if root.is_symlink() or not root.is_dir():
+            raise BootstrapError(f"realm root is unavailable: {root}")
+        argv = [sys.executable, "-m", "runtime_protocol", "doctor", "--root", str(root), "--json"]
+        try:
+            result = subprocess.run(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, check=False,
+            )
+        except OSError as exc:
+            raise BootstrapError("Runtime realm inspection could not start.") from exc
+        try:
+            report = json.loads(result.stdout.strip())
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise BootstrapError("Runtime realm inspection returned invalid metadata.") from exc
+        if not isinstance(report, Mapping):
+            raise BootstrapError("Runtime realm inspection returned invalid metadata.")
+        return report
+
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path, source_profile: SourceProfile) -> Mapping[str, Any]:
         if self._process and self._process.poll() is None:
             raise BootstrapError("runtime boundary already owns a live daemon")
@@ -330,6 +351,24 @@ class LocalRuntimeBoundary:
         try:
             endpoint = self._wait_endpoint(support_root, self._process)
             discovery = self._read_discovery(support_root)
+            health = self._http_health_payload(endpoint)
+            try:
+                advertised_pid = int(discovery.get("pid", 0))
+            except (TypeError, ValueError):
+                advertised_pid = 0
+            advertised_instance = str(discovery.get("runtime_instance_id") or "")
+            advertised_birth = str(discovery.get("process_birth_id") or "")
+            if (
+                advertised_pid != self._process.pid
+                or str(discovery.get("endpoint") or "") != endpoint
+                or str(discovery.get("active_realm") or "") != realm_id
+                or Path(str(discovery.get("realm_root") or "")) != realm_root
+                or not advertised_instance
+                or not advertised_birth
+                or not health
+                or health.get("runtime_instance_id") != advertised_instance
+            ):
+                raise BootstrapError("Runtime endpoint identity changed during startup.")
         except Exception:
             self._terminate(self._process)
             token_file.unlink(missing_ok=True)
@@ -415,7 +454,9 @@ class LocalRuntimeBoundary:
                 time.sleep(0.05)
                 continue
             endpoint = str(discovery.get("endpoint", ""))
-            if endpoint and self._http_health(endpoint):
+            instance_id = str(discovery.get("runtime_instance_id", ""))
+            health = self._http_health_payload(endpoint) if endpoint else None
+            if endpoint and instance_id and health and health.get("status") == "ok" and health.get("runtime_instance_id") == instance_id:
                 return endpoint
             time.sleep(0.05)
         self._terminate(process)
@@ -472,7 +513,52 @@ class LocalRuntimeBoundary:
         return connection
 
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool:
-        return self.is_pid_alive(pid) and self._http_health(endpoint)
+        health = self._http_health_payload(endpoint)
+        return bool(
+            self.is_pid_alive(pid)
+            and health
+            and health.get("status") == "ok"
+            and health.get("runtime_instance_id") == instance_id
+        )
+
+    def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]:
+        """Read health plus the authenticated realm identity without mutation."""
+        health = self._http_health_payload(endpoint)
+        if not health:
+            return {}
+        try:
+            credential_path = self._validate_path(Path(credential_file), "runtime credential")
+            fd = os.open(credential_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return {}
+                raw = bytearray()
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+            finally:
+                os.close(fd)
+            text = bytes(raw).decode("utf-8").strip()
+            try:
+                parsed_credential = json.loads(text)
+            except json.JSONDecodeError:
+                parsed_credential = None
+            token = str(parsed_credential.get("token") or "") if isinstance(parsed_credential, Mapping) else text
+            if not token:
+                return {}
+            request = urllib.request.Request(
+                str(endpoint).rstrip("/") + "/v1/realm",
+                headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(request, timeout=self.HEALTH_TIMEOUT_SECONDS) as response:
+                realm = json.loads(response.read().decode("utf-8"))
+            if not isinstance(realm, Mapping) or not realm.get("realm_id"):
+                return {}
+            return {**health, "realm_id": str(realm["realm_id"])}
+        except (BootstrapError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            return {}
 
     def validate_owner(self, *, endpoint: str, pid: int, instance_id: str, owner_lock: Path, process_birth_id: str | None = None) -> bool:
         if not self.is_pid_alive(pid):

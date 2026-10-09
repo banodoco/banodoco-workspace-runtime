@@ -265,7 +265,17 @@ def plan_relocation(paths: RuntimePaths, destination: str | Path, backup: str | 
         "destination_support_root": str(target_support),
         "current_root": str(old_realm),
         "destination_root": str(target_support / old_realm.relative_to(old_support)),
-        "backup": str(backup_path) if backup_path is not None else None,
+        # This option has historically been plan metadata only.  Say so
+        # explicitly: no artifact exists and it provides no protection until
+        # the caller separately executes and verifies ``backup``.
+        "backup": {
+            "requested_path": str(backup_path) if backup_path is not None else None,
+            "status": "not_created",
+            "protects_data": False,
+            "required_action": "run and verify banodoco-local backup separately" if backup_path is not None else None,
+        },
+        "effects": ["observe"],
+        "authorization_required": False,
         "execution": "same-volume-offline-cutover",
         "steps": [
             "acquire launcher bootstrap lock and verify owner birth identity",
@@ -343,7 +353,15 @@ def relocate(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCo
             if target_staged:
                 target_aux.rmdir()
                 target_staged = False
-            return {"status": "relocated", "realm_id": realm_id, "support_root": str(new_support), "data_root": str(new_support / Path(str(realm["data_root"])).relative_to(old_support)), "old_support_root": str(old_support)}
+            return {
+                "status": "relocated", "realm_id": realm_id,
+                "support_root": str(new_support),
+                "data_root": str(new_support / Path(str(realm["data_root"])).relative_to(old_support)),
+                "old_support_root": str(old_support),
+                "backup": plan["backup"],
+                "effects": ["configure-install", "start-stop-local-service", "interrupt-work", "write-relocate-change-data"],
+                "authorization_required": True,
+            }
         except Exception as exc:
             try:
                 if moved and new_support.exists() and not old_support.exists():

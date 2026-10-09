@@ -26,7 +26,14 @@ from .bootstrap import (
 from .io import read_json
 from .paths import DATA_ROOT_ENV, RuntimePaths
 from .runtime_boundary import LocalRuntimeBoundary
+from .workspace import configure_workspace, inspect_workspace
 from runtime_protocol.upgrade import DEFAULT_UPGRADE_TIMEOUT_SECONDS
+
+RUNTIME_UP_EFFECTS = [
+    "start-stop-local-service",
+    "configure-install",
+    "write-relocate-change-data",
+]
 
 
 class UnconfiguredBoundary:
@@ -53,15 +60,37 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--version", action="version", version=__version__)
     sub = root.add_subparsers(dest="command")
     up = sub.add_parser("up", help="start or reconnect the selected runtime")
-    _profile_args(up)
+    _profile_args(up, data_root_required=True)
     connect_cmd = sub.add_parser("connect", help="connect to the selected live runtime without starting one")
-    _profile_args(connect_cmd)
+    _profile_args(connect_cmd, data_root_required=True)
     status = sub.add_parser("status", help="read runtime discovery and health")
     _read_args(status)
     restart_cmd = sub.add_parser("restart", help="restart the selected runtime owner")
-    _profile_args(restart_cmd)
+    _profile_args(restart_cmd, data_root_required=True)
     doc = sub.add_parser("doctor", help="read-only support-state diagnostics")
     _read_args(doc)
+
+    workspace = sub.add_parser("workspace", help="inspect or explicitly configure the sole workspace")
+    workspace_sub = workspace.add_subparsers(dest="workspace_command", required=True)
+    inspect = workspace_sub.add_parser("inspect", help="read-only inspection of the configured or candidate realm")
+    inspect.add_argument("--data-root", type=Path, required=True, help="explicit absolute support root")
+    inspect.add_argument("--json", action="store_true")
+    inspect.add_argument("--realm-root", type=Path)
+    inspect.add_argument("--expected-realm-id")
+    create = workspace_sub.add_parser("create", help="create and select one fresh canonical realm")
+    create.add_argument("--data-root", type=Path, required=True, help="explicit absolute support root")
+    create.add_argument("--json", action="store_true")
+    create.add_argument("--realm-root", type=Path, required=True)
+    create.add_argument("--realm-id")
+    create.add_argument("--display-name", default="Astrid Workspace")
+    create.add_argument("--source-manifest", type=Path)
+    attach = workspace_sub.add_parser("attach", help="inspect and select one existing canonical realm without copying")
+    attach.add_argument("--data-root", type=Path, required=True, help="explicit absolute support root")
+    attach.add_argument("--json", action="store_true")
+    attach.add_argument("--realm-root", type=Path, required=True)
+    attach.add_argument("--realm-id", required=True)
+    attach.add_argument("--display-name", default="Astrid Workspace")
+    attach.add_argument("--source-manifest", type=Path)
 
     backup = sub.add_parser("backup", help="create a verified backup through the runtime")
     _read_args(backup)
@@ -72,7 +101,7 @@ def parser() -> argparse.ArgumentParser:
     restore.add_argument("--destination", required=True, type=Path)
 
     relocate = sub.add_parser("relocate", help="plan or execute a verified support-root relocation")
-    _profile_args(relocate)
+    _profile_args(relocate, data_root_required=True)
     relocate.add_argument("--backup", type=Path, help="optional backup destination recorded in the plan")
     relocate.add_argument("--destination", required=True, type=Path)
     relocate.add_argument("--confirm", help="RELOCATE <selected-realm-id> to execute")
@@ -162,6 +191,33 @@ def _emit(value: Any, *, json_mode: bool) -> None:
         print(rendered)
 
 
+def _error_payload(exc: Exception, *, configured: bool = False) -> dict[str, Any]:
+    code = "workspace_configured_runtime_not_ready" if configured else "workspace_missing"
+    return {
+        "ok": False,
+        "error": {"code": code, "message": str(exc)},
+        "state": code,
+        "problem_code": code,
+        "next_action": "astrid-runtime up" if configured else "banodoco-local workspace create|attach",
+    }
+
+
+def _selected_catalog(paths: RuntimePaths) -> bool:
+    catalog = _read_catalog(paths)
+    selected = str(catalog.get("selected_realm_id") or "")
+    return bool(selected and any(str(row.get("realm_id")) == selected for row in catalog.get("realms", [])))
+
+
+def _effect_metadata(value: Any, effects: list[str], *, authorization_required: bool) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            **dict(value),
+            "effects": effects,
+            "authorization_required": authorization_required,
+        }
+    return {"result": value, "effects": effects, "authorization_required": authorization_required}
+
+
 def _paths(args: argparse.Namespace) -> RuntimePaths:
     home = args.home if getattr(args, "home", None) else os.environ.get("BANODOCO_LOCAL_HOME")
     return RuntimePaths.current_mac(home, data_root=getattr(args, "data_root", None))
@@ -219,11 +275,41 @@ def _load_state(raw: str) -> Mapping[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    paths = _paths(args)
+    try:
+        paths = _paths(args)
+    except (ValueError, OSError) as exc:
+        _emit(_error_payload(exc), json_mode=True)
+        return 1
+    if args.command == "workspace":
+        try:
+            boundary = LocalRuntimeBoundary()
+            if args.workspace_command == "inspect":
+                result = inspect_workspace(
+                    paths, boundary, realm_root=args.realm_root,
+                    expected_realm_id=args.expected_realm_id,
+                )
+            else:
+                result = configure_workspace(
+                    paths, boundary, _config(args, paths),
+                    mode=args.workspace_command, realm_root=args.realm_root,
+                    realm_id=args.realm_id,
+                )
+            _emit(result, json_mode=args.json)
+            return 0 if result.get("ok") else 1
+        except (BootstrapError, ValueError, OSError) as exc:
+            configured = False
+            try:
+                configured = _selected_catalog(paths)
+            except Exception:
+                pass
+            _emit(_error_payload(exc, configured=configured), json_mode=True)
+            return 1
     if args.command == "doctor":
         # Doctor is read-only but must still use the concrete process boundary
         # to distinguish a live, matching owner from a stale/reused PID.
         result = doctor(paths, LocalRuntimeBoundary())
+        result["effects"] = ["observe"]
+        result["authorization_required"] = False
         _emit(result, json_mode=args.json)
         return 0 if result["healthy"] else 1
     if args.command == "up":
@@ -235,9 +321,26 @@ def main(argv: list[str] | None = None) -> int:
             # import, protocol, filesystem, and OS failures are represented as
             # one structured error with no traceback.  KeyboardInterrupt is a
             # BaseException and intentionally remains interruptible.
-            _emit({"ok": False, "error": str(exc)}, json_mode=True)
+            configured = False
+            try:
+                configured = _selected_catalog(paths)
+            except Exception:
+                pass
+            payload = _error_payload(exc, configured=configured)
+            payload["effects"] = list(RUNTIME_UP_EFFECTS)
+            payload["authorization_required"] = True
+            _emit(payload, json_mode=True)
             return 1
-        _emit(result, json_mode=args.json)
+        # Keep the operator command's effect classification explicit at the
+        # CLI boundary.  BootstrapResult describes what happened; this
+        # metadata describes what invoking ``astrid-runtime up`` is allowed to
+        # do, so setup/status/doctor and Runtime consumers share one typed
+        # authorization vocabulary.
+        _emit(_effect_metadata(
+            result,
+            RUNTIME_UP_EFFECTS,
+            authorization_required=True,
+        ), json_mode=args.json)
         return 0
     try:
         if args.command == "connect":
@@ -265,6 +368,8 @@ def main(argv: list[str] | None = None) -> int:
             _validate_support_paths(paths)
             discovery = _read_support_json(paths.discovery_path)
             result = {"discovery": discovery, "support": doctor(paths, LocalRuntimeBoundary())}
+            result["effects"] = ["observe"]
+            result["authorization_required"] = False
             if discovery is not None and not result["support"].get("pid_alive", False):
                 result["stale_discovery"] = True
             if discovery and discovery.get("endpoint"):
@@ -275,10 +380,16 @@ def main(argv: list[str] | None = None) -> int:
             _emit(result, json_mode=args.json)
             return 0 if result["support"].get("healthy") and not result.get("stale_discovery") else 1
         if args.command == "backup":
-            _emit(_client(paths).create_backup(str(args.destination.expanduser().resolve())), json_mode=args.json)
+            _emit(_effect_metadata(
+                _client(paths).create_backup(str(args.destination.expanduser().resolve())),
+                ["observe", "write-relocate-change-data"], authorization_required=True,
+            ), json_mode=args.json)
             return 0
         if args.command == "restore":
-            _emit(_client(paths).restore_backup(str(args.backup.expanduser().resolve()), str(args.destination.expanduser().resolve())), json_mode=args.json)
+            _emit(_effect_metadata(
+                _client(paths).restore_backup(str(args.backup.expanduser().resolve()), str(args.destination.expanduser().resolve())),
+                ["write-relocate-change-data"], authorization_required=True,
+            ), json_mode=args.json)
             return 0
         if args.command == "relocate":
             from .relocation import plan_relocation, relocate

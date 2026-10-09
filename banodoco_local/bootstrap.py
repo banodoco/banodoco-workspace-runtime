@@ -83,12 +83,16 @@ class RuntimeBoundary(Protocol):
     def create(self, *, realm_id: str, realm_root: Path, display_name: str,
                source_profile: "SourceProfile") -> Mapping[str, Any]: ...
 
+    def inspect(self, *, realm_root: Path) -> Mapping[str, Any]: ...
+
     def start(self, *, realm_id: str, realm_root: Path, owner_lock: Path,
               source_profile: "SourceProfile") -> Mapping[str, Any]: ...
 
     def connect(self, *, endpoint: str, credential: str) -> Any: ...
 
     def health(self, *, endpoint: str, pid: int, instance_id: str) -> bool: ...
+
+    def endpoint_metadata(self, *, endpoint: str, credential_file: Path) -> Mapping[str, Any]: ...
 
     def validate_owner(self, *, endpoint: str, pid: int, instance_id: str,
                        owner_lock: Path, process_birth_id: str | None = None) -> bool: ...
@@ -659,13 +663,40 @@ def bootstrap(
     if collision is not None:
         raise LegacyRootCollisionError(LEGACY_NEXT_ACTION.format(legacy_root=collision))
     config.resolve_source_profile(paths)
+    # ``up`` is lifecycle only. Workspace identity must already have been
+    # selected by the explicit Create/Attach configuration boundary, and an
+    # unconfigured invocation must not create even a bootstrap lock directory.
+    catalog = _read_catalog(paths)
+    if _selected_realm(catalog) is None:
+        raise BootstrapError(
+            "No workspace is configured; run banodoco-local workspace create or workspace attach."
+        )
     with _bootstrap_mutex(paths):
         return _bootstrap_locked(paths, boundary, config)
 
 
 def _commit_bootstrap_metadata(paths: RuntimePaths, source: SourceProfile, catalog: Mapping[str, Any], discovery: Mapping[str, Any]) -> None:
-    """Commit catalog, source provenance, and ephemeral discovery in order."""
-    atomic_write_json(paths.catalog_path, dict(catalog))
+    """Merge launcher fields without erasing Runtime-owned readiness state."""
+    live = _read_catalog(paths)
+    configured = _selected_realm(dict(catalog))
+    live_realm = _selected_realm(live)
+    if configured is None or live_realm is None:
+        raise BootstrapError("Runtime did not preserve the selected workspace catalog")
+    if (
+        str(configured.get("realm_id")) != str(live_realm.get("realm_id"))
+        or Path(str(configured.get("data_root"))) != Path(str(live_realm.get("data_root")))
+    ):
+        raise BootstrapError("Runtime catalog identity changed during startup")
+    # Runtime's live row wins for readiness, epoch, and instance ownership;
+    # only explicit launcher composition metadata is applied from the input.
+    merged_realm = dict(live_realm)
+    for key in ("source_profile", "selection_source"):
+        if key in configured:
+            merged_realm[key] = configured[key]
+    live["selected_realm_id"] = str(configured["realm_id"])
+    live["realms"] = [merged_realm]
+    live.setdefault("source_profiles", {})[source.profile] = source.as_dict()
+    atomic_write_json(paths.catalog_path, live)
     atomic_write_json(paths.source_profiles_dir / f"{source.profile}.json", source.as_dict())
     atomic_write_json(paths.discovery_path, dict(discovery))
 
@@ -715,10 +746,20 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
 
     paths.ensure_support_dirs()
     catalog = _read_catalog(paths)
-    catalog_before = paths.catalog_path.read_bytes() if paths.catalog_path.is_file() and not paths.catalog_path.is_symlink() else None
     realm = _selected_realm(catalog)
-    new_realm = realm is None
+    if realm is None:
+        raise BootstrapError("No workspace is configured; explicit Create or Attach is required before up.")
+    new_realm = False
     diagnostics: list[str] = []
+
+    # Commit the caller's source composition before process startup. If the
+    # daemon fails, the selected UUID/root and source choice remain resumable.
+    realm["source_profile"] = source.profile
+    catalog["source_profiles"][source.profile] = source.as_dict()
+    _commit_source_profile_metadata(paths, source, catalog)
+    catalog_before = paths.catalog_path.read_bytes()
+    source_manifest_path = paths.source_profiles_dir / f"{source.profile}.json"
+    source_before = source_manifest_path.read_bytes()
 
     discovery = _read_support_json(paths.discovery_path)
     if discovery is not None and discovery.get("active_realm"):
@@ -778,48 +819,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             "stop it before retrying banodoco-local up --profile astrid."
         )
 
-    if realm is None:
-        realm = {
-            "realm_id": _new_realm_id(),
-            "display_name": config.display_name,
-            "data_root": str(paths.realms_dir / _new_realm_id()),
-        }
-        # Use one opaque id for both catalog identity and root name.
-        realm["data_root"] = str(paths.realms_dir / realm["realm_id"])
-        catalog["realms"] = [realm]
-        catalog["selected_realm_id"] = realm["realm_id"]
-    elif catalog.get("selected_realm_id") is None:
-        catalog["selected_realm_id"] = realm["realm_id"]
-
     realm_id = str(realm["realm_id"])
     realm_root = Path(str(realm["data_root"])).expanduser()
     # ``realm`` was synthesized above only when the catalog was empty. Keep
     # this explicit ownership bit so rollback can remove only a fresh root.
     credential_path = paths.credentials_dir / "astrid.json"
     credential_before = credential_path.read_bytes() if credential_path.is_file() and not credential_path.is_symlink() else None
-    source_manifest_path = paths.source_profiles_dir / f"{source.profile}.json"
-    source_before = source_manifest_path.read_bytes() if source_manifest_path.is_file() and not source_manifest_path.is_symlink() else None
     try:
-        if new_realm:
-            create = getattr(boundary, "create", None)
-            if not callable(create):
-                raise BootstrapError(
-                    "The runtime boundary cannot explicitly provision a fresh realm."
-                )
-            created = create(
-                realm_id=realm_id,
-                realm_root=realm_root,
-                display_name=str(realm["display_name"]),
-                source_profile=source,
-            )
-            if (
-                not isinstance(created, Mapping)
-                or created.get("state") != "created"
-                or str(created.get("realm_id")) != realm_id
-            ):
-                raise BootstrapError(
-                    "Runtime realm creation returned incomplete or mismatched identity."
-                )
         handle = boundary.start(
             realm_id=realm_id,
             realm_root=realm_root,
@@ -827,7 +833,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
             source_profile=source,
         )
     except Exception:
-        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=new_realm, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
+        _rollback_failed_bootstrap(paths, boundary, realm_root=realm_root, new_realm=False, credential_before=credential_before, catalog_before=catalog_before, source_before=source_before, source_profile=source.profile)
         raise
     try:
         endpoint = str(handle["endpoint"])
@@ -867,7 +873,13 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
     worker = _worker_handoff(handle)
     # The marker contains ownership metadata only and never a credential.
     try:
-        atomic_write_json(paths.instance_lock_path, {"pid": pid, "process_birth_id": process_birth_id, "runtime_instance_id": instance_id, "realm_id": realm_id})
+        atomic_write_json(paths.instance_lock_path, {
+            "pid": pid,
+            "process_birth_id": process_birth_id,
+            "runtime_instance_id": instance_id,
+            "realm_id": realm_id,
+            "realm_root": str(realm_root),
+        })
         actor_id, token = _credential(paths)
         connection = boundary.connect(endpoint=endpoint, credential=token)
         _provision_connection(connection, actor_id, token, realm_id)
@@ -890,6 +902,7 @@ def _bootstrap_locked(paths: RuntimePaths, boundary: RuntimeBoundary, config: Bo
         "process_birth_id": process_birth_id,
         "runtime_instance_id": instance_id,
         "active_realm": realm_id,
+        "realm_root": str(realm_root),
         "coordinator_epoch": handle.get("coordinator_epoch"),
         "protocol_version": handle.get("protocol_version", source.protocol_version),
         "schema_version": handle.get("schema_version", source.schema_version),
@@ -931,7 +944,11 @@ def connect(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         instance_id = str(discovery["runtime_instance_id"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BootstrapError("Runtime discovery is incomplete; run banodoco-local restart --profile astrid.") from exc
-    if not _pid_alive(boundary, pid) or not boundary.validate_owner(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path):
+    process_birth_id = str(discovery.get("process_birth_id") or "")
+    if not process_birth_id or not _pid_alive(boundary, pid) or not boundary.validate_owner(
+        endpoint=endpoint, pid=pid, instance_id=instance_id,
+        owner_lock=paths.instance_lock_path, process_birth_id=process_birth_id,
+    ):
         raise BootstrapError("Runtime discovery is stale or owned by another process; run banodoco-local up --profile astrid.")
     if not boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id):
         raise BootstrapError("The selected runtime is unhealthy; run banodoco-local restart --profile astrid.")
@@ -977,6 +994,11 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
     validate = getattr(boundary, "validate_owner", None)
     if validate is None or not validate(endpoint=endpoint, pid=pid, instance_id=instance_id, owner_lock=paths.instance_lock_path, process_birth_id=process_birth_id):
         raise BootstrapError("Runtime restart refused: owner endpoint or process identity failed validation.")
+    catalog = _read_catalog(paths)
+    selected = _selected_realm(catalog)
+    if selected is None or str(selected.get("realm_id")) != realm_id:
+        raise BootstrapError("Runtime restart refused: discovery does not match the selected workspace.")
+    realm_root = Path(str(selected["data_root"])).expanduser()
     restart_fn = getattr(boundary, "restart", None)
     if restart_fn is None:
         remove_file(paths.discovery_path)
@@ -998,6 +1020,8 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         "pid": int(handle["pid"]),
         "process_birth_id": str(handle.get("process_birth_id") or handle.get("birth_id") or f"synthetic:{handle.get('runtime_instance_id')}:{handle.get('pid')}"),
         "runtime_instance_id": str(handle["runtime_instance_id"]),
+        "active_realm": realm_id,
+        "realm_root": str(realm_root),
         "coordinator_epoch": handle.get("coordinator_epoch", discovery.get("coordinator_epoch")),
         "protocol_version": handle.get("protocol_version", discovery.get("protocol_version")),
         "schema_version": handle.get("schema_version", discovery.get("schema_version")),
@@ -1009,6 +1033,7 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
         "process_birth_id": refreshed["process_birth_id"],
         "runtime_instance_id": str(handle["runtime_instance_id"]),
         "realm_id": str(discovery["active_realm"]),
+        "realm_root": str(realm_root),
     })
     atomic_write_json(paths.discovery_path, refreshed)
     result = bootstrap(paths, boundary, config)
@@ -1023,52 +1048,173 @@ def restart(paths: RuntimePaths, boundary: RuntimeBoundary, config: BootstrapCon
 
 def doctor(paths: RuntimePaths, boundary: RuntimeBoundary | None = None) -> dict[str, Any]:
     """Read-only support-state diagnostics.  This function creates no files."""
-    catalog = discovery = None
+    catalog = discovery = owner_lock = None
     report: dict[str, Any] = {
         "healthy": True,
         "catalog_path": str(paths.catalog_path),
         "discovery_path": str(paths.discovery_path),
-        "catalog_present": catalog is not None,
-        "discovery_present": discovery is not None,
+        "catalog_present": False,
+        "discovery_present": False,
+        "owner_lock_present": False,
+        "runtime_ready": False,
         "issues": [],
     }
     try:
         _validate_support_paths(paths)
-        catalog = _read_support_json(paths.catalog_path)
+        catalog_value = _read_support_json(paths.catalog_path)
+        catalog = _read_catalog(paths) if catalog_value is not None else None
         discovery = _read_support_json(paths.discovery_path)
+        owner_lock = _read_support_json(paths.instance_lock_path)
     except BootstrapError as exc:
-        catalog = discovery = None
         report["healthy"] = False
         report["issues"].append(str(exc))
     report["catalog_present"] = catalog is not None
     report["discovery_present"] = discovery is not None
+    report["owner_lock_present"] = owner_lock is not None
+    realm: dict[str, Any] | None = None
+    realm_root: Path | None = None
     if catalog is None:
         report["healthy"] = False
         report["issues"].append("catalog_missing")
     else:
         try:
             realm = _selected_realm(catalog)
-            report["realm_id"] = realm.get("realm_id") if realm else None
-            if realm and not Path(str(realm.get("data_root", ""))).exists():
+            if realm is None:
+                report["healthy"] = False
+                report["issues"].append("selected_workspace_missing")
+            else:
+                report["realm_id"] = str(realm.get("realm_id") or "")
+                try:
+                    uuid.UUID(report["realm_id"])
+                except (ValueError, AttributeError):
+                    report["healthy"] = False
+                    report["issues"].append("workspace_identity_invalid")
+                realm_root = Path(str(realm.get("data_root") or "")).expanduser().resolve()
+                report["realm_root"] = str(realm_root)
+            if realm_root is not None and not realm_root.exists():
                 report["healthy"] = False
                 report["issues"].append("realm_root_missing")
         except BootstrapError as exc:
             report["healthy"] = False
             report["issues"].append(str(exc))
+    if realm is not None and discovery is None:
+        report["healthy"] = False
+        report["issues"].append("workspace_configured_runtime_not_ready")
     if discovery is not None:
-        report["pid_alive"] = bool(_pid_alive(boundary, discovery.get("pid")))
+        try:
+            pid = int(discovery["pid"])
+            endpoint = _validate_loopback_endpoint(str(discovery["endpoint"]))
+            instance_id = str(discovery["runtime_instance_id"])
+            process_birth_id = str(discovery["process_birth_id"])
+            discovered_realm = str(discovery["active_realm"])
+            discovered_root_raw = str(discovery["realm_root"])
+            if not instance_id or not process_birth_id or not discovered_realm or not discovered_root_raw:
+                raise ValueError
+            discovered_root_path = Path(discovered_root_raw).expanduser()
+            if not discovered_root_path.is_absolute():
+                raise ValueError
+            discovered_root = discovered_root_path.resolve()
+        except (KeyError, TypeError, ValueError, OSError, BootstrapError):
+            pid = 0
+            endpoint = ""
+            instance_id = process_birth_id = discovered_realm = ""
+            discovered_root = None
+            report["healthy"] = False
+            report["issues"].append("discovery_identity_incomplete")
+
+        if realm is not None and realm_root is not None:
+            selected_realm = str(realm.get("realm_id") or "")
+            if discovered_realm != selected_realm:
+                report["healthy"] = False
+                report["issues"].append("discovery_realm_mismatch")
+            if discovered_root != realm_root:
+                report["healthy"] = False
+                report["issues"].append("discovery_root_mismatch")
+            if str(realm.get("readiness") or "") != "ready":
+                report["healthy"] = False
+                report["issues"].append("catalog_runtime_not_ready")
+            if str(realm.get("runtime_instance_id") or "") != instance_id:
+                report["healthy"] = False
+                report["issues"].append("catalog_instance_mismatch")
+
+        if owner_lock is None:
+            report["healthy"] = False
+            report["issues"].append("owner_lock_missing")
+        else:
+            lock_root_raw = str(owner_lock.get("realm_root") or "")
+            lock_root_path = Path(lock_root_raw).expanduser()
+            try:
+                lock_root = lock_root_path.resolve() if lock_root_path.is_absolute() else None
+            except OSError:
+                lock_root = None
+            lock_matches = bool(
+                str(owner_lock.get("pid")) == str(pid)
+                and str(owner_lock.get("runtime_instance_id") or "") == instance_id
+                and str(owner_lock.get("process_birth_id") or "") == process_birth_id
+                and str(owner_lock.get("realm_id") or "") == discovered_realm
+                and lock_root is not None
+                and lock_root == discovered_root
+                and (realm_root is None or lock_root == realm_root)
+            )
+            if not lock_matches:
+                report["healthy"] = False
+                report["issues"].append("owner_lock_identity_mismatch")
+
+        report["pid_alive"] = bool(pid and _pid_alive(boundary, pid))
         if not report["pid_alive"]:
             report["healthy"] = False
             report["issues"].append("stale_discovery")
-        elif boundary:
+        elif boundary and endpoint and instance_id:
             try:
-                owner_ok = bool(boundary.validate_owner(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", "")), owner_lock=paths.instance_lock_path, process_birth_id=str(discovery.get("process_birth_id") or "")))
+                owner_ok = bool(boundary.validate_owner(
+                    endpoint=endpoint,
+                    pid=pid,
+                    instance_id=instance_id,
+                    owner_lock=paths.instance_lock_path,
+                    process_birth_id=process_birth_id,
+                ))
             except Exception:
                 owner_ok = False
             if not owner_ok:
                 report["healthy"] = False
                 report["issues"].append("discovery_identity")
-            elif not boundary.health(endpoint=str(discovery.get("endpoint", "")), pid=int(discovery["pid"]), instance_id=str(discovery.get("runtime_instance_id", ""))):
+            try:
+                runtime_healthy = bool(boundary.health(endpoint=endpoint, pid=pid, instance_id=instance_id))
+            except Exception:
+                runtime_healthy = False
+            if not runtime_healthy:
                 report["healthy"] = False
                 report["issues"].append("runtime_unhealthy")
+            metadata_fn = getattr(boundary, "endpoint_metadata", None)
+            try:
+                credential_file = Path(str(discovery.get("credential_file") or ""))
+                endpoint_metadata = metadata_fn(
+                    endpoint=endpoint, credential_file=credential_file,
+                ) if callable(metadata_fn) else None
+            except Exception:
+                endpoint_metadata = None
+            endpoint_realm = str(endpoint_metadata.get("realm_id") or "") if isinstance(endpoint_metadata, Mapping) else ""
+            endpoint_matches = bool(
+                isinstance(endpoint_metadata, Mapping)
+                and endpoint_metadata.get("status") == "ok"
+                and str(endpoint_metadata.get("runtime_instance_id") or "") == instance_id
+                and endpoint_realm == discovered_realm
+                and (realm is None or endpoint_realm == str(realm.get("realm_id") or ""))
+            )
+            if not endpoint_matches:
+                report["healthy"] = False
+                report["issues"].append("endpoint_identity_mismatch")
+        else:
+            report["healthy"] = False
+            report["issues"].append("runtime_identity_unavailable")
+
+    report["runtime_ready"] = bool(report["healthy"] and realm is not None and discovery is not None)
+    if report["runtime_ready"]:
+        report["state"] = "ready"
+    elif realm is None:
+        report["state"] = "workspace_missing"
+    elif discovery is None:
+        report["state"] = "workspace_configured_runtime_not_ready"
+    else:
+        report["state"] = "runtime_unavailable"
     return report

@@ -11,6 +11,7 @@ from banodoco_local.bootstrap import BootstrapConfig, SourceProfile, bootstrap
 from banodoco_local.operator_upgrade import OperatorUpgradeError, upgrade_workspace
 from banodoco_local.paths import RuntimePaths
 from banodoco_local.runtime_boundary import LocalRuntimeBoundary
+from banodoco_local.workspace import configure_workspace
 from runtime_protocol.store import RealmStore
 
 
@@ -150,8 +151,14 @@ def test_operator_upgrade_restarts_a_real_current_runtime(tmp_path):
     profile = SourceProfile(profile="astrid", runtime_checkout=str(repo), source_checkout=str(repo))
     boundary = LocalRuntimeBoundary(wait_seconds=8)
     try:
-        first = bootstrap(paths, boundary, BootstrapConfig(source_profile=profile))
-        result = upgrade_workspace(paths, boundary, BootstrapConfig(source_profile=profile))
+        config = BootstrapConfig(source_profile=profile)
+        configure_workspace(
+            paths, boundary, config, mode="create",
+            realm_root=paths.realms_dir / "3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+            realm_id="3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+        )
+        first = bootstrap(paths, boundary, config)
+        result = upgrade_workspace(paths, boundary, config)
         assert first.ready and result["ok"]
         assert result["schema_before"] == "v25"
         assert result["verification"]["health"] is True

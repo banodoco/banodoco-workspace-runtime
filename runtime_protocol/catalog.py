@@ -168,8 +168,12 @@ class RealmCatalog:
         with self._write_lock() as identity:
             write_identity = path_identity or identity
             catalog = self.read(path_identity=write_identity)
+            prior = next((dict(r) for r in catalog.get("realms", []) if r.get("realm_id") == realm_id), {})
             realms = [r for r in catalog.get("realms", []) if r.get("realm_id") != realm_id]
-            row = {"realm_id": realm_id, "display_name": display_name, "data_root": str(root), "registered_at": now()}
+            # Selection/configuration fields belong to the launcher. Runtime
+            # overlays only its live authority fields so startup cannot erase
+            # how the sole workspace was chosen.
+            row = {**prior, "realm_id": realm_id, "display_name": display_name, "data_root": str(root), "registered_at": prior.get("registered_at") or now()}
             if runtime_epoch is not None:
                 row["runtime_epoch"] = int(runtime_epoch)
             if runtime_instance_id is not None:
@@ -219,7 +223,7 @@ class LiveDiscovery:
         self.path = _safe_path(path, "discovery path")
 
     def publish(self, **fields):
-        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "worker_credential_file", "worker_actor", "worker_scopes"}
+        allowed = {"version", "endpoint", "pid", "process_birth_id", "active_realm", "realm_root", "runtime_instance_id", "protocol_version", "schema_version", "coordinator_epoch", "credential_file", "worker_credential_file", "worker_actor", "worker_scopes"}
         atomic_json_write(self.path, {k: fields[k] for k in allowed if k in fields})
 
     def clear(self, instance_id: str | None = None):

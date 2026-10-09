@@ -9,6 +9,7 @@ import pytest
 
 from banodoco_local.bootstrap import BootstrapConfig, BootstrapError, SourceProfile, bootstrap
 from banodoco_local.paths import RuntimePaths
+from banodoco_local.workspace import configure_workspace
 from runtime_protocol.errors import AuthorizationError, ConflictError, LeaseError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
@@ -89,7 +90,7 @@ def test_source_profile_requires_pinned_runtime_and_rejects_authority_fields() -
         SourceProfile.from_mapping({"profile": "astrid", "runtime_checkout": "/runtime", "source_checkout": "/source", "runtime_command": ["sh", "-c", "evil"]})
 
 
-def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) -> None:
+def test_bootstrap_preserves_configured_realm_after_handoff_failure(tmp_path: Path) -> None:
     paths = RuntimePaths.sandbox(tmp_path)
     profile = SourceProfile("astrid", "/runtime", "/source")
 
@@ -103,6 +104,9 @@ def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) ->
                 display_name=kwargs["display_name"],
             ).close()
             return {"state": "created", "realm_id": kwargs["realm_id"], "root": str(kwargs["realm_root"])}
+
+        def inspect(self, *, realm_root):
+            return RealmStore.inspect_realm(realm_root)
 
         def start(self, **kwargs):
             assert (kwargs["realm_root"] / "realm.sqlite3").is_file()
@@ -118,11 +122,17 @@ def test_bootstrap_rolls_back_new_realm_after_handoff_failure(tmp_path: Path) ->
             self.stopped = True
 
     boundary = FailingBoundary()
+    config = BootstrapConfig(source_profile=profile)
+    configure_workspace(
+        paths, boundary, config, mode="create",
+        realm_root=paths.realms_dir / "3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+        realm_id="3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+    )
     with pytest.raises(RuntimeError, match="handoff failed"):
-        bootstrap(paths, boundary, BootstrapConfig(source_profile=profile))
+        bootstrap(paths, boundary, config)
     assert boundary.stopped
-    assert not list(paths.realms_dir.iterdir()) if paths.realms_dir.exists() else True
-    assert not paths.catalog_path.exists()
+    assert list(paths.realms_dir.iterdir())
+    assert paths.catalog_path.exists()
     assert not paths.discovery_path.exists()
     assert not paths.instance_lock_path.exists()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import sys
 
 import pytest
@@ -11,6 +12,7 @@ from banodoco_local.bootstrap import BootstrapConfig, SourceProfile, bootstrap
 from banodoco_local.relocation import RelocationError, relocate
 from banodoco_local.runtime_boundary import LocalRuntimeBoundary
 from banodoco_local import RuntimePaths
+from banodoco_local.workspace import configure_workspace
 
 
 def _config(repo: Path) -> BootstrapConfig:
@@ -22,6 +24,14 @@ def _config(repo: Path) -> BootstrapConfig:
         runtime_checkout=str(repo),
         source_checkout=str(repo),
     ))
+
+
+def _configure(paths, boundary, config):
+    return configure_workspace(
+        paths, boundary, config, mode="create",
+        realm_root=paths.realms_dir / "3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+        realm_id="3f3d09c0-8bd4-4dfa-8cd4-0e16a4f735d4",
+    )
 
 
 def test_real_runtime_daemon_cutover_starts_from_new_support_root(tmp_path):
@@ -36,6 +46,7 @@ def test_real_runtime_daemon_cutover_starts_from_new_support_root(tmp_path):
     config = _config(repo)
 
     try:
+        _configure(paths, boundary, config)
         first = bootstrap(paths, boundary, config)
         assert first.ready
         marker = old_support / "auxiliary-preserved.txt"
@@ -71,8 +82,9 @@ def test_real_runtime_cutover_failure_rolls_back_tree_and_metadata(tmp_path, mon
     boundary = LocalRuntimeBoundary(wait_seconds=8)
     config = _config(repo)
     try:
+        _configure(paths, boundary, config)
         first = bootstrap(paths, boundary, config)
-        before = paths.catalog_path.read_bytes()
+        before = json.loads(paths.catalog_path.read_text())
         original_start = boundary.start
 
         def fail_candidate(*args, **kwargs):
@@ -85,8 +97,11 @@ def test_real_runtime_cutover_failure_rolls_back_tree_and_metadata(tmp_path, mon
             relocate(paths, boundary, config, client=None, destination=new_support, confirmation=f"RELOCATE {first.realm_id}")
         assert old_support.is_dir()
         assert not new_support.exists()
-        assert paths.catalog_path.read_bytes() == before
-        import json
+        after = json.loads(paths.catalog_path.read_text())
+        assert after["selected_realm_id"] == before["selected_realm_id"]
+        assert after["realms"][0]["realm_id"] == before["realms"][0]["realm_id"]
+        assert after["realms"][0]["data_root"] == before["realms"][0]["data_root"]
+        assert after["realms"][0]["readiness"] == "ready"
         restored = json.loads(paths.discovery_path.read_text(encoding="utf-8"))
         assert boundary.health(
             endpoint=restored["endpoint"],
