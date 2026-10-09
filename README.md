@@ -34,6 +34,25 @@ lookup verifies ownership, size, and SHA-256 bytes before returning the current
 CAS path. Paths are valid for the local runtime host at lookup time; task and
 managed-output receipts remain portable and do not embed them.
 
+Binary object and project media-import POSTs stream raw bytes with a default
+5 GiB limit. Set `RUNTIME_MAX_OBJECT_BYTES` to a positive decimal byte count to
+lower that limit (ASCII digits only, no signs, whitespace or separators).
+Values above 5,368,709,120 bytes or zero are rejected before opening a realm.
+JSON control requests remain limited to 64 MiB. Binary
+requests require one Content-Length or chunked Transfer-Encoding; ambiguous
+framing, compressed bodies, incomplete transfers and chunk trailers are
+rejected. The TypeScript client's `RequestBody` accepts `Uint8Array | Blob`;
+pass browser File/Blob bodies directly instead of materializing an ArrayBuffer.
+
+Typed image/video/audio imports require local `ffprobe` and `ffmpeg`. A forced
+local demuxer and one decoded frame/sample check the declared media type before
+publication. Generic object routes continue accepting arbitrary blobs. Keep the
+same Idempotency-Key, bytes and metadata for a full-request retry. An interrupted
+prepublication transfer creates no durable operation; a lost response after
+commit is recoverable by import-operation lookup or exact receipt replay.
+Object GET/HEAD supports single closed, open and suffix byte ranges and 416
+responses. Transfers and hash verification run outside SQLite transactions.
+
 ```bash
 python3 -m runtime_protocol doctor --root .runtime --json
 python3 -m runtime_protocol create --root .runtime

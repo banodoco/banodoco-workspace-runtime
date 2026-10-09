@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .cas import ContentAddressedStore
+from .cas import ContentAddressedStore, StagedObject, DEFAULT_MAX_OBJECT_BYTES, file_identity
 from .backup import create_backup, restore_backup, structured_export
 from .store import (
     GENERATION_INTENT_STORAGE_KEY,
@@ -40,7 +40,7 @@ from .timeline_view import markdown as render_timeline_markdown, png as render_t
 
 
 CHECKPOINT_MAX_BYTES = 1024 * 1024
-OBJECT_MAX_BYTES = 64 * 1024 * 1024
+OBJECT_MAX_BYTES = DEFAULT_MAX_OBJECT_BYTES
 MEDIA_IMPORT_CAPABILITY = "runtime.media.import.v1"
 MEDIA_IMPORT_EXECUTOR = "runtime-host-media-import"
 MEDIA_IMPORT_CAPABILITY_DIGEST = "sha256:" + hashlib.sha256(MEDIA_IMPORT_CAPABILITY.encode()).hexdigest()
@@ -412,6 +412,12 @@ class RuntimeService:
     """Neutral application service composed by the daemon or an isolated test."""
 
     def __init__(self, root, *, display_name="Workspace", realm_id=None, support_root=None, export_root=None, reboot_executor=None, reboot_allowlist=None, runtime_epoch_floor=None, admission_timeout=None):
+        configured_max = os.environ.get("RUNTIME_MAX_OBJECT_BYTES", str(OBJECT_MAX_BYTES))
+        if not re.fullmatch(r"[0-9]{1,20}", configured_max):
+            raise ValidationError("RUNTIME_MAX_OBJECT_BYTES must be a positive decimal integer")
+        self.max_object_bytes = int(configured_max, 10)
+        if not 0 < self.max_object_bytes <= OBJECT_MAX_BYTES:
+            raise ValidationError("RUNTIME_MAX_OBJECT_BYTES must be between 1 and 5368709120")
         root_path = Path(root).expanduser().resolve()
         # Service startup is an open/admission operation.  Realm creation is
         # explicit through RealmStore.initialize; a missing path must fail
@@ -447,6 +453,14 @@ class RuntimeService:
             self.store.close()
             raise
         self.support_root = Path(support_root).expanduser().resolve() if support_root else None
+        # Reconstruct before any admission/replay. An unreadable existing fence
+        # is uncertainty, never an unfenced generation. The daemon installs the
+        # credential-owner verifier before starting HTTP or a local launcher.
+        self._local_claim_actor = "astrid-pack-host"
+        self._local_generation_verifier = None
+        self._local_claim_fence_unknown = False
+        self._local_claim_fence = None
+        self._load_local_claim_fence()
         self.export_root = Path(export_root).expanduser().resolve() if export_root else None
         if self.export_root is not None:
             if self.export_root == self.store.root or self.export_root.is_relative_to(self.store.root) or self.store.root.is_relative_to(self.export_root):
@@ -458,10 +472,104 @@ class RuntimeService:
         if not configured_allowlist or not configured_allowlist.issubset(REBOOT_COMMAND_ALLOWLIST):
             raise ValidationError("reboot allowlist contains an unsupported command", details={"allowlist": sorted(configured_allowlist), "supported": sorted(REBOOT_COMMAND_ALLOWLIST)})
         self.reboot_allowlist = configured_allowlist
+        self._verified_cas_objects = {}
         self._recover_cas_publication_journals()
+        # Only startup may remove abandoned transfers: live handlers own their files.
+        upload_dir = self.store.staging_root / "uploads"
+        if upload_dir.exists():
+            fd = _open_directory_chain(upload_dir)
+            try:
+                for entry in os.scandir(fd):
+                    if re.fullmatch(r"[0-9a-f]{32}\.upload", entry.name):
+                        os.unlink(entry.name, dir_fd=fd)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     def close(self):
         self.store.close()
+
+    def _local_claim_fence_path(self):
+        return (self.support_root or self.store.root) / "local-execution-claim-fence.json"
+
+    def _load_local_claim_fence(self):
+        from .local_execution_handoff import read_protected, validate_fence
+        path = self._local_claim_fence_path()
+        if not path.exists() and not path.is_symlink():
+            return
+        try:
+            self._local_claim_fence = validate_fence(read_protected(path))
+            if self._local_claim_fence["workspace_uuid"] != self.realm["id"]:
+                raise ConflictError("claim fence workspace differs")
+        except Exception:
+            self._local_claim_fence_unknown = True
+
+    def set_local_claim_generation_verifier(self, callback, *, actor):
+        """Daemon-only composition, not an RPC or a new credential API."""
+        self._local_generation_verifier = callback
+        self._local_claim_actor = actor
+
+    def _assert_local_claim_admission(self, executor_id, *, identity=None, registration=False):
+        if executor_id != self._local_claim_actor:
+            return
+        self._load_local_claim_fence()
+        fence = self._local_claim_fence
+        if self._local_claim_fence_unknown:
+            raise ConflictError("local execution claim fence is unresolved")
+        if fence is None:
+            return
+        verifier = self._local_generation_verifier
+        if verifier is None or verifier(fence, identity) != fence["credential_generation_digest"]:
+            raise ConflictError("local execution credential generation is unresolved")
+        if fence["state"] == "held":
+            if not registration:
+                raise ConflictError("local execution claims are fenced")
+            binding = identity.get("execution_binding") if isinstance(identity, dict) else None
+            if not isinstance(binding, dict) or binding.get("executor_incarnation") != fence["executor_incarnation"]:
+                raise ConflictError("registration differs from fenced incarnation")
+
+    def hold_local_claim_fence(self, value, *, assert_no_work):
+        """No-work check and durable fence share the canonical claim mutex."""
+        from .local_execution_handoff import validate_fence, write_protected
+        value = validate_fence(dict(value))
+        with self.store._mutex:
+            self._assert_mutation_admitted()
+            self._load_local_claim_fence()
+            if self._local_claim_fence_unknown or value["state"] != "held" or value["workspace_uuid"] != self.realm["id"]:
+                raise ConflictError("claim fence cannot be published")
+            previous = self._local_claim_fence
+            if previous == value:
+                return dict(previous)
+            if previous is not None and (previous["state"] != "released" or value["fence_generation"] != previous["fence_generation"] + 1):
+                raise ConflictError("claim fence generation conflicts")
+            if previous is None and value["fence_generation"] != 1:
+                raise ConflictError("initial claim fence generation must be one")
+            verifier = self._local_generation_verifier
+            if verifier is None or verifier(value, None) != value["credential_generation_digest"]:
+                raise ConflictError("claim fence credential generation differs")
+            assert_no_work()
+            write_protected(self._local_claim_fence_path(), value)
+            self._local_claim_fence = value
+            return dict(value)
+
+    def release_local_claim_fence(self, held, *, durable_ack, verify_ack):
+        """Only a daemon-verified durable terminal outcome permits release."""
+        from .local_execution_handoff import digest, validate_fence, write_protected
+        validate_fence(held)
+        with self.store._mutex:
+            self._load_local_claim_fence()
+            if self._local_claim_fence_unknown or self._local_claim_fence != held or held["state"] != "held":
+                raise ConflictError("claim fence release has no exact held generation")
+            verifier = self._local_generation_verifier
+            if verifier is None or verifier(held, None) != held["credential_generation_digest"]:
+                raise ConflictError("claim fence credential generation changed")
+            # verify_ack only checks retained/durable evidence. It must not do
+            # RPC or waits under the store mutex; no public caller selects it.
+            verify_ack(durable_ack)
+            released = {**held, "state": "released", "release_ack_digest": digest(durable_ack)}
+            write_protected(self._local_claim_fence_path(), released)
+            self._local_claim_fence = released
+            return dict(released)
 
     def set_readiness_callback(self, callback) -> None:
         """Install the daemon-owned readiness revocation hook."""
@@ -4128,54 +4236,87 @@ class RuntimeService:
     def archive_reference(self, reference_id, body, *, idempotency_key=None): return self._update_reference_state(reference_id, body, archived=True, idempotency_key=idempotency_key)
     def recover_reference(self, reference_id, body, *, idempotency_key=None): return self._update_reference_state(reference_id, body, archived=False, idempotency_key=idempotency_key)
 
-    @_durable_mutation
-    def ingest(self, project, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None):
+    def stage_object(self, chunks, *, expected_digest=None):
+        return self.cas.stage(chunks, self.store.staging_root,
+                              max_bytes=self.max_object_bytes, expected_digest=expected_digest)
+
+    def ingest(self, project, data, *, media_type="application/octet-stream", original_name=None,
+               expected_digest=None, idempotency_key=None):
+        return self._ingest_transfer(project, data, media_type=media_type, original_name=original_name,
+                                     expected_digest=expected_digest, idempotency_key=idempotency_key)
+
+    def _ingest_transfer(self, project, data, *, media_type, original_name, expected_digest,
+                         idempotency_key, identity=None, upload_binding=None):
         idempotency_key = require_idempotency_key(idempotency_key)
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise InvalidRequestError("object body must be bytes")
-        if len(data) > OBJECT_MAX_BYTES:
-            raise ValidationError("object exceeds 64 MiB limit")
-        data = bytes(data)
-        project_row = self.store.get_project(project)
-        expected = (expected_digest or "").removeprefix("sha256:") or None
-        request_hash = hashlib.sha256(canonical_json({
-            "project_id": project_row["id"],
-            "content_digest": sha256_bytes(data),
-            "media_type": media_type,
-            "original_name": original_name,
-            "expected_digest": expected,
-        }).encode()).hexdigest()
-        aggregate_id = project_row["id"]
-        replay = self._command_replay("object.ingest", aggregate_id, idempotency_key, request_hash, project_id=project_row["id"])
-        if replay is not None:
-            return replay
-        destination = self.cas.path_for(sha256_bytes(data))
-        if not destination.exists():
-            self._begin_cas_publication_journal("ingest", [{"digest": sha256_bytes(data)}], project_id=project_row["id"])
-        obj = self.cas.put(data, expected_digest=expected)
+        owned_stage = not isinstance(data, StagedObject)
+        if owned_stage:
+            if not isinstance(data, (bytes, bytearray, memoryview)):
+                raise InvalidRequestError("object body must be bytes or a runtime staged transfer")
+            if len(data) > self.max_object_bytes:
+                raise ValidationError(f"object exceeds {self.max_object_bytes} byte limit")
+            data = self.stage_object((data,), expected_digest=expected_digest)
         try:
-            timestamp = now()
-            self.store.conn.execute(
-                "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
-                (obj["digest"], obj["size"], media_type, original_name, timestamp),
-            )
-            self.store.conn.execute(
-                "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)",
-                (project_row["id"], obj["digest"], timestamp),
-            )
-            row = dict(self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (obj["digest"],)).fetchone())
-            # The durable result is the closed managed-object resource.  The
-            # project association and CAS deduplication state remain durable
-            # transaction facts, not extra fields in the public object wire.
-            result = self._object_resource(row) | {"relation": "managed"}
-            return self._command_record("object.ingest", aggregate_id, idempotency_key, request_hash, result, project_id=project_row["id"])
-        except Exception:
-            # The CAS write precedes the SQLite transaction.  If the durable
-            # metadata/receipt transaction fails, remove only the file this
-            # command introduced so a retry cannot observe a phantom object.
-            if not obj["deduplicated"]:
-                self._discard_published_digest(obj["digest"])
-            raise
+            if data.size > self.max_object_bytes:
+                raise ValidationError(f"object exceeds {self.max_object_bytes} byte limit")
+            expected = (expected_digest or "").removeprefix("sha256:") or None
+            if expected and expected != data.digest:
+                raise ConflictError("content hash does not match expected digest")
+            # The store mutex is the only publication/journal/receipt serializer.
+            # Binary handlers verify before acquiring it; pinned stat tokens fence
+            # reuse. A second upload lock would invert callers' existing store lock
+            # (for example create_timeline_view -> ingest).
+            existing = self.cas.existing_identity(data.digest, data.size)
+            with self.store._mutex:
+                self._assert_mutation_admitted()
+                project_row = self.store.get_project(project) if project is not None else None
+                project_id = project_row["id"] if project_row else "unscoped"
+                aggregate_id = project_id if project_row else "objects"
+                binding = dict(upload_binding) if upload_binding is not None else None
+                request = {"content_digest": data.digest, "media_type": media_type,
+                           "original_name": original_name, "expected_digest": expected}
+                if project_row:
+                    request["project_id"] = project_id
+                if binding is not None:
+                    request["publication_binding"] = binding
+                request_hash = hashlib.sha256(canonical_json(request).encode()).hexdigest()
+                replay = self._command_replay("object.ingest", aggregate_id, idempotency_key,
+                                              request_hash, project_id=project_id)
+                if replay is not None:
+                    return replay
+                if binding is not None:
+                    self._validate_generic_output_binding(binding, identity=identity,
+                        digest=data.digest, size=data.size, media_type=media_type,
+                        original_name=original_name, idempotency_key=idempotency_key)
+                if existing is None:
+                    self._begin_cas_publication_journal("ingest", [{"digest": data.digest}], project_id=project_id)
+                try:
+                    self.cas.publish(data, existing_identity=existing)
+                    data.discard()  # Drop the staging link before receipt/stat proofs.
+                    with self.cas.open(data.digest) as published:
+                        self._verified_cas_objects[data.digest] = file_identity(os.fstat(published.fileno()))
+                    with self.store._transaction():
+                        timestamp = now()
+                        self.store.conn.execute(
+                            "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                            (data.digest, data.size, media_type, original_name, timestamp))
+                        if project_row:
+                            self.store.conn.execute(
+                                "INSERT OR IGNORE INTO project_objects(project_id, digest, relation, created_at) VALUES (?, ?, 'managed', ?)",
+                                (project_id, data.digest, timestamp))
+                        row = dict(self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (data.digest,)).fetchone())
+                        result = self._object_resource(row)
+                        if project_row:
+                            result["relation"] = "managed"
+                        result = self._command_record("object.ingest", aggregate_id, idempotency_key,
+                                                      request_hash, result, project_id=project_id)
+                except BaseException:
+                    self._recover_cas_publication_journals()
+                    raise
+                self._recover_cas_publication_journals()
+                return result
+        finally:
+            if owned_stage:
+                data.discard()
 
     @staticmethod
     def _media_import_operation_id(project_id, idempotency_key):
@@ -4221,11 +4362,10 @@ class RuntimeService:
                               expected_digest, actor_id, width, height,
                               duration_seconds, idempotency_key):
         idempotency_key = require_idempotency_key(idempotency_key)
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise InvalidRequestError("media import body must be bytes")
-        if len(data) > OBJECT_MAX_BYTES:
-            raise ValidationError("object exceeds 64 MiB limit")
-        data = bytes(data)
+        if not isinstance(data, StagedObject):
+            raise InvalidRequestError("media import body must be a runtime staged transfer")
+        if data.size > self.max_object_bytes:
+            raise ValidationError(f"object exceeds {self.max_object_bytes} byte limit")
         project_row = self.store.get_project(project)
         if not isinstance(media_type, str) or not media_type or len(media_type) > 255:
             raise ValidationError("media import Content-Type is invalid")
@@ -4244,7 +4384,7 @@ class RuntimeService:
         if content_type == "image" and duration_seconds is not None:
             raise ValidationError("image imports must not declare duration_seconds")
         expected = (expected_digest or "").removeprefix("sha256:") or None
-        digest = sha256_bytes(data)
+        digest = data.digest
         operation_id = self._media_import_operation_id(project_row["id"], idempotency_key)
         request = {
             "project_id": project_row["id"],
@@ -4313,7 +4453,7 @@ class RuntimeService:
         }
 
     @_durable_mutation
-    def _settle_media_import_catalog(self, prepared, object_resource):
+    def _settle_media_import_catalog(self, prepared, object_resource, verified_objects):
         """Atomically settle the host-owned task and publish one catalog pair."""
         project = prepared["project"]
         operation_id = prepared["operation_id"]
@@ -4396,6 +4536,7 @@ class RuntimeService:
                 "effect": effect,
             },
             idempotency_key=self._media_import_subkey(operation_id, "settle"),
+            _verified_objects=verified_objects,
         )
         generation_variant = settled["data"]["result"]["generation_variant"]
         result = {
@@ -4424,24 +4565,72 @@ class RuntimeService:
             prepared["request_hash"], result, project_id=project["id"],
         )
 
-    def import_media(self, project, data: bytes, *, media_type, original_name=None,
+    @staticmethod
+    def _validate_media_file(staged, media_type):
+        """Bounded local decode check; forced demuxers cannot open playlists/URLs."""
+        demuxers = {
+            "image/png": "png_pipe", "image/jpeg": "jpeg_pipe", "image/webp": "webp_pipe",
+            "image/gif": "gif", "image/bmp": "bmp_pipe", "image/tiff": "tiff_pipe",
+            "image/avif": "mov", "video/mp4": "mov", "video/quicktime": "mov",
+            "video/webm": "matroska", "video/x-matroska": "matroska", "video/x-msvideo": "avi",
+            "video/mpeg": "mpeg", "video/mp2t": "mpegts", "audio/wav": "wav",
+            "audio/x-wav": "wav", "audio/mpeg": "mp3", "audio/ogg": "ogg",
+            "audio/flac": "flac", "audio/aac": "aac", "audio/mp4": "mov", "audio/webm": "matroska",
+        }
+        normalized = media_type.lower().split(";", 1)[0].strip()
+        demuxer = demuxers.get(normalized)
+        if demuxer is None:
+            raise ValidationError("media import type has no supported local decoder")
+        common = ["-v", "error", "-max_alloc", "67108864", "-protocol_whitelist", "file,pipe",
+                  "-probesize", "8388608", "-analyzeduration", "5000000", "-f", demuxer]
+        try:
+            kind = "audio" if normalized.startswith("audio/") else "video"
+            probe = subprocess.run(["ffprobe", *common, "-select_streams", "a:0" if kind == "audio" else "v:0", "-show_entries",
+                "stream=codec_type,codec_name,width,height,duration:format=duration", "-of", "json", str(staged.path)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, check=True)
+            info = json.loads(probe.stdout)
+            streams = [item for item in info.get("streams", []) if item.get("codec_type") == kind]
+            if not streams or any(int(item.get("width", 0)) * int(item.get("height", 0)) > 67108864 for item in streams):
+                raise ValidationError("media import bytes do not match declared media type or dimensions exceed decoder limit")
+            # Decode at least one frame/sample, beyond a merely recognizable header.
+            decoded = subprocess.run(["ffmpeg", *common, "-threads", "1", "-i", str(staged.path),
+                "-map", "0:a:0" if kind == "audio" else "0:v:0", "-frames:a" if kind == "audio" else "-frames:v", "1",
+                "-threads", "1", "-f", "framehash", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30, check=True)
+            if not any(line and not line.startswith(b"#") for line in decoded.stdout.splitlines()):
+                raise ValidationError("media import has no decodable media frames")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValidationError("media import is not locally decodable (ffprobe and ffmpeg are required)") from exc
+
+    def import_media(self, project, data, *, media_type, original_name=None,
                      expected_digest=None, actor_id, width=None, height=None,
                      duration_seconds=None, idempotency_key=None):
-        """Ingest and settle one authenticated image/video/audio import operation."""
-        prepared = self._media_import_request(
-            project, data, media_type=media_type, original_name=original_name,
-            expected_digest=expected_digest, actor_id=actor_id, width=width,
-            height=height, duration_seconds=duration_seconds,
-            idempotency_key=idempotency_key,
-        )
-        ingested = self.ingest(
-            prepared["project"]["id"], prepared["data"],
-            media_type=prepared["request"]["media_type"],
-            original_name=prepared["request"]["original_name"],
-            expected_digest=prepared["request"]["expected_digest"],
-            idempotency_key=self._media_import_subkey(prepared["operation_id"], "object"),
-        )
-        return self._settle_media_import_catalog(prepared, ingested["data"])
+        """Transfer/decode outside SQLite, then reuse fenced host settlement."""
+        owned_stage = not isinstance(data, StagedObject)
+        if owned_stage:
+            if not isinstance(data, (bytes, bytearray, memoryview)):
+                raise InvalidRequestError("media import body must be bytes")
+            if len(data) > self.max_object_bytes:
+                raise ValidationError(f"object exceeds {self.max_object_bytes} byte limit")
+            data = self.stage_object((data,), expected_digest=expected_digest)
+        try:
+            with self.store._mutex:
+                self._assert_mutation_admitted()
+                prepared = self._media_import_request(
+                    project, data, media_type=media_type, original_name=original_name,
+                    expected_digest=expected_digest, actor_id=actor_id, width=width, height=height,
+                    duration_seconds=duration_seconds, idempotency_key=idempotency_key)
+            self._validate_media_file(data, media_type)
+            ingested = self.ingest(prepared["project"]["id"], data,
+                media_type=prepared["request"]["media_type"], original_name=prepared["request"]["original_name"],
+                expected_digest=prepared["request"]["expected_digest"],
+                idempotency_key=self._media_import_subkey(prepared["operation_id"], "object"))
+            verified = self.cas.existing_identity(data.digest, data.size)
+            if verified is None:
+                raise ConflictError("imported CAS object is missing")
+            return self._settle_media_import_catalog(prepared, ingested["data"], {data.digest: verified})
+        finally:
+            if owned_stage:
+                data.discard()
 
     def get_media_import(self, project, operation_id):
         """Recover a completed import or its durable pre-settlement ingest."""
@@ -4554,50 +4743,11 @@ class RuntimeService:
             request["publication_binding"] = binding
         return hashlib.sha256(canonical_json(request).encode()).hexdigest()
 
-    @_durable_mutation
-    def ingest_object(self, data: bytes, *, media_type="application/octet-stream", original_name=None, expected_digest=None, idempotency_key=None, identity=None, upload_binding=None):
-        idempotency_key = require_idempotency_key(idempotency_key)
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise InvalidRequestError("object body must be bytes")
-        if len(data) > OBJECT_MAX_BYTES:
-            raise ValidationError("object exceeds 64 MiB limit")
-        data = bytes(data)
-        expected = (expected_digest or "").removeprefix("sha256:") or None
-        digest = sha256_bytes(data)
-        binding = dict(upload_binding) if upload_binding is not None else None
-        request_hash = self._generic_output_request_hash(
-            digest, media_type, original_name, expected, binding,
-        )
-        aggregate_id = "objects"
-        replay = self._command_replay("object.ingest", aggregate_id, idempotency_key, request_hash, project_id="unscoped")
-        if replay is not None:
-            return replay
-        if binding is not None:
-            self._validate_generic_output_binding(
-                binding,
-                identity=identity,
-                digest=digest,
-                size=len(data),
-                media_type=media_type,
-                original_name=original_name,
-                idempotency_key=idempotency_key,
-            )
-        destination = self.cas.path_for(digest)
-        if not destination.exists():
-            self._begin_cas_publication_journal("ingest", [{"digest": digest}], project_id="unscoped")
-        obj = self.cas.put(data, expected_digest=expected)
-        try:
-            timestamp = now()
-            self.store.conn.execute(
-                "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
-                (obj["digest"], obj["size"], media_type, original_name, timestamp),
-            )
-            result = self._object_resource(dict(self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (obj["digest"],)).fetchone()))
-            return self._command_record("object.ingest", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped")
-        except Exception:
-            if not obj["deduplicated"]:
-                self._discard_published_digest(obj["digest"])
-            raise
+    def ingest_object(self, data, *, media_type="application/octet-stream", original_name=None,
+                      expected_digest=None, idempotency_key=None, identity=None, upload_binding=None):
+        return self._ingest_transfer(None, data, media_type=media_type, original_name=original_name,
+            expected_digest=expected_digest, idempotency_key=idempotency_key,
+            identity=identity, upload_binding=upload_binding)
 
     def _discard_published_digest(self, digest):
         """Remove a newly published CAS file after a failed metadata commit."""
@@ -4618,24 +4768,49 @@ class RuntimeService:
             raise NotFoundError("object not found")
         return dict(row), self.cas.read(digest)
 
+    def open_object(self, digest):
+        normalized = str(digest).removeprefix("sha256:")
+        with self.store._mutex:
+            row = self.store.conn.execute("SELECT * FROM objects WHERE digest=?", (normalized,)).fetchone()
+            if not row:
+                raise NotFoundError("object not found")
+            metadata = dict(row)
+            stream = self.cas.open(normalized)
+        try:
+            value = os.fstat(stream.fileno())
+            if value.st_size != int(metadata["size"]):
+                raise ConflictError("CAS object size does not match metadata")
+            token = file_identity(value)
+            # Verify once per immutable file identity, including after restart.
+            # Repeated byte-range seeks do not scan the entire large object.
+            if self._verified_cas_objects.get(normalized) != token:
+                verified = self._verify_open_file(stream.fileno(), normalized, int(metadata["size"]), label="CAS object")
+                self._verified_cas_objects[normalized] = file_identity(verified)
+            stream.seek(0)
+            return metadata, stream
+        except BaseException:
+            stream.close()
+            raise
+
     def object_location(self, project, digest):
         """Verify project-owned bytes and return their current local CAS path.
 
         This separate local-host lookup is not a portable output receipt.
         Verification describes the file at lookup time, not a path lease.
         """
-        project_id = self.store.get_project(project)["id"]
-        match = OBJECT_ID_RE.fullmatch(str(digest))
-        if not match:
-            raise ValidationError("object_id must be a canonical SHA-256 object id")
-        normalized = match.group(1)
-        row = self.store.conn.execute(
-            "SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest "
-            "WHERE o.digest=? AND po.project_id=? AND po.relation='managed'",
-            (normalized, project_id),
-        ).fetchone()
-        if not row:
-            raise NotFoundError("object is not owned by project")
+        with self.store._mutex:
+            project_id = self.store.get_project(project)["id"]
+            match = OBJECT_ID_RE.fullmatch(str(digest))
+            if not match:
+                raise ValidationError("object_id must be a canonical SHA-256 object id")
+            normalized = match.group(1)
+            row = self.store.conn.execute(
+                "SELECT o.* FROM objects o JOIN project_objects po ON po.digest=o.digest "
+                "WHERE o.digest=? AND po.project_id=? AND po.relation='managed'",
+                (normalized, project_id),
+            ).fetchone()
+            if not row:
+                raise NotFoundError("object is not owned by project")
         root_fd = prefix_fd = file_fd = None
         try:
             root_fd, prefix_fd = self._cas_prefix_fds(normalized, create=False)
@@ -6016,6 +6191,7 @@ class RuntimeService:
         )
         executor_id = _wire_string(body, "executor_id")
         self._assert_executor_identity(identity, executor_id)
+        self._assert_local_claim_admission(executor_id, identity=identity, registration=True)
         max_concurrency = body.get("max_concurrency", 1)
         if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int) or max_concurrency < 1:
             raise ValidationError("max_concurrency must be positive")
@@ -6125,6 +6301,7 @@ class RuntimeService:
         capability_ids = body.get("capability_ids")
         runtime_epoch = body.get("runtime_epoch")
         self._assert_executor_identity(identity, executor_id)
+        self._assert_local_claim_admission(executor_id, identity=identity)
         if not isinstance(capability_ids, list) or any(not isinstance(value, str) or not value for value in capability_ids) or len(set(capability_ids)) != len(capability_ids):
             raise ValidationError("capability_ids must be a list of unique non-empty strings")
         _wire_integer(body, "runtime_epoch", positive=True)
@@ -6282,7 +6459,7 @@ class RuntimeService:
         return self._command_record("task.claim", "claim", idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
     @_durable_mutation
-    def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None):
+    def settle_attempt(self, attempt_id, body, *, idempotency_key=None, identity=None, _verified_objects=None):
         idempotency_key = require_idempotency_key(idempotency_key)
         body = dict(_wire_object(
             body,
@@ -6358,6 +6535,8 @@ class RuntimeService:
                         or outputs[0].get("kind", "object") != "object"
                         or outputs[0].get("durability", "durable") != "durable"):
                     raise AuthorizationError("final publication must use the declared verified output")
+            if _verified_objects is not None and (row["executor_id"] != MEDIA_IMPORT_EXECUTOR or task["capability"] != MEDIA_IMPORT_CAPABILITY):
+                raise AuthorizationError("verified import proof requires the host import executor")
             staged = self._stage_outputs(
                 attempt_id,
                 body.get("outputs", []),
@@ -6365,6 +6544,7 @@ class RuntimeService:
                 attempt_row=row,
                 task_row=task,
                 lease_body=body,
+                verified_objects=_verified_objects,
             )
             try:
                 # Persist one flat result object. Outputs are the only
@@ -6631,7 +6811,7 @@ class RuntimeService:
             and result.get("media_type") == media_type
         )
 
-    def _stage_outputs(self, attempt_id, outputs, *, project_id=None, attempt_row=None, task_row=None, lease_body=None):
+    def _stage_outputs(self, attempt_id, outputs, *, project_id=None, attempt_row=None, task_row=None, lease_body=None, verified_objects=None):
         """Validate and stage every output without making it globally reachable."""
         if not isinstance(outputs, list):
             raise ValidationError("outputs must be a list")
@@ -6676,7 +6856,7 @@ class RuntimeService:
                     raise ValidationError("output media_type is invalid")
                 declared_size = output.get("size")
                 if declared_size is not None and (isinstance(declared_size, bool) or not isinstance(declared_size, int) or declared_size < 0 or declared_size > OBJECT_MAX_BYTES):
-                    raise ValidationError("output size must be an integer between 0 and 64 MiB")
+                    raise ValidationError("output size must be an integer between 0 and 5 GiB")
                 data_field = output.get("data_base64")
                 stage_path = None
                 if data_field is not None:
@@ -6687,7 +6867,7 @@ class RuntimeService:
                     except (ValueError, TypeError) as exc:
                         raise ValidationError("output data_base64 is invalid") from exc
                     if len(data) > OBJECT_MAX_BYTES:
-                        raise ValidationError("output exceeds 64 MiB object limit")
+                        raise ValidationError("output exceeds 5 GiB object limit")
                     actual_digest = sha256_bytes(data)
                     if actual_digest != digest:
                         raise ConflictError("output content hash does not match declared digest", details={"expected": digest_value, "actual": "sha256:" + actual_digest})
@@ -6722,8 +6902,12 @@ class RuntimeService:
                             ) from exc
                         size = int(os.fstat(file_fd).st_size)
                         if size > OBJECT_MAX_BYTES:
-                            raise ValidationError("output exceeds 64 MiB object limit")
-                        self._verify_open_file(file_fd, digest, size, label="CAS object")
+                            raise ValidationError("output exceeds 5 GiB object limit")
+                        if verified_objects is not None and digest in verified_objects:
+                            if file_identity(os.fstat(file_fd)) != verified_objects[digest]:
+                                raise ConflictError("verified imported CAS object changed")
+                        else:
+                            self._verify_open_file(file_fd, digest, size, label="CAS object")
                     finally:
                         if file_fd >= 0:
                             os.close(file_fd)
@@ -6849,6 +7033,7 @@ class RuntimeService:
                     normalized["coverage"] = coverage
                 staged.append({
                     "digest": digest, "path": stage_path, "size": size, "media_type": media_type,
+                    "verified_identity": (verified_objects or {}).get(digest),
                     "name": name, "filename": filename, "output": normalized,
                     "output_port": output_port, "group_key": group_key, "variant_key": variant_key,
                     "generation_id": generation_id, "durability": durability, "producer": producer,
@@ -6883,6 +7068,8 @@ class RuntimeService:
             final.st_dev != initial.st_dev
             or final.st_ino != initial.st_ino
             or final.st_size != expected_size
+            or final.st_mtime_ns != initial.st_mtime_ns
+            or final.st_ctime_ns != initial.st_ctime_ns
             or hasher.hexdigest() != digest
         ):
             raise ConflictError(f"{label} hash or size does not match staged metadata")
@@ -7100,9 +7287,14 @@ class RuntimeService:
                     finally:
                         os.close(source_fd)
                 else:
-                    self._verify_file_at(
-                        prefix_fd, destination_name, digest, item["size"], label="CAS object",
-                    )
+                    if item.get("verified_identity") is not None:
+                        value = os.stat(destination_name, dir_fd=prefix_fd, follow_symlinks=False)
+                        if not stat.S_ISREG(value.st_mode) or file_identity(value) != item["verified_identity"]:
+                            raise ConflictError("verified imported CAS object changed")
+                    else:
+                        self._verify_file_at(
+                            prefix_fd, destination_name, digest, item["size"], label="CAS object",
+                        )
                 self.store.conn.execute(
                     "INSERT OR IGNORE INTO objects(digest, size, media_type, original_name, created_at) VALUES (?, ?, ?, ?, ?)",
                     (digest, item["size"], item["media_type"], item["name"], now()),
@@ -7412,6 +7604,8 @@ class RuntimeService:
 
     @_verified_mutation
     def resume_attempt(self, body, *, identity=None):
+        if isinstance(identity, dict):
+            self._assert_local_claim_admission(identity.get("actor"), identity=identity)
         body = _wire_object(
             body,
             required=("nonce", "authorization", "runtime_epoch"),
@@ -7451,7 +7645,12 @@ class RuntimeService:
             current = self.store._validate_runtime_epoch(body.get("runtime_epoch"), identity="executor", required=True)
             row = self._checkpoint_row(body.get("checkpoint_id"), body.get("attempt_id"))
             self._assert_attempt_identity(row, identity)
-            # request_reboot consumes the one-shot authorization.  The exact
+            attempt_owner = self.store.conn.execute("SELECT executor_id FROM attempts WHERE id=?", (row["attempt_id"],)).fetchone()
+            if attempt_owner is None:
+                raise ConflictError("resume executor is unresolved")
+            self._assert_local_claim_admission(attempt_owner["executor_id"], identity=identity)
+            # Fence validation precedes even a consumed checkpoint replay.
+            # request_reboot consumes the one-shot authorization. The exact
             # consumed token remains the authorization for this checkpoint's
             # one successful resume; it is not a newly reusable nonce.
             self._reboot_authorized(body, row["attempt_id"], row["nonce"], allow_consumed=True)

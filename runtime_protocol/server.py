@@ -8,6 +8,7 @@ from urllib.parse import unquote, urlsplit, parse_qs
 
 from .errors import RuntimeErrorBase, AuthorizationError, ConflictError, ForbiddenError, NotFoundError, ProtocolError, InvalidRequestError, RetiredRouteError
 from .service import validate_idempotency_key
+from .cas import IO_CHUNK_BYTES
 
 
 class RuntimeHTTPServer(ThreadingHTTPServer):
@@ -55,18 +56,76 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             raise AuthorizationError("bearer credential required")
         return self.server.credentials.require(value[7:], scope)  # type: ignore[attr-defined]
 
-    def _content_length(self):
-        """Return a strict, bounded request length before touching the body."""
-        raw = self.headers.get("Content-Length")
-        value = raw.strip() if raw is not None else ""
-        if not value or any(char < "0" or char > "9" for char in value):
-            raise ProtocolError("Content-Length header is required and must be a non-negative decimal integer")
+    def _header_values(self, name):
+        if hasattr(self.headers, "get_all"):
+            return self.headers.get_all(name, [])
+        value = self.headers.get(name)
+        return [] if value is None else [value]
+
+    def _content_length(self, limit=None):
+        """Strict framing, bounded decimal parsing, before touching the body."""
+        values = self._header_values("Content-Length")
+        value = values[0].strip() if len(values) == 1 else ""
+        if not re.fullmatch(r"[0-9]{1,20}", value):
+            raise ProtocolError("one Content-Length header is required and must be a non-negative decimal integer")
         length = int(value, 10)
-        if length > self.MAX_BODY_BYTES:
-            raise ProtocolError("request body exceeds 64 MiB limit")
+        maximum = self.MAX_BODY_BYTES if limit is None else limit
+        if length > maximum:
+            raise ProtocolError(f"request body exceeds {maximum} byte limit")
         return length
 
+    def _binary_chunks(self):
+        # Rejections/cancellations never leave unread framing on a reusable connection.
+        self.close_connection = True
+        encodings = self._header_values("Content-Encoding")
+        if encodings and (len(encodings) != 1 or encodings[0].strip().lower() != "identity"):
+            raise ProtocolError("binary Content-Encoding must be one identity value")
+        if self._header_values("Trailer"):
+            raise ProtocolError("chunk trailers are unsupported")
+        maximum = self.runtime.max_object_bytes
+        transfer = self._header_values("Transfer-Encoding")
+        if transfer:
+            if len(transfer) != 1 or transfer[0].strip().lower() != "chunked" or self._header_values("Content-Length"):
+                raise ProtocolError("binary request requires either Content-Length or chunked Transfer-Encoding")
+            total = 0
+            while True:
+                line = self.rfile.readline(8193)
+                # Chunk extensions follow the token/quoted-string grammar;
+                # arbitrary text after a semicolon is not valid framing.
+                token = rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+                quoted = rb'"(?:[\x09\x20\x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\x09\x20-\x7e\x80-\xff])*"'
+                extension = rb"[ \t]*;[ \t]*" + token + rb"(?:[ \t]*=[ \t]*(?:" + token + rb"|" + quoted + rb"))?"
+                if len(line) > 8192 or not re.fullmatch(rb"[0-9a-fA-F]{1,16}(?:" + extension + rb")*\r\n", line):
+                    raise ProtocolError("malformed or incomplete chunk header")
+                size = int(line.split(b";", 1)[0].strip(), 16)
+                if size == 0:
+                    if self.rfile.readline(8193) != b"\r\n":
+                        raise ProtocolError("chunk trailers are unsupported or incomplete")
+                    return
+                total += size
+                if total > maximum:
+                    raise ProtocolError(f"request body exceeds {maximum} byte limit")
+                remaining = size
+                while remaining:
+                    chunk = self.rfile.read(min(remaining, IO_CHUNK_BYTES))
+                    if not chunk:
+                        raise ProtocolError("request body contains an incomplete chunk")
+                    remaining -= len(chunk)
+                    yield chunk
+                if self.rfile.read(2) != b"\r\n":
+                    raise ProtocolError("malformed or incomplete chunk terminator")
+        else:
+            remaining = self._content_length(maximum)
+            while remaining:
+                chunk = self.rfile.read(min(remaining, IO_CHUNK_BYTES))
+                if not chunk:
+                    raise ProtocolError("request body is shorter than Content-Length")
+                remaining -= len(chunk)
+                yield chunk
+
     def _raw_body(self):
+        if self._header_values("Transfer-Encoding"):
+            raise ProtocolError("JSON requests require Content-Length without Transfer-Encoding")
         length = self._content_length()
         raw = self.rfile.read(length)
         if len(raw) != length:
@@ -122,6 +181,46 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(encoded)
+
+    def _send_file(self, status, stream, start, length, headers):
+        if getattr(self, "_defer_response", False):
+            self._pending_file_response = (status, stream, start, length, headers)
+            return
+        try:
+            self.send_response(status)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Request-ID", self._request_id())
+            for key, value in headers.items():
+                self.send_header(key, str(value))
+            self.send_header("Content-Length", str(length))
+            self.end_headers()
+            self._response_started = True
+            if self.command != "HEAD":
+                stream.seek(start)
+                remaining = length
+                while remaining:
+                    chunk = stream.read(min(remaining, IO_CHUNK_BYTES))
+                    if not chunk:
+                        self.close_connection = True
+                        return
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        finally:
+            stream.close()
+
+    def _is_binary_io(self):
+        if not hasattr(self, "path"):
+            return False
+        path = [unquote(x) for x in urlsplit(self.path).path.split("/") if x]
+        if path == ["v1", "objects"] and self.command == "POST":
+            return True
+        if len(path) == 3 and path[:2] == ["v1", "objects"] and self.command in ("GET", "HEAD"):
+            return True
+        if (self.command == "GET" and len(path) == 6 and path[:2] == ["v1", "projects"]
+                and path[3] == "objects" and path[5] == "location"):
+            return True
+        return (self.command == "POST" and len(path) == 4 and path[:2] == ["v1", "projects"]
+                and path[3] in ("objects", "media-imports"))
 
     def _error(self, exc):
         if isinstance(exc, RuntimeErrorBase):
@@ -375,18 +474,19 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             if len(path) == 4 and path[3] == "media-imports" and method == "POST":
                 identity = self._identity("projects:write")
                 key = self._idempotency_key()
-                result = self.runtime.import_media(
-                    selector,
-                    self._raw_body(),
-                    media_type=self.headers.get("Content-Type", "application/octet-stream"),
-                    original_name=self.headers.get("X-Original-Name"),
-                    expected_digest=self.headers.get("X-Expected-Digest"),
-                    actor_id=identity["actor"],
-                    width=self.headers.get("X-Media-Width"),
-                    height=self.headers.get("X-Media-Height"),
-                    duration_seconds=self.headers.get("X-Media-Duration-Seconds"),
-                    idempotency_key=key,
-                )
+                with self.runtime.stage_object(self._binary_chunks(), expected_digest=self.headers.get("X-Expected-Digest")) as data:
+                    result = self.runtime.import_media(
+                        selector,
+                        data,
+                        media_type=self.headers.get("Content-Type", "application/octet-stream"),
+                        original_name=self.headers.get("X-Original-Name"),
+                        expected_digest=self.headers.get("X-Expected-Digest"),
+                        actor_id=identity["actor"],
+                        width=self.headers.get("X-Media-Width"),
+                        height=self.headers.get("X-Media-Height"),
+                        duration_seconds=self.headers.get("X-Media-Duration-Seconds"),
+                        idempotency_key=key,
+                    )
                 return self._send(201, result)
             if len(path) == 5 and path[3] == "media-imports" and method == "GET":
                 self._identity("projects:read")
@@ -407,8 +507,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     return self._send(200, self.runtime.list_project_objects(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST":
                     key = self._idempotency_key()
-                    data = self._raw_body()
-                    result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key)
+                    with self.runtime.stage_object(self._binary_chunks(), expected_digest=self.headers.get("X-Expected-Digest")) as data:
+                        result = self.runtime.ingest(selector, data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Original-Name"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key)
                     return self._send(201, result)
             if len(path) == 6 and path[3] == "objects" and path[5] == "location" and method == "GET":
                 self._identity("objects:read")
@@ -527,7 +627,6 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if path == ["v1", "objects"] and method == "POST":
             identity = self._identity("objects:write")
             key = self._idempotency_key()
-            data = self._raw_body()
             upload_binding = None
             raw_binding = self.headers.get("X-Output-Binding")
             if raw_binding:
@@ -535,41 +634,52 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     upload_binding = json.loads(raw_binding)
                 except (TypeError, ValueError) as exc:
                     raise ProtocolError("X-Output-Binding must contain valid JSON") from exc
-            value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key, identity=identity, upload_binding=upload_binding)
+            with self.runtime.stage_object(self._binary_chunks(), expected_digest=self.headers.get("X-Expected-Digest")) as data:
+                value = self.runtime.ingest_object(data, media_type=self.headers.get("Content-Type", "application/octet-stream"), original_name=self.headers.get("X-Filename"), expected_digest=self.headers.get("X-Expected-Digest"), idempotency_key=key, identity=identity, upload_binding=upload_binding)
             return self._send(201, value)
         if len(path) == 3 and path[:2] == ["v1", "objects"] and method in ("GET", "HEAD"):
             self._identity("objects:read")
-            metadata, data = self.runtime.object(path[2])
-            total = len(data)
-            start, end = 0, total - 1
-            range_header = self.headers.get("Range")
-            status = 200
-            if range_header:
-                try:
-                    unit, spec = range_header.split("=", 1)
-                    if unit != "bytes" or "," in spec:
-                        raise ValueError
-                    left, right = spec.split("-", 1)
-                    if not left:
-                        suffix_length = int(right)
-                        if suffix_length <= 0:
+            metadata, stream = self.runtime.open_object(path[2])
+            try:
+                total = int(metadata["size"])
+                start, end = 0, total - 1
+                digest = path[2].removeprefix("sha256:")
+                etag_value = "sha256:" + digest
+                etag = f'"{etag_value}"'
+                range_header = self.headers.get("Range")
+                if self.headers.get("If-Range") not in (None, etag):
+                    range_header = None
+                status = 200
+                if range_header:
+                    match = re.fullmatch(r"bytes=([0-9]{0,20})-([0-9]{0,20})", range_header)
+                    try:
+                        if not match:
                             raise ValueError
-                        start, end = max(0, total - suffix_length), total - 1
-                    else:
-                        start = int(left)
-                        end = int(right) if right else total - 1
-                        end = min(end, total - 1)
-                    if start < 0 or start >= total or end < start:
-                        raise ValueError
-                    status = 206
-                except ValueError as exc:
-                    return self._send(416, {"code": "invalid_range", "message": "invalid byte range"}, headers={"Content-Range": f"bytes */{total}"})
-            digest = path[2].removeprefix("sha256:")
-            etag_value = "sha256:" + digest
-            headers = {"Content-Type": metadata["media_type"], "ETag": f'"{etag_value}"', "Accept-Ranges": "bytes", "X-Content-Digest": etag_value}
-            if status == 206:
-                headers["Content-Range"] = f"bytes {start}-{end}/{total}"
-            return self._send(status, headers=headers, body=data[start:end+1])
+                        left, right = match.groups()
+                        if not left:
+                            suffix_length = int(right)
+                            if suffix_length <= 0:
+                                raise ValueError
+                            start = max(0, total - suffix_length)
+                        else:
+                            start = int(left)
+                            end = min(int(right), total - 1) if right else total - 1
+                        if start >= total or end < start:
+                            raise ValueError
+                        status = 206
+                    except ValueError:
+                        return self._send(416, {"code": "invalid_range", "message": "invalid byte range"},
+                            headers={"Content-Range": f"bytes */{total}", "Accept-Ranges": "bytes"})
+                headers = {"Content-Type": metadata["media_type"], "ETag": etag,
+                           "Accept-Ranges": "bytes", "X-Content-Digest": etag_value}
+                if status == 206:
+                    headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+                self._send_file(status, stream, start, max(0, end - start + 1), headers)
+                stream = None  # The deferred response or sender owns the open file.
+                return
+            finally:
+                if stream is not None:
+                    stream.close()
         if path == ["v1", "tasks"] and method == "POST":
             self._identity("tasks:write")
             body = self._project_mutation_body()
@@ -809,6 +919,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         """
         try:
             self._pending_response = None
+            self._pending_file_response = None
             self._defer_response = True
             try:
                 if self._is_local_worker_control():
@@ -816,9 +927,9 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     # outside the SQLite mutex. Credential authentication and
                     # publication use CredentialStore's short internal lock.
                     self._local_worker_control()
-                elif self._is_remote_credential_control():
-                    # Daemon takes actor then short store sections. Never
-                    # acquire the store lock before actor ownership.
+                elif self._is_remote_credential_control() or self._is_binary_io():
+                    # Both routes own short store sections. Transfer, hashing,
+                    # and daemon actor ownership must stay outside this lock.
                     self._route()
                 else:
                     with self.runtime.store._mutex:
@@ -829,10 +940,22 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 status, payload, kwargs = self._pending_response
                 self._pending_response = None
                 self._send(status, payload, **kwargs)
+            if self._pending_file_response is not None:
+                pending = self._pending_file_response
+                self._pending_file_response = None
+                self._send_file(*pending)
         except (ConnectionError, TimeoutError):
             self.close_connection = True
         except Exception as exc:
-            self._error(exc)
+            if getattr(self, "_response_started", False):
+                self.close_connection = True
+            else:
+                self._error(exc)
+        finally:
+            pending = getattr(self, "_pending_file_response", None)
+            if pending is not None:
+                pending[1].close()
+                self._pending_file_response = None
 
     def do_GET(self):
         self._dispatch()

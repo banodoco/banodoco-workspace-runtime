@@ -69,8 +69,9 @@ def _frame_receive(channel: socket.socket) -> dict[str, Any]:
     if remainder:
         raise ConflictError("local Worker control channel carried multiple frames")
     try:
-        value = json.loads(encoded.decode())
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        from .local_execution_handoff import decode
+        value = decode(encoded)
+    except (UnicodeDecodeError, ValueError, ValidationError) as exc:
         raise ConflictError("local Worker control frame is malformed") from exc
     if not isinstance(value, dict):
         raise ConflictError("local Worker control frame must be an object")
@@ -96,6 +97,21 @@ class _PreparedWorker:
     custody_scope: str | None = None
 
 
+@dataclass
+class _AdoptedHandoffControl:
+    """Nonchild retained control obligation; never a manufactured Popen."""
+    control: socket.socket
+    relay_actor: Any
+    binding: dict[str, Any]
+    result: dict[str, Any] | None = None
+    rpc_lock: threading.Lock = field(default_factory=threading.Lock)
+    cleanup_unresolved: bool = True
+
+    def verify(self):
+        if self.relay_actor.verify() != self.binding["source_relay_reference"]["target"]:
+            raise ConflictError("adopted relay private peer incarnation changed")
+
+
 class CrossProcessWorkerPreparer(LocalWorkerPreparer):
     """Runtime-side transport for the installed Worker private ABI."""
 
@@ -107,6 +123,8 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
         self.cleanup_timeout_seconds = max(0.05, float(cleanup_timeout_seconds))
         self._active: _PreparedWorker | None = None
         self._activation_binding = None
+        self._generation_verifier = None
+        self._adopted_handoff = None
         self._prepare_cancel = threading.Event()
         # The only uninterruptible handoff is spawn -> handle construction ->
         # publication. Cancellation waits for this tiny critical section so a
@@ -364,6 +382,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             raise ConflictError("Runtime activation publisher lacks this retained relay")
         self._activation_binding = (handle, json.loads(json.dumps(dict(grant))), acceptor)
 
+    def bind_retained_generation_verifier(self, handle, verifier):
+        if handle is not self._active or not handle.relay or not callable(verifier):
+            raise ConflictError("generation verifier lacks the retained launch")
+        self._generation_verifier = (handle, verifier)
+
     def activate(self, handle: _PreparedWorker, grant: Mapping[str, Any]) -> None:
         if not handle.relay:
             response = self._rpc(handle, {"version": CONTROL_VERSION, "command": "activate", "grant": dict(grant)})
@@ -392,6 +415,11 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
             handle.activated = True
 
     def abort(self, handle: _PreparedWorker) -> None:
+        if isinstance(handle, _AdoptedHandoffControl):
+            # Neither EOF nor PID absence proves this nonchild relay exited.
+            # Keep its control/custody obligation; no fabricated waitpid/Popen
+            # or successful cleanup until a separate retained exit proof exists.
+            raise ConflictError("adopted relay nonchild cleanup remains unresolved")
         if isinstance(handle, _PreparedWorker) and handle.closed:
             return
         if isinstance(handle, _PreparedWorker) and handle.relay:
@@ -550,15 +578,109 @@ class CrossProcessWorkerPreparer(LocalWorkerPreparer):
 
     def reconnect(self, receipt: Mapping[str, Any]) -> _PreparedWorker | None:
         if self.profile.engine_launch is not None:
-            # The activation record does not confer recovery/signal authority.
-            # Until capability recovery is implemented, a restarted owner may
-            # not replace a surviving graph merely because control is absent.
-            raise ConflictError("local relay capability recovery remains unresolved")
+            handle = self._active
+            if handle is None or handle.closed or not handle.relay or not handle.activated:
+                raise ConflictError("local relay capability recovery remains unresolved without retained control")
+            self._verify_retained_relay_receipt(handle, receipt)
+            report = self.report(handle)
+            if (report.get("owner_epoch") != receipt.get("owner_epoch")
+                    or report.get("profile_binding_digest") != receipt.get("profile_binding_digest")
+                    or report.get("custody_scope") != receipt.get("custody_scope")
+                    or report.get("custody_capabilities") != receipt.get("custody_capabilities")
+                    or any(report.get("processes", {}).get(role) != {k: receipt.get(role, {}).get(k) for k in ("pid", "birth_id")} for role in ("worker", "host", "engine", "engine_listener"))):
+                raise ConflictError("retained relay report differs from immutable receipt")
+            self._verify_retained_relay_receipt(handle, receipt)
+            return handle
         handle = self._active
         if handle is None or handle.closed or not handle.activated:
             return None
         response = self._rpc(handle, {"version": CONTROL_VERSION, "command": "reconnect", "receipt": dict(receipt)})
         return handle if response.get("reconnected") is True else None
+
+    def _verify_retained_relay_receipt(self, handle, receipt):
+        from banodoco_local.custody_broker import AuthenticatedCleanupActor, RoleCustodyAuthority, _read_owner_file
+        from .local_execution_handoff import decode, read_protected
+        if (handle is not self._active or not handle.relay or handle.closed or not handle.activated
+                or receipt.get("version") != "runtime.local-worker-receipt/v4"
+                or receipt.get("owner_epoch") != handle.owner_epoch or receipt.get("custody_scope") != handle.custody_scope):
+            raise ConflictError("reconnect lacks exact retained receipt/owner")
+        handle.retained.verify()
+        actor = AuthenticatedCleanupActor.current()
+        caps = receipt.get("custody_capabilities")
+        if not isinstance(caps, dict) or set(caps) != {"relay", "host", "engine", "engine_listener"}:
+            raise ConflictError("reconnect lacks exact retained role graph")
+        scope = Path(handle.custody_scope)
+        owners = {"relay": actor.verify(), "host": caps["relay"]["target"], "engine": caps["host"]["target"], "engine_listener": caps["host"]["target"]}
+        for role, ref in caps.items():
+            RoleCustodyAuthority(scope, role).verify_reference(ref, expected_actor=owners[role], owner_epoch=handle.owner_epoch)
+        record = read_protected(scope / "activation-record.json")
+        if (record.get("evidence_digest") != receipt.get("evidence_digest") or record.get("executor_incarnation") != receipt.get("executor_incarnation")
+                or record.get("custody_capabilities") != caps or record.get("original_owner_epoch") != handle.owner_epoch):
+            raise ConflictError("reconnect immutable activation evidence differs")
+        verifier = self._generation_verifier
+        if verifier is None or verifier[0] is not handle or verifier[1]() != record.get("credential_generation"):
+            raise ConflictError("reconnect credential generation changed")
+        for path in (scope / "relay-handoff-state.json", self.profile.support_root / "local-execution-claim-fence.json"):
+            if path.exists() or path.is_symlink():
+                state = read_protected(path)
+                if state.get("phase") not in (None, "owned", "finalized") or state.get("state") == "held":
+                    raise ConflictError("retained reconnect is fenced by unresolved handoff")
+
+    def handoff_command(self, handle, payload):
+        from .local_execution_handoff import validate_request, validate_reply
+        from .local_execution_supervisor import CONTROL_VERSION as relay_version
+        validate_request(dict(payload))
+        if isinstance(handle, _AdoptedHandoffControl):
+            return self._adopted_handoff_command(handle, dict(payload))
+        if handle is not self._active or not handle.relay or handle.closed or not handle.activated:
+            raise ConflictError("handoff lacks retained activated relay")
+        handle.retained.verify()
+        response = self._rpc(handle, {"version": relay_version, "command": "handoff", "request": dict(payload)})
+        if set(response) != {"version", "status", "handoff"} or response.get("status") != "ok":
+            raise ConflictError("relay handoff outcome remains unresolved")
+        return validate_reply(response["handoff"], dict(payload))
+
+    def adopt_fresh_handoff(self, request):
+        from .local_execution_handoff import validate_request
+        from .local_worker_handoff import connect_fresh_successor
+        validate_request(request)
+        if request["command"] != "handoff_adopt" or self._active is not None:
+            raise ConflictError("fresh handoff adoption has no unoccupied successor")
+        control, relay_actor = connect_fresh_successor(request["binding"], request["payload"]["sealed_record_digest"], timeout=min(self.timeout_seconds, 10.0))
+        handle = _AdoptedHandoffControl(control, relay_actor, dict(request["binding"]))
+        # Publish before the RPC can transfer custody or fail. A lost reply
+        # retains the channel/operation and its protected ledger obligation.
+        self._adopted_handoff = handle
+        handle.result = self._adopted_handoff_command(handle, request)
+        return handle
+
+    def adopted_handoff_obligation(self):
+        return self._adopted_handoff
+
+    def _adopted_handoff_command(self, handle, request):
+        from .local_execution_supervisor import CONTROL_VERSION as relay_version
+        from .local_execution_handoff import validate_reply
+        from banodoco_local.custody_broker import AuthenticatedCleanupActor, RoleCustodyAuthority
+        if handle is not self._adopted_handoff or request["binding"] != handle.binding:
+            raise ConflictError("adopted handoff control binding differs")
+        with handle.rpc_lock:
+            handle.verify()
+            _frame_send(handle.control, {"version": relay_version, "command": "handoff", "request": request})
+            reply = _frame_receive(handle.control)
+            if set(reply) != {"version", "status", "handoff"} or reply["version"] != relay_version or reply["status"] != "ok":
+                raise ConflictError("fresh handoff outcome remains unresolved")
+            value = validate_reply(reply["handoff"], request)
+            handle.verify()
+            if value["status"] == "ok":
+                ref = {**handle.binding["source_relay_reference"], "generation": handle.binding["source_relay_reference"]["generation"] + 1}
+                RoleCustodyAuthority(Path(handle.binding["custody_scope"]), "relay").verify_reference(ref, expected_actor=AuthenticatedCleanupActor.current().verify(), owner_epoch=handle.binding["new_owner_epoch"])
+            handle.result = value
+            return value
+
+    def adopt_control_descriptor(self, descriptor, receipt, request):
+        # No fresh authenticated B accept/retained-child route exists on this
+        # inherited A transport. Keep descriptor/child obligations untouched.
+        raise ConflictError("successor adoption requires fresh authenticated B connection; stale A descriptor refused")
 
 
 def _ps(pid: int, field: str) -> str:

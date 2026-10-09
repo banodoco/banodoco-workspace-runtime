@@ -37,6 +37,23 @@ def _receipt_version(profile):
     return RELAY_RECEIPT_VERSION if profile.engine_launch is not None else RECEIPT_VERSION
 
 
+def _credential_commit_generation(credentials: CredentialStore, actor: str) -> str:
+    """Validate the complete owner generation, then hash unchanged commit bytes.
+
+    The owner path may validate the token; this helper never uses or publishes
+    bearer bytes as identity. All reads occur under the existing owner lock.
+    """
+    from banodoco_local.custody_broker import _read_owner_file
+    with credentials._lock:
+        path = credentials.path_for(actor).with_suffix(".commit")
+        before, before_stat = _read_owner_file(path)
+        credentials._read_actor(actor)
+        after, after_stat = _read_owner_file(path)
+        if before != after or (before_stat.st_dev, before_stat.st_ino) != (after_stat.st_dev, after_stat.st_ino):
+            raise ConflictError("credential commit changed during generation validation")
+        return "sha256:" + hashlib.sha256(before).hexdigest()
+
+
 @dataclass(frozen=True)
 class LocalWorkerProfile:
     profile_id: str
@@ -253,7 +270,7 @@ class _OrderlyHandoff:
     profile: LocalWorkerProfile
     identity: dict[str, Any]
     receipt: dict[str, Any]
-    generation: dict[str, str]
+    generation: str
     common: dict[str, Any]
     registered_state: dict[str, Any]
     phase: str
@@ -290,6 +307,8 @@ class LocalWorkerLauncher:
         self.scopes = tuple(scopes)
         self._operation_lock = threading.Lock()
         self._state_lock = threading.RLock()
+        self._adopted_handoff_control = None
+        self._adopted_handoff_receipt = None
         self._shutdown = threading.Event()
         self._watch_stop = threading.Event()
         self._watch_thread: threading.Thread | None = None
@@ -768,7 +787,7 @@ class LocalWorkerLauncher:
                 with self.credentials._lock:
                     record = json.loads(_read_owner_file(Path(self._active_identity["custody_scope"]) / "activation-record.json")[0])
                     commit = self.credentials.path_for(self.actor).with_suffix(".commit")
-                    generation = "sha256:" + hashlib.sha256(_read_owner_file(commit)[0]).hexdigest()
+                    generation = _credential_commit_generation(self.credentials, self.actor)
                     metadata = self.credentials.actor_metadata(self.actor)
                     if record.get("credential_generation") != generation or record.get("executor_incarnation") != self._active_receipt.get("executor_incarnation") or metadata is None or metadata.get("local_launch_receipt") != self._active_receipt:
                         raise ConflictError("local activation credential generation changed before enablement")
@@ -818,7 +837,7 @@ class LocalWorkerLauncher:
                 raise ConflictError("no active local Worker can be handed off")
             if not self._control_alive(handle):
                 raise ConflictError("local Worker control channel is not alive")
-            generation = self.credentials.generation_snapshot(self.actor)
+            generation = _credential_commit_generation(self.credentials, self.actor)
             if request.get("credential_generation") != generation:
                 raise ConflictError("handoff credential generation changed")
             if request.get("receipt_evidence_digest") != receipt.get("evidence_digest"):
@@ -842,7 +861,7 @@ class LocalWorkerLauncher:
                 profile=profile,
                 identity=dict(identity),
                 receipt=dict(receipt),
-                generation=dict(generation),
+                generation=generation,
                 common={
                     key: request[key]
                     for key in (
@@ -869,6 +888,133 @@ class LocalWorkerLauncher:
                 "registered_state": dict(registered_state),
             }
 
+    def verify_retained_handoff_binding(self, binding):
+        """Validate immutable launch evidence separately from current custody."""
+        from banodoco_local.custody_broker import AuthenticatedCleanupActor, RoleCustodyAuthority, _read_owner_file
+        from .local_execution_handoff import decode
+        with self._state_lock:
+            receipt = self._active_receipt
+            handle = self._active_handle
+            if self._shutdown.is_set() or handle is None or receipt is None or not self._control_alive(handle):
+                raise ConflictError("handoff lacks the retained active owner")
+            snapshot = dict(receipt)
+        raw, _ = _read_owner_file(Path(binding["custody_scope"]) / "activation-record.json")
+        record = decode(raw)
+        if ("sha256:" + hashlib.sha256(raw).hexdigest() != binding["activation_record_digest"]
+                or snapshot.get("evidence_digest") != binding["launch_evidence_digest"]
+                or snapshot.get("executor_incarnation") != binding["executor_incarnation"]
+                or snapshot.get("workspace_uuid") != binding["workspace_uuid"]
+                or snapshot.get("profile_binding_digest") != binding["profile_binding_digest"]
+                or snapshot.get("custody_scope") != binding["custody_scope"]
+                or snapshot.get("owner_epoch") != binding["original_owner_epoch"]
+                or snapshot.get("custody_capabilities") != binding["original_roles"]
+                or any(record.get(k) != binding[k] for k in ("operation_id", "channel_id", "workspace_uuid", "executor_incarnation", "profile_binding_digest", "original_owner_epoch"))
+                or record.get("evidence_digest") != binding["launch_evidence_digest"]):
+            raise ConflictError("handoff immutable activation evidence differs")
+        if record.get("credential_generation") != binding["credential_generation_digest"] or _credential_commit_generation(self.credentials, self.actor) != binding["credential_generation_digest"]:
+            raise ConflictError("handoff protected credential generation changed")
+        actual = AuthenticatedCleanupActor.current().verify()
+        if actual != binding["source_owner"]:
+            raise ConflictError("handoff source is not this authenticated Runtime")
+        current = binding["current_roles"]
+        if current["relay"] != binding["source_relay_reference"]:
+            raise ConflictError("handoff source relay projection differs")
+        owners = {"relay": actual, "host": current["relay"]["target"], "engine": current["host"]["target"], "engine_listener": current["host"]["target"]}
+        for role, ref in current.items():
+            epoch = binding["source_owner_epoch"] if role == "relay" else binding["original_owner_epoch"]
+            RoleCustodyAuthority(Path(binding["custody_scope"]), role).verify_reference(ref, expected_actor=owners[role], owner_epoch=epoch)
+        return handle
+
+    def retained_handoff_command(self, request):
+        """Bounded relay adapter; original receipts and activation bytes stay put."""
+        from .local_execution_handoff import validate_request, validate_reply, HandoffJournal
+        validate_request(request)
+        with self._operation_lock:
+            if self._adopted_handoff_control is not None:
+                handle = self._verify_adopted_handoff(request["binding"])
+                binding = request["binding"]
+                journal = HandoffJournal(Path(binding["custody_scope"]) / "runtime-handoff-state.json", writer=binding["new_owner"], owner_epoch=binding["new_owner_epoch"], authority=lambda: self._verify_adopted_handoff(binding))
+                if request["command"] != "handoff_report":
+                    prior = journal.replay(request)
+                    if prior is not None:
+                        return prior
+                    journal.begin(request)
+                response = self.preparer.handoff_command(handle, request)
+                self._verify_adopted_handoff(binding)
+                return response if request["command"] == "handoff_report" else journal.finish(request, response)
+            handle = self.verify_retained_handoff_binding(request["binding"])
+            binding = request["binding"]
+            journal = HandoffJournal(Path(binding["custody_scope"]) / "runtime-handoff-state.json", writer=binding["source_owner"], owner_epoch=binding["source_owner_epoch"], authority=lambda: self.verify_retained_handoff_binding(binding))
+            if request["command"] != "handoff_report":
+                prior = journal.replay(request)
+                if prior is not None:
+                    return prior
+                journal.begin(request)
+            # The canonical daemon fence owns readiness; the launcher does not
+            # rotate metadata or enable claims while handling control messages.
+            response = dict(self.preparer.handoff_command(handle, request))
+            validate_reply(response, request)
+            self.verify_retained_handoff_binding(request["binding"])
+            return response if request["command"] == "handoff_report" else journal.finish(request, response)
+
+    def _verify_adopted_handoff(self, binding):
+        from banodoco_local.custody_broker import AuthenticatedCleanupActor, RoleCustodyAuthority
+        handle = self._adopted_handoff_control
+        if self._shutdown.is_set() or handle is None or handle.binding != binding:
+            raise ConflictError("adopted handoff has no retained exact control")
+        handle.verify()
+        actual = AuthenticatedCleanupActor.current().verify()
+        if actual != binding["new_owner"] or _credential_commit_generation(self.credentials, self.actor) != binding["credential_generation_digest"]:
+            raise ConflictError("adopted handoff Runtime/generation changed")
+        metadata = self.credentials.actor_metadata(self.actor)
+        if metadata is None or metadata.get("local_launch_receipt") != self._adopted_handoff_receipt:
+            raise ConflictError("adopted handoff immutable receipt changed")
+        ref = {**binding["source_relay_reference"], "generation": binding["source_relay_reference"]["generation"] + 1}
+        RoleCustodyAuthority(Path(binding["custody_scope"]), "relay").verify_reference(ref, expected_actor=actual, owner_epoch=binding["new_owner_epoch"])
+        return handle
+
+    def adopt_retained_handoff(self, request, receipt):
+        """Adopt fresh B control without publishing an active/ready generation."""
+        from .local_execution_handoff import validate_request, HandoffJournal, digest
+        from banodoco_local.custody_broker import AuthenticatedCleanupActor, _read_owner_file
+        validate_request(request); b = request["binding"]
+        profile = self.profiles.get(receipt.get("profile_id"))
+        if (request["command"] != "handoff_adopt" or profile is None or profile.engine_launch is None
+                or not _receipt_identity_digest_valid(profile, receipt, workspace_uuid=self.workspace_uuid, realm_root=self.realm_root, support_root=self.support_root)
+                or receipt.get("evidence_digest") != b["launch_evidence_digest"] or receipt.get("custody_capabilities") != b["original_roles"]
+                or receipt.get("executor_incarnation") != b["executor_incarnation"] or receipt.get("owner_epoch") != b["original_owner_epoch"]
+                or AuthenticatedCleanupActor.current().verify() != b["new_owner"]):
+            raise ConflictError("fresh handoff immutable launch/successor differs")
+        raw, _ = _read_owner_file(Path(b["custody_scope"]) / "activation-record.json")
+        if "sha256:" + hashlib.sha256(raw).hexdigest() != b["activation_record_digest"]:
+            raise ConflictError("fresh handoff activation bytes differ")
+        if _credential_commit_generation(self.credentials, self.actor) != b["credential_generation_digest"]:
+            raise ConflictError("fresh handoff credential generation differs")
+        metadata = self.credentials.actor_metadata(self.actor)
+        if metadata is None or metadata.get("local_launch_receipt") != receipt:
+            raise ConflictError("fresh handoff credential receipt differs")
+        with self._operation_lock:
+            try:
+                control = self.preparer.adopt_fresh_handoff(request)
+            finally:
+                obligation = self.preparer.adopted_handoff_obligation()
+                if obligation is not None:
+                    self._adopted_handoff_control = obligation
+                    self._adopted_handoff_receipt = dict(receipt)
+                    if not any(item is obligation for item in self._cleanup_handles):
+                        self._cleanup_handles.append(obligation)
+            self._verify_adopted_handoff(b)
+            if control.result["status"] != "ok" or control.result["phase"] != "adopt_prepared":
+                raise ConflictError("fresh handoff host adoption remains unresolved")
+            journal = HandoffJournal(Path(b["custody_scope"]) / "runtime-handoff-state.json", writer=b["new_owner"], owner_epoch=b["new_owner_epoch"], authority=lambda: self._verify_adopted_handoff(b))
+            with journal.locked() as state:
+                entry = state["entries"].get(b["handoff_id"] + ":handoff_adopt")
+                pending = entry is not None and entry["request_digest"] == digest(request) and entry["reply"] is None
+            if not pending:
+                journal.begin(request)
+            journal.finish(request, control.result)
+            return control.result
+
     def orderly_handoff_source_facts(self) -> dict[str, Any]:
         """Return secret-free facts needed to bind A's sealed request."""
 
@@ -881,7 +1027,7 @@ class LocalWorkerLauncher:
         return {
             "receipt": dict(receipt),
             "identity": dict(identity),
-            "credential_generation": self.credentials.generation_snapshot(self.actor),
+            "credential_generation": _credential_commit_generation(self.credentials, self.actor),
         }
 
     def fence_orderly_handoff(self, handoff_id: str) -> dict[str, Any]:
@@ -897,7 +1043,7 @@ class LocalWorkerLauncher:
                 if self._active_handle is not session.handle:
                     raise ConflictError("local Worker ownership changed before fencing")
                 self.credentials.disable_actor(self.actor)
-                if self.credentials.generation_snapshot(self.actor) != session.generation:
+                if _credential_commit_generation(self.credentials, self.actor) != session.generation:
                     raise ConflictError("handoff credential generation changed while fencing")
                 observed = self._validate_observation(
                     session.profile,
@@ -914,7 +1060,7 @@ class LocalWorkerLauncher:
                     "handoff_id": handoff_id,
                     "receipt": dict(session.receipt),
                     "identity": dict(session.identity),
-                    "credential_generation": dict(session.generation),
+                    "credential_generation": session.generation,
                     "registered_state": dict(session.registered_state),
                 }
 
@@ -935,7 +1081,7 @@ class LocalWorkerLauncher:
             response = self.preparer.handoff_command(session.handle, payload)
             if response.get("worker_phase") != "owned":
                 raise ConflictError("Worker did not restore owner A custody")
-            if self.credentials.generation_snapshot(self.actor) != session.generation:
+            if _credential_commit_generation(self.credentials, self.actor) != session.generation:
                 raise ConflictError("handoff credential generation changed during rollback")
             self.credentials.enable_actor(self.actor)
             with self._state_lock:
@@ -953,7 +1099,7 @@ class LocalWorkerLauncher:
             return descriptor, {
                 "receipt": dict(session.receipt),
                 "identity": dict(session.identity),
-                "credential_generation": dict(session.generation),
+                "credential_generation": session.generation,
                 "registered_state": dict(session.registered_state),
             }
 
@@ -1012,7 +1158,7 @@ class LocalWorkerLauncher:
                 metadata = self.credentials.actor_metadata(self.actor)
                 if not isinstance(metadata, Mapping) or metadata.get("local_launch_receipt") != receipt:
                     raise ConflictError("handoff receipt does not match retained credential metadata")
-                generation = self.credentials.generation_snapshot(self.actor)
+                generation = _credential_commit_generation(self.credentials, self.actor)
                 if request.get("credential_generation") != generation:
                     raise ConflictError("handoff credential generation changed before adoption")
                 # From this point B is the committed custodian. The cleanup
@@ -1044,7 +1190,7 @@ class LocalWorkerLauncher:
                     profile=profile,
                     identity=second,
                     receipt=dict(receipt),
-                    generation=dict(generation),
+                    generation=generation,
                     common={
                         key: request[key]
                         for key in (
@@ -1120,7 +1266,7 @@ class LocalWorkerLauncher:
             session = self._orderly_handoff
             if session is None or session.phase != "adopt_prepared":
                 raise ConflictError("orderly handoff is not adoption-prepared")
-            if self.credentials.generation_snapshot(self.actor) != session.generation:
+            if _credential_commit_generation(self.credentials, self.actor) != session.generation:
                 raise ConflictError("handoff credential generation changed before commit")
             self.credentials.enable_actor(self.actor)
         try:
@@ -1130,7 +1276,7 @@ class LocalWorkerLauncher:
                 extras={
                     "new_owner": dict(session.new_owner or {}),
                     "new_runtime": dict(new_runtime),
-                    "credential_generation": dict(session.generation),
+                    "credential_generation": session.generation,
                     "registered_state": dict(session.registered_state),
                 },
                 expected_phase="rebind_committed",
@@ -1168,7 +1314,7 @@ class LocalWorkerLauncher:
             session = self._orderly_handoff
             if session is None or session.handoff_id != handoff_id or session.phase != "resumed":
                 raise ConflictError("orderly handoff has not completed resume")
-            if self.credentials.generation_snapshot(self.actor) != session.generation:
+            if _credential_commit_generation(self.credentials, self.actor) != session.generation:
                 raise ConflictError("handoff credential generation changed before publication")
             new_runtime = session.registered_state.get("runtime")
             if not isinstance(new_runtime, Mapping):
@@ -1484,7 +1630,7 @@ class LocalWorkerLauncher:
             "host": {k: receipt["host"][k] for k in ("pid", "birth_id")},
         }
         with self.credentials._lock:
-            generation = "sha256:" + hashlib.sha256(_read_owner_file(credential_path.with_suffix(".commit"))[0]).hexdigest()
+            generation = _credential_commit_generation(self.credentials, self.actor)
             expected_metadata = self.credentials.actor_metadata(self.actor)
         scope = Path(identity["custody_scope"])
         record_path = scope / "activation-record.json"
@@ -1496,7 +1642,7 @@ class LocalWorkerLauncher:
                 if self._shutdown.is_set() or self._prepare_cancel.is_set() or self._preparing_handle is not handle:
                     raise ConflictError("local activation owner was fenced")
                 current = self.credentials.actor_metadata(self.actor)
-                current_generation = "sha256:" + hashlib.sha256(_read_owner_file(credential_path.with_suffix(".commit"))[0]).hexdigest()
+                current_generation = _credential_commit_generation(self.credentials, self.actor)
                 if current != expected_metadata or current_generation != generation or not isinstance(current, Mapping) or current.get("local_launch_receipt") != receipt:
                     raise ConflictError("local activation credential generation changed or was revoked")
                 observed = self._validate_observation(profile, self.inspector.observe(handle), report=report,
@@ -1642,6 +1788,9 @@ class LocalWorkerLauncher:
                     raise ConflictError("local relay cannot retain Runtime activation receipt publisher")
                 bind(handle, grant, self._activation_acceptor(handle=handle, profile=profile, report=report,
                     identity=second, receipt=receipt, grant=grant, credential_path=credential_path))
+                bind_generation = getattr(self.preparer, "bind_retained_generation_verifier", None)
+                if callable(bind_generation):
+                    bind_generation(handle, lambda: _credential_commit_generation(self.credentials, self.actor))
             self.preparer.activate(handle, grant)
             activated = self._validate_observation(
                 profile, self.inspector.observe(handle), report=report,

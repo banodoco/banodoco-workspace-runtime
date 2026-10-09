@@ -1122,3 +1122,35 @@ def test_restarted_relay_owner_honors_existing_durable_cleanup_fence(tmp_path):
     with pytest.raises(ConflictError, match="cleanup is uncertain"):
         launcher.start(profile.profile_id, profile.workspace_uuid)
     assert preparer.events == []
+
+
+def test_handoff_preserves_original_activation_evidence_and_fences_ready(tmp_path):
+    from runtime_protocol.local_worker import _credential_commit_generation
+    from runtime_protocol.local_execution_handoff import FENCE_VERSION, read_protected
+    from runtime_protocol.service import RuntimeService
+    launcher, credentials, profile, scope, events, errors, close = _relay_activation_fixture(tmp_path)
+    launcher._start_watcher = lambda: None
+    service = None
+    try:
+        assert launcher.start(profile.profile_id, profile.workspace_uuid)["state"] == "active"
+        original = (scope / "activation-record.json").read_bytes()
+        generation = _credential_commit_generation(credentials, WORKER_ACTOR)
+        receipt = credentials.actor_metadata(WORKER_ACTOR)["local_launch_receipt"]
+        root = tmp_path / "fence-realm"; RealmStore.initialize(root)
+        support = tmp_path / "fence-support"; support.mkdir(mode=0o700)
+        service = RuntimeService(root, support_root=support)
+        service.set_local_claim_generation_verifier(lambda f, i: _credential_commit_generation(credentials, WORKER_ACTOR), actor=WORKER_ACTOR)
+        fence = {"version": FENCE_VERSION, "state": "held", "workspace_uuid": service.realm["id"], "executor_incarnation": receipt["executor_incarnation"], "credential_generation_digest": generation,
+                 "operation_id": "op", "handoff_id": "handoff", "intent_digest": "sha256:" + "1" * 64, "source_owner_epoch": "A", "target_owner_epoch": "B", "fence_generation": 1, "release_ack_digest": None}
+        service.hold_local_claim_fence(fence, assert_no_work=lambda: None)
+        with pytest.raises(ConflictError, match="claims are fenced"):
+            service.claim_next({"executor_id": WORKER_ACTOR, "capability_ids": [], "runtime_epoch": service.health()["runtime_epoch"]})
+        assert read_protected(service._local_claim_fence_path()) == fence
+        assert (scope / "activation-record.json").read_bytes() == original
+        assert credentials.actor_metadata(WORKER_ACTOR)["local_launch_receipt"] == receipt
+        assert _credential_commit_generation(credentials, WORKER_ACTOR) == generation
+        assert errors == []
+    finally:
+        if service is not None:
+            service.close()
+        close()

@@ -14,6 +14,7 @@ import re
 import socket
 from typing import Any, Mapping
 from urllib.parse import urlsplit
+from .errors import ValidationError
 
 HOST_PREPARATION_VERSION = "runtime.local-execution-host/v1"
 ENGINE_CONTROL_VERSION = "runtime.local-execution-engine-control/v1"
@@ -68,8 +69,9 @@ def receive_frame(channel: socket.socket) -> dict[str, Any]:
     if extra:
         raise RelayError("local execution control channel has an unsolicited frame")
     try:
-        value = json.loads(encoded.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
+        from .local_execution_handoff import decode
+        value = decode(encoded)
+    except (ValueError, UnicodeDecodeError, ValidationError) as exc:
         raise RelayError("local execution control frame is malformed") from exc
     if not isinstance(value, dict):
         raise RelayError("local execution control frame is not an object")
@@ -395,6 +397,171 @@ class LocalExecutionRelay:
         return value
 
 
+class RelayHandoffEndpoint:
+    """Authenticated original-owner forwarding, with no successor adoption.
+
+    The journal authority and fence verifier come from retained local owners,
+    never from serialized actor fields. No lock spans the host exchange.
+    """
+    def __init__(self, bridge, journal, *, verify_binding, verify_fence, verify_active_owner=None, verify_successor=None, transfer_successor=None, on_export=None):
+        self.bridge = bridge; self.journal = journal
+        self.verify_binding = verify_binding; self.verify_fence = verify_fence
+        self._phase = "owned"
+        self.verify_active_owner = verify_active_owner
+        self.verify_successor = verify_successor
+        self.transfer_successor = transfer_successor
+        self.on_export = on_export
+        self.successor_listener = None
+
+    def handoff(self, request, *, successor_peer=None):
+        from .local_execution_handoff import validate_request, digest, VERSION, COUNTERS
+        from .errors import ConflictError
+        validate_request(request)
+        try:
+            return self._handoff(request, successor_peer=successor_peer)
+        except Exception as exc:
+            b = request["binding"]
+            conflict = isinstance(exc, ConflictError) and any(word in str(exc) for word in ("changed input", "binding changed", "phase conflict", "stale"))
+            return {"version": VERSION, "command": request["command"], "binding_digest": digest(b), "request_digest": digest(request), "status": "conflict" if conflict else "unresolved", "phase": self._phase,
+                    "host": {k: b["current_roles"]["host"]["target"][k] for k in ("pid", "birth_id", "uid")}, "registered_state": None,
+                    "quiescence": {"claim_gate_closed": None, **{k: None for k in COUNTERS}, "observation_status": "unknown"},
+                    "custody_capabilities": b["current_roles"], "error_code": "binding_conflict" if conflict else "custody_unresolved"}
+
+    def _handoff(self, request, *, successor_peer=None):
+        from .local_execution_handoff import validate_request, validate_reply, digest, VERSION, COUNTERS
+        validate_request(request)
+        b = request["binding"]
+        if successor_peer is None:
+            self.verify_binding(b)
+        else:
+            successor_peer.verify_binding(b)
+            if self.verify_successor is None:
+                raise RelayError("fresh successor authority is unavailable")
+            self.verify_successor(b, successor_peer)
+        with self.journal.locked() as state:
+            phase = state["phase"]
+            self._phase = phase
+        # This retained A descriptor is not fresh B authentication. Even a
+        # correctly hashed claimant-supplied proof must not unlock adoption.
+        if successor_peer is None and request["command"] in ("handoff_adopt", "handoff_commit", "resume_prepare", "resume_commit", "handoff_finalize"):
+            return {"version": VERSION, "command": request["command"], "binding_digest": digest(b), "request_digest": digest(request), "status": "unresolved", "phase": phase,
+                    "host": {k: b["current_roles"]["host"]["target"][k] for k in ("pid", "birth_id", "uid")}, "registered_state": None,
+                    "quiescence": {"claim_gate_closed": None, **{k: None for k in COUNTERS}, "observation_status": "unknown"},
+                    "custody_capabilities": b["current_roles"], "error_code": "identity_unresolved"}
+        if request["command"] == "handoff_report":
+            return validate_reply(dict(self.bridge._call(request)), request)
+        prior = self.journal.replay(request)
+        if prior is not None:
+            if request["command"] == "handoff_export_sealed" and prior["status"] == "ok" and self.on_export is not None:
+                self.on_export(request)
+            return prior
+        if successor_peer is None and self.verify_active_owner is not None:
+            self.verify_active_owner(b)
+        if successor_peer is not None:
+            if request["command"] == "handoff_adopt":
+                if self.transfer_successor is None:
+                    raise RelayError("successor transfer adapter is unavailable")
+                self.transfer_successor(request, successor_peer)
+            elif request["command"] not in ("handoff_report", "handoff_commit", "resume_prepare", "resume_commit", "handoff_finalize"):
+                raise RelayError("successor cannot mutate source preparation")
+        if request["command"] != "handoff_prepare":
+            self.verify_fence(request)
+        prior = self.journal.begin(request)
+        if prior is not None:
+            return prior
+        reply = validate_reply(dict(self.bridge._call(request)), request)
+        if successor_peer is None:
+            self.verify_binding(b)
+        else:
+            self.verify_successor(b, successor_peer)
+        if request["command"] != "handoff_prepare":
+            self.verify_fence(request)
+        expected_host = {k: b["current_roles"]["host"]["target"][k] for k in ("pid", "birth_id", "uid")}
+        if reply["host"] != expected_host:
+            raise RelayError("handoff reply replaced retained host")
+        result = self.journal.finish(request, reply)
+        self._phase = result["phase"]
+        if request["command"] == "handoff_export_sealed" and result["status"] == "ok" and self.on_export is not None:
+            self.on_export(request)
+        return result
+
+
+def _native_handoff_endpoint(channel, session, preparation, binding):
+    from banodoco_local.custody_broker import AuthenticatedCleanupActor, RoleCustodyAuthority, _read_owner_file
+    from .local_execution_handoff import HandoffJournal, decode, read_protected, validate_fence, digest
+    peer = AuthenticatedCleanupActor.private_peer(channel)
+    relay_actor = AuthenticatedCleanupActor.current()
+    scope = Path(preparation["custody_scope"])
+    def verify_binding(b, *, participant=True):
+        if (b["custody_scope"] != str(scope) or b["operation_id"] != preparation["operation_id"] or b["channel_id"] != preparation["channel_id"]
+                or b["workspace_uuid"] != preparation["profile"]["workspace_uuid"] or b["profile_binding_digest"] != digest(preparation["profile"])
+                or b["original_owner_epoch"] != preparation["owner_epoch"] or (participant and peer.verify() != b["source_owner"])):
+            raise RelayError("handoff source is not the retained authenticated Runtime")
+        raw, _ = _read_owner_file(scope / "activation-record.json")
+        record = decode(raw)
+        if ("sha256:" + hashlib.sha256(raw).hexdigest() != b["activation_record_digest"]
+                or record.get("evidence_digest") != b["launch_evidence_digest"] or record.get("executor_incarnation") != b["executor_incarnation"]
+                or record.get("custody_capabilities") != b["original_roles"] or record.get("credential_generation") != b["credential_generation_digest"]):
+            raise RelayError("handoff immutable launch record differs")
+        current = b["current_roles"]
+        owners = {"host": relay_actor.verify(), "engine": current["host"]["target"], "engine_listener": current["host"]["target"]}
+        if current["relay"]["target"] != relay_actor.verify():
+            raise RelayError("handoff relay incarnation differs")
+        for role, owner in owners.items():
+            RoleCustodyAuthority(scope, role).verify_reference(current[role], expected_actor=owner, owner_epoch=b["original_owner_epoch"])
+    def verify_source_active(b):
+        verify_binding(b)
+        RoleCustodyAuthority(scope, "relay").verify_reference(b["source_relay_reference"], expected_actor=peer.verify(), owner_epoch=b["source_owner_epoch"])
+    def verify_fence(request):
+        b = request["binding"]
+        fence = validate_fence(read_protected(Path(preparation["profile"]["support_root"]) / "local-execution-claim-fence.json"))
+        if fence["state"] != "held" or any(fence[k] != b[k] for k in ("workspace_uuid", "executor_incarnation", "credential_generation_digest", "operation_id", "handoff_id", "intent_digest", "source_owner_epoch")) or fence["target_owner_epoch"] != b["new_owner_epoch"]:
+            raise RelayError("handoff canonical claim fence differs")
+        if "task_fence_digest" in request["payload"] and request["payload"]["task_fence_digest"] != digest(fence):
+            raise RelayError("handoff fence digest differs")
+        if request["command"] == "handoff_export_sealed" and request["payload"]["export_metadata"]["task_fence_digest"] != digest(fence):
+            raise RelayError("handoff export fence digest differs")
+        record = read_protected(scope / "activation-record.json")
+        commit_path = Path(record["request"]["grant"]["credential_file"]).with_suffix(".commit")
+        if "sha256:" + hashlib.sha256(_read_owner_file(commit_path)[0]).hexdigest() != b["credential_generation_digest"]:
+            raise RelayError("handoff protected credential commit changed")
+    verify_source_active(binding)
+    # Relay remains its own endpoint writer after Runtime ownership changes.
+    def relay_writer_authority():
+        relay_actor.verify()
+        RoleCustodyAuthority(scope, "host").verify_reference(binding["current_roles"]["host"], expected_actor=relay_actor.verify(), owner_epoch=binding["original_owner_epoch"])
+    journal = HandoffJournal(scope / "relay-handoff-state.json", writer=relay_actor.verify(), owner_epoch=preparation["owner_epoch"], authority=relay_writer_authority)
+    runtime_journal = HandoffJournal(scope / "runtime-handoff-state.json", writer=binding["source_owner"], owner_epoch=binding["source_owner_epoch"], authority=lambda: verify_source_active(binding))
+    def verify_successor(b, fresh_peer):
+        verify_binding(b, participant=False)
+        fresh_peer.verify_binding(b)
+        authority = RoleCustodyAuthority(scope, "relay")
+        current = authority.reference()
+        if current == b["source_relay_reference"]:
+            verify_source_active(b)
+        else:
+            from .local_worker_handoff import committed_relay_transfer
+            committed_relay_transfer(b, successor_actor=fresh_peer.actor, authority=authority)
+    def transfer_successor(request, fresh_peer):
+        from .local_worker_handoff import transfer_relay_to_successor
+        return transfer_relay_to_successor(request, peer=fresh_peer, source_actor=peer, runtime_journal=runtime_journal, authority=RoleCustodyAuthority(scope, "relay"), verify_fence=verify_fence)
+    endpoint = RelayHandoffEndpoint(session.bridge, journal, verify_binding=verify_binding, verify_fence=verify_fence, verify_active_owner=verify_source_active, verify_successor=verify_successor, transfer_successor=transfer_successor)
+    def on_export(request):
+        from .local_worker_handoff import HandoffSuccessorListener
+        if endpoint.successor_listener is None:
+            endpoint.successor_listener = HandoffSuccessorListener(request["binding"], request["payload"]["sealed_record_digest"], timeout=min(session.timeout, 10.0))
+        elif endpoint.successor_listener.binding != request["binding"] or endpoint.successor_listener.sealed_record_digest != request["payload"]["sealed_record_digest"]:
+            raise RelayError("successor transport replay changed binding")
+    endpoint.on_export = on_export
+    def verify_control_requester(control):
+        requester = AuthenticatedCleanupActor.private_peer(control)
+        authority = RoleCustodyAuthority(scope, "relay")
+        record = read_protected(authority.path)
+        authority.verify_reference(authority.reference(), expected_actor=requester.verify(), owner_epoch=record["owner_epoch"])
+    endpoint.verify_control_requester = verify_control_requester
+    return endpoint
+
+
 def preparation_report(preparation, prepared, *, relay_process, relay_reference, host_reference):
     """Compose the legacy worker alias from exact retained relay evidence."""
     value = validate_host_prepared(prepared, request=preparation,
@@ -607,6 +774,265 @@ class NativeHostSession:
         return result
 
 
+class _RelaySupervisionFailure(RelayError):
+    def __init__(self, reason, *, cleanup_verified=False):
+        self.reason = reason
+        self.cleanup_verified = cleanup_verified
+        disposition = "cleanup verified" if cleanup_verified else "cleanup remains unresolved"
+        label = "Runtime control channel closed" if reason == "runtime_control_closed" else reason
+        super().__init__(label + "; " + disposition)
+
+
+class _DeadlineExpired(TimeoutError):
+    """The single retained monotonic budget is exhausted."""
+
+
+class _HostExchangeFailure(RelayError):
+    def __init__(self, original):
+        self.original = original
+        super().__init__("host exchange remains unresolved")
+
+
+class _HostStreamState:
+    def __init__(self):
+        self.state = "idle"
+        self.operations = 0
+        self.original_failure = None
+
+
+class _CleanupBudget:
+    def __init__(self, seconds):
+        import time
+        self.monotonic = time.monotonic
+        self.deadline = self.monotonic() + seconds
+
+    def current_deadline(self):
+        return self.deadline
+
+    def check(self):
+        if self.monotonic() >= self.deadline:
+            raise _DeadlineExpired("delegated cleanup deadline expired")
+
+
+class _DeadlineIO:
+    """Keep the existing parser on its raw socket, with one absolute budget."""
+    def __init__(self, channel, monitor, stream=None):
+        self.channel = channel
+        self.monitor = monitor
+        self.stream = stream
+
+    def __getattr__(self, name):
+        return getattr(self.channel, name)
+
+    def _call(self, name, *args):
+        deadline = self.monitor.current_deadline()
+        remaining = None if deadline is None else deadline - self.monitor.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise _DeadlineExpired("absolute handoff deadline expired")
+        previous = self.channel.gettimeout()
+        timeout = previous if remaining is None else remaining if previous is None else min(previous, remaining)
+        if self.stream is not None:
+            self.stream.state = "outstanding"
+            self.stream.operations += 1
+        try:
+            self.channel.settimeout(timeout)
+            return getattr(self.channel, name)(*args)
+        except Exception:
+            if self.stream is not None:
+                self.stream.state = "failed"
+            raise
+        finally:
+            # A successful recvmsg must reach the existing ancillary parser,
+            # even if another owner has closed the socket in the meantime.
+            try:
+                if self.channel.fileno() >= 0:
+                    self.channel.settimeout(previous)
+            except OSError:
+                pass
+
+    def recv(self, *args):
+        return self._call("recv", *args)
+
+    def recvmsg(self, *args):
+        return self._call("recvmsg", *args)
+
+    def sendall(self, *args):
+        return self._call("sendall", *args)
+
+    def accept(self):
+        return self._call("accept")
+
+
+class _RelayFailureMonitor:
+    """Observe an accepted handoff; observation never confers authority."""
+    def __init__(self, *, monotonic=None, wall_time=None):
+        import time
+        self.monotonic = monotonic or time.monotonic
+        self.wall_time = wall_time or time.time
+        self.binding_digest = None
+        self.deadline = None
+        self.dispatch_deadline = None
+
+    def accepted(self, request, reply, *, current_phase=None):
+        if reply["status"] != "ok" or request["command"] == "handoff_report":
+            return
+        binding_digest = digest(request["binding"])
+        if self.binding_digest is None:
+            self.binding_digest = binding_digest
+            remaining = request["binding"]["deadline_unix_ms"] / 1000 - self.wall_time()
+            self.deadline = self.dispatch_deadline if self.dispatch_deadline is not None else self.monotonic() + max(0.0, remaining)
+        if binding_digest != self.binding_digest:
+            # Even an unexpected accepted reply cannot extend a retained timer.
+            return
+        phase = current_phase or reply["phase"]
+        if phase in ("owned", "finalized"):
+            self.deadline = None
+            if phase == "owned":
+                self.binding_digest = None
+
+    def expired(self):
+        deadline = self.current_deadline()
+        return deadline is not None and self.monotonic() >= deadline
+
+    def accepted_expired(self):
+        return self.deadline is not None and self.monotonic() >= self.deadline
+
+    def current_deadline(self):
+        deadlines = [d for d in (self.deadline, self.dispatch_deadline) if d is not None]
+        return min(deadlines) if deadlines else None
+
+    def check(self):
+        if self.expired():
+            raise _DeadlineExpired("absolute handoff deadline expired")
+
+    def timeout(self):
+        deadline = self.current_deadline()
+        if deadline is None:
+            return 10.0
+        return min(10.0, max(0.0, deadline - self.monotonic()))
+
+
+def _host_stream_usable(session, stream):
+    import select
+    if session is None or stream.state != "idle":
+        return False
+    control = getattr(session, "control", None)
+    if not isinstance(control, socket.socket) or control.fileno() < 0:
+        return False
+    try:
+        # Any queued bytes, EOF or observer error disqualifies cleanup RPC.
+        readable, _, _ = select.select([control], [], [], 0)
+        if readable:
+            control.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+            return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _host_call(session, monitor, stream, callback, *, endpoint_call=False, replay_only=False):
+    originals = {}
+    before = stream.operations
+    if stream.state != "idle" and not replay_only:
+        raise _HostExchangeFailure(stream.original_failure) from stream.original_failure
+    original_exchange = getattr(session.bridge, "_exchange", None)
+    if original_exchange is not None:
+        def observed_exchange(request):
+            exchange_before = stream.operations
+            try:
+                if replay_only:
+                    raise RelayError("terminal durable replay cannot start a host exchange")
+                monitor.check()
+                reply = original_exchange(request)
+                # The complete existing parser returned. Check before the
+                # endpoint can validate/finish its journal or transfer phase.
+                monitor.check()
+                return reply
+            except Exception as exc:
+                if stream.operations != exchange_before:
+                    stream.state = "failed"
+                    if stream.original_failure is None:
+                        stream.original_failure = exc
+                raise
+        session.bridge._exchange = observed_exchange
+    for name in ("control", "activation"):
+        channel = getattr(session, name, None)
+        if isinstance(channel, socket.socket):
+            originals[name] = channel
+            setattr(session, name, _DeadlineIO(channel, monitor, stream))
+    try:
+        monitor.check()
+        result = callback()
+        if stream.original_failure is not None and not replay_only:
+            raise _HostExchangeFailure(stream.original_failure) from stream.original_failure
+        if not endpoint_call:
+            monitor.check()
+        if stream.operations != before:
+            # The endpoint catches failed exchanges in this bounded outcome.
+            if stream.state == "failed" or (isinstance(result, Mapping) and result.get("error_code") == "custody_unresolved"):
+                stream.state = "failed"
+            else:
+                stream.state = "idle"
+        return result
+    except Exception as exc:
+        if stream.operations != before:
+            stream.state = "failed"
+            if stream.original_failure is None:
+                stream.original_failure = exc
+        raise
+    finally:
+        if original_exchange is not None:
+            session.bridge._exchange = original_exchange
+        for name, channel in originals.items():
+            setattr(session, name, channel)
+
+
+def _control_failure_reason(exc, monitor):
+    if isinstance(exc, _DeadlineExpired) or (isinstance(exc, TimeoutError) and monitor.expired()):
+        return "deadline_expired"
+    if isinstance(exc, TimeoutError):
+        return "runtime_control_timeout"
+    if isinstance(exc, RelayError):
+        return "runtime_control_closed" if str(exc) == "local execution control channel closed" else "runtime_control_malformed"
+    return "runtime_control_failed"
+
+
+def _fail_supervision(channels, session, reason, *, stream, cause=None, host_control_usable=True, cleanup_allowed=True):
+    """Publish failure before bounded delegated cleanup; retain uncertainty."""
+    if stream.original_failure is not None:
+        cause = stream.original_failure
+    for channel in channels:
+        previous_timeout = channel.gettimeout()
+        try:
+            channel.settimeout(1.0 if previous_timeout is None else min(previous_timeout, 1.0))
+            send_frame(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": reason})
+        except Exception:
+            pass
+        finally:
+            if channel.fileno() >= 0:
+                channel.settimeout(previous_timeout)
+    cleanup_verified = False
+    if cleanup_allowed and host_control_usable and _host_stream_usable(session, stream) and hasattr(session, "bridge"):
+        # Only the already retained relay/host owner protocol may clean up.
+        # Broken/unsolicited host channels cannot supply a trustworthy reply.
+        control = getattr(session, "control", None)
+        previous_timeout = control.gettimeout() if isinstance(control, socket.socket) else None
+        try:
+            # Cleanup has its own finite budget after the failed handoff.
+            # It cannot reset or resume the expired handoff's authority.
+            cleanup_monitor = _CleanupBudget(min(getattr(session, "timeout", 5.0), 5.0))
+            result = _host_call(session, cleanup_monitor, stream, session.bridge.abort)
+            if result.get("status") == "cleaned":
+                exit_code = session.reap_host()
+                cleanup_verified = isinstance(exit_code, int) and not isinstance(exit_code, bool)
+        except Exception:
+            pass
+        finally:
+            if isinstance(control, socket.socket) and control.fileno() >= 0:
+                control.settimeout(previous_timeout)
+    raise _RelaySupervisionFailure(reason, cleanup_verified=cleanup_verified) from cause
+
+
 def serve_control(channel, *, session_factory=NativeHostSession.create, reference_reader=None, relay_identity=None):
     """Serve one Runtime-owned launch over its retained private descriptor.
 
@@ -619,6 +1045,10 @@ def serve_control(channel, *, session_factory=NativeHostSession.create, referenc
     session = None
     prepare_input = None
     terminal_abort = None
+    handoff_endpoint = None
+    monitor = _RelayFailureMonitor()
+    host_stream = _HostStreamState()
+    channels = {channel: None}
     def retain(value):
         nonlocal session
         session = value
@@ -634,12 +1064,88 @@ def serve_control(channel, *, session_factory=NativeHostSession.create, referenc
             relay_process={"pid": identity["pid"], "birth_id": identity["birth_id"]},
             relay_reference=reference_reader(preparation["custody_scope"], "relay"),
             host_reference=reference_reader(preparation["custody_scope"], "host"))
-    while True:
-        request = receive_frame(channel)
+    def lose_control(control, exc):
+        channels.pop(control, None)
+        control.close()
+        listener = handoff_endpoint.successor_listener if handoff_endpoint is not None else None
+        reason = _control_failure_reason(exc, monitor)
+        if reason == "deadline_expired":
+            _fail_supervision(channels, session, reason, stream=host_stream, cause=exc)
+        if channels or (listener is not None and not listener.closed):
+            return True
+        if terminal_abort is not None and reason == "runtime_control_closed":
+            return False
+        _fail_supervision(channels, session, reason, stream=host_stream, cause=exc,
+            cleanup_allowed=reason not in ("runtime_control_malformed", "runtime_control_timeout"))
+    def respond(control, response, *, refusal=False):
+        previous_timeout = control.gettimeout()
         try:
+            if refusal:
+                control.settimeout(1.0 if previous_timeout is None else min(previous_timeout, 1.0))
+            send_frame(_DeadlineIO(control, monitor), response)
+            return True
+        except Exception as exc:
+            return lose_control(control, exc)
+        finally:
+            if refusal and control.fileno() >= 0:
+                control.settimeout(previous_timeout)
+    while True:
+        import select
+        listener = handoff_endpoint.successor_listener if handoff_endpoint is not None else None
+        if listener is not None:
+            listener._frame_io = lambda control: _DeadlineIO(control, monitor)
+        surfaces = list(channels) + ([listener.socket] if listener is not None and not listener.closed else [])
+        host_control = getattr(session, "control", None) if terminal_abort is None else None
+        if isinstance(host_control, socket.socket) and host_control.fileno() >= 0:
+            surfaces.append(host_control)
+        else:
+            host_control = None
+        if monitor.expired():
+            _fail_supervision(channels, session, "deadline_expired", stream=host_stream)
+        if not surfaces:
+            _fail_supervision(channels, session, "runtime_control_closed", stream=host_stream)
+        ready, _, _ = select.select(surfaces, [], [], monitor.timeout())
+        if monitor.expired():
+            _fail_supervision(channels, session, "deadline_expired", stream=host_stream)
+        if not ready:
+            continue
+        if host_control is not None and host_control in ready:
+            try:
+                pending = host_control.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0))
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                _fail_supervision(channels, session, "host_control_failed", stream=host_stream, cause=exc, host_control_usable=False)
+            _fail_supervision(channels, session, "host_control_unsolicited" if pending else "host_control_closed", stream=host_stream, host_control_usable=False)
+        if listener is not None and listener.socket in ready:
+            try:
+                successor_peer, request = listener.accept()
+            except Exception as exc:
+                # Rejected peers/frames own no role. accept() closes that FD;
+                # keep the selected listener and all retained obligations.
+                if monitor.expired():
+                    _fail_supervision(channels, session, "deadline_expired", stream=host_stream, cause=exc)
+                continue
+            channel = successor_peer.channel
+            channels[channel] = successor_peer
+        else:
+            channel = next(control for control in channels if control in ready)
+            successor_peer = channels[channel]
+            try:
+                request = receive_frame(_DeadlineIO(channel, monitor))
+            except Exception as exc:
+                if lose_control(channel, exc):
+                    continue
+                return
+        try:
+            monitor.check()
             if request.get("version") != CONTROL_VERSION:
                 raise RelayError("relay control version is invalid")
             command = request.get("command")
+            if handoff_endpoint is not None and command not in ("handoff", "report"):
+                handoff_endpoint.verify_control_requester(channel)
+                if successor_peer is None and command in ("activate", "abort") and handoff_endpoint._phase not in ("owned", "host_paused"):
+                    raise RelayError("source descriptor relinquished mutation authority at export")
             if command == "prepare":
                 if set(request) != {"version", "command", "preparation", "config"}:
                     raise RelayError("relay prepare request shape is invalid")
@@ -658,28 +1164,39 @@ def serve_control(channel, *, session_factory=NativeHostSession.create, referenc
                     session_factory(preparation, request["config"], retain=retain)
                 if not hasattr(session, "bridge"):
                     raise RelayError("host sealing remains unresolved")
-                reply = session.bridge.prepare(preparation)
+                reply = _host_call(session, monitor, host_stream, lambda: session.bridge.prepare(preparation))
                 if reply["status"] != "prepared":
-                    send_frame(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "preparation_unresolved", "host_result": reply})
+                    if not respond(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "preparation_unresolved", "host_result": reply}):
+                        return
                     continue
                 response = {"version": CONTROL_VERSION, "status": "ok", "report": report(reply)}
             elif command == "report":
                 if set(request) != {"version", "command"} or session is None or terminal_abort is not None:
                     raise RelayError("relay has no reportable retained host")
-                reply = session.bridge.report()
+                reply = _host_call(session, monitor, host_stream, session.bridge.report)
                 if reply["status"] != "prepared":
-                    send_frame(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "report_unresolved", "host_result": reply})
+                    if not respond(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "report_unresolved", "host_result": reply}):
+                        return
                     continue
                 response = {"version": CONTROL_VERSION, "status": "ok", "report": report(reply)}
             elif command == "activate":
                 if set(request) != {"version", "command", "grant"} or session is None or terminal_abort is not None or session.bridge._prepared is None:
                     raise RelayError("relay activation lacks a retained prepared graph")
-                activation_request = session.begin_activation(request["grant"])
-                send_frame(channel, {"version": CONTROL_VERSION, "status": "activation_requested", "request": activation_request})
-                confirmation = receive_frame(channel)
+                activation_request = _host_call(session, monitor, host_stream, lambda: session.begin_activation(request["grant"]))
+                if not respond(channel, {"version": CONTROL_VERSION, "status": "activation_requested", "request": activation_request}):
+                    return
+                if channel not in channels:
+                    continue
+                try:
+                    confirmation = receive_frame(_DeadlineIO(channel, monitor))
+                except Exception as exc:
+                    if lose_control(channel, exc):
+                        continue
+                    return
+                monitor.check()
                 if set(confirmation) != {"version", "command", "receipt"} or confirmation.get("version") != CONTROL_VERSION or confirmation.get("command") != "record_activation_receipt":
                     raise RelayError("relay activation receipt forwarding frame is invalid")
-                accepted = session.finish_activation(confirmation["receipt"])
+                accepted = _host_call(session, monitor, host_stream, lambda: session.finish_activation(confirmation["receipt"]))
                 response = {"version": CONTROL_VERSION, "status": "ok", "accepted": accepted}
             elif command == "abort":
                 if set(request) != {"version", "command"} or session is None:
@@ -687,22 +1204,83 @@ def serve_control(channel, *, session_factory=NativeHostSession.create, referenc
                 if terminal_abort is None:
                     if not hasattr(session, "bridge"):
                         raise RelayError("host setup failed with retained unresolved launch")
-                    result = session.bridge.abort()
+                    if host_stream.state != "idle" or (isinstance(getattr(session, "control", None), socket.socket) and not _host_stream_usable(session, host_stream)):
+                        raise RelayError("host cleanup stream is unresolved")
+                    result = _host_call(session, monitor, host_stream, session.bridge.abort)
                     if result["status"] != "cleaned":
-                        send_frame(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "cleanup_unresolved", "host_result": result})
+                        if not respond(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "cleanup_unresolved", "host_result": result}):
+                            return
                         continue
                     host_exit = session.reap_host()
                     if isinstance(host_exit, bool) or not isinstance(host_exit, int):
                         raise RelayError("relay host child exit is unresolved")
                     terminal_abort = {"version": CONTROL_VERSION, "status": "ok", "host_result": result, "host_exit_code": host_exit}
+                    monitor.deadline = None
                 response = terminal_abort
+            elif command == "handoff":
+                if set(request) != {"version", "command", "request"} or session is None or terminal_abort is not None:
+                    raise RelayError("handoff lacks retained host control")
+                from .local_execution_handoff import validate_request
+                validate_request(request["request"])
+                if handoff_endpoint is None:
+                    handoff_endpoint = _native_handoff_endpoint(channel, session, preparation, request["request"]["binding"])
+                phase = getattr(handoff_endpoint, "_phase", None)
+                owned_committed_replay = False
+                if hasattr(handoff_endpoint, "journal"):
+                    with handoff_endpoint.journal.locked() as state:
+                        phase = state["phase"]
+                        received = request["request"]
+                        key = received["binding"]["handoff_id"] + ":" + received["command"]
+                        entry = state["entries"].get(key)
+                        prior = entry.get("reply") if entry is not None else None
+                        # This is only an I/O-budget hint. The unchanged
+                        # endpoint must authenticate and return durable replay;
+                        # no success is composed from journal metadata here.
+                        owned_committed_replay = phase == "owned" and prior is not None
+                if monitor.binding_digest is None and phase != "finalized" and not owned_committed_replay:
+                    remaining = request["request"]["binding"]["deadline_unix_ms"] / 1000 - monitor.wall_time()
+                    if remaining <= 0:
+                        if not respond(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "deadline_expired"}, refusal=True):
+                            return
+                        continue
+                    monitor.dispatch_deadline = monitor.monotonic() + max(0.0, remaining)
+                try:
+                    monitor.check()
+                    outcome = _host_call(session, monitor, host_stream,
+                        lambda: handoff_endpoint.handoff(request["request"], successor_peer=successor_peer),
+                        endpoint_call=True, replay_only=owned_committed_replay)
+                    if not owned_committed_replay:
+                        monitor.accepted(request["request"], outcome, current_phase=getattr(handoff_endpoint, "_phase", None))
+                except (_HostExchangeFailure, TimeoutError) as exc:
+                    original = exc.original if isinstance(exc, _HostExchangeFailure) else exc
+                    reason = "deadline_expired" if isinstance(original, _DeadlineExpired) else "host_exchange_timeout" if isinstance(original, TimeoutError) else "host_exchange_failed"
+                    if monitor.accepted_expired():
+                        _fail_supervision(channels, session, "deadline_expired", stream=host_stream, cause=original, cleanup_allowed=False)
+                    # Provisional expiry or failed exchange is refusal only.
+                    # The endpoint may have swallowed the original exception;
+                    # retain it without another host RPC or journal advance.
+                    # A provisional request has been refused. Its I/O budget
+                    # must not turn the refusal send into lifecycle expiry.
+                    monitor.dispatch_deadline = None
+                    if not respond(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": reason}, refusal=True):
+                        return
+                    continue
+                finally:
+                    monitor.dispatch_deadline = None
+                response = {"version": CONTROL_VERSION, "status": "ok", "handoff": outcome}
             else:
                 raise RelayError("relay command is outside this checkpoint")
-            send_frame(channel, response)
-        except Exception:
+            if not respond(channel, response):
+                return
+        except _RelaySupervisionFailure:
+            raise
+        except Exception as exc:
             # Bounded error only. Retained session/child obligations remain
             # available for retry; EOF, failed seal and timeout never clean them.
-            send_frame(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "cleanup_unresolved" if request.get("command") == "abort" else "operation_unresolved"})
+            if monitor.accepted_expired():
+                _fail_supervision(channels, session, "deadline_expired", stream=host_stream, cause=exc)
+            if not respond(channel, {"version": CONTROL_VERSION, "status": "unresolved", "error_code": "cleanup_unresolved" if request.get("command") == "abort" else "operation_unresolved"}):
+                return
 
 
 def main(argv=None):
@@ -716,6 +1294,11 @@ def main(argv=None):
     os.set_inheritable(channel.fileno(), False)
     try:
         serve_control(channel)
+    except _RelaySupervisionFailure as exc:
+        # Failure is never an authority transfer or a clean shutdown receipt.
+        # Existing protected custody remains authoritative after this exit.
+        os.write(2, ("local execution supervision failed: " + str(exc) + "\n").encode("utf-8"))
+        return 78
     finally:
         channel.close()
     return 0

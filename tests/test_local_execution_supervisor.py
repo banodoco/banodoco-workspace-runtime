@@ -54,6 +54,141 @@ def _prepare_case():
     return request, response
 
 
+def _handoff_case(tmp_path):
+    """Synthetic contract peer; no native/joined custody qualification."""
+    import time
+    from runtime_protocol.local_execution_handoff import VERSION, digest
+    scope = tmp_path / "custody"; scope.mkdir(mode=0o700)
+    def actor(pid):
+        return {"pid": pid, "uid": 501, "birth_id": f"birth-{pid}", "audit_token_sha256": "sha256:" + "a" * 64, "audit_token_pidversion": pid + 1}
+    roles = {role: {"version": "runtime.role-custody-reference/v1", "scope_root": str(scope), "role": role, "generation": 1, "target": actor(pid)} for role, pid in (("relay", 20), ("host", 21), ("engine", 22), ("engine_listener", 23))}
+    b = {"operation_id": "op", "channel_id": "channel", "handoff_id": "handoff", "nonce_digest": "sha256:" + "b" * 64,
+         "deadline_unix_ms": time.time_ns() // 1_000_000 + 60_000, "workspace_uuid": "workspace", "profile_binding_digest": "sha256:" + "c" * 64,
+         "launch_evidence_digest": "sha256:" + "d" * 64, "activation_record_digest": "sha256:" + "e" * 64,
+         "executor_incarnation": "executor", "custody_scope": str(scope), "original_owner_epoch": "A", "new_owner_epoch": "B", "new_owner": actor(11),
+         "credential_generation_digest": "sha256:" + "f" * 64, "original_roles": copy.deepcopy(roles), "source_owner": actor(10), "source_owner_epoch": "A",
+         "source_relay_reference": roles["relay"], "current_roles": roles}
+    b["intent_digest"] = digest({"version": VERSION, "binding": b})
+    request = {"version": VERSION, "command": "handoff_prepare", "binding": b, "payload": {}}
+    runtime = {"endpoint": "http://127.0.0.1:1234", "protocol": "workspace.v1", "schema_digest": "sha256:" + "1" * 64, "runtime_epoch": 1, "runtime_session_id": "session", "runtime_instance_id": "instance", "coordinator_epoch": "A"}
+    reply = {"version": VERSION, "command": "handoff_prepare", "binding_digest": digest(b), "request_digest": digest(request), "status": "ok", "phase": "host_paused",
+             "host": {k: roles["host"]["target"][k] for k in ("pid", "birth_id", "uid")}, "registered_state": {"executor_incarnation": "executor", "source_epoch": "source", "capabilities": {}, "runtime": runtime},
+             "quiescence": {"claim_gate_closed": True, "claim_rpc_in_flight": 0, "active_attempts": 0, "pending_settlements": 0, "registration_rpc_in_flight": 0, "observation_status": "known"}, "custody_capabilities": roles, "error_code": None}
+    return request, reply
+
+
+def test_relay_handoff_phase_replay_preserves_delegated_roles(tmp_path):
+    from runtime_protocol.local_execution_handoff import HandoffJournal, read_protected
+    from runtime_protocol.local_execution_supervisor import RelayHandoffEndpoint
+    request, reply = _handoff_case(tmp_path)
+    calls = []
+    class Bridge:
+        def _call(self, received):
+            calls.append(copy.deepcopy(received))
+            return copy.deepcopy(reply)
+    journal = HandoffJournal(tmp_path / "custody" / "relay-handoff-state.json", writer=request["binding"]["current_roles"]["relay"]["target"], owner_epoch="A", authority=lambda: None)
+    endpoint = RelayHandoffEndpoint(Bridge(), journal, verify_binding=lambda b: None, verify_fence=lambda r: None)
+    assert endpoint.handoff(request) == reply
+    assert endpoint.handoff(request) == reply
+    assert len(calls) == 1
+    state = read_protected(journal.path)
+    assert state["phase"] == "host_paused"
+    assert state["binding"]["original_roles"] == request["binding"]["original_roles"]
+    assert state["binding"]["current_roles"] == reply["custody_capabilities"]
+
+
+def test_relay_handoff_refuses_active_work_and_changed_input(tmp_path):
+    from runtime_protocol.local_execution_handoff import HandoffJournal, read_protected, digest
+    from runtime_protocol.local_execution_supervisor import RelayHandoffEndpoint
+    from runtime_protocol.errors import ConflictError
+    request, reply = _handoff_case(tmp_path)
+    reply.update(status="active_work", phase="owned", error_code="active_work")
+    reply["quiescence"]["active_attempts"] = 1
+    class Bridge:
+        def _call(self, received):
+            return reply
+    journal = HandoffJournal(tmp_path / "custody" / "relay-handoff-state.json", writer=request["binding"]["source_owner"], owner_epoch="A", authority=lambda: None)
+    endpoint = RelayHandoffEndpoint(Bridge(), journal, verify_binding=lambda b: None, verify_fence=lambda r: None)
+    assert endpoint.handoff(request)["status"] == "active_work"
+    assert read_protected(journal.path)["phase"] == "owned"
+    changed = copy.deepcopy(request); changed["binding"]["nonce_digest"] = "sha256:" + "9" * 64
+    changed["binding"]["intent_digest"] = digest({"version": changed["version"], "binding": {k: v for k, v in changed["binding"].items() if k != "intent_digest"}})
+    assert endpoint.handoff(changed)["status"] == "conflict"
+
+
+def test_handoff_wire_rejects_nested_duplicate_keys_and_unknown_quiescence(tmp_path):
+    from runtime_protocol.local_execution_handoff import canonical, validate_reply
+    from runtime_protocol.errors import ValidationError
+    for payload in (b'{"x":1,"x":2}\n', b'{"binding":{"pid":1,"pid":2}}\n'):
+        a, b = socket.socketpair()
+        try:
+            a.sendall(payload)
+            with pytest.raises(RelayError):
+                receive_frame(b)
+        finally:
+            a.close(); b.close()
+    request, reply = _handoff_case(tmp_path)
+    reply["quiescence"].update(active_attempts=None, observation_status="unknown")
+    with pytest.raises(ValidationError, match="measured quiescence"):
+        validate_reply(reply, request)
+
+
+def test_successor_rejects_stale_source_descriptor_and_journal_writer(tmp_path):
+    from runtime_protocol.local_execution_handoff import HandoffJournal, digest, read_protected, write_protected
+    from runtime_protocol.local_execution_supervisor import RelayHandoffEndpoint
+    from runtime_protocol.errors import ConflictError
+    request, reply = _handoff_case(tmp_path)
+    path = tmp_path / "custody" / "relay-handoff-state.json"
+    journal = HandoffJournal(path, writer=request["binding"]["source_owner"], owner_epoch="A", authority=lambda: None)
+    journal.begin(request); journal.finish(request, reply)
+    class Bridge:
+        def _call(self, received):
+            pytest.fail("inherited A descriptor must not forward B adoption")
+    endpoint = RelayHandoffEndpoint(Bridge(), journal, verify_binding=lambda b: None, verify_fence=lambda r: None)
+    adoption = {**request, "command": "handoff_adopt", "payload": {"export_digest": "sha256:" + "1" * 64, "sealed_record_digest": "sha256:" + "2" * 64, "task_fence_digest": "sha256:" + "3" * 64, "relay_transfer_ack": {}, "successor_authentication_digest": "sha256:" + "4" * 64}}
+    result = endpoint.handoff(adoption)
+    assert result["status"] == "unresolved" and result["error_code"] == "identity_unresolved"
+    state = read_protected(path)
+    # Model an independently committed writer transition; serialized B alone
+    # cannot enact it. A must refuse subsequent writes/replay from its old FD.
+    state["writer_incarnation"] = request["binding"]["new_owner"]
+    state["writer_owner_epoch"] = "B"; state["writer_generation"] += 1
+    write_protected(path, state)
+    with pytest.raises(ConflictError, match="stale.*writer"):
+        journal.replay(request)
+
+
+@pytest.mark.parametrize("command,closed,valid", [
+    ("resume_prepare", True, True), ("resume_prepare", False, False),
+    ("resume_commit", True, True), ("resume_commit", False, False),
+    ("handoff_finalize", False, True), ("handoff_finalize", True, False),
+])
+def test_handoff_reply_gate_matches_finalization_phase(tmp_path, command, closed, valid):
+    from runtime_protocol.local_execution_handoff import PHASES, digest, validate_reply
+    from runtime_protocol.errors import ValidationError
+    prepare, reply = _handoff_case(tmp_path)
+    payload = {"registered_state_digest": digest(reply["registered_state"]), "task_fence_digest": "sha256:" + "7" * 64}
+    if command != "handoff_finalize":
+        payload["new_runtime"] = copy.deepcopy(reply["registered_state"]["runtime"])
+        payload["new_runtime"]["coordinator_epoch"] = "B"
+        reply["registered_state"]["runtime"] = copy.deepcopy(payload["new_runtime"])
+        payload["registered_state_digest"] = digest(reply["registered_state"])
+    request = {**prepare, "command": command, "payload": payload}
+    reply.update(command=command, request_digest=digest(request), phase=PHASES[command][1])
+    reply["quiescence"]["claim_gate_closed"] = closed
+    if valid:
+        assert validate_reply(reply, request) == reply
+        changed = copy.deepcopy(reply); changed["registered_state"]["source_epoch"] += "-changed"
+        with pytest.raises(ValidationError, match="registration digest changed"):
+            validate_reply(changed, request)
+        changed = copy.deepcopy(reply); changed["phase"] = "owned"
+        with pytest.raises(ValidationError, match="phase differs"):
+            validate_reply(changed, request)
+    else:
+        with pytest.raises(ValidationError, match="claim gate differs"):
+            validate_reply(reply, request)
+
+
 def test_private_utf8_frame_roundtrip_without_credential_fields():
     a, b = socket.socketpair()
     try:

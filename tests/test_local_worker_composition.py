@@ -450,3 +450,68 @@ def test_relay_restart_cannot_treat_missing_control_as_absent_generation():
     preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
     with pytest.raises(ConflictError, match="capability recovery remains unresolved"):
         preparer.reconnect({"version": "runtime.local-worker-receipt/v4"})
+
+
+def test_relay_retained_reconnect_requires_exact_receipt_and_incarnation(tmp_path, monkeypatch):
+    import copy
+    from test_local_execution_supervisor import _handoff_case, _prepare_case
+    from runtime_protocol.auth import CredentialStore
+    from runtime_protocol.local_worker import _credential_commit_generation
+    from runtime_protocol.local_execution_handoff import write_protected
+    request, _ = _handoff_case(tmp_path)
+    caps = request["binding"]["current_roles"]
+    selected = _prepare_case()[0]["profile"]
+    selected.update(support_root=str(tmp_path))
+    profile = LocalWorkerProfile(**{k: Path(v) if k in {"realm_root", "support_root", "worker_executable", "host_executable", "engine_executable", "engine_listener_executable"} else v for k, v in selected.items()})
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    scope = tmp_path / "custody"
+    receipt = {"version": "runtime.local-worker-receipt/v4", "owner_epoch": "A", "custody_scope": str(scope), "profile_binding_digest": "sha256:" + "1" * 64, "executor_incarnation": "incarnation", "evidence_digest": "sha256:" + "2" * 64, "custody_capabilities": caps,
+               **{alias: {k: caps[role]["target"][k] for k in ("pid", "birth_id")} for alias, role in (("worker", "relay"), ("host", "host"), ("engine", "engine"), ("engine_listener", "engine_listener"))}}
+    credentials = CredentialStore(tmp_path / "credentials")
+    credentials.provision("actor", [], metadata={"local_launch_receipt": receipt})
+    generation = _credential_commit_generation(credentials, "actor")
+    write_protected(scope / "activation-record.json", {"evidence_digest": receipt["evidence_digest"], "executor_incarnation": "incarnation", "custody_capabilities": caps, "original_owner_epoch": "A", "credential_generation": generation})
+    live = copy.deepcopy(caps)
+    current = request["binding"]["source_owner"]
+    monkeypatch.setattr("banodoco_local.custody_broker.AuthenticatedCleanupActor.current", lambda: SimpleNamespace(verify=lambda: current))
+    class Authority:
+        def __init__(self, scope, role):
+            self.role = role
+        def verify_reference(self, ref, **kwargs):
+            if ref != live[self.role]:
+                raise ConflictError("kernel incarnation changed")
+            return ref
+    monkeypatch.setattr("banodoco_local.custody_broker.RoleCustodyAuthority", Authority)
+    handle = SimpleNamespace(relay=True, activated=True, closed=False, owner_epoch="A", custody_scope=str(scope), retained=SimpleNamespace(verify=lambda: caps["relay"]["target"]))
+    preparer._active = handle
+    preparer._generation_verifier = (handle, lambda: _credential_commit_generation(credentials, "actor"))
+    report = {"owner_epoch": "A", "profile_binding_digest": receipt["profile_binding_digest"], "custody_scope": str(scope), "custody_capabilities": caps, "processes": {role: receipt[role] for role in ("worker", "host", "engine", "engine_listener")}}
+    monkeypatch.setattr(preparer, "report", lambda h: copy.deepcopy(report))
+    before = (scope / "activation-record.json").read_bytes()
+    assert preparer.reconnect(receipt) is handle
+    assert (scope / "activation-record.json").read_bytes() == before
+    changed = {**receipt, "evidence_digest": "sha256:" + "9" * 64}
+    with pytest.raises(ConflictError, match="activation evidence"):
+        preparer.reconnect(changed)
+    live["engine"]["target"]["birth_id"] = "replacement"
+    with pytest.raises(ConflictError, match="incarnation changed"):
+        preparer.reconnect(receipt)
+
+
+def test_relay_adoption_failure_retains_nonchild_cleanup_obligation(tmp_path, monkeypatch):
+    from test_local_execution_supervisor import _prepare_case
+    selected = _prepare_case()[0]["profile"]
+    profile = LocalWorkerProfile(**{k: Path(v) if k in {"realm_root", "support_root", "worker_executable", "host_executable", "engine_executable", "engine_listener_executable"} else v for k, v in selected.items()})
+    preparer = CrossProcessWorkerPreparer(profile=profile, config={}, environment={})
+    a, b = socket.socketpair()
+    obligation = SimpleNamespace(control=a, inherited_from="A", cleanup_unresolved=True)
+    monkeypatch.setattr(os, "kill", lambda *_: pytest.fail("numeric fallback"))
+    monkeypatch.setattr(os, "waitpid", lambda *_: pytest.fail("nonchild wait"))
+    try:
+        with pytest.raises(ConflictError, match="fresh authenticated B"):
+            preparer.adopt_control_descriptor(obligation, {}, {})
+        assert obligation.control.fileno() >= 0 and obligation.cleanup_unresolved
+        assert preparer._active is None
+        a.sendall(b"retained"); assert b.recv(8) == b"retained"
+    finally:
+        a.close(); b.close()

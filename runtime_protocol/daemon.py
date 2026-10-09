@@ -221,6 +221,7 @@ class RuntimeDaemon:
         epoch_floor = self._read_epoch_floor()
         self.service = RuntimeService(self.root, display_name=self.display_name, realm_id=self.realm_id, support_root=self.support_root, export_root=self.export_root, reboot_executor=self.reboot_executor, reboot_allowlist=self.reboot_allowlist, runtime_epoch_floor=epoch_floor, admission_timeout=self.admission_timeout)
         self.service.set_readiness_callback(self._revoke_readiness)
+        self.service.set_local_claim_generation_verifier(self._verify_local_claim_generation, actor=WORKER_ACTOR)
         self.catalog.bind_owner(self._catalog_owner_valid)
         self._provision_credentials(rotate=rotate_credentials)
         if self.local_worker_profiles and not self._local_worker_deferred:
@@ -336,6 +337,230 @@ class RuntimeDaemon:
         for label, query in queries:
             if self.service.store.conn.execute(query, (WORKER_ACTOR,)).fetchone():
                 raise ConflictError(f"local Worker has outstanding {label}")
+
+    def _verify_local_claim_generation(self, fence, identity):
+        from .local_worker import _credential_commit_generation
+        with self.credentials._lock:
+            generation = _credential_commit_generation(self.credentials, WORKER_ACTOR)
+            metadata = self.credentials.actor_metadata(WORKER_ACTOR)
+            receipt = metadata.get("local_launch_receipt") if isinstance(metadata, dict) else None
+            if (not isinstance(receipt, dict) or receipt.get("workspace_uuid") != fence["workspace_uuid"]
+                    or receipt.get("executor_incarnation") != fence["executor_incarnation"]):
+                raise ConflictError("claim fence differs from protected launch generation")
+            if identity is not None and (not isinstance(identity, dict)
+                    or identity.get("actor") != WORKER_ACTOR
+                    or identity.get("execution_binding") != metadata.get("execution_binding")):
+                raise ConflictError("claim fence caller differs from selected credential binding")
+            return generation
+
+    def hold_local_execution_claims(self, binding):
+        """Publish a generation fence after the host's durable pause.
+
+        This is a composed owner method, not an HTTP authority grant. It never
+        holds the claim mutex across relay/host RPC or credential rotation.
+        """
+        from .local_execution_handoff import FENCE_VERSION, validate_request
+        validate_request({"version": "runtime.local-execution-handoff/v1", "command": "handoff_prepare", "binding": binding, "payload": {}})
+        launcher = self.local_worker_launcher
+        if launcher is None:
+            raise ConflictError("handoff has no retained launch owner")
+        launcher.verify_retained_handoff_binding(binding)
+        with self._worker_actor_lock:
+            prior = self.service._local_claim_fence
+            same = prior is not None and prior["handoff_id"] == binding["handoff_id"] and prior["intent_digest"] == binding["intent_digest"]
+            if same and prior["state"] == "released":
+                # Exact old pause receipt retrieval must not rehold or rotate
+                # a finalized/rolled-back fence. Export still requires held.
+                return dict(prior)
+            generation = prior["fence_generation"] if same else (prior["fence_generation"] + 1 if prior else 1)
+            value = {"version": FENCE_VERSION, "state": "held", **{k: binding[k] for k in ("workspace_uuid", "executor_incarnation", "credential_generation_digest", "operation_id", "handoff_id", "intent_digest", "source_owner_epoch")}, "target_owner_epoch": binding["new_owner_epoch"], "fence_generation": generation, "release_ack_digest": None}
+            return self.service.hold_local_claim_fence(value, assert_no_work=self._assert_worker_actor_has_no_work)
+
+    def forward_local_execution_handoff(self, request):
+        from .local_execution_handoff import digest, read_protected, validate_request
+        validate_request(request)
+        final_fence = None
+        if request["command"] == "handoff_finalize":
+            final_fence = self._local_finalization_fence(request)
+            # Recheck the actual registration before asking the host to open.
+            # This reads durable state; no store lock spans the host RPC.
+            state = read_protected(Path(request["binding"]["custody_scope"]) / "runtime-handoff-state.json")
+            command = "handoff_finalize" if state.get("phase") == "finalized" else "resume_commit"
+            entry = state.get("entries", {}).get(request["binding"]["handoff_id"] + ":" + command)
+            if entry is None or entry.get("reply") is None or entry["reply"].get("status") != "ok":
+                raise ConflictError("finalization lacks durable resumed registration")
+            registered = entry["reply"].get("registered_state")
+            if digest(registered) != request["payload"]["registered_state_digest"]:
+                raise ConflictError("finalization registration changed before host opening")
+            self._verify_local_finalization_registration(request["binding"], registered)
+        # No canonical store/credential/role lock spans this RPC.
+        reply = self.local_worker_launcher.retained_handoff_command(request)
+        if request["command"] == "handoff_prepare" and reply["status"] == "ok":
+            # Pause is durable first. The no-work check and fence publication
+            # then exclude any stale concurrent claim before export. A failed
+            # fence keeps the host paused and denies further transitions.
+            self.hold_local_execution_claims(request["binding"])
+        if request["command"] == "handoff_abort" and reply["status"] == "ok":
+            def verify_ack(ack):
+                state = read_protected(Path(request["binding"]["custody_scope"]) / "relay-handoff-state.json")
+                entry = state["entries"].get(request["binding"]["handoff_id"] + ":handoff_abort")
+                if (state["phase"] != "owned" or state["binding_digest"] != digest(request["binding"])
+                        or entry is None or entry["request_digest"] != digest(request) or entry["reply"] != ack):
+                    raise ConflictError("rollback lacks exact durable relay ACK")
+            held = self.service._local_claim_fence
+            if held is None:
+                raise ConflictError("rollback has no retained canonical claim fence")
+            if held["state"] == "released":
+                verify_ack(reply)
+                if held["release_ack_digest"] != digest(reply):
+                    raise ConflictError("rollback replay differs from released fence ACK")
+            else:
+                self.service.release_local_claim_fence(held, durable_ack=reply, verify_ack=verify_ack)
+        if request["command"] == "handoff_finalize":
+            from .local_execution_handoff import validate_reply
+            validate_reply(reply, request)
+            if reply["status"] != "ok":
+                return reply  # Unknown outcomes never release canonical claims.
+            def verify_final(ack):
+                self._verify_local_finalization_outcome(request, ack)
+            # Reload even after an exception/lost persistence ACK: the file,
+            # not an old in-memory flag, determines whether release committed.
+            with self.service.store._mutex:
+                self.service._load_local_claim_fence()
+                current = self.service._local_claim_fence
+                if self.service._local_claim_fence_unknown or current is None:
+                    raise ConflictError("finalization claim fence is unresolved")
+                if current["state"] == "released":
+                    if {k: v for k, v in current.items() if k not in ("state", "release_ack_digest")} != {k: v for k, v in final_fence.items() if k not in ("state", "release_ack_digest")}:
+                        raise ConflictError("finalization released generation changed")
+                    verify_final(reply)
+                    if current["release_ack_digest"] != digest(reply):
+                        raise ConflictError("finalization replay changed terminal ACK")
+                else:
+                    if current != final_fence:
+                        raise ConflictError("finalization held generation changed")
+                    self.service.release_local_claim_fence(current, durable_ack=reply, verify_ack=verify_final)
+        return reply
+
+    def _local_finalization_fence(self, request):
+        """Bind finalization to the actual B and existing canonical generation."""
+        from .local_execution_handoff import digest
+        b = request["binding"]
+        if self.service is None or self.local_worker_launcher is None:
+            raise ConflictError("finalization has no admitted successor owner")
+        self.local_worker_launcher._verify_adopted_handoff(b)
+        with self.service.store._mutex:
+            self.service._assert_mutation_admitted()
+            self.service._load_local_claim_fence()
+            fence = self.service._local_claim_fence
+            if (self.service._local_claim_fence_unknown or fence is None
+                    or any(fence[k] != b[k] for k in ("workspace_uuid", "executor_incarnation", "credential_generation_digest", "operation_id", "handoff_id", "intent_digest", "source_owner_epoch"))
+                    or fence["target_owner_epoch"] != b["new_owner_epoch"]
+                    or self._verify_local_claim_generation(fence, None) != b["credential_generation_digest"]):
+                raise ConflictError("finalization canonical generation differs")
+            held_projection = {**fence, "state": "held", "release_ack_digest": None}
+            if request["payload"]["task_fence_digest"] != digest(held_projection):
+                raise ConflictError("finalization exact held fence digest differs")
+            return dict(fence)
+
+    def _verify_local_finalization_registration(self, binding, registered):
+        """Observe the canonical executor, without changing registration/metadata."""
+        from .local_execution_handoff import digest, registered_state
+        registered_state(registered)
+        with self.service.store._mutex:
+            health = self.service.health()
+            expected_runtime = {"endpoint": self.endpoint, "protocol": health["protocol"], "schema_digest": health["schema_digest"], "runtime_epoch": health["runtime_epoch"], "runtime_session_id": self.service.runtime_session_id, "runtime_instance_id": self.instance_id, "coordinator_epoch": self.instance_id}
+            row = self.service.store.conn.execute("SELECT * FROM executors WHERE id=?", (WORKER_ACTOR,)).fetchone()
+            if (registered["executor_incarnation"] != binding["executor_incarnation"]
+                    or self.instance_id != binding["new_owner_epoch"]
+                    or registered["runtime"] != expected_runtime or row is None
+                    or row["protocol"] != expected_runtime["protocol"] or row["runtime_epoch"] != expected_runtime["runtime_epoch"]
+                    or row["source_epoch"] != registered["source_epoch"]):
+                raise ConflictError("finalization actual executor registration differs")
+            observed = self.service.store._executor_result(row)
+            capabilities = registered["capabilities"]
+            if ({c["capability_id"]: c["definition_digest"] for c in observed["capabilities"]}
+                    != {k: c["capability_digest"] for k, c in capabilities.items()}
+                    or row["source_digest"] != digest({k: c["source_digest"].removeprefix("sha256:") for k, c in capabilities.items()}).removeprefix("sha256:")
+                    or row["dependency_digest"] != digest({k: c["dependency_digest"].removeprefix("sha256:") for k, c in capabilities.items()}).removeprefix("sha256:")):
+                raise ConflictError("finalization capability/source registration changed")
+
+    def _verify_local_finalization_outcome(self, request, ack):
+        """Exact host/relay/B journal proof, current custody, and real registration."""
+        import hashlib
+        from banodoco_local.custody_broker import AuthenticatedCleanupActor, RoleCustodyAuthority, _read_owner_file
+        from .local_execution_handoff import digest, exact, read_protected, validate_reply
+        from .local_worker_handoff import committed_relay_transfer, relay_transition_id
+        b = request["binding"]; scope = Path(b["custody_scope"])
+        validate_reply(ack, request)
+        self._local_finalization_fence(request)
+        actual = AuthenticatedCleanupActor.current()
+        if actual.verify() != b["new_owner"]:
+            raise ConflictError("finalization actual B incarnation differs")
+        relay_ref = {**b["source_relay_reference"], "generation": b["source_relay_reference"]["generation"] + 1}
+        roles = {**b["current_roles"], "relay": relay_ref}
+        if ack["custody_capabilities"] != roles or ack["host"] != {k: roles["host"]["target"][k] for k in ("pid", "uid", "birth_id")}:
+            raise ConflictError("finalization current host/custody projection differs")
+        owners = {"relay": b["new_owner"], "host": relay_ref["target"], "engine": roles["host"]["target"], "engine_listener": roles["host"]["target"]}
+        for role, ref in roles.items():
+            RoleCustodyAuthority(scope, role).verify_reference(ref, expected_actor=owners[role], owner_epoch=b["new_owner_epoch"] if role == "relay" else b["original_owner_epoch"])
+        transfer_ack = committed_relay_transfer(b, successor_actor=actual, authority=RoleCustodyAuthority(scope, "relay"))
+        activation, _ = _read_owner_file(scope / "activation-record.json")
+        if "sha256:" + hashlib.sha256(activation).hexdigest() != b["activation_record_digest"]:
+            raise ConflictError("finalization immutable activation bytes changed")
+        host = read_protected(scope / "host-handoff-state.json")
+        exact(host, ("version", "writer_incarnation", "writer_owner_epoch", "handoff_id", "command", "request_digest", "reply"))
+        if (host["version"] != "runtime.local-execution-handoff-journal/v1"
+                or host["writer_incarnation"] != f"{ack['host']['pid']}:{ack['host']['birth_id']}"
+                or host["writer_owner_epoch"] != b["original_owner_epoch"] or host["handoff_id"] != b["handoff_id"]
+                or host["command"] != "handoff_finalize" or host["request_digest"] != digest(request) or host["reply"] != ack):
+            raise ConflictError("finalization lacks exact durable host outcome")
+        for name in ("relay", "runtime"):
+            state = read_protected(scope / (name + "-handoff-state.json"))
+            entry = state.get("entries", {}).get(b["handoff_id"] + ":handoff_finalize")
+            expected_writer = relay_ref["target"] if name == "relay" else b["new_owner"]
+            expected_epoch = b["original_owner_epoch"] if name == "relay" else b["new_owner_epoch"]
+            if (state.get("phase") != "finalized" or state.get("binding_digest") != digest(b) or state.get("binding") != b
+                    or state.get("writer_incarnation") != expected_writer or state.get("writer_owner_epoch") != expected_epoch
+                    or entry != {"request_digest": digest(request), "binding_digest": digest(b), "reply": ack}):
+                raise ConflictError("finalization lacks exact durable " + name + " outcome")
+            if name == "runtime":
+                transition = state.get("writer_transfer", {})
+                intent = transition.get("intent", {})
+                ownership = state.get("ownership", {})
+                if (transition.get("state") != "committed" or transition.get("relay_ack") != transfer_ack
+                        or intent.get("transition_id") != relay_transition_id(b) or intent.get("binding_digest") != digest(b)
+                        or intent.get("from_writer") != b["source_owner"] or intent.get("to_writer") != b["new_owner"]
+                        or intent.get("from_epoch") != b["source_owner_epoch"] or intent.get("to_epoch") != b["new_owner_epoch"]
+                        or intent.get("source_relay_reference") != b["source_relay_reference"]
+                        or type(intent.get("from_generation")) is not int or state.get("writer_generation") != intent["from_generation"] + 1
+                        or ownership.get("owner") != b["new_owner"] or ownership.get("owner_epoch") != b["new_owner_epoch"]
+                        or ownership.get("relay_reference") != relay_ref or ownership.get("current_roles") != roles):
+                    raise ConflictError("finalization current Runtime writer transfer differs")
+        self._verify_local_finalization_registration(b, ack["registered_state"])
+        self._assert_worker_actor_has_no_work()
+
+    def adopt_local_execution_handoff(self, request, receipt):
+        """Fresh B custody/control adoption remains behind the held task fence."""
+        from .local_execution_handoff import validate_request
+        validate_request(request)
+        if self.service is None or self.local_worker_launcher is None:
+            raise ConflictError("successor requires its admitted canonical Runtime owner")
+        with self.service.store._mutex:
+            self.service._load_local_claim_fence()
+            fence = self.service._local_claim_fence
+            if (self.service._local_claim_fence_unknown or fence is None or fence["state"] != "held"
+                    or any(fence[k] != request["binding"][k] for k in ("workspace_uuid", "executor_incarnation", "credential_generation_digest", "operation_id", "handoff_id", "intent_digest"))
+                    or self._verify_local_claim_generation(fence, None) != fence["credential_generation_digest"]):
+                raise ConflictError("successor canonical claim fence is unresolved")
+        # No store lock spans the fresh accept/role transfer/host exchange.
+        result = self.local_worker_launcher.adopt_retained_handoff(request, receipt)
+        with self.service.store._mutex:
+            self.service._load_local_claim_fence()
+            if self.service._local_claim_fence != fence:
+                raise ConflictError("successor claim fence changed during adoption")
+        # No activation, credential enablement, registration or fence release.
+        return result
 
     def _assert_local_relinquish_receipt(self, receipt, metadata):
         from .local_worker import RECEIPT_VERSION
@@ -493,6 +718,8 @@ class RuntimeDaemon:
         if self.service is None or self.httpd is None:
             raise ConflictError("local Worker start requires a running Runtime owner")
         with self._worker_actor_lock:
+            with self.service.store._mutex:
+                self.service._assert_local_claim_admission(WORKER_ACTOR)
             if self._remote_worker_custody_unresolved() or self._local_relinquish_pending():
                 raise ConflictError(
                     "remote or unresolved Worker credential custody must be reconciled before local launch"
