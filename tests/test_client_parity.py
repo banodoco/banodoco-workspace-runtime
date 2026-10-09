@@ -80,3 +80,25 @@ def test_product_clients_match_canonical_contract_projection() -> None:
     assert PYTHON_SCHEMA_DIGEST == contract_digest_value
     assert f'COMPONENT_MANIFEST_SHA256 = "{component_digest}"' in typescript_metadata
     assert f'SCHEMA_DIGEST = "{contract_digest_value}"' in typescript_metadata
+
+
+def test_typescript_client_carries_execution_binding_and_imported_media_surface() -> None:
+    source = (ROOT / "packages" / "typescript" / "src" / "generated.ts").read_text()
+
+    for interface in ("Task", "AttemptFence", "Executor"):
+        declaration = re.search(rf"^export interface {interface} \{{.*\}}$", source, re.MULTILINE)
+        assert declaration, f"missing TypeScript {interface} interface"
+        assert "execution_binding?: ExecutionBinding" in declaration.group(0)
+
+    admit = re.search(r"^  async admitTask\(.*$", source, re.MULTILINE)
+    assert admit, "missing TypeScript admitTask method"
+    assert "execution_binding?: ExecutionBinding" in admit.group(0)
+    assert "...input" in admit.group(0)
+
+    register = re.search(r"^  async registerExecutor\(.*$", source, re.MULTILINE)
+    assert register, "missing TypeScript registerExecutor method"
+    assert "executor: Executor" in register.group(0)
+    assert "JSON.stringify(executor)" in register.group(0)
+
+    assert "async importProjectMedia(" in source
+    assert "async getProjectMediaImport(" in source

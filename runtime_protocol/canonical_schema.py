@@ -44,7 +44,8 @@ CREATE TABLE tasks (
     executor_id TEXT, attempt INTEGER NOT NULL DEFAULT 0, expected_effect_json TEXT,
     result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     capability_digest TEXT, waiting_reason TEXT, lease_expires_at TEXT,
-    lease_fence INTEGER NOT NULL DEFAULT 0, attempt_id TEXT, runtime_epoch INTEGER
+    lease_fence INTEGER NOT NULL DEFAULT 0, attempt_id TEXT, runtime_epoch INTEGER,
+    execution_binding_json TEXT
 );
 CREATE TABLE events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id),
@@ -70,13 +71,13 @@ CREATE TABLE executors (
     protocol TEXT NOT NULL, created_at TEXT NOT NULL,
     runtime_epoch INTEGER NOT NULL DEFAULT 1, readiness TEXT NOT NULL DEFAULT 'ready',
     readiness_reason TEXT, last_seen_at TEXT, source_digest TEXT,
-    dependency_digest TEXT, source_epoch TEXT
+    dependency_digest TEXT, source_epoch TEXT, execution_binding_json TEXT
 );
 CREATE TABLE attempts (
     id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
     lease_id TEXT NOT NULL, fence INTEGER NOT NULL, executor_id TEXT NOT NULL,
     lease_expires_at TEXT NOT NULL, settled INTEGER NOT NULL DEFAULT 0,
-    runtime_epoch INTEGER NOT NULL DEFAULT 1, recovery_nonce TEXT,
+    runtime_epoch INTEGER NOT NULL DEFAULT 1, execution_binding_json TEXT, recovery_nonce TEXT,
     recovery_nonce_expires_at TEXT, recovery_nonce_used INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE timelines (

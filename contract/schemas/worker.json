@@ -31,6 +31,7 @@
         "source_epoch": { "type": ["string", "null"], "minLength": 1 },
         "schema_digest": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" },
         "verified_facts": { "$ref": "#/definitions/VerifiedFacts" },
+        "execution_binding": { "$ref": "#/definitions/ExecutionBinding" },
         "runtime_epoch": { "type": ["integer", "null"], "minimum": 1 },
         "readiness": { "type": "string", "enum": ["ready", "not_ready"] },
         "readiness_reason": { "type": ["string", "null"] }
@@ -79,6 +80,7 @@
         "generation_intent": { "type": "object", "additionalProperties": true },
         "expected_effect": { "$ref": "#/definitions/Effect" },
         "required_facts": { "$ref": "#/definitions/VerifiedFacts" },
+        "execution_binding": { "$ref": "#/definitions/BoundExecutionBinding" },
         "storage_estimate": {
           "type": "object", "additionalProperties": false,
           "required": ["scratch_bytes", "output_bytes"],
@@ -94,8 +96,88 @@
       "required": ["task", "waiting_reason"],
       "properties": {
         "task": { "$ref": "./task.json" },
-        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts", "waiting_for_dependencies", "dependency_failed", "dependency_cancelled"] }
+        "waiting_reason": { "type": "string", "enum": ["waiting_for_worker", "capability_unavailable", "insufficient_storage", "waiting_for_gpu", "waiting_for_cpu", "waiting_for_network", "waiting_for_executor_facts", "execution_binding_missing", "execution_binding_unverified", "execution_binding_mismatch", "provider_state_unknown", "waiting_for_dependencies", "dependency_failed", "dependency_cancelled"] }
       }
+    },
+    "ExecutionTarget": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["default", "profile", "machine", "runpod"] },
+        "id": { "type": "string", "minLength": 1 },
+        "pod_id": { "type": "string", "minLength": 1 },
+        "provider_account_ref": { "type": "string", "minLength": 1 },
+        "profile_revision": { "type": "string", "minLength": 1 },
+        "profile_digest": { "type": "string", "minLength": 1 },
+        "release_digest": { "type": "string", "minLength": 1 },
+        "storage": { "type": "object", "minProperties": 1 },
+        "mounts": { "type": "array", "minItems": 1, "items": { "type": "object" } }
+      }
+    },
+    "ExecutionEndpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["target", "profile"],
+      "properties": {
+        "target": { "$ref": "#/definitions/ExecutionTarget" },
+        "profile": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ExecutionVerification": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["method", "evidence_digest", "verified"],
+          "properties": {
+            "method": { "const": "credential_claim" },
+            "evidence_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+            "verified": { "const": true }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["method", "verified", "reason"],
+          "properties": {
+            "method": { "const": "unavailable" },
+            "verified": { "const": false },
+            "reason": { "const": "trusted_placement_unavailable" }
+          }
+        }
+      ]
+    },
+    "SelectedExecutionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["selected"],
+      "properties": { "selected": { "$ref": "#/definitions/ExecutionEndpoint" } }
+    },
+    "ActualExecutionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actual"],
+      "properties": { "actual": { "$ref": "#/definitions/ExecutionEndpoint" } }
+    },
+    "VerifiedExecutionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["actual", "verification"],
+      "properties": {
+        "actual": { "$ref": "#/definitions/ExecutionEndpoint" },
+        "verification": { "$ref": "#/definitions/ExecutionVerification" }
+      }
+    },
+    "BoundExecutionBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["selected", "actual", "verification"],
+      "properties": {
+        "selected": { "$ref": "#/definitions/ExecutionEndpoint" },
+        "actual": { "$ref": "#/definitions/ExecutionEndpoint" },
+        "verification": { "$ref": "#/definitions/ExecutionVerification" }
+      }
+    },
+    "ExecutionBinding": {
+      "oneOf": [
+        { "$ref": "#/definitions/SelectedExecutionBinding" },
+        { "$ref": "#/definitions/ActualExecutionBinding" },
+        { "$ref": "#/definitions/VerifiedExecutionBinding" },
+        { "$ref": "#/definitions/BoundExecutionBinding" }
+      ]
     },
     "Settlement": {
       "type": "object", "additionalProperties": false,

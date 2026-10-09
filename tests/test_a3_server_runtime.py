@@ -77,7 +77,12 @@ def test_heartbeat_progress_is_exposed_on_task_resource(service):
         for event in service.events_page(attempt["task_id"])["items"]
         if event["event_type"] == "task.progress"
     ]
-    assert progress_events[-1]["payload"] == {"phase": "render", "percent": 42}
+    assert progress_events[-1]["payload"] == {
+        "attempt_id": attempt["attempt_id"],
+        "fence": attempt["fence"],
+        "runtime_epoch": epoch,
+        "progress": {"phase": "render", "percent": 42},
+    }
 
 
 @pytest.mark.parametrize(

@@ -69,6 +69,25 @@ test("generated TypeScript client registers capabilities and fences failure", as
   assert.equal(failed.state, "failed");
 });
 
+test("generated TypeScript client preserves execution bindings in admission and executor registration", async () => {
+  const selected = { selected: { target: { kind: "runpod", pod_id: "pod-selected" }, profile: "pip_embedded" } };
+  const actual = { actual: { target: { kind: "runpod", pod_id: "pod-actual" }, profile: "pip_embedded" } };
+  const calls = [];
+  const transport = async (method, path, headers, body) => {
+    const value = JSON.parse(new TextDecoder().decode(body));
+    calls.push({ method, path, value });
+    if (path === "/v1/tasks") return { status: 201, headers: {}, body: json({ data: { task_id: "t", execution_binding: value.execution_binding }, receipt: { receipt_id: "admit" } }) };
+    if (path === "/v1/executors") return { status: 201, headers: {}, body: json(value) };
+    throw new Error(`unexpected ${method} ${path}`);
+  };
+  const client = new WorkspaceClient("http://runtime", "token", transport);
+  const task = await client.admitTask({ capability_id: "render.bound", capability_digest: `sha256:${"d".repeat(64)}`, input_object_ids: [], execution_binding: selected }, "admit-bound");
+  const executor = await client.registerExecutor({ executor_id: "executor-bound", max_concurrency: 1, resource_keys: [], capabilities: [], protocol: "workspace.v1", execution_binding: actual }, "register-bound");
+  assert.deepEqual(task.execution_binding, selected);
+  assert.deepEqual(executor.execution_binding, actual);
+  assert.deepEqual(calls.map(({ path, value }) => [path, value.execution_binding]), [["/v1/tasks", selected], ["/v1/executors", actual]]);
+});
+
 test("generated TypeScript recovery routes preserve path identity and 201 checkpoint responses", async () => {
   const calls = [];
   const transport = async (method, path, headers, body) => {

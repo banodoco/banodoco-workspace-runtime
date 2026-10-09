@@ -313,12 +313,13 @@ class Task:
     project_id: str | None = None
     attempt_id: str | None = None
     result: Mapping[str, Any] | None = None
+    execution_binding: Mapping[str, Any] | None = None
     storage_estimate: Mapping[str, int] | None = None
     required_facts: Mapping[str, Any] | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Task":
-        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), generation_intent=dict(value["generation_intent"]) if value.get("generation_intent") is not None else None, project_id=value.get("project_id"), attempt_id=value.get("attempt_id"), runtime_epoch=int(value["runtime_epoch"]), result=value.get("result"), storage_estimate=dict(value["storage_estimate"]) if value.get("storage_estimate") is not None else None, required_facts=dict(value["required_facts"]) if value.get("required_facts") is not None else None)
+        return cls(task_id=value["task_id"], run_id=value["run_id"], state=value["state"], version=int(value["version"]), capability_id=value["capability_id"], capability_digest=value["capability_digest"], idempotency_key=value["idempotency_key"], created_at=value["created_at"], updated_at=value["updated_at"], input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), generation_intent=dict(value["generation_intent"]) if value.get("generation_intent") is not None else None, project_id=value.get("project_id"), attempt_id=value.get("attempt_id"), runtime_epoch=int(value["runtime_epoch"]), result=value.get("result"), execution_binding=dict(value["execution_binding"]) if value.get("execution_binding") is not None else None, storage_estimate=dict(value["storage_estimate"]) if value.get("storage_estimate") is not None else None, required_facts=dict(value["required_facts"]) if value.get("required_facts") is not None else None)
 
 
 @dataclass(frozen=True)
@@ -334,12 +335,13 @@ class AttemptFence:
     generation_intent: Mapping[str, Any] | None = None
     project_id: str | None = None
     expected_effect: Mapping[str, Any] | None = None
+    execution_binding: Mapping[str, Any] | None = None
     storage_estimate: Mapping[str, int] | None = None
     required_facts: Mapping[str, Any] | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "AttemptFence":
-        return cls(attempt_id=value["attempt_id"], task_id=value["task_id"], lease_id=value["lease_id"], fence=int(value["fence"]), lease_expires_at=value["lease_expires_at"], runtime_epoch=int(value["runtime_epoch"]), input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), generation_intent=dict(value["generation_intent"]) if value.get("generation_intent") is not None else None, project_id=value.get("project_id"), expected_effect=dict(value["expected_effect"]) if value.get("expected_effect") is not None else None, storage_estimate=dict(value["storage_estimate"]) if value.get("storage_estimate") is not None else None, required_facts=dict(value["required_facts"]) if value.get("required_facts") is not None else None)
+        return cls(attempt_id=value["attempt_id"], task_id=value["task_id"], lease_id=value["lease_id"], fence=int(value["fence"]), lease_expires_at=value["lease_expires_at"], runtime_epoch=int(value["runtime_epoch"]), input_object_ids=list(value.get("input_object_ids") or []), spec=dict(value.get("spec") or {}), generation_intent=dict(value["generation_intent"]) if value.get("generation_intent") is not None else None, project_id=value.get("project_id"), expected_effect=dict(value["expected_effect"]) if value.get("expected_effect") is not None else None, execution_binding=dict(value["execution_binding"]) if value.get("execution_binding") is not None else None, storage_estimate=dict(value["storage_estimate"]) if value.get("storage_estimate") is not None else None, required_facts=dict(value["required_facts"]) if value.get("required_facts") is not None else None)
 
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
@@ -474,10 +476,11 @@ class Executor:
     dependency_digest: str | None = None
     source_epoch: str | None = None
     verified_facts: Mapping[str, Any] | None = None
+    execution_binding: Mapping[str, Any] | None = None
 
     @classmethod
     def from_json(cls, value: Mapping[str, Any]) -> "Executor":
-        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"], runtime_epoch=int(value["runtime_epoch"]) if value.get("runtime_epoch") is not None else None, source_digest=value.get("source_digest"), dependency_digest=value.get("dependency_digest"), source_epoch=value.get("source_epoch"), verified_facts=dict(value["verified_facts"]) if value.get("verified_facts") is not None else None)
+        return cls(executor_id=value["executor_id"], max_concurrency=int(value["max_concurrency"]), resource_keys=tuple(value.get("resource_keys", [])), capabilities=tuple(Capability.from_json(item) for item in value.get("capabilities", [])), protocol=value["protocol"], runtime_epoch=int(value["runtime_epoch"]) if value.get("runtime_epoch") is not None else None, source_digest=value.get("source_digest"), dependency_digest=value.get("dependency_digest"), source_epoch=value.get("source_epoch"), verified_facts=dict(value["verified_facts"]) if value.get("verified_facts") is not None else None, execution_binding=dict(value["execution_binding"]) if value.get("execution_binding") is not None else None)
 
 
 def _decode_error(status: int, body: bytes, *, request_id: str = "") -> ApiError:
@@ -1010,7 +1013,7 @@ class WorkspaceClient:
         status, response_headers, body = self._request("HEAD", f"/v1/objects/{_path_part(object_id)}", headers=headers, expected=(200, 206))
         return ByteResponse(body, status, response_headers)
 
-    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None, project_id: str | None = None, spec: Mapping[str, Any] | None = None, generation_intent: Mapping[str, Any] | None = None, storage_estimate: Mapping[str, int] | None = None, required_facts: Mapping[str, Any] | None = None) -> MutationResult:
+    def admit_task(self, *, capability_id: str, capability_digest: str, input_object_ids: list[str], idempotency_key: str, schema_version: str = "1", settlement_effect: Mapping[str, Any] | None = None, project_id: str | None = None, spec: Mapping[str, Any] | None = None, generation_intent: Mapping[str, Any] | None = None, storage_estimate: Mapping[str, int] | None = None, required_facts: Mapping[str, Any] | None = None, execution_binding: Mapping[str, Any] | None = None) -> MutationResult:
         payload: dict[str, Any] = {"capability_id": capability_id, "capability_digest": capability_digest, "schema_version": schema_version, "input_object_ids": input_object_ids}
         if settlement_effect is not None:
             payload["settlement_effect"] = settlement_effect
@@ -1019,6 +1022,7 @@ class WorkspaceClient:
         if generation_intent is not None: payload["generation_intent"] = dict(generation_intent)
         if storage_estimate is not None: payload["storage_estimate"] = dict(storage_estimate)
         if required_facts is not None: payload["required_facts"] = dict(required_facts)
+        if execution_binding is not None: payload["execution_binding"] = dict(execution_binding)
         _, _, body = self._request("POST", "/v1/tasks", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))
         return self._mutation_json(body)
 

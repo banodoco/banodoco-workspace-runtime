@@ -6,8 +6,13 @@ from .store import (
     GENERATION_INTENT_STORAGE_KEY,
     OBJECT_ID_RE,
     RealmStore,
+    bound_execution_binding,
+    normalize_executor_execution_binding,
     normalize_execution_facts,
+    normalize_selected_execution_binding,
+    normalize_trusted_execution_binding,
     public_task_spec,
+    unverified_execution_binding,
 )
 from .util import atomic_json_write
 from .util import canonical_json, durable_json_bytes, new_id, now, sha256_bytes
@@ -4009,7 +4014,11 @@ class RuntimeService:
             task_spec["required_facts"] = normalize_execution_facts(body["required_facts"], field="required_facts")
         if "storage_estimate" in body:
             task_spec["storage_estimate"] = self.store._validate_storage_estimate(body["storage_estimate"])
-        value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness)
+        execution_binding = (
+            normalize_selected_execution_binding(body["execution_binding"])
+            if "execution_binding" in body else None
+        )
+        value = self.store.create_task(capability, task_spec, body.get("project"), body.get("idempotency_key"), body.get("settlement_effect"), digest, enforce_readiness=enforce_readiness, execution_binding=execution_binding)
         return value
 
     def task(self, task_id):
@@ -4336,14 +4345,36 @@ class RuntimeService:
             resource["lease_expires_at"] = task["lease_expires_at"]
         if task.get("result") is not None:
             resource["result"] = task["result"]
-        progress = self.store.conn.execute(
-            "SELECT payload_json FROM events WHERE task_id=? AND kind='task.progress' ORDER BY id DESC LIMIT 1",
-            (task["id"],),
-        ).fetchone()
-        if progress:
-            payload = json.loads(progress["payload_json"])
-            if isinstance(payload, dict):
-                resource["progress"] = payload
+        if task.get("execution_binding") is not None:
+            resource["execution_binding"] = dict(task["execution_binding"])
+        # The task owns the immutable selected binding.  While a current
+        # attempt exists, project its selected+trusted-actual binding without
+        # overwriting admission identity in the task row.
+        if task.get("attempt_id"):
+            attempt = self.store.conn.execute(
+                "SELECT execution_binding_json FROM attempts WHERE id=?",
+                (task["attempt_id"],),
+            ).fetchone()
+            if attempt and attempt["execution_binding_json"]:
+                resource["execution_binding"] = json.loads(attempt["execution_binding_json"])
+        # Progress is attempt evidence, never a task-global sticky value. Old
+        # events deliberately become invisible when a replacement attempt is
+        # claimed, until that attempt emits its own fenced heartbeat.
+        if task.get("attempt_id"):
+            progress = self.store.conn.execute(
+                "SELECT payload_json FROM events WHERE task_id=? AND kind='task.progress' "
+                "ORDER BY id DESC LIMIT 1",
+                (task["id"],),
+            ).fetchone()
+            if progress:
+                payload = json.loads(progress["payload_json"])
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("attempt_id") == task.get("attempt_id")
+                    and payload.get("fence") == task.get("lease_fence")
+                    and isinstance(payload.get("progress"), dict)
+                ):
+                    resource["progress"] = dict(payload["progress"])
         return resource
 
     @_verified_mutation
@@ -4386,6 +4417,15 @@ class RuntimeService:
             if replay is not None:
                 return replay
             status = current["task"]["status"]
+            if current["task"].get("waiting_reason") == "provider_state_unknown":
+                raise ConflictError(
+                    "task provider state is unknown; authorized checkpoint resume is required before retry",
+                    details={
+                        "status": status,
+                        "waiting_reason": "provider_state_unknown",
+                        "attempt_id": current["task"].get("attempt_id"),
+                    },
+                )
             if status not in {"completed", "cancelled", "failed"}:
                 raise ConflictError("task is not retryable", details={"status": status})
             expected = (body or {}).get("expected_version")
@@ -4455,7 +4495,7 @@ class RuntimeService:
                 "executor_id", "max_concurrency", "resource_keys", "capabilities",
                 "protocol", "readiness", "readiness_reason", "runtime_epoch",
                 "source_digest", "dependency_digest", "source_epoch", "schema_digest",
-                "verified_facts",
+                "verified_facts", "execution_binding",
             ),
         )
         executor_id = _wire_string(body, "executor_id")
@@ -4484,7 +4524,14 @@ class RuntimeService:
             if not isinstance(body["schema_digest"], str) or body["schema_digest"] != SCHEMA_DIGEST:
                 raise ValidationError("schema_digest does not match the runtime contract")
         verified_facts = normalize_execution_facts(body["verified_facts"], field="verified_facts") if "verified_facts" in body else None
-        request_hash = hashlib.sha256(canonical_json(body).encode()).hexdigest()
+        claimed_binding = normalize_executor_execution_binding(body["execution_binding"]) if "execution_binding" in body else None
+        trusted_binding = None
+        if identity is not None and identity.get("execution_binding") is not None:
+            trusted_binding = normalize_trusted_execution_binding(identity["execution_binding"])
+            if claimed_binding is not None and claimed_binding["actual"] != trusted_binding["actual"]:
+                raise AuthorizationError("executor placement claim does not match its credential")
+        effective_binding = trusted_binding or unverified_execution_binding(claimed_binding)
+        request_hash = hashlib.sha256(canonical_json({"body": body, "trusted_execution_binding": effective_binding}).encode()).hexdigest()
         # Executor registration is an endpoint-scoped command.  The request
         # hash includes executor identity and all registration fields, so a
         # reused key can only replay the exact durable result.
@@ -4525,10 +4572,12 @@ class RuntimeService:
             body.get("runtime_epoch"), identity="executor",
             identity_id=body.get("executor_id"), required=existing is not None,
         )
-        registered = self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts)
+        registered = self.store.upsert_executor(body["executor_id"], capabilities, max_concurrency, body.get("resource_keys", []), protocol=body.get("protocol", "workspace.v1"), readiness=body.get("readiness", "ready"), readiness_reason=body.get("readiness_reason"), runtime_epoch=epoch, source_digest=body.get("source_digest"), dependency_digest=body.get("dependency_digest"), source_epoch=body.get("source_epoch"), verified_facts=verified_facts, execution_binding=effective_binding)
         result = {"executor_id": body["executor_id"], "max_concurrency": max_concurrency, "resource_keys": body.get("resource_keys", []), "capabilities": registered["capabilities"], "protocol": body.get("protocol", "workspace.v1"), "readiness": body.get("readiness", "ready"), "runtime_epoch": epoch, "source_digest": body.get("source_digest"), "dependency_digest": body.get("dependency_digest"), "source_epoch": body.get("source_epoch")}
         if verified_facts is not None:
             result["verified_facts"] = verified_facts
+        if registered.get("execution_binding") is not None:
+            result["execution_binding"] = registered["execution_binding"]
         return self._command_record("executor.register", aggregate_id, idempotency_key, request_hash, result, project_id="unscoped", with_receipt=False)
 
     @_durable_mutation
@@ -4583,7 +4632,21 @@ class RuntimeService:
             task = value["task"]
             fence = int(task.get("lease_fence") or task.get("attempt") or 1)
             expires = task.get("lease_expires_at") or now()
-            self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, row["id"], lease_id, fence, executor_id, expires, epoch))
+            selected_binding = task.get("execution_binding")
+            executor = self.store.conn.execute(
+                "SELECT execution_binding_json FROM executors WHERE id=?", (executor_id,)
+            ).fetchone()
+            executor_binding = (
+                json.loads(executor["execution_binding_json"])
+                if executor and executor["execution_binding_json"] else None
+            )
+            attempt_binding = (
+                bound_execution_binding(selected_binding, executor_binding)
+                if selected_binding is not None else None
+            )
+            if selected_binding is not None and attempt_binding is None:
+                raise LeaseError("selected execution binding lost trusted placement before attempt creation")
+            self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch, execution_binding_json) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)", (attempt_id, row["id"], lease_id, fence, executor_id, expires, epoch, canonical_json(attempt_binding) if attempt_binding else None))
             self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=?", (attempt_id, row["id"]))
             # Return the immutable admitted spec alongside the lease. Workers
             # must execute exactly what was claimed, without a racy second read.
@@ -4591,6 +4654,8 @@ class RuntimeService:
             if task.get("generation_intent") is not None:
                 generation_intent = task["generation_intent"]
             result = {"attempt_id": attempt_id, "task_id": row["id"], "project_id": value["run"].get("project_id"), "lease_id": lease_id, "fence": fence, "lease_expires_at": expires, "runtime_epoch": epoch, "input_object_ids": list(admitted_spec.get("input_object_ids") or []), "spec": admitted_spec}
+            if attempt_binding is not None:
+                result["execution_binding"] = dict(attempt_binding)
             if generation_intent is not None:
                 result["generation_intent"] = generation_intent
             if task.get("expected_effect") is not None:
@@ -5519,6 +5584,22 @@ class RuntimeService:
             raise LeaseError("attempt fence is invalid") from exc
         if row["lease_id"] != body.get("lease_id") or int(row["fence"]) != supplied_fence:
             raise LeaseError("attempt lease is stale or already settled")
+        attempt_binding = json.loads(row["execution_binding_json"]) if row["execution_binding_json"] else None
+        task = self.store.conn.execute(
+            "SELECT attempt_id, execution_binding_json FROM tasks WHERE id=?", (row["task_id"],)
+        ).fetchone()
+        selected_binding = json.loads(task["execution_binding_json"]) if task and task["execution_binding_json"] else None
+        binding_invalid = False
+        if selected_binding is None:
+            binding_invalid = attempt_binding is not None
+        else:
+            binding_invalid = (
+                attempt_binding is None
+                or attempt_binding.get("selected") != selected_binding.get("selected")
+                or not (attempt_binding.get("verification") or {}).get("verified")
+            )
+        if binding_invalid:
+            raise LeaseError("attempt execution binding is stale or unverified")
         if not allow_expired and row["lease_expires_at"]:
             try:
                 if datetime.fromisoformat(row["lease_expires_at"]) <= datetime.now(timezone.utc):
@@ -5734,6 +5815,8 @@ class RuntimeService:
             }
             if generation_intent is not None:
                 resource["generation_intent"] = generation_intent
+            if attempt["execution_binding_json"]:
+                resource["execution_binding"] = json.loads(attempt["execution_binding_json"])
             return resource
 
         with self.store._mutex:
@@ -5758,13 +5841,52 @@ class RuntimeService:
             # Claim this exact task.  Never use claim_next here: a mismatch
             # must not consume an unrelated queued task.
             lease_id = new_id()
-            claim = self.store._claim_task(row["task_id"], row["executor_id"], lease_id, runtime_epoch=current)
+            prior_attempt = self.store.conn.execute(
+                "SELECT * FROM attempts WHERE id=?", (row["attempt_id"],)
+            ).fetchone()
+            prior_binding = (
+                json.loads(prior_attempt["execution_binding_json"])
+                if prior_attempt and prior_attempt["execution_binding_json"] else None
+            )
+            task_row = self.store.conn.execute(
+                "SELECT execution_binding_json FROM tasks WHERE id=?", (row["task_id"],)
+            ).fetchone()
+            selected_binding = (
+                json.loads(task_row["execution_binding_json"])
+                if task_row and task_row["execution_binding_json"] else None
+            )
+            executor = self.store.conn.execute(
+                "SELECT execution_binding_json FROM executors WHERE id=?", (row["executor_id"],)
+            ).fetchone()
+            executor_binding = (
+                json.loads(executor["execution_binding_json"])
+                if executor and executor["execution_binding_json"] else None
+            )
+            resumed_binding = (
+                bound_execution_binding(selected_binding, executor_binding)
+                if selected_binding is not None else None
+            )
+            if selected_binding is not None:
+                if (
+                    not isinstance(prior_binding, dict)
+                    or not (prior_binding.get("verification") or {}).get("verified")
+                    or resumed_binding is None
+                    or prior_binding.get("selected") != resumed_binding.get("selected")
+                    or prior_binding.get("actual") != resumed_binding.get("actual")
+                ):
+                    raise LeaseError(
+                        "authorized resume requires the same verified execution binding"
+                    )
+            claim = self.store._claim_task(
+                row["task_id"], row["executor_id"], lease_id,
+                runtime_epoch=current, allow_provider_recovery=True,
+            )
             task = claim["task"]
             if task.get("status") != "running" or task.get("id") != row["task_id"]:
                 raise ConflictError("checkpoint task is not queued for resume")
             attempt_id = new_id()
             with self.store._transaction():
-                self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch) VALUES (?, ?, ?, ?, ?, ?, 0, ?)", (attempt_id, row["task_id"], lease_id, task["lease_fence"], row["executor_id"], task["lease_expires_at"], current))
+                self.store.conn.execute("INSERT INTO attempts(id, task_id, lease_id, fence, executor_id, lease_expires_at, settled, runtime_epoch, execution_binding_json) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)", (attempt_id, row["task_id"], lease_id, task["lease_fence"], row["executor_id"], task["lease_expires_at"], current, canonical_json(resumed_binding) if resumed_binding else None))
                 self.store.conn.execute("UPDATE tasks SET attempt_id=? WHERE id=? AND status='running'", (attempt_id, row["task_id"]))
             resumed_attempt = self.store.conn.execute("SELECT * FROM attempts WHERE id=?", (attempt_id,)).fetchone()
             receipt = {"type": "runtime.recovery.receipt", "version": 1, "checkpoint_id": row["id"], "attempt_id": resumed_attempt["id"], "task_id": row["task_id"], "runtime_epoch": current, "command": "resume", "status": "resumed", "checkpoint_digest": "sha256:" + row["checkpoint_digest"], "checkpoint": checkpoint}
@@ -5841,8 +5963,18 @@ class RuntimeService:
                 expires = value["task"].get("lease_expires_at")
                 self.store.conn.execute("UPDATE attempts SET lease_expires_at=? WHERE id=?", (expires, attempt_id))
                 if progress is not None:
-                    self.store._append_event(task["run_id"], row["task_id"], "task.progress", progress)
+                    self.store._append_event(
+                        task["run_id"], row["task_id"], "task.progress",
+                        {
+                            "attempt_id": attempt_id,
+                            "fence": int(row["fence"]),
+                            "runtime_epoch": current,
+                            "progress": dict(body["progress"]),
+                        },
+                    )
                 result = {"attempt_id": attempt_id, "task_id": row["task_id"], "lease_id": row["lease_id"], "fence": row["fence"], "lease_expires_at": expires, "runtime_epoch": self.store._current_runtime_epoch()}
+                if row["execution_binding_json"]:
+                    result["execution_binding"] = json.loads(row["execution_binding_json"])
                 recorded = self._command_record("attempt.heartbeat", attempt_id, idempotency_key, request_hash, result, project_id=project_id or "unscoped")
             self.store.heartbeat_task(row["task_id"], row["lease_id"], fence=row["fence"], lease_seconds=body.get("lease_seconds", 30), record=record)
             return recorded

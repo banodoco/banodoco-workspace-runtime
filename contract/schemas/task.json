@@ -21,6 +21,7 @@
     "runtime_epoch": { "type": "integer", "minimum": 1 },
     "input_object_ids": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
     "required_facts": { "$ref": "#/definitions/RequiredFacts" },
+    "execution_binding": { "$ref": "./worker.json#/definitions/ExecutionBinding" },
     "spec": { "type": "object", "additionalProperties": true },
     "generation_intent": { "type": "object", "additionalProperties": true },
     "storage_estimate": {
