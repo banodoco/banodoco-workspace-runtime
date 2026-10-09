@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
+from runtime_protocol.util import canonical_json
 
 
 def _service(tmp_path):
@@ -56,6 +59,63 @@ def _publication(project_id, *, expected_head=None, parent_revision_id="parent-1
             }],
         },
     }
+
+
+def _publish_with_explicit_media(service, project_id, *, parent_revision_id="parent-media"):
+    scene = service.ingest(
+        project_id, b'{"schema":"live-scene-package/v1"}',
+        media_type="application/json", original_name="scene.json",
+        idempotency_key="scene-package",
+    )["data"]["object_id"]
+    audio = service.ingest(
+        project_id, b"audio-object", media_type="audio/wav",
+        original_name="tone.wav", idempotency_key="audio-object",
+    )["data"]["object_id"]
+    body = _explicit_media_publication(project_id, scene, audio, parent_revision_id=parent_revision_id)
+    result = service.publish_parent_composition(
+        project_id, "main", body, idempotency_key=f"publish-{parent_revision_id}"
+    )
+    return result, scene, audio
+
+
+def _explicit_media_publication(project_id, scene, audio, *, parent_revision_id="parent-media"):
+    body = _publication(project_id, parent_revision_id=parent_revision_id)
+    body["parent_composition"]["config"]["clips"] = [{
+        "clipType": "com.reigh.astrid.liveScene",
+        "app": {"liveScene": {"revision": scene, "source": {"objectId": scene, "revision": scene}}},
+    }]
+    body["dependency_manifest"] = {"media": [
+        {"media_id": scene, "content_digest": scene},
+        {"media_id": audio, "content_digest": audio},
+    ]}
+    return body
+
+
+def _revision_errors(report):
+    return report["checks"]["revisions"]["errors"]
+
+
+def _rehash_timeline_events(service, timeline_id, *, replacements=None):
+    replacements = replacements or {}
+    previous = ""
+    rows = service.store.conn.execute(
+        "SELECT id, kind, payload_json, created_at FROM timeline_events WHERE timeline_id=? ORDER BY id",
+        (timeline_id,),
+    ).fetchall()
+    for row in rows:
+        payload = replacements.get(row["id"], json.loads(row["payload_json"]))
+        event_hash = hashlib.sha256(canonical_json({
+            "timeline_id": timeline_id,
+            "kind": row["kind"],
+            "payload": payload,
+            "previous_hash": previous,
+            "created_at": row["created_at"],
+        }).encode()).hexdigest()
+        service.store.conn.execute(
+            "UPDATE timeline_events SET payload_json=?, previous_hash=?, event_hash=? WHERE id=?",
+            (canonical_json(payload), previous, event_hash, row["id"]),
+        )
+        previous = event_hash
 
 
 def test_historical_revision_is_exact_after_mutable_edits(tmp_path):
@@ -153,6 +213,254 @@ def test_integrity_report_detects_revision_digest_tampering(tmp_path):
         assert report["ok"] is False
         assert "revisions" in report["issues"]
         assert any(error["reason"] == "content_digest_mismatch" for error in report["checks"]["revisions"]["errors"])
+    finally:
+        service.close()
+
+
+def test_integrity_report_accepts_media_pinned_by_publication_evidence(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _publish_with_explicit_media(service, project_id)
+        report = service.store.integrity_report()
+        assert report["ok"] is True, report["checks"]["revisions"]["errors"]
+        assert report["checks"]["event_chain"]["ok"] is True
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_undeclared_media_dependency(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _publish_with_explicit_media(service, project_id)
+        extra = service.ingest(
+            project_id, b"undeclared-object", media_type="application/octet-stream",
+            idempotency_key="undeclared-object",
+        )["data"]["object_id"]
+        service.store.conn.execute(
+            "INSERT INTO composition_revision_dependencies(parent_revision_id, dependency_kind, dependency_id, content_digest, ordinal) VALUES (?, 'media', ?, ?, 2)",
+            ("parent-media", extra, extra),
+        )
+        report = service.store.integrity_report()
+        assert any(error["reason"] == "dependency_graph_mismatch" for error in _revision_errors(report)), _revision_errors(report)
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_missing_manifest_media_dependency(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _, _, audio = _publish_with_explicit_media(service, project_id)
+        service.store.conn.execute(
+            "DELETE FROM composition_revision_dependencies WHERE parent_revision_id=? AND dependency_id=?",
+            ("parent-media", audio),
+        )
+        report = service.store.integrity_report()
+        assert any(error["reason"] == "dependency_graph_mismatch" for error in _revision_errors(report))
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_wrong_project_media_dependency(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _, _, audio = _publish_with_explicit_media(service, project_id)
+        other = service.create_project({"slug": "other", "name": "Other"}, idempotency_key="other-project")
+        foreign = service.ingest(
+            other["id"], b"foreign-object", media_type="application/octet-stream",
+            idempotency_key="foreign-object",
+        )["data"]["object_id"]
+        service.store.conn.execute(
+            "UPDATE composition_revision_dependencies SET dependency_id=?, content_digest=? WHERE parent_revision_id=? AND dependency_id=?",
+            (foreign, foreign, "parent-media", audio),
+        )
+        report = service.store.integrity_report()
+        assert any(error["reason"] == "dependency_closure" for error in _revision_errors(report))
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_dependency_digest_mismatch(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _, scene, _ = _publish_with_explicit_media(service, project_id)
+        service.store.conn.execute(
+            "UPDATE composition_revision_dependencies SET content_digest=? WHERE parent_revision_id=? AND dependency_id=?",
+            ("sha256:" + "0" * 64, "parent-media", scene),
+        )
+        report = service.store.integrity_report()
+        assert any(error["reason"] == "dependency_closure" for error in _revision_errors(report))
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("tamper", ["duplicate", "noncontiguous"])
+def test_integrity_report_rejects_duplicate_or_noncontiguous_dependencies(tmp_path, tamper):
+    service, project_id = _service(tmp_path)
+    try:
+        _, scene, audio = _publish_with_explicit_media(service, project_id)
+        if tamper == "duplicate":
+            service.store.conn.execute(
+                "INSERT INTO composition_revision_dependencies(parent_revision_id, dependency_kind, dependency_id, content_digest, ordinal) VALUES (?, 'media', ?, ?, 2)",
+                ("parent-media", scene, scene),
+            )
+        else:
+            service.store.conn.execute(
+                "UPDATE composition_revision_dependencies SET ordinal=4 WHERE parent_revision_id=? AND dependency_id=?",
+                ("parent-media", audio),
+            )
+        report = service.store.integrity_report()
+        assert any(error["reason"] == "dependency_graph_mismatch" for error in _revision_errors(report)), _revision_errors(report)
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_inconsistent_publication_evidence(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _publish_with_explicit_media(service, project_id)
+        event = service.store.conn.execute(
+            "SELECT id, payload_json FROM timeline_events WHERE timeline_id=? AND kind='parent.composition.published'",
+            ("main",),
+        ).fetchone()
+        payload = json.loads(event["payload_json"])
+        payload["dependency_manifest"]["media"].pop()
+        _rehash_timeline_events(service, "main", replacements={event["id"]: payload})
+        report = service.store.integrity_report()
+        assert report["checks"]["event_chain"]["ok"] is True
+        assert any(error["reason"] == "publication_evidence_mismatch" for error in _revision_errors(report))
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_manifest_receipt_paired_with_manifestless_event(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _publish_with_explicit_media(service, project_id)
+        event = service.store.conn.execute(
+            "SELECT id, payload_json FROM timeline_events WHERE timeline_id=? AND kind='parent.composition.published'",
+            ("main",),
+        ).fetchone()
+        payload = json.loads(event["payload_json"])
+        del payload["dependency_manifest"]
+        _rehash_timeline_events(service, "main", replacements={event["id"]: payload})
+        report = service.store.integrity_report()
+        assert report["checks"]["event_chain"]["ok"] is True
+        assert any(error["reason"] == "publication_evidence_mismatch" for error in _revision_errors(report)), _revision_errors(report)
+    finally:
+        service.close()
+
+
+def test_integrity_report_does_not_trust_manifest_without_publication_event(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _publish_with_explicit_media(service, project_id)
+        service.store.conn.execute(
+            "DELETE FROM timeline_events WHERE timeline_id=? AND kind='parent.composition.published'",
+            ("main",),
+        )
+        report = service.store.integrity_report()
+        assert any(error["reason"] == "publication_evidence_mismatch" for error in _revision_errors(report))
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_receipt_for_missing_event_even_without_manifest_rows(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _, scene, audio = _publish_with_explicit_media(service, project_id)
+        service.store.conn.execute(
+            "DELETE FROM timeline_events WHERE timeline_id=? AND kind='parent.composition.published'",
+            ("main",),
+        )
+        service.store.conn.execute(
+            "DELETE FROM composition_revision_dependencies WHERE parent_revision_id=? AND dependency_id IN (?, ?)",
+            ("parent-media", scene, audio),
+        )
+        report = service.store.integrity_report()
+        assert any(error["reason"] == "publication_evidence_mismatch" for error in _revision_errors(report)), _revision_errors(report)
+        assert not any(error["reason"] == "dependency_graph_mismatch" for error in _revision_errors(report)), _revision_errors(report)
+    finally:
+        service.close()
+
+
+def test_integrity_report_keeps_payload_only_legacy_closure_without_event(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-legacy")
+        service.store.conn.execute(
+            "DELETE FROM timeline_events WHERE timeline_id=? AND kind='parent.composition.published'",
+            ("main",),
+        )
+        service.store.conn.execute(
+            "DELETE FROM command_idempotency WHERE command_kind=? AND aggregate_id=?",
+            ("parent_composition.publish", "main"),
+        )
+        report = service.store.integrity_report()
+        assert report["ok"] is True, report["checks"]["revisions"]["errors"]
+    finally:
+        service.close()
+
+
+def test_integrity_report_accepts_identical_parent_republished_with_new_key(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _, scene, audio = _publish_with_explicit_media(service, project_id)
+        body = _explicit_media_publication(project_id, scene, audio)
+        body["expected_head"] = "parent-media"
+        service.publish_parent_composition(
+            project_id, "main", body, idempotency_key="publish-parent-media-again"
+        )
+        report = service.store.integrity_report()
+        assert report["ok"] is True, report["checks"]["revisions"]["errors"]
+    finally:
+        service.close()
+
+
+def test_integrity_report_rejects_conflicting_repeat_publication_manifests(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        _, scene, audio = _publish_with_explicit_media(service, project_id)
+        body = _explicit_media_publication(project_id, scene, audio)
+        body["expected_head"] = "parent-media"
+        service.publish_parent_composition(
+            project_id, "main", body, idempotency_key="publish-parent-media-conflict"
+        )
+        event = service.store.conn.execute(
+            "SELECT id, payload_json FROM timeline_events WHERE timeline_id=? AND kind='parent.composition.published' ORDER BY id DESC LIMIT 1",
+            ("main",),
+        ).fetchone()
+        event_payload = json.loads(event["payload_json"])
+        event_payload["dependency_manifest"]["media"].pop()
+        _rehash_timeline_events(service, "main", replacements={event["id"]: event_payload})
+        receipt = service.store.conn.execute(
+            "SELECT idempotency_key, result_json FROM command_idempotency WHERE command_kind=? AND idempotency_key=?",
+            ("parent_composition.publish", "publish-parent-media-conflict"),
+        ).fetchone()
+        result = json.loads(receipt["result_json"])
+        result["dependency_manifest"] = event_payload["dependency_manifest"]
+        service.store.conn.execute(
+            "UPDATE command_idempotency SET result_json=? WHERE command_kind=? AND idempotency_key=?",
+            (canonical_json(result), "parent_composition.publish", receipt["idempotency_key"]),
+        )
+        report = service.store.integrity_report()
+        assert report["checks"]["event_chain"]["ok"] is True
+        assert any(error["reason"] == "publication_evidence_mismatch" for error in _revision_errors(report)), _revision_errors(report)
+    finally:
+        service.close()
+
+
+def test_integrity_report_checks_timeline_event_hash_chain(tmp_path):
+    service, project_id = _service(tmp_path)
+    try:
+        service.publish_parent_composition(project_id, "main", _publication(project_id), idempotency_key="publish-chain")
+        event_id = service.store.conn.execute(
+            "SELECT id FROM timeline_events WHERE timeline_id=? AND kind='parent.composition.published'",
+            ("main",),
+        ).fetchone()["id"]
+        service.store.conn.execute("UPDATE timeline_events SET event_hash='broken' WHERE id=?", (event_id,))
+        report = service.store.integrity_report()
+        assert report["checks"]["event_chain"]["ok"] is False
+        assert any(error.get("stream") == "timeline" and error["reason"] == "hash_mismatch" for error in report["checks"]["event_chain"]["errors"])
     finally:
         service.close()
 

@@ -141,7 +141,7 @@ paths:
   /v1/projects/{project_id}/media-imports:
     post:
       operationId: importProjectMedia
-      description: Authenticated Runtime-host image/video ingest and atomic Generation plus original primary Variant settlement. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
+      description: Authenticated Runtime-host image/video/audio ingest and atomic Generation plus original primary Variant settlement. Audio imports accept duration but must omit visual dimensions. The import key is durable and replayable; worker claim and settlement routes remain host-owned.
       parameters:
         - { $ref: '#/components/parameters/ProjectId' }
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -156,6 +156,7 @@ paths:
           application/octet-stream: { schema: { type: string, format: binary, maxLength: 67108864 } }
           image/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
           video/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
+          audio/*: { schema: { type: string, format: binary, maxLength: 67108864 } }
       responses:
         '201': { description: Completed Runtime media import with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
         '409': { $ref: '#/components/responses/Conflict' }
@@ -521,6 +522,23 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateMediaRelation' } } } }
       responses: { '201': { description: Media relation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/thumbnails/source-frame:
+    get:
+      operationId: getSourceFrameThumbnail
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { name: source_object_id, in: query, required: true, schema: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+        - { name: source_time_seconds, in: query, required: true, schema: { type: number, minimum: 0, maximum: 4000000000, multipleOf: 0.000001 } }
+        - { name: recipe_version, in: query, required: false, schema: { type: integer, const: 1, default: 1 } }
+      responses:
+        '200': { description: Matching source-frame thumbnail or no match, content: { application/json: { schema: { type: object, required: [thumbnail], properties: { thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] } } } } }
+    post:
+      operationId: ensureSourceFrameThumbnail
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' } } } }
+      responses:
+        '200': { description: Existing or newly associated source-frame thumbnail, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
   /v1/objects:
     post:
       operationId: ingestObject
@@ -1089,12 +1107,7 @@ components:
         object_id: { type: [string, 'null'] }
         variant_type: { type: string }
         metadata: { type: object }
-        thumbnail:
-          type: [object, 'null']
-          properties:
-            object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
-            source_object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
-            recipe_version: { type: integer, const: 1 }
+        thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] }
         viewed_at: { type: [string, 'null'] }
         created_at: { type: string }
     VariantPage:

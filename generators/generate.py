@@ -86,6 +86,28 @@ def render_python_client(manifest_path: Path = MANIFEST) -> str:
     return rendered
 
 
+def render_typescript_client() -> str:
+    """Render the source-frame thumbnail operations into the typed TS client."""
+    source = _regular(TYPESCRIPT_CLIENT_OUTPUT, "TypeScript client").decode("utf-8")
+    source = source.replace(
+        'export interface GenerationVariant { variant_id: string; generation_id: string; object_id?: string | null; variant_type: string; metadata: Record<string, unknown>; thumbnail?: { object_id: string; source_object_id: string; recipe_version: number } | null; viewed_at?: string | null; created_at: string }',
+        'export interface ThumbnailDescriptor { object_id: string; source_object_id: string; recipe_version: number; selection?: { kind: "variant" | "source_frame"; source_time_seconds?: number } }\nexport interface GenerationVariant { variant_id: string; generation_id: string; object_id?: string | null; variant_type: string; metadata: Record<string, unknown>; thumbnail?: ThumbnailDescriptor | null; viewed_at?: string | null; created_at: string }',
+        1,
+    )
+    get_method = '  async getSourceFrameThumbnail(projectId: string, sourceObjectId: string, sourceTimeSeconds: number, recipeVersion = 1): Promise<Record<string, unknown> | null> { const query = `source_object_id=${encodeURIComponent(sourceObjectId)}&source_time_seconds=${sourceTimeSeconds.toFixed(6)}&recipe_version=${recipeVersion}`; return this.json<{ thumbnail: Record<string, unknown> | null }>((await this.request("GET", `/v1/projects/${encodeURIComponent(projectId)}/thumbnails/source-frame?${query}`)).body).thumbnail }'
+    ensure_method = '  async ensureSourceFrameThumbnail(projectId: string, thumbnail: Record<string, unknown>, idempotencyKey: string): Promise<MutationResult<Record<string, unknown>>> { return this.mutation<Record<string, unknown>>((await this.request("POST", `/v1/projects/${encodeURIComponent(projectId)}/thumbnails/source-frame`, new TextEncoder().encode(JSON.stringify(thumbnail)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey }, [200, 201])).body) }'
+    markers = ("  async getSourceFrameThumbnail(", "  async ensureSourceFrameThumbnail(")
+    present = tuple(marker in source for marker in markers)
+    if all(present):
+        return source
+    if any(present):
+        raise SystemExit("TypeScript source-frame thumbnail client projection is partially present")
+    anchor = next((line for line in source.splitlines() if line.startswith("  async listMediaRelations(")), None)
+    if anchor is None:
+        raise SystemExit("TypeScript client is missing the listMediaRelations insertion point")
+    return source.replace(anchor, anchor + "\n" + get_method + "\n" + ensure_method, 1)
+
+
 def validate_typescript_client(manifest_path: Path = MANIFEST) -> None:
     """Fail closed when the typed product projection drifts from OpenAPI.
 
@@ -150,6 +172,7 @@ def main() -> int:
     args = parser.parse_args()
     generated = render(component_path=Path(args.component_manifest).expanduser())
     generated["packages/python/banodoco_workspace_client/generated.py"] = render_python_client()
+    generated["packages/typescript/src/generated.ts"] = render_typescript_client()
     for relative, content in generated.items():
         path = Path(args.python_output).expanduser().resolve() if relative == "packages/python/banodoco_workspace_client/generated.py" else ROOT / relative
         if args.check:

@@ -184,9 +184,9 @@ class CapabilityIdentity:
 class InputBinding:
     """One ordered Runtime input binding.
 
-    Runtime's canonical input identity is the ordered ``input_object_ids``
-    mirror of ``execution_request.inputs``.  The digest is therefore a
-    repeated, explicit witness of the same immutable object identity.
+    Runtime's canonical input identity is the ordered ``input_object_ids``.
+    Names come from explicit request inputs or admitted spec descriptors.
+    The digest repeats the same immutable object identity.
     """
 
     name: str
@@ -591,6 +591,63 @@ def _recovery_digest(decision: Mapping[str, Any]) -> str:
     return expected
 
 
+def _spec_input_bindings(spec: Mapping[str, Any], supplied_ids: list[str]) -> list[InputBinding]:
+    """Resolve omitted request inputs from named, admitted CAS descriptors."""
+    candidates: list[dict[str, str]] = []
+    witnesses: list[dict[str, str]] = []
+    capability_spec = spec.get("spec")
+    for location, section in (("spec", spec), ("spec.spec", capability_spec)):
+        if not isinstance(section, Mapping):
+            continue
+        descriptors = section.get("inputs")
+        if descriptors is not None:
+            if not isinstance(descriptors, Mapping):
+                raise DeploymentReferenceError(f"{location}.inputs must be a named input manifest")
+            named: dict[str, str] = {}
+            for name, descriptor in descriptors.items():
+                if not isinstance(name, str) or not name.strip():
+                    raise DeploymentReferenceError(f"{location}.inputs contains an invalid name")
+                object_id = None
+                if isinstance(descriptor, Mapping):
+                    raw_id = descriptor.get("object_id")
+                    raw_digest = descriptor.get("digest")
+                    if "object_id" in descriptor or "digest" in descriptor:
+                        object_id = _object_id(raw_id if raw_id is not None else raw_digest, f"{location}.inputs[{name}]")
+                        if raw_digest is not None and _object_id(raw_digest, f"{location}.inputs[{name}].digest") != object_id:
+                            raise DeploymentReferenceError(f"{location}.inputs[{name}] has conflicting digest")
+                elif isinstance(descriptor, str) and _OBJECT_ID.fullmatch(descriptor):
+                    object_id = _object_id(descriptor, f"{location}.inputs[{name}]")
+                if object_id is not None:
+                    named[name] = object_id
+            candidates.append(named)
+        digest_rows = section.get("input_digests")
+        if digest_rows is not None:
+            if not isinstance(digest_rows, list):
+                raise DeploymentReferenceError(f"{location}.input_digests must be a list")
+            named_digests: dict[str, str] = {}
+            for index, row in enumerate(digest_rows):
+                if not isinstance(row, Mapping):
+                    raise DeploymentReferenceError(f"{location}.input_digests[{index}] is invalid")
+                name = _text(row.get("name"), f"{location}.input_digests[{index}].name")
+                if name in named_digests:
+                    raise DeploymentReferenceError(f"{location}.input_digests contains duplicate names")
+                named_digests[name] = _object_id(row.get("digest"), f"{location}.input_digests[{index}].digest")
+            witnesses.append(named_digests)
+
+    if candidates and any(candidate != candidates[0] for candidate in candidates[1:]):
+        raise DeploymentReferenceError("admitted spec has ambiguous input descriptors")
+    named = candidates[0] if candidates else {}
+    if len(set(named.values())) != len(named):
+        raise DeploymentReferenceError("admitted spec has ambiguous input descriptors")
+    for witness in witnesses:
+        if witness != named:
+            raise DeploymentReferenceError("input_digests conflicts with admitted input descriptors")
+    if set(named.values()) != set(supplied_ids):
+        raise DeploymentReferenceError("admitted input descriptors do not match input_object_ids")
+    by_id = {object_id: name for name, object_id in named.items()}
+    return [InputBinding(name=by_id[object_id], object_id=object_id, digest=object_id) for object_id in supplied_ids]
+
+
 def deployment_binding_from_task(value: Mapping[str, Any]) -> DeploymentBinding:
     """Project a Runtime task read into the shared immutable deployment binding.
 
@@ -644,25 +701,28 @@ def deployment_binding_from_task(value: Mapping[str, Any]) -> DeploymentBinding:
         raise DeploymentReferenceError("input_object_ids is required")
     if spec_input_ids is not None and list(spec_input_ids) != input_ids:
         raise DeploymentReferenceError("input_object_ids has conflicting identity values")
-    inputs = request.get("inputs", [])
-    if not isinstance(inputs, list):
-        raise DeploymentReferenceError("execution_request.inputs must be a list")
-    if len(inputs) != len(input_ids):
-        raise DeploymentReferenceError("input_object_ids does not mirror execution_request.inputs")
-    bindings: list[InputBinding] = []
-    normalized_ids: list[str] = []
-    for index, item in enumerate(inputs):
-        if not isinstance(item, Mapping):
-            raise DeploymentReferenceError(f"execution_request.inputs[{index}] is invalid")
-        object_id = _object_id(item.get("object_id"), f"execution_request.inputs[{index}].object_id")
-        normalized_ids.append(object_id)
-        digest = item.get("digest", object_id)
-        bindings.append(InputBinding(name=item.get("name"), object_id=object_id, digest=digest))
     supplied_ids = [_object_id(item, f"input_object_ids[{index}]") for index, item in enumerate(input_ids)]
-    if supplied_ids != normalized_ids:
-        raise DeploymentReferenceError("input_object_ids does not exactly mirror execution_request.inputs in order")
     if len(set(supplied_ids)) != len(supplied_ids):
         raise DeploymentReferenceError("input_object_ids contains duplicate object IDs")
+    if "inputs" in request:
+        inputs = request["inputs"]
+        if not isinstance(inputs, list):
+            raise DeploymentReferenceError("execution_request.inputs must be a list")
+        if len(inputs) != len(supplied_ids):
+            raise DeploymentReferenceError("input_object_ids does not mirror execution_request.inputs")
+        bindings: list[InputBinding] = []
+        normalized_ids: list[str] = []
+        for index, item in enumerate(inputs):
+            if not isinstance(item, Mapping):
+                raise DeploymentReferenceError(f"execution_request.inputs[{index}] is invalid")
+            object_id = _object_id(item.get("object_id"), f"execution_request.inputs[{index}].object_id")
+            normalized_ids.append(object_id)
+            digest = item.get("digest", object_id)
+            bindings.append(InputBinding(name=item.get("name"), object_id=object_id, digest=digest))
+        if supplied_ids != normalized_ids:
+            raise DeploymentReferenceError("input_object_ids does not exactly mirror execution_request.inputs in order")
+    else:
+        bindings = _spec_input_bindings(spec, supplied_ids)
 
     binding_projection = value.get("execution_binding")
     if not isinstance(binding_projection, Mapping):

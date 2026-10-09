@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import sys
 import json
 from pathlib import Path
 
 import pytest
 
-from runtime_protocol.errors import NotFoundError, ValidationError
+from runtime_protocol.errors import ConflictError, NotFoundError, ValidationError
 from runtime_protocol.daemon import RuntimeDaemon
 from runtime_protocol.service import RuntimeService
 from runtime_protocol.store import RealmStore
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "packages" / "python"))
 from banodoco_workspace_client import WorkspaceClient
 
 
@@ -61,6 +59,146 @@ def _with_clips(publication, clips):
 def _clip(clip_id, at_ms=0, duration_ms=500):
     return {"id": clip_id, "clip_type": "text", "track": "picture", "at_ms": at_ms,
             "duration_ms": duration_ms, "text": clip_id}
+
+
+def _parent_clip(clip_id, *, clip_type="media", track="V1", at_ms=0, duration_ms=1000):
+    return {
+        "id": clip_id, "clipType": clip_type, "track": track,
+        "at_ms": at_ms, "duration_ms": duration_ms,
+    }
+
+
+def test_config_only_parent_clips_project_maple_and_parent_media_rows(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = []
+        publication["parent_composition"]["config"]["clips"] = [
+            _parent_clip(
+                "live-scene-import",
+                clip_type="com.reigh.astrid.liveScene",
+                duration_ms=176500,
+            ),
+            _parent_clip("audio-bed", clip_type="audio", track="A1", at_ms=125),
+            _parent_clip("overlay", clip_type="overlay", track="V2", at_ms=500, duration_ms=250),
+        ]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-config-only")
+
+        result = service.inspect_timeline(project, "main", {"limit": 20})
+
+        assert result["selection_status"] == "selected"
+        assert [clip["clip_id"] for clip in result["selected_parent_clips"]] == [
+            "live-scene-import", "audio-bed", "overlay",
+        ]
+        maple = result["selected_parent_clips"][0]
+        assert maple["start"] == [0, 1]
+        assert maple["duration"] == [353, 2]
+        assert maple["track_id"] == "V1"
+        assert maple["clip_type"] == "com.reigh.astrid.liveScene"
+        assert result["parent_clip_count"] == 3
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    ("config_clips", "parent_clips", "expected"),
+    [
+        ([], [_parent_clip("top-level")], ["top-level"]),
+        ([_parent_clip("config-only")], [], ["config-only"]),
+        ([_parent_clip("duplicate")], [_parent_clip("duplicate")], ["duplicate"]),
+    ],
+)
+def test_parent_clip_projection_uses_one_canonical_list(tmp_path, config_clips, parent_clips, expected):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = []
+        publication["parent_composition"]["config"]["clips"] = config_clips
+        publication["parent_composition"]["clips"] = parent_clips
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-list-shape")
+
+        result = service.inspect_timeline(project, "main", {})
+
+        assert [clip["clip_id"] for clip in result["selected_parent_clips"]] == expected
+    finally:
+        service.close()
+
+
+def test_conflicting_parent_clip_lists_fail_closed(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = []
+        publication["parent_composition"]["config"]["clips"] = [_parent_clip("config")]
+        publication["parent_composition"]["clips"] = [_parent_clip("top-level")]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-conflicting-lists")
+
+        with pytest.raises(ConflictError, match="clips"):
+            service.inspect_timeline(project, "main", {})
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("field", ["clips", "config"])
+def test_malformed_parent_clip_collections_are_rejected(tmp_path, field):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = []
+        publication["parent_composition"]["clips"] = [_parent_clip("valid")]
+        service.publish_parent_composition(project, "main", publication, idempotency_key=f"publish-malformed-{field}")
+        row = service.store.conn.execute(
+            "SELECT payload_json FROM parent_composition_revisions WHERE id=?",
+            ("parent-1",),
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        if field == "clips":
+            payload["clips"] = {}
+        else:
+            payload["config"]["clips"] = {}
+        service.store.conn.execute(
+            "UPDATE parent_composition_revisions SET payload_json=? WHERE id=?",
+            (json.dumps(payload), "parent-1"),
+        )
+
+        with pytest.raises(ConflictError, match="clips"):
+            service.inspect_timeline(project, "main", {})
+    finally:
+        service.close()
+
+
+def test_config_only_parent_clips_support_selectors_pagination_and_pinned_revisions(tmp_path):
+    service, project, _ = _service(tmp_path)
+    try:
+        publication = _publication(project)
+        publication["parent_composition"]["occurrences"] = []
+        publication["parent_composition"]["config"]["clips"] = [
+            _parent_clip("config-one", track="V1"),
+            _parent_clip("config-two", track="V2", at_ms=1000),
+            _parent_clip("config-three", track="V2", at_ms=2000),
+        ]
+        service.publish_parent_composition(project, "main", publication, idempotency_key="publish-config-page-1")
+
+        first = service.inspect_timeline(project, "main", {"limit": 2})
+        second = service.inspect_timeline(project, "main", {"limit": 2, "cursor": first["next_cursor"]})
+        selected = service.inspect_timeline(project, "main", {"track": "V2"})
+        assert [clip["clip_id"] for clip in first["selected_parent_clips"]] == ["config-one", "config-two"]
+        assert [clip["clip_id"] for clip in second["selected_parent_clips"]] == ["config-three"]
+        assert [clip["clip_id"] for clip in selected["selected_parent_clips"]] == ["config-two", "config-three"]
+
+        later = _publication(project, revision="parent-2", expected_head="parent-1")
+        later["parent_composition"]["occurrences"] = []
+        later["parent_composition"]["config"]["clips"] = [_parent_clip("current-only")]
+        service.publish_parent_composition(project, "main", later, idempotency_key="publish-config-page-2")
+
+        pinned = service.inspect_timeline(project, "main", {
+            "revision_id": "parent-1", "clip": "config-one",
+        })
+        current = service.inspect_timeline(project, "main", {})
+        assert [clip["clip_id"] for clip in pinned["selected_parent_clips"]] == ["config-one"]
+        assert [clip["clip_id"] for clip in current["selected_parent_clips"]] == ["current-only"]
+    finally:
+        service.close()
 
 
 def test_pinned_inspection_and_neighbor_order(tmp_path):

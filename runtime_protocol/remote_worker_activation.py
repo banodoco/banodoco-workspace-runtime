@@ -12,7 +12,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .auth import CredentialStore
 from .errors import ConflictError, ValidationError
@@ -58,18 +58,23 @@ class ParkedRemoteHost:
 class QualifiedRemoteWorkerLauncher:
     """Compose parked launch, independent observation, private ack and Runtime commit."""
 
-    def __init__(self, *, runtime: RuntimeService, credentials: CredentialStore,
+    def __init__(self, *, runtime: RuntimeService, credentials: CredentialStore | None,
                  preparer: RemotePreparer, inspector: RemoteInspector,
+                 credential_control: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
                  scopes: tuple[str, ...] = ("worker:execute",),
                  ttl_seconds: int = 300):
         if ttl_seconds <= 0 or ttl_seconds > 3600:
             raise ValidationError("remote activation TTL is out of range")
         self.runtime = runtime
         self.credentials = credentials
+        self.credential_control = credential_control
+        if (credentials is None) == (credential_control is None):
+            raise ValidationError("exactly one resident credential control is required")
         self.preparer = preparer
         self.inspector = inspector
         self.scopes = scopes
         self.ttl_seconds = ttl_seconds
+        self.activation_state = "inactive"
 
     @staticmethod
     def _validate_observation(value: Mapping[str, Any], target: Mapping[str, Any]) -> dict[str, Any]:
@@ -112,7 +117,10 @@ class QualifiedRemoteWorkerLauncher:
                 handle, dict(target), second, _digest(second), uuid.uuid4().hex,
             )
         except Exception:
-            self.preparer.abort(handle)
+            try:
+                self.preparer.abort(handle)
+            except Exception:
+                pass
             raise
 
     def activate(self, task: Mapping[str, Any], reference: DeploymentReference,
@@ -178,12 +186,24 @@ class QualifiedRemoteWorkerLauncher:
             "executor_incarnation": parked.executor_incarnation,
         }
         issued = False
+        self.activation_state = "inactive"
         try:
-            _token, path = self.credentials.provision(
-                credential_actor, list(self.scopes), rotate=True, enabled=False,
-                metadata={"execution_binding": placement, "qualified_activation": qualification},
-            )
+            if self.credential_control is None:
+                _token, path = self.credentials.provision(
+                    credential_actor, list(self.scopes), rotate=True, enabled=False,
+                    metadata={"execution_binding": placement, "qualified_activation": qualification},
+                )
+            else:
+                response = self.credential_control(binding.admission_identity.task_id, {
+                    "action": "provision", "qualification": qualification, "placement": placement,
+                })
+                if (not isinstance(response, Mapping)
+                        or response.get("credential_actor") != credential_actor
+                        or not isinstance(response.get("credential_file"), str)):
+                    raise ConflictError("resident Runtime did not provision the disabled credential")
+                path = response["credential_file"]
             issued = True
+            self.activation_state = "unknown"
             grant = {
                 "activation_id": activation_id,
                 "credential_file": str(path),
@@ -200,18 +220,45 @@ class QualifiedRemoteWorkerLauncher:
             self.runtime.record_remote_activation(
                 binding.admission_identity.task_id, qualification, identity=OWNER
             )
-            self.credentials.enable_actor(credential_actor)
+            if self.credential_control is None:
+                self.credentials.enable_actor(credential_actor)
+            elif self.credential_control(binding.admission_identity.task_id, {
+                "action": "enable", "activation_id": activation_id,
+            }) != {"enabled": True}:
+                raise ConflictError("resident Runtime did not enable the remote credential")
+            await_ready = getattr(self.preparer, "await_ready", None)
+            if callable(await_ready):
+                await_ready(parked.handle)
+            self.activation_state = "active"
             return qualification
         except Exception:
-            if issued:
-                self.credentials.revoke(credential_actor)
+            credential_revoked = not issued
+            try:
+                if issued:
+                    if self.credential_control is None:
+                        self.credentials.revoke(credential_actor)
+                    else:
+                        revoked = self.credential_control(binding.admission_identity.task_id, {
+                            "action": "revoke", "activation_id": activation_id,
+                        })
+                        if revoked != {"revoked": True}:
+                            raise ConflictError("resident Runtime did not confirm credential revocation")
+                    credential_revoked = True
+            except Exception:
+                pass
+            activation_revoked = False
             try:
                 self.runtime.revoke_remote_activation(
                     binding.admission_identity.task_id, activation_id, identity=OWNER
                 )
-            except ConflictError:
+                activation_revoked = True
+            except Exception:
                 pass
-            self.preparer.abort(parked.handle)
+            try:
+                self.preparer.abort(parked.handle)
+            except Exception:
+                pass
+            self.activation_state = "inactive" if credential_revoked and activation_revoked else "unknown"
             raise
 
     def assert_fresh(self, task: Mapping[str, Any], reference: DeploymentReference,
@@ -219,14 +266,18 @@ class QualifiedRemoteWorkerLauncher:
         binding = deployment_binding_from_task(task)
         if (binding != reference.deployment_binding
                 or qualification.get("binding_digest") != binding.digest()
-                or qualification.get("deployment_digest") != reference.digest()
-                or self.credentials.actor_metadata(reference.executor_id) is None):
+                or qualification.get("deployment_digest") != reference.digest()):
             raise ConflictError("remote activation is stale before queue")
-        placement = self.credentials.actor_metadata(reference.executor_id)["execution_binding"]
-        if not self.runtime._remote_activation_matches(binding.admission_identity.task_id,
-                                                       {"actor": reference.executor_id,
-                                                        "qualified_activation": dict(qualification)},
-                                                       placement):
+        if self.credential_control is None:
+            metadata = self.credentials.actor_metadata(reference.executor_id)
+            if metadata is None or not self.runtime._remote_activation_matches(
+                    binding.admission_identity.task_id,
+                    {"actor": reference.executor_id, "qualified_activation": dict(qualification)},
+                    metadata["execution_binding"]):
+                raise ConflictError("remote activation is revoked or expired before queue")
+        elif self.credential_control(binding.admission_identity.task_id, {
+                "action": "verify", "activation_id": qualification["activation_id"],
+        }) != {"fresh": True}:
             raise ConflictError("remote activation is revoked or expired before queue")
         if self._validate_observation(self.inspector.observe(parked.handle), parked.target) != parked.observation:
             raise ConflictError("remote provider, process, child, model or session changed before queue")

@@ -192,6 +192,20 @@ def _clip(raw, registry, occurrence, start, end):
             "mute": bool(raw.get("mute", False)), "text": str(raw.get("text", ""))[:2000], **asset}
 
 
+def _canonical_parent_clips(payload):
+    """Resolve the canonical parent clip list without merging authorities."""
+    if not isinstance(payload, dict):
+        raise ConflictError("canonical parent composition payload is invalid")
+    config = payload.get("config", {})
+    parent_clips = payload.get("clips", [])
+    config_clips = config.get("clips", []) if isinstance(config, dict) else None
+    if not isinstance(parent_clips, list) or not isinstance(config_clips, list):
+        raise ConflictError("canonical parent composition clips are invalid")
+    if config_clips and parent_clips and config_clips != parent_clips:
+        raise ConflictError("canonical parent clips and config.clips disagree")
+    return parent_clips or config_clips
+
+
 def _parent_clip(raw, registry):
     """Project an ordinary parent-level effect/code clip without shot identity."""
     if not isinstance(raw, dict):
@@ -247,6 +261,7 @@ def inspect(connection, project_id, timeline_id, options):
         raise NotFoundError("timeline has no parent composition revision")
     parent = _row(connection, "SELECT * FROM parent_composition_revisions WHERE id=? AND project_id=? AND timeline_id=?", (revision, project_id, timeline_id), "parent composition revision")
     payload = json.loads(parent["payload_json"])
+    parent_clips_raw = _canonical_parent_clips(payload)
     occurrences = payload.get("occurrences")
     if not isinstance(occurrences, list) or len(occurrences) > MAX_OCCURRENCES:
         raise ValidationError("timeline has too many occurrences; narrow the revision")
@@ -287,20 +302,30 @@ def inspect(connection, project_id, timeline_id, options):
         closure_clips += len(clips)
         if closure_clips > MAX_CLOSURE_CLIPS:
             raise ValidationError("timeline closure exceeds clip limit; narrow the revision")
+        track_id = raw.get("track")
+        if track_id is None:
+            track_id = placement.get("track")
+        text_bindings = shot_payload.get("text_bindings", [])
+        if isinstance(text_bindings, list):
+            # Keep old, unregistered descriptors readable for historical
+            # compositions while making their weaker provenance explicit.
+            text_bindings = [
+                ({**item, "authority": "shot_text_binding"} if isinstance(item, dict) and item.get("binding_id")
+                 else ({**item, "authority": "legacy_unregistered"} if isinstance(item, dict) else item))
+                for item in text_bindings
+            ]
         identity = {"ordinal": ordinal, "occurrence_id": occurrence_id, "shot_id": shot_id,
                     "shot_revision_id": shot_revision_id, "shot_digest": shot["content_digest"],
                     "internal_timeline_revision_id": internal_id, "internal_timeline_digest": internal["content_digest"],
                     "name": _shot_name(shot_payload, shot_id),
-                    "start": _wire(start), "duration": _wire(duration), "track_id": raw.get("track"),
+                    "start": _wire(start), "duration": _wire(duration), "track_id": track_id,
                     "source_offset": raw.get("source_offset", 0), "speed": raw.get("speed", 1),
                     "gain": raw.get("gain", 1), "mute": bool(raw.get("muted", raw.get("mute", False))),
-                    "text_bindings": shot_payload.get("text_bindings", []),
+                    "text_bindings": text_bindings,
                     "audio_bindings": shot_payload.get("audio_bindings", [])}
         projected = [item for clip in clips if (item := _clip(clip, registry, identity, start, start + duration)) is not None]
         children.append((identity, projected))
-    parent_clips_raw = payload.get("clips", [])
-    if not isinstance(parent_clips_raw, list):
-        raise ConflictError("canonical parent composition clips are invalid")
+
     parent_clips = [item for raw in parent_clips_raw if (item := _parent_clip(raw, parent_registry)) is not None]
     closure_clips += len(parent_clips)
     if closure_clips > MAX_CLOSURE_CLIPS:
