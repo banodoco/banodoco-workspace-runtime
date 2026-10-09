@@ -1072,6 +1072,99 @@ class RuntimeService:
             if not isinstance(item, dict) or not isinstance(item.get("item_id", item.get("id")), str) or not item.get("media_id"):
                 raise ValidationError("shot revision items cannot be projected losslessly")
 
+    def _validate_published_text_bindings(self, project_id, shot_id, payload, *, require_current):
+        """Verify immutable shot text pins against the registered text authority."""
+        bindings = payload.get("text_bindings", [])
+        if not isinstance(bindings, list):
+            raise ValidationError("shot text_bindings must be a list")
+        scripts = []
+        seen_binding_ids = set()
+        seen_slots = set()
+        for descriptor in bindings:
+            if not isinstance(descriptor, dict):
+                raise ValidationError("shot text binding must be an object")
+            binding_id = descriptor.get("binding_id")
+            if not isinstance(binding_id, str) or not binding_id:
+                raise ValidationError(
+                    "embedded shot text is not authoritative; register it with the shot text binding service, then publish its binding_id and head",
+                    details={"shot_id": shot_id, "action": "register_text_binding"},
+                )
+            if binding_id in seen_binding_ids:
+                raise ValidationError("shot text_bindings contain a duplicate binding_id", details={"binding_id": binding_id})
+            seen_binding_ids.add(binding_id)
+            row = self.store.conn.execute(
+                "SELECT * FROM shot_text_bindings WHERE id=? AND project_id=?",
+                (binding_id, project_id),
+            ).fetchone()
+            if row is None:
+                raise ConflictError(
+                    "shot text binding is not registered in this project; register it before publishing",
+                    details={"shot_id": shot_id, "binding_id": binding_id, "action": "register_text_binding"},
+                )
+            if str(row["shot_id"]) != shot_id:
+                raise ConflictError("shot text binding belongs to a different shot", details={"binding_id": binding_id})
+            head = descriptor.get("head")
+            if isinstance(head, bool) or not isinstance(head, int) or head < 1:
+                raise ValidationError("shot text binding descriptor requires its positive pinned head", details={"binding_id": binding_id})
+            if require_current and head != int(row["head_seq"]):
+                raise ConflictError(
+                    "shot text binding head is stale; read the current binding and republish the shot",
+                    details={"binding_id": binding_id, "expected_head": head, "actual_head": int(row["head_seq"]), "action": "refresh_text_binding_pin"},
+                )
+            # Verify the complete registered event chain and current authority
+            # object before accepting any historical pin from that stream.
+            resource = self._text_binding_resource(row)
+            for field in ("project_id", "shot_id", "kind", "slot", "event_stream_id"):
+                if field in descriptor and descriptor[field] != resource[field]:
+                    raise ConflictError("shot text binding descriptor identity does not match its registered binding", details={"binding_id": binding_id, "field": field})
+            slot_key = (resource["kind"], resource["slot"])
+            if slot_key in seen_slots:
+                raise ValidationError("shot text_bindings contain duplicate kind/slot descriptors", details={"kind": resource["kind"], "slot": resource["slot"]})
+            seen_slots.add(slot_key)
+            event = self.store.conn.execute(
+                "SELECT kind, payload_json, created_at FROM shot_text_binding_events WHERE binding_id=? AND seq=?",
+                (binding_id, head),
+            ).fetchone()
+            if event is None:
+                raise ConflictError("pinned shot text binding event is missing", details={"binding_id": binding_id, "head": head})
+            event_payload = json.loads(event["payload_json"])
+            media_id = event_payload.get("media_id")
+            content_hash = event_payload.get("content_hash")
+            if not isinstance(media_id, str) or not media_id.startswith("sha256:") or content_hash != media_id:
+                raise ConflictError("pinned shot text binding event has invalid content provenance", details={"binding_id": binding_id, "head": head})
+            for field, expected in (("media_id", media_id), ("content_hash", content_hash)):
+                if descriptor.get(field) != expected:
+                    raise ConflictError("shot text binding descriptor does not match its pinned event", details={"binding_id": binding_id, "head": head, "field": field})
+            media = self._verify_text_object(project_id, media_id)
+            if descriptor.get("byte_size") != int(media["size"]):
+                raise ConflictError("shot text binding byte_size does not match its pinned media", details={"binding_id": binding_id, "head": head})
+            if descriptor.get("mime_type") != str(media["media_type"]):
+                raise ConflictError("shot text binding mime_type does not match its pinned media", details={"binding_id": binding_id, "head": head})
+            if "created_at" in descriptor and descriptor["created_at"] != resource["created_at"]:
+                raise ConflictError("shot text binding created_at does not match its registered identity", details={"binding_id": binding_id})
+            if "updated_at" in descriptor and descriptor["updated_at"] != event["created_at"]:
+                raise ConflictError("shot text binding updated_at does not match its pinned event", details={"binding_id": binding_id, "head": head})
+            text_path = self.cas.path_for(media["digest"])
+            text_bytes = text_path.read_bytes()
+            try:
+                text = text_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ConflictError("pinned shot text binding bytes are not valid UTF-8", details={"binding_id": binding_id, "head": head}) from exc
+            if "text" in descriptor and descriptor["text"] != text:
+                raise ConflictError("embedded text does not match its registered shot text binding", details={"binding_id": binding_id, "head": head, "field": "text"})
+            if resource["kind"] == "voiceover_script":
+                scripts.append((binding_id, text))
+        metadata = payload.get("metadata", {})
+        if isinstance(metadata, dict) and "voiceover_script" in metadata:
+            script = metadata["voiceover_script"]
+            if not scripts:
+                raise ValidationError(
+                    "metadata.voiceover_script has no registered voiceover_script binding; register the script and publish its text binding descriptor",
+                    details={"shot_id": shot_id, "action": "register_text_binding"},
+                )
+            if not isinstance(script, str) or all(script != value for _, value in scripts):
+                raise ConflictError("metadata.voiceover_script does not match the registered voiceover_script binding", details={"shot_id": shot_id})
+
     def _apply_published_shot_projection(self, project_id, value, timestamp):
         """Keep the mutable shot projection semantically equal to a new child revision."""
         self._validate_published_shot_payload(value)
@@ -1858,13 +1951,23 @@ class RuntimeService:
         for source, target in aliases.items():
             if source in result and target not in result:
                 result[target] = result.pop(source)
+        clips_were_supplied = "clips" in result
         defaults = {"config": {}, "registry": {}, "clips": [], "occurrences": []}
         for key, default in defaults.items():
             result.setdefault(key, default)
         if not isinstance(result["config"], dict) or not isinstance(result["registry"], dict):
             raise ValidationError("parent composition config and registry must be objects")
+        config_clips = result["config"].get("clips")
+        if not clips_were_supplied and isinstance(config_clips, list):
+            # Older payloads may only carry the renderer-facing config mirror.
+            # Promote it once, then keep the two views synchronized.
+            result["clips"] = copy.deepcopy(config_clips)
         if not isinstance(result["clips"], list) or not isinstance(result["occurrences"], list):
             raise ValidationError("parent composition clips and occurrences must be lists")
+        # The top-level list is the canonical authored field. The config copy
+        # exists for legacy renderers and must never survive a publication
+        # with different bytes (which makes inspection fail after the CAS).
+        result["config"]["clips"] = copy.deepcopy(result["clips"])
         for clip in result["clips"]:
             if not isinstance(clip, dict):
                 raise ValidationError("ordinary clips must be objects")
@@ -1876,7 +1979,66 @@ class RuntimeService:
             for effect in effects:
                 if not isinstance(effect, dict) or effect.get("type") not in SUPPORTED_COMPOSITION_EFFECTS:
                     raise ValidationError("unsupported composition effect", details={"effect": effect})
+        RuntimeService._validate_parent_visual_overlaps(result)
         return result
+
+    @staticmethod
+    def _validate_parent_visual_overlaps(payload):
+        """Reject parent media that collides with a shot on the same picture lane."""
+        config = payload.get("config", {})
+        tracks = config.get("tracks", []) if isinstance(config, dict) else []
+        visual_tracks = {
+            row.get("id") for row in tracks
+            if isinstance(row, dict) and row.get("kind") in {"visual", "video", "image"}
+        }
+        if not visual_tracks:
+            return
+        occurrences = payload.get("occurrences", [])
+        for clip in payload.get("clips", []):
+            if clip.get("track") not in visual_tracks:
+                continue
+            clip_type = clip.get("clipType", clip.get("clip_type", "media"))
+            if clip_type not in {"media", "video", "image"}:
+                continue
+            start = clip.get("at", 0)
+            if isinstance(start, bool) or not isinstance(start, (int, float)):
+                continue
+            if isinstance(clip.get("hold"), (int, float)) and not isinstance(clip.get("hold"), bool):
+                duration = float(clip["hold"])
+            elif isinstance(clip.get("to"), (int, float)) and not isinstance(clip.get("to"), bool):
+                duration = float(clip["to"]) - float(clip.get("from", 0))
+            else:
+                continue
+            clip_start, clip_end = float(start), float(start) + duration
+            if duration <= 0:
+                continue
+            for occurrence in occurrences:
+                if not isinstance(occurrence, dict):
+                    continue
+                placement = occurrence.get("placement", {})
+                if not isinstance(placement, dict):
+                    placement = {}
+                track = placement.get("track", occurrence.get("track"))
+                if track != clip.get("track"):
+                    continue
+                start_ms = placement.get("start_ms", occurrence.get("at_ms"))
+                duration_ms = occurrence.get("duration_ms")
+                if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in (start_ms, duration_ms)):
+                    continue
+                shot_start = float(start_ms) / 1000.0
+                shot_end = shot_start + float(duration_ms) / 1000.0
+                overlap_start, overlap_end = max(clip_start, shot_start), min(clip_end, shot_end)
+                if overlap_start < overlap_end:
+                    raise ValidationError(
+                        "ordinary parent picture media overlaps a placed shot on the same visual track; move one clip to another visual track",
+                        details={
+                            "code": "same_track_picture_overlap",
+                            "clip_id": clip.get("id"),
+                            "occurrence_id": occurrence.get("occurrence_id"),
+                            "track": track,
+                            "overlap": {"start": overlap_start, "end": overlap_end},
+                        },
+                    )
 
     def get_project_shot_revision(self, project_id, shot_id, revision):
         project = self.store.get_project(project_id)
@@ -1909,6 +2071,204 @@ class RuntimeService:
         if not row:
             raise NotFoundError("parent composition revision not found", details={"timeline_id": timeline_id, "revision": revision})
         return {"revision_id": row["id"], "project_id": row["project_id"], "timeline_id": row["timeline_id"], "content_digest": row["content_digest"], "payload": json.loads(row["payload_json"]), "created_at": row["created_at"]}
+
+    def list_project_parent_composition_revisions(self, project_id, timeline_id, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
+        """List immutable canonical history for one project timeline."""
+        project = self.store.get_project(project_id)
+        timeline = self.store.conn.execute(
+            "SELECT 1 FROM timelines WHERE id=? AND project_id=?", (timeline_id, project["id"])
+        ).fetchone()
+        if timeline is None:
+            raise NotFoundError("timeline not found", details={"timeline_id": timeline_id, "project_id": project["id"]})
+        head = self.store.conn.execute(
+            "SELECT revision_id FROM parent_composition_heads WHERE timeline_id=? AND project_id=?",
+            (timeline_id, project["id"]),
+        ).fetchone()
+        current_head = head["revision_id"] if head else None
+        rows = self.store.conn.execute(
+            "SELECT * FROM parent_composition_revisions WHERE project_id=? AND timeline_id=? ORDER BY created_at DESC, id DESC",
+            (project["id"], timeline_id),
+        ).fetchall()
+        return _page_rows(
+            rows,
+            scope=f"parent-composition-history:{project['id']}:{timeline_id}",
+            cursor=cursor,
+            limit=limit,
+            key_fn=lambda row: (row["created_at"], row["id"]),
+            resource_fn=lambda row: {
+                "revision_id": row["id"],
+                "project_id": row["project_id"],
+                "timeline_id": row["timeline_id"],
+                "content_digest": row["content_digest"],
+                "created_at": row["created_at"],
+                "is_current_head": row["id"] == current_head,
+            },
+            skip_after=lambda key, after: key >= after,
+        )
+
+    @_durable_mutation
+    def restore_project_parent_composition_revision(self, project_id, timeline_id, revision, body, *, idempotency_key=None):
+        """Restore an exact historical closure by publishing it as a new head."""
+        idempotency_key = require_idempotency_key(idempotency_key)
+        self._require_object_body(body)
+        allowed = {"expected_head"}
+        unexpected = set(body) - allowed
+        if unexpected:
+            raise ValidationError("parent composition restore contains unsupported fields", details={"fields": sorted(unexpected)})
+        if "expected_head" not in body:
+            raise ValidationError("expected_head is required for parent composition restore")
+        expected_head = body.get("expected_head")
+        if expected_head is not None:
+            self._revision_id(expected_head, "expected_head")
+        project = self.store.get_project(project_id)
+        source = self.get_project_parent_composition_revision(project["id"], timeline_id, revision)
+        parent_payload = source["payload"]
+        if self._revision_digest(parent_payload) != source["content_digest"]:
+            raise ConflictError(
+                "historical parent composition failed immutable verification",
+                details={"revision_id": revision},
+            )
+        canonical_parent_payload = self._complete_parent_payload(copy.deepcopy(parent_payload))
+        if canonical_json(canonical_parent_payload) != canonical_json(parent_payload):
+            raise ConflictError(
+                "historical parent composition is non-canonical and cannot be restored exactly",
+                details={"revision_id": revision},
+            )
+        occurrences = parent_payload.get("occurrences") if isinstance(parent_payload, dict) else None
+        if not isinstance(occurrences, list):
+            raise ValidationError("historical parent composition occurrences must be a list")
+
+        # Restore the exact historical dependency closure only after the
+        # store's existing publication-ledger validator proves the source
+        # rows. This preserves manifest-only declared media without treating
+        # raw dependency rows as provenance or creating a second validator.
+        integrity = self.store.integrity_report()
+        checks = integrity.get("checks", {}) if isinstance(integrity, dict) else {}
+        revision_check = checks.get("revisions", {})
+        event_check = checks.get("event_chain", {})
+        revision_errors = revision_check.get("errors", []) if isinstance(revision_check, dict) else []
+        event_errors = event_check.get("errors", []) if isinstance(event_check, dict) else []
+        integrity_shape_ok = (
+            isinstance(revision_check, dict)
+            and "ok" in revision_check
+            and isinstance(revision_errors, list)
+            and isinstance(event_check, dict)
+            and "ok" in event_check
+            and event_check.get("reason") != "not_checked"
+            and isinstance(event_errors, list)
+        )
+        if not isinstance(revision_errors, list):
+            revision_errors = []
+        if not isinstance(event_errors, list):
+            event_errors = []
+        source_errors = [
+            error for error in revision_errors
+            if isinstance(error, dict)
+            and (
+                str(error.get("identity", "")) == revision
+                or str(error.get("identity", "")).startswith(revision + ":")
+            )
+        ]
+        source_errors.extend(
+            error for error in event_errors
+            if isinstance(error, dict) and error.get("timeline_id") == timeline_id
+        )
+        if not integrity_shape_ok:
+            source_errors.append({"reason": "integrity_report_unavailable"})
+        if source_errors:
+            raise ConflictError(
+                "historical parent composition dependency closure failed immutable verification",
+                details={"revision_id": revision, "errors": source_errors},
+            )
+        verified_dependencies = self.store.conn.execute(
+            "SELECT dependency_kind, dependency_id FROM composition_revision_dependencies "
+            "WHERE parent_revision_id=? ORDER BY ordinal",
+            (revision,),
+        ).fetchall()
+
+        shot_revisions = {}
+        internal_revisions = {}
+        media = {
+            row["dependency_id"]
+            for row in verified_dependencies
+            if row["dependency_kind"] == "media"
+        }
+        for occurrence in occurrences:
+            if not isinstance(occurrence, dict):
+                raise ValidationError("historical parent composition occurrence must be an object")
+            shot_id = occurrence.get("shot_id")
+            shot_revision_id = occurrence.get("shot_revision_id")
+            if not isinstance(shot_id, str) or not isinstance(shot_revision_id, str):
+                raise ValidationError("historical occurrence is missing its pinned shot identity")
+            shot_key = (shot_id, shot_revision_id)
+            if shot_key in shot_revisions:
+                continue
+            shot = self.store.conn.execute(
+                "SELECT * FROM shot_revisions WHERE id=? AND project_id=? AND shot_id=?",
+                (shot_revision_id, project["id"], shot_id),
+            ).fetchone()
+            if shot is None:
+                raise ConflictError("historical shot revision dependency is missing", details={"revision_id": shot_revision_id})
+            shot_payload = json.loads(shot["payload_json"])
+            if self._revision_digest(shot_payload) != shot["content_digest"]:
+                raise ConflictError("historical shot revision failed immutable verification", details={"revision_id": shot_revision_id})
+            internal_id = shot["internal_timeline_revision_id"]
+            internal = self.store.conn.execute(
+                "SELECT * FROM internal_timeline_revisions WHERE id=? AND project_id=?",
+                (internal_id, project["id"]),
+            ).fetchone()
+            if internal is None:
+                raise ConflictError("historical internal timeline dependency is missing", details={"revision_id": internal_id})
+            internal_payload = json.loads(internal["payload_json"])
+            if self._revision_digest(internal_payload) != internal["content_digest"]:
+                raise ConflictError("historical internal timeline revision failed immutable verification", details={"revision_id": internal_id})
+            shot_revisions[shot_key] = {
+                "shot_id": shot_id,
+                "revision_id": shot_revision_id,
+                "internal_timeline_revision_id": internal_id,
+                "content_digest": shot["content_digest"],
+                "payload": shot_payload,
+            }
+            internal_revisions[(internal["timeline_id"], internal_id)] = {
+                "timeline_id": internal["timeline_id"],
+                "revision_id": internal_id,
+                "content_digest": internal["content_digest"],
+                "payload": internal_payload,
+            }
+            media.update(self._collect_digest_media(shot_payload))
+            media.update(self._collect_digest_media(internal_payload))
+
+        dependency_manifest = {
+            "shots": [
+                {key: value[key] for key in ("shot_id", "revision_id", "internal_timeline_revision_id", "content_digest")}
+                for value in sorted(shot_revisions.values(), key=lambda item: (item["shot_id"], item["revision_id"]))
+            ],
+            "internal_timelines": [
+                {key: value[key] for key in ("timeline_id", "revision_id", "content_digest")}
+                for value in sorted(internal_revisions.values(), key=lambda item: (item["timeline_id"], item["revision_id"]))
+            ],
+            "media": sorted(media),
+        }
+        parent_revision_id = "restore-" + hashlib.sha256(canonical_json({
+            "project_id": project["id"],
+            "timeline_id": timeline_id,
+            "source_revision_id": revision,
+            "expected_head": expected_head,
+            "idempotency_key": idempotency_key,
+        }).encode()).hexdigest()[:48]
+        publication = {
+            "project_id": project["id"],
+            "timeline_id": timeline_id,
+            "expected_head": expected_head,
+            "parent_revision_id": parent_revision_id,
+            "parent_composition": parent_payload,
+            "shot_revisions": list(shot_revisions.values()),
+            "internal_timeline_revisions": list(internal_revisions.values()),
+            "dependency_manifest": dependency_manifest,
+        }
+        return self.publish_parent_composition(
+            project["id"], timeline_id, publication, idempotency_key=idempotency_key,
+        )
 
     def inspect_timeline(self, project, timeline_id, options=None):
         """Inspect one immutable timeline closure without reading source media."""
@@ -2498,6 +2858,26 @@ class RuntimeService:
             if match is None:
                 raise NotFoundError("shot revision internal timeline dependency is missing", details={"revision_id": value["internal_timeline_revision_id"]})
             resolved_internal[(match["timeline_id"], match["revision_id"])] = match
+        # A caller may include an already-committed child in `shot_revisions`
+        # instead of linking it only from an occurrence. Preserve that exact
+        # immutable pin without requiring the mutable text binding head to
+        # remain current. New child revisions must pin the binding head seen
+        # by this same publication transaction.
+        for value in resolved_shots.values():
+            existing = self.store.conn.execute(
+                "SELECT * FROM shot_revisions WHERE id=?", (value["revision_id"],)
+            ).fetchone()
+            if existing is not None:
+                if (existing["project_id"] != project["id"] or existing["shot_id"] != value["shot_id"]
+                        or existing["internal_timeline_revision_id"] != value["internal_timeline_revision_id"]
+                        or existing["content_digest"] != value["content_digest"]
+                        or existing["payload_json"] != canonical_json(value["payload"])):
+                    raise ConflictError("shot revision identity was reused with different bytes", details={"revision_id": value["revision_id"]})
+                value["existing"] = True
+            if not value.get("existing", False):
+                self._validate_published_text_bindings(
+                    project["id"], value["shot_id"], value["payload"], require_current=True,
+                )
         # Recompute closure only after every occurrence has been resolved to
         # immutable child bytes.  This is the source of truth for both the
         # manifest check and the rows stored below.
@@ -4371,6 +4751,115 @@ class RuntimeService:
         created_at = self.store.conn.execute("SELECT created_at FROM media_relations WHERE project_id=? AND from_digest=? AND to_digest=? AND kind=? AND ordinal=?", (project_id, source, target, kind, ordinal)).fetchone()[0]
         result = {"project_id": project_id, "from_object_id": "sha256:" + source, "to_object_id": "sha256:" + target, "kind": kind, "ordinal": ordinal, "metadata": metadata, "created_at": created_at}
         return self._command_record("media_relation.create", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
+
+    @staticmethod
+    def _source_frame_thumbnail_descriptor(body):
+        if not isinstance(body, dict) or set(body) != {"object_id", "source_object_id", "recipe_version", "selection"}:
+            raise ValidationError("source-frame thumbnail requires object_id, source_object_id, recipe_version, and selection")
+        descriptor = copy.deepcopy(body)
+        for field in ("object_id", "source_object_id"):
+            value = descriptor[field]
+            if not isinstance(value, str) or not OBJECT_ID_RE.fullmatch(value) or not value.startswith("sha256:"):
+                raise ValidationError(f"thumbnail {field} must be a canonical sha256 object id")
+        if isinstance(descriptor["recipe_version"], bool) or not isinstance(descriptor["recipe_version"], int) or descriptor["recipe_version"] != 1:
+            raise ValidationError("thumbnail recipe_version is unsupported")
+        selection = descriptor["selection"]
+        if not isinstance(selection, dict) or set(selection) != {"kind", "source_time_seconds"} or selection.get("kind") != "source_frame":
+            raise ValidationError("thumbnail selection must identify a source_frame and source_time_seconds")
+        source_time = selection.get("source_time_seconds")
+        if isinstance(source_time, bool) or not isinstance(source_time, (int, float)) or not math.isfinite(float(source_time)) or not 0 <= float(source_time) <= 4_000_000_000:
+            raise ValidationError("thumbnail source_time_seconds must be finite and in [0, 4000000000]")
+        normalized_time = round(float(source_time), 6)
+        if normalized_time != float(source_time):
+            raise ValidationError("thumbnail source_time_seconds must be normalized to six decimal places")
+        descriptor["selection"]["source_time_seconds"] = normalized_time
+        return descriptor
+
+    @staticmethod
+    def _source_frame_thumbnail_identity(descriptor):
+        time_micros = int(round(float(descriptor["selection"]["source_time_seconds"]) * 1_000_000))
+        return (1 << 62) + time_micros * 1_000 + int(descriptor["recipe_version"])
+
+    def get_source_frame_thumbnail(self, project, *, source_object_id, source_time_seconds, recipe_version=1):
+        project_id = self.store.get_project(project)["id"]
+        if not isinstance(source_object_id, str) or not OBJECT_ID_RE.fullmatch(source_object_id) or not source_object_id.startswith("sha256:"):
+            raise ValidationError("thumbnail source_object_id must be a canonical sha256 object id")
+        source_digest = source_object_id.removeprefix("sha256:")
+        owned = self.store.conn.execute(
+            "SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, source_digest),
+        ).fetchone()
+        if not owned:
+            raise NotFoundError("thumbnail source object is outside the project")
+        descriptor = self._source_frame_thumbnail_descriptor({
+            "object_id": "sha256:" + "0" * 64,
+            "source_object_id": source_object_id,
+            "recipe_version": recipe_version,
+            "selection": {"kind": "source_frame", "source_time_seconds": source_time_seconds},
+        })
+        source = descriptor["source_object_id"].removeprefix("sha256:")
+        rows = self.store.conn.execute(
+            "SELECT from_digest, metadata_json FROM media_relations "
+            "WHERE project_id=? AND to_digest=? AND kind='derived_from' AND ordinal=? "
+            "ORDER BY created_at, from_digest",
+            (project_id, source, self._source_frame_thumbnail_identity(descriptor)),
+        ).fetchall()
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            if metadata.get("thumbnail") == descriptor | {"object_id": "sha256:" + row["from_digest"]}:
+                return {"thumbnail": descriptor | {"object_id": "sha256:" + row["from_digest"]}}
+        return {"thumbnail": None}
+
+    @_durable_mutation
+    def ensure_source_frame_thumbnail(self, project, body, *, idempotency_key=None):
+        idempotency_key = require_idempotency_key(idempotency_key)
+        project_id = self.store.get_project(project)["id"]
+        descriptor = self._source_frame_thumbnail_descriptor(body)
+        source = descriptor["source_object_id"].removeprefix("sha256:")
+        thumbnail = descriptor["object_id"].removeprefix("sha256:")
+        if source == thumbnail:
+            raise ValidationError("thumbnail source and image objects must be distinct")
+        ordinal = self._source_frame_thumbnail_identity(descriptor)
+        for digest in (source, thumbnail):
+            if not self.store.conn.execute("SELECT 1 FROM objects WHERE digest=?", (digest,)).fetchone():
+                raise NotFoundError("thumbnail source or image object not found")
+            if not self.store.conn.execute("SELECT 1 FROM project_objects WHERE project_id=? AND digest=?", (project_id, digest)).fetchone():
+                raise NotFoundError("thumbnail source or image object is outside the project")
+        source_row = self.store.conn.execute("SELECT media_type FROM objects WHERE digest=?", (source,)).fetchone()
+        if not str(source_row["media_type"]).lower().startswith("video/"):
+            raise ConflictError("source-frame thumbnail source object must be video")
+        image = self.store.conn.execute("SELECT media_type FROM objects WHERE digest=?", (thumbnail,)).fetchone()
+        if not image or str(image["media_type"]).lower() != "image/jpeg":
+            raise ConflictError("source-frame thumbnail object must be image/jpeg")
+        aggregate_id = f"{source}:{ordinal}:{descriptor['recipe_version']}"
+        request_hash = hashlib.sha256(canonical_json({"project_id": project_id, "thumbnail": descriptor}).encode()).hexdigest()
+        replay = self._command_replay("thumbnail.source_frame.ensure", aggregate_id, idempotency_key, request_hash, project_id=project_id)
+        if replay is not None:
+            return replay
+        candidates = self.store.conn.execute(
+            "SELECT from_digest, metadata_json, created_at FROM media_relations "
+            "WHERE project_id=? AND to_digest=? AND kind='derived_from' AND ordinal=? "
+            "ORDER BY created_at, from_digest",
+            (project_id, source, ordinal),
+        ).fetchall()
+        existing = None
+        for candidate in candidates:
+            candidate_thumbnail = json.loads(candidate["metadata_json"]).get("thumbnail")
+            if isinstance(candidate_thumbnail, dict) and all(
+                candidate_thumbnail.get(key) == descriptor.get(key)
+                for key in ("source_object_id", "recipe_version", "selection")
+            ):
+                existing = {"thumbnail": candidate_thumbnail}
+                break
+        if existing:
+            result = existing["thumbnail"]
+        else:
+            metadata = {"thumbnail": descriptor}
+            self.store.conn.execute(
+                "INSERT INTO media_relations VALUES (?, ?, ?, 'derived_from', ?, ?, ?)",
+                (project_id, thumbnail, source, ordinal, canonical_json(metadata), now()),
+            )
+            result = descriptor
+        return self._command_record("thumbnail.source_frame.ensure", aggregate_id, idempotency_key, request_hash, result, project_id=project_id)
 
     def list_media_relations(self, project, *, cursor=None, limit=PAGE_DEFAULT_LIMIT):
         project_id = self.store.get_project(project)["id"]

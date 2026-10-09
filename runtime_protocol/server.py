@@ -197,10 +197,13 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             body = self._body()
             if not body.get("candidate"):
                 raise ProtocolError("candidate is required")
+            retain_superseded = body.get("retain_superseded", False)
+            if not isinstance(retain_superseded, bool):
+                raise ProtocolError("retain_superseded must be a boolean")
             daemon = getattr(self.server, "daemon_runtime", None)
             if daemon is None:
                 raise ProtocolError("replacement is unavailable outside the owning daemon")
-            return self._send(200, daemon.activate_candidate(body["candidate"]))
+            return self._send(200, daemon.activate_candidate(body["candidate"], retain_superseded=retain_superseded))
         if path == ["v1", "projects", "selection"] and method in ("GET", "PUT"):
             identity = self._identity("projects:read" if method == "GET" else "projects:write")
             if method == "GET":
@@ -241,6 +244,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "POST":
             self._identity("projects:write")
             return self._send(200, self.runtime.publish_parent_composition(path[2], path[4], self._project_mutation_body(), idempotency_key=self._idempotency_key()))
+        if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "GET":
+            self._identity("projects:read")
+            query = parse_qs(urlsplit(self.path).query)
+            return self._send(200, self.runtime.list_project_parent_composition_revisions(
+                path[2], path[4], cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0],
+            ))
         if len(path) == 6 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "inspect" and method == "POST":
             self._identity("projects:read")
             return self._send(200, self.runtime.inspect_timeline(path[2], path[4], self._timeline_options()))
@@ -253,6 +262,11 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         if len(path) == 7 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and method == "GET":
             self._identity("projects:read")
             return self._send(200, self.runtime.get_project_parent_composition_revision(path[2], path[4], path[6]))
+        if len(path) == 8 and path[:2] == ["v1", "projects"] and path[3] == "timelines" and path[5] == "composition-revisions" and path[7] == "restore" and method == "POST":
+            self._identity("projects:write")
+            return self._send(200, self.runtime.restore_project_parent_composition_revision(
+                path[2], path[4], path[6], self._project_mutation_body(), idempotency_key=self._idempotency_key(),
+            ))
         if len(path) == 7 and path[:2] == ["v1", "projects"] and path[5] == "revisions" and method == "GET":
             self._identity("projects:read")
             if path[3] == "shots":
@@ -487,6 +501,26 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     query = parse_qs(urlsplit(self.path).query)
                     return self._send(200, self.runtime.list_media_relations(selector, cursor=query.get("cursor", [None])[0], limit=query.get("limit", [50])[0]))
                 if method == "POST": return self._send(201, self.runtime.create_media_relation(selector, self._body(), idempotency_key=self._idempotency_key()))
+            if len(path) == 5 and path[3:] == ["thumbnails", "source-frame"]:
+                query = parse_qs(urlsplit(self.path).query)
+                if method == "GET":
+                    self._identity("objects:read")
+                    if not query.get("source_object_id") or not query.get("source_time_seconds"):
+                        raise ProtocolError("source_object_id and source_time_seconds query parameters are required")
+                    try:
+                        recipe_version = int(query.get("recipe_version", ["1"])[0])
+                        source_time = float(query["source_time_seconds"][0])
+                    except (TypeError, ValueError) as exc:
+                        raise ProtocolError("source-frame thumbnail query parameters are invalid") from exc
+                    return self._send(200, self.runtime.get_source_frame_thumbnail(
+                        selector, source_object_id=query["source_object_id"][0],
+                        source_time_seconds=source_time, recipe_version=recipe_version,
+                    ))
+                if method == "POST":
+                    self._identity("objects:write")
+                    return self._send(200, self.runtime.ensure_source_frame_thumbnail(
+                        selector, self._body(), idempotency_key=self._idempotency_key(),
+                    ))
         if path == ["v1", "objects"] and method == "POST":
             identity = self._identity("objects:write")
             key = self._idempotency_key()

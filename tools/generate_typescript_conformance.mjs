@@ -308,6 +308,14 @@ export class WorkspaceClient {
   async getProjectParentCompositionRevision(projectId: string, timelineId: string, revision: string): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("getProjectParentCompositionRevision", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/composition-revisions/" + encodeURIComponent(revision))).body);
   }
+  async listProjectParentCompositionRevisions(projectId: string, timelineId: string, cursor?: string, limit = 50): Promise<Page<Record<string, unknown>>> {
+    const query = "?limit=" + limit + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
+    return this.page((await this.call("listProjectParentCompositionRevisions", "GET", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/composition-revisions" + query)).body);
+  }
+  async restoreProjectParentCompositionRevision(projectId: string, timelineId: string, revision: string, expectedHead: string | null, idempotencyKey: string): Promise<MutationResult<Record<string, unknown>>> {
+    const body = { expected_head: expectedHead };
+    return this.mutation<Record<string, unknown>>((await this.call("restoreProjectParentCompositionRevision", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/composition-revisions/" + encodeURIComponent(revision) + "/restore", new TextEncoder().encode(JSON.stringify(body)), { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey })).body);
+  }
   async inspectTimeline(projectId: string, timelineId: string, options: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     return this.json<Record<string, unknown>>((await this.call("inspectTimeline", "POST", "/v1/projects/" + encodeURIComponent(projectId) + "/timelines/" + encodeURIComponent(timelineId) + "/inspect", new TextEncoder().encode(JSON.stringify(options)), { "Content-Type": "application/json" })).body);
   }

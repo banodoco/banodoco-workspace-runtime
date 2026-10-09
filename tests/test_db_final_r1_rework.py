@@ -1,9 +1,11 @@
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
 import runtime_protocol.backup as backup_module
+import runtime_protocol.daemon as daemon_module
 import runtime_protocol.store as store_module
 from runtime_protocol.backup import verify_backup
 from runtime_protocol.daemon import RuntimeDaemon
@@ -208,7 +210,8 @@ def test_older_snapshot_offline_replacement_preserves_external_support_custody(t
         daemon.stop()
 
 
-def test_offline_replacement_verifies_backup_without_admitting_damaged_root(tmp_path):
+@pytest.mark.parametrize("retain_superseded", [False, True])
+def test_offline_replacement_retains_damaged_root_only_when_requested(tmp_path, retain_superseded):
     source = tmp_path / "source"
     RealmStore.initialize(source).close()
     source_service = RuntimeService(source)
@@ -222,14 +225,66 @@ def test_offline_replacement_verifies_backup_without_admitting_damaged_root(tmp_
     RealmStore.initialize(damaged).close()
     (damaged / "realm.sqlite3").write_bytes(b"damaged-active-root")
     daemon = RuntimeDaemon(damaged, support_root=tmp_path / "support", production_worker_credentials=True)
-    result = daemon.replace_from_backup(backup)
+    result = daemon.replace_from_backup(backup, retain_superseded=retain_superseded)
     try:
         assert result["offline"] is True
         assert daemon.service.health()["status"] == "ok"
-        superseded = tmp_path / result["superseded_root"].split("/")[-1]
-        assert (superseded / "realm.sqlite3").read_bytes() == b"damaged-active-root"
+        if retain_superseded:
+            superseded = tmp_path / result["superseded_root"].split("/")[-1]
+            assert (superseded / "realm.sqlite3").read_bytes() == b"damaged-active-root"
+        else:
+            assert result["superseded_root"] is None
+            assert not any(path.name.startswith(".damaged.superseded-") for path in tmp_path.iterdir())
         state = json.loads((tmp_path / "support" / "replacement-state.json").read_text())
         assert state["state"] == "complete"
+        assert state["retain_superseded"] is retain_superseded
+    finally:
+        daemon.stop()
+
+
+def test_offline_cleanup_failure_reports_committed_candidate_and_keeps_receipt(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    RealmStore.initialize(source).close()
+    backup = tmp_path / "backup"
+    source_service = RuntimeService(source)
+    try:
+        source_service.backup(backup)
+    finally:
+        source_service.close()
+
+    damaged = tmp_path / "damaged"
+    RealmStore.initialize(damaged).close()
+    (damaged / "realm.sqlite3").write_bytes(b"damaged-active-root")
+    support_root = tmp_path / "support"
+    daemon = RuntimeDaemon(damaged, support_root=support_root, production_worker_credentials=True)
+    original_rmtree = daemon_module.shutil.rmtree
+    original_atomic_write = daemon_module.atomic_json_write
+
+    def partial_cleanup(path, *args, **kwargs):
+        path = Path(path)
+        if path.name.startswith(".damaged.superseded-"):
+            (path / "owner.lock").unlink(missing_ok=True)
+            raise OSError("injected cleanup ENOSPC")
+        return original_rmtree(path, *args, **kwargs)
+
+    def fail_cleanup_receipt(path, value, **kwargs):
+        if Path(path).name == "replacement-state.json" and value.get("state") == "cleanup_pending":
+            raise OSError("injected journal ENOSPC")
+        return original_atomic_write(path, value, **kwargs)
+
+    monkeypatch.setattr(daemon_module.shutil, "rmtree", partial_cleanup)
+    monkeypatch.setattr(daemon_module, "atomic_json_write", fail_cleanup_receipt)
+    try:
+        result = daemon.replace_from_backup(backup)
+        assert result["state"] == "complete"
+        assert result["cleanup_pending"] is True
+        assert "ENOSPC" in result["cleanup_error"]
+        assert daemon.service.health()["status"] == "ok"
+        assert (damaged / "realm.sqlite3").is_file()
+        state = json.loads((support_root / "replacement-state.json").read_text())
+        assert state["state"] == "complete"
+        assert state["retain_superseded"] is False
+        assert state["superseded_root"] == result["superseded_root"]
     finally:
         daemon.stop()
 

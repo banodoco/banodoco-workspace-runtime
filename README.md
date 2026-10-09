@@ -56,11 +56,23 @@ python3 -m runtime_protocol replace --root ./runtime-realm \
   --support-root ./runtime-support --backup ./realm-backup
 ```
 
-Replacement retains the superseded root for recovery evidence, rotates the
-owner credentials, advances the Runtime epoch, and publishes readiness only
-after the new owner has passed admission. Old realms and backups are
-unsupported and are neither migrated nor salvaged by Runtime; preserve them
-for an explicitly owned offline disposition.
+The `backup` command is the durable backup operation. Upgrades use a temporary
+same-filesystem rollback copy and remove it after success or successful
+rollback; an upgrade failure that cannot roll back reports the retained recovery
+path. To keep a pre-upgrade snapshot intentionally, add `--retain-backup`;
+`--archive-root` is accepted only with that flag. The launcher's automatic
+upgrade path never opts in.
+
+Replacement keeps the old realm available until the new owner passes admission,
+then removes it by default. Add `--retain-superseded` to `replace` when you
+explicitly want a retained copy. The authenticated `v1/replace` request accepts
+the same opt-in as `retain_superseded: true`. A failed rollback preserves both
+recovery roots and reports their paths. Replacement still rotates owner
+credentials and advances the Runtime epoch before publishing readiness.
+
+Do not create full-realm copies before routine start, reconnect, repair, or
+migration. Runtime transaction staging is temporary and operation-owned;
+durable copies are created only by an explicit user backup request.
 
 `start` prints the loopback endpoint and owner credential path, then keeps the
 daemon alive until SIGINT/SIGTERM. The test suite demonstrates the workspace.v1

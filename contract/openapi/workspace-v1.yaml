@@ -243,6 +243,15 @@ paths:
       requestBody: { required: false, content: { application/json: { schema: { $ref: './schemas/timeline-inspection.json' } } } }
       responses: { '200': { description: Deterministic metadata-only Markdown/PNG view, content: { application/json: { schema: { $ref: './schemas/timeline-view.json' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
   /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions:
+    get:
+      operationId: listProjectParentCompositionRevisions
+      description: List immutable canonical parent revisions in one project and timeline scope.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses: { '200': { description: Canonical parent-composition history page, content: { application/json: { schema: { $ref: '#/components/schemas/ParentCompositionRevisionPage' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
     post:
       operationId: publishParentComposition
       description: Atomically publish one complete one-level parent composition and its immutable child/internal revisions.
@@ -264,6 +273,17 @@ paths:
         - { $ref: '#/components/parameters/TimelineId' }
         - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
       responses: { '200': { description: Exact immutable parent composition revision, content: { application/json: { schema: { $ref: '#/components/schemas/ImmutableRevision' } } } }, '404': { $ref: '#/components/responses/NotFound' } }
+  /v1/projects/{project_id}/timelines/{timeline_id}/composition-revisions/{revision}/restore:
+    post:
+      operationId: restoreProjectParentCompositionRevision
+      description: Publish the exact historical parent and dependency closure as a new head using compare-and-swap.
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { $ref: '#/components/parameters/TimelineId' }
+        - { name: revision, in: path, required: true, schema: { type: string, minLength: 1 } }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/RestoreParentCompositionRevision' } } } }
+      responses: { '200': { description: New parent revision published from the exact historical closure, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '404': { $ref: '#/components/responses/NotFound' }, '409': { $ref: '#/components/responses/Conflict' } }
   /v1/projects/{project_id}/timeline-documents:
     post:
       operationId: createTimelineDocument
@@ -522,6 +542,23 @@ paths:
       parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
       requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/CreateMediaRelation' } } } }
       responses: { '201': { description: Media relation with committed receipt, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }, '409': { $ref: '#/components/responses/Conflict' } }
+  /v1/projects/{project_id}/thumbnails/source-frame:
+    get:
+      operationId: getSourceFrameThumbnail
+      parameters:
+        - { $ref: '#/components/parameters/ProjectId' }
+        - { name: source_object_id, in: query, required: true, schema: { type: string, pattern: '^sha256:[0-9a-f]{64}$' } }
+        - { name: source_time_seconds, in: query, required: true, schema: { type: number, minimum: 0, maximum: 4000000000, multipleOf: 0.000001 } }
+        - { name: recipe_version, in: query, required: false, schema: { type: integer, const: 1, default: 1 } }
+      responses:
+        '200': { description: Matching source-frame thumbnail or no match, content: { application/json: { schema: { type: object, required: [thumbnail], properties: { thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] } } } } }
+    post:
+      operationId: ensureSourceFrameThumbnail
+      parameters: [ { $ref: '#/components/parameters/ProjectId' }, { $ref: '#/components/parameters/IdempotencyKey' } ]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' } } } }
+      responses:
+        '200': { description: Existing or newly associated source-frame thumbnail, content: { application/json: { schema: { $ref: '#/components/schemas/CommittedMutation' } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
   /v1/objects:
     post:
       operationId: ingestObject
@@ -1090,12 +1127,7 @@ components:
         object_id: { type: [string, 'null'] }
         variant_type: { type: string }
         metadata: { type: object }
-        thumbnail:
-          type: [object, 'null']
-          properties:
-            object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
-            source_object_id: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
-            recipe_version: { type: integer, const: 1 }
+        thumbnail: { oneOf: [ { $ref: './schemas/generation.json#/definitions/ThumbnailDescriptor' }, { type: 'null' } ] }
         viewed_at: { type: [string, 'null'] }
         created_at: { type: string }
     VariantPage:
@@ -1311,6 +1343,29 @@ components:
         content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
         payload: { type: object }
         created_at: { type: string }
+    ParentCompositionRevision:
+      type: object
+      additionalProperties: false
+      required: [revision_id, project_id, timeline_id, content_digest, created_at, is_current_head]
+      properties:
+        revision_id: { type: string, minLength: 1 }
+        project_id: { type: string, minLength: 1 }
+        timeline_id: { type: string, minLength: 1 }
+        content_digest: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        created_at: { type: string }
+        is_current_head: { type: boolean }
+    ParentCompositionRevisionPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/ParentCompositionRevision' } }
+        next_cursor: { type: [string, 'null'] }
+    RestoreParentCompositionRevision:
+      type: object
+      additionalProperties: false
+      required: [expected_head]
+      properties:
+        expected_head: { type: [string, 'null'] }
     ParentCompositionPublication:
       type: object
       additionalProperties: false

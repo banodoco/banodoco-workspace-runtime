@@ -745,6 +745,16 @@ class WorkspaceClient:
     def get_project_parent_composition_revision(self, project_id: str, timeline_id: str, revision: str) -> Mapping[str, Any]:
         return self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/composition-revisions/{_path_part(revision)}")[2])
 
+    def list_project_parent_composition_revisions(self, project_id: str, timeline_id: str, *, cursor: str | None = None, limit: int = 50) -> tuple[list[Mapping[str, Any]], str | None]:
+        query = f"?limit={int(limit)}" + (f"&cursor={_path_part(cursor)}" if cursor else "")
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/composition-revisions" + query)[2])
+        items, next_cursor = self._page(value)
+        return list(items), next_cursor
+
+    def restore_project_parent_composition_revision(self, project_id: str, timeline_id: str, revision: str, *, expected_head: str | None, idempotency_key: str) -> MutationResult:
+        payload = {"expected_head": expected_head}
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/composition-revisions/{_path_part(revision)}/restore", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key})[2])
+
     def inspect_timeline(self, project_id: str, timeline_id: str, options: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
         payload = dict(options or {})
         return self._json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/timelines/{_path_part(timeline_id)}/inspect", body=json.dumps(payload, separators=(",", ":")).encode(), headers={"Content-Type": "application/json"})[2])
@@ -1007,6 +1017,14 @@ class WorkspaceClient:
         value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/media-relations" + query)[2])
         items, next_cursor = self._page(value)
         return list(items), next_cursor
+
+    def get_source_frame_thumbnail(self, project_id: str, source_object_id: str, source_time_seconds: float, *, recipe_version: int = 1) -> Mapping[str, Any] | None:
+        query = f"?source_object_id={_path_part(source_object_id)}&source_time_seconds={float(source_time_seconds):.6f}&recipe_version={int(recipe_version)}"
+        value = self._json(self._request("GET", f"/v1/projects/{_path_part(project_id)}/thumbnails/source-frame" + query)[2])
+        return value.get("thumbnail")
+
+    def ensure_source_frame_thumbnail(self, project_id: str, thumbnail: Mapping[str, Any], *, idempotency_key: str) -> MutationResult:
+        return self._mutation_json(self._request("POST", f"/v1/projects/{_path_part(project_id)}/thumbnails/source-frame", body=json.dumps(dict(thumbnail), separators=(",", ":")).encode(), headers={"Content-Type": "application/json", "Idempotency-Key": idempotency_key}, expected=(200, 201))[2])
 
     def get_object(self, object_id: str, *, byte_range: tuple[int, int | None] | None = None) -> ByteResponse:
         headers: dict[str, str] = {}

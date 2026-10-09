@@ -234,6 +234,58 @@ def test_existing_realm_missing_required_column_fails_admission_with_schema_deta
     assert error.value.details["checks"]["schema"]["missing_columns"] == {"attempts": ["lease_id"]}
 
 
+def test_revision_admission_preserves_declared_media_and_rejects_post_publication_extra(tmp_path):
+    root = tmp_path / "realm"
+    service = _new_service(root)
+    try:
+        project = service.create_project({"slug": "declared-media", "name": "Declared media", "metadata": {}})
+        project_id = project["id"]
+        service.create_timeline(project_id, "main", idempotency_key="timeline")
+        referenced = service.ingest_object(b"referenced-media", idempotency_key="referenced-media")["data"]["digest"]
+        declared_extra = service.ingest_object(b"declared-extra-media", idempotency_key="declared-extra")["data"]["digest"]
+        undeclared_extra = service.ingest_object(b"undeclared-extra-media", idempotency_key="undeclared-extra")["data"]["digest"]
+        for digest in (referenced, declared_extra, undeclared_extra):
+            bare = digest.removeprefix("sha256:")
+            service.store.conn.execute(
+                "INSERT INTO project_objects(project_id,digest,relation,created_at) VALUES (?, ?, 'managed', datetime('now'))",
+                (project_id, bare),
+            )
+
+        service.publish_parent_composition(
+            project_id,
+            "main",
+            {
+                "project_id": project_id,
+                "timeline_id": "main",
+                "expected_head": None,
+                "parent_revision_id": "declared-parent",
+                "parent_composition": {
+                    "config": {},
+                    "clips": [],
+                    "occurrences": [],
+                    "registry": {"assets": {"tone": {"media_id": referenced}}},
+                },
+                "dependency_manifest": {"media": [referenced, declared_extra]},
+            },
+            idempotency_key="declared-parent-publication",
+        )
+        clean = service.store.integrity_report()
+        assert clean["ok"] is True, clean["checks"]["revisions"]["errors"]
+
+        service.store.conn.execute(
+            "INSERT INTO composition_revision_dependencies(parent_revision_id,dependency_kind,dependency_id,content_digest,ordinal) VALUES (?, 'media', ?, ?, 2)",
+            ("declared-parent", undeclared_extra, undeclared_extra),
+        )
+        report = service.store.integrity_report()
+        assert report["ok"] is False
+        assert any(
+            error["reason"] == "dependency_graph_mismatch"
+            for error in report["checks"]["revisions"]["errors"]
+        )
+    finally:
+        service.close()
+
+
 @pytest.mark.parametrize(
     ("mutation", "reason"),
     [
