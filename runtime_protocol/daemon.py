@@ -133,7 +133,7 @@ class RuntimeDaemon:
         if not self.production_worker_credentials and not self.local_worker_profiles:
             # Test-only in-process convenience.  The production CLI never
             # selects this branch; its pack host receives WORKER_ACTOR's
-            # scoped token and cannot call admin/project routes.
+            # scoped token and cannot call admin routes or mutate projects.
             self.worker_token = self.token
         if self.bootstrap_token_file and self.bootstrap_token_file.exists():
             bootstrap_token = self.bootstrap_token_file.read_text(encoding="utf-8").strip()

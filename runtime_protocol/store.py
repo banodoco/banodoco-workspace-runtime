@@ -1285,8 +1285,8 @@ class RealmStore:
         through Astrid's managed-render helper.  Runtime is the authenticated
         project/timeline authority, so it may resolve that reference once and
         carry the resulting immutable snapshot into the claimed task.  The
-        generic host still receives only the snapshot and never gets project
-        or timeline read scope.
+        The generic host uses this snapshot for the render task and does not
+        need a fresh project or timeline read while processing that task.
         """
         if not isinstance(spec, dict):
             raise ValidationError("task spec must be an object")
